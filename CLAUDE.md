@@ -4,7 +4,7 @@ This file provides guidance to Claude Code when working with code in this reposi
 
 ## Project Overview
 
-RunPodFarm — distributed VFX rendering/simulation pipeline on RunPod GPU Pods for SideFX Houdini. Based on the AWS ECS Scheduler from a SideFX content library example (MIT license, 2024), adapted for RunPod with Redis-based task queue, JuiceFS shared filesystem, and a full management stack.
+RunPodFarm — distributed VFX rendering/simulation pipeline on RunPod GPU Pods for SideFX Houdini. Based on the AWS ECS Scheduler from a SideFX content library example (MIT license, 2024), adapted for RunPod with Redis-based task queue, Network Volume shared storage, and a full management stack.
 
 ## Architecture
 
@@ -13,10 +13,19 @@ PDG-native scheduling: no separate Scheduler Server. Each Houdini instance runs 
 ```
 Houdini (Scheduler HDA) → Redis queue → RunPod Pods (Worker daemon)
                                       ↕
-Desktop App → Auth API → JuiceFS config → JuiceFS mount (B2 + Redis)
+                              Network Volume (/workspace)
+                         (shared NVMe storage between pods)
+                                      ↕
+Desktop App → Auth API → project config → upload to Network Volume (S3 API / rsync)
                                       ↕
 Dashboard (Web UI) ← Monitoring API ← Redis (read-only)
 ```
+
+### Storage Architecture
+- **Network Volume** (RunPod NVMe): Primary shared storage between pods. Houdini install + project files + render output.
+- **Backblaze B2**: Archive for completed projects. NOT used during active rendering.
+- **JuiceFS**: Optional, artist-side only (local FUSE mount). NOT available on RunPod (no FUSE support).
+- FUSE is not supported on RunPod — confirmed platform limitation.
 
 ## Repository Structure
 
@@ -37,8 +46,8 @@ hda/runpodfarm_scheduler.hda/  — Houdini Digital Asset (expanded format)
     Tools.shelf              Shelf tool definition
 
 docker/                    — Docker image for RunPod pods
-  Dockerfile                 Ubuntu 22.04 + CUDA 12.4 + JuiceFS + Worker
-  entrypoint.sh              Mount JuiceFS → setup Houdini → start worker
+  Dockerfile                 Ubuntu 22.04 + CUDA 12.4 + Worker daemon
+  entrypoint.sh              Setup project dir → setup Houdini from Network Volume → start worker
   docker-compose.dev.yml     Local dev environment with Redis
   .dockerignore
 
@@ -143,7 +152,7 @@ juicefs:*                          — JuiceFS metadata (managed by JuiceFS)
 ## Manual Testing
 
 No automated tests yet. Test flow:
-1. Infrastructure: `juicefs mount` locally → write file → mount on pod → file visible
+1. Infrastructure: upload files to Network Volume → start pod → files visible at /workspace/projects
 2. Worker: start pod → worker connects to Redis → heartbeat visible → push test task → result in Redis
 3. HDA: Houdini → TOP Network → RunPodFarm Scheduler → cook → frames render on pods → results in /project/renders/
 ### Dokploy Server
