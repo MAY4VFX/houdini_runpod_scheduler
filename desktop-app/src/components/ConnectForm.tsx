@@ -7,7 +7,7 @@ interface ConnectFormProps {
 
 export default function ConnectForm({ onConnected }: ConnectFormProps) {
   const [apiKey, setApiKey] = useState("");
-  const [apiUrl, setApiUrl] = useState("https://api.runpodfarm.com");
+  const [apiUrl, setApiUrl] = useState("https://db.ai-vfx.com");
   const [loading, setLoading] = useState(false);
   const [loadingMessage, setLoadingMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -164,7 +164,7 @@ export default function ConnectForm({ onConnected }: ConnectFormProps) {
                   type="url"
                   value={apiUrl}
                   onChange={(e) => setApiUrl(e.target.value)}
-                  placeholder="https://api.runpodfarm.com"
+                  placeholder="https://db.ai-vfx.com"
                   className="input-field"
                   disabled={loading}
                 />

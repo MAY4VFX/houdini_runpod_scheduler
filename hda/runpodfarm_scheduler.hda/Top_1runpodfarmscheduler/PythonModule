@@ -1126,7 +1126,7 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
             "work_item_name": work_item.name,
             "command": full_command,
             "env": task_env,
-            "warmup_paths": warmup_paths,
+            "warmup_paths": warmup_paths.split() if warmup_paths else [],
             "created_at": datetime.datetime.now().isoformat(),
         }
 
@@ -1182,7 +1182,7 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
             status = result_data.get("status", "failed")
             exit_code = result_data.get("exit_code", -1)
 
-            if status == "success" and exit_code == 0:
+            if status in ("success", "succeeded") and exit_code == 0:
                 self._verboseLog(
                     f"Task {task_id} succeeded "
                     f"(work_item={work_item.name}, "
@@ -1371,6 +1371,7 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
                     unhealthy_pods.append(pod_info)
 
         # Handle unhealthy pods
+        pods_to_remove = []
         for pod_info in unhealthy_pods:
             pod_id = pod_info["pod_id"]
 
@@ -1384,6 +1385,7 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
                         f"Removing from pool."
                     )
                     pod_info["status"] = _POD_STATUS_EXITED
+                    pods_to_remove.append(pod_info)
                 else:
                     # Update heartbeat -- pod is still running
                     pod_info["last_heartbeat"] = datetime.datetime.now()
@@ -1391,6 +1393,10 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
                 self._verboseLog(
                     f"Warning: Cannot query status of pod {pod_id}"
                 )
+
+        # Remove dead pods from pool after iteration
+        for pod_info in pods_to_remove:
+            self.pod_infos.remove(pod_info)
 
     def onStopCook(self, cancel):
         """
@@ -1429,7 +1435,7 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
                         status = result_data.get("status", "failed")
                         exit_code = result_data.get("exit_code", -1)
 
-                        if status == "success" and exit_code == 0:
+                        if status in ("success", "succeeded") and exit_code == 0:
                             self.workItemSucceeded(
                                 work_item.id, -1, int(duration)
                             )

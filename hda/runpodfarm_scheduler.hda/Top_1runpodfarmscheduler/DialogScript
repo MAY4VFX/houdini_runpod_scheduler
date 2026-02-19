@@ -223,7 +223,7 @@
                 label   "Label"
                 type    label
                 nolabel
-                default { "Ensure JuiceFS is mounted at the Local Shared Path\nbefore starting the cook." }
+                default { "Ensure the Network Volume is mounted at the Local Shared Path\nbefore starting the cook." }
             }
             parm {
                 name    "rpfarm_overrideremoteworkingdir"
