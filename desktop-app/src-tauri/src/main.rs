@@ -303,6 +303,128 @@ fn get_fuse_install_instructions() -> String {
     }
 }
 
+// ─── FUSE auto-install ───────────────────────────────────────────────
+
+async fn install_fuse_macos() -> Result<String, String> {
+    // Find Homebrew binary — check common paths directly since Tauri subprocesses
+    // often don't have /opt/homebrew/bin in PATH
+    let brew_path = ["/opt/homebrew/bin/brew", "/usr/local/bin/brew"]
+        .iter()
+        .find(|p| std::path::Path::new(p).exists())
+        .map(|p| p.to_string());
+
+    let brew = match brew_path {
+        Some(b) => b,
+        None => {
+            return Err(
+                "Homebrew not found. Install it from https://brew.sh first.".to_string(),
+            );
+        }
+    };
+
+    // Quick check: already installed?
+    let list_out = Command::new(&brew)
+        .args(["list", "--cask", "macfuse"])
+        .output()
+        .ok();
+    if list_out.map(|o| o.status.success()).unwrap_or(false) {
+        return Ok("macFUSE is already installed.".to_string());
+    }
+
+    // Create a temporary askpass script that shows a native macOS password dialog.
+    // When brew needs sudo (no tty available), sudo uses SUDO_ASKPASS automatically.
+    let askpass_path = std::env::temp_dir().join("runpodfarm-askpass.sh");
+    std::fs::write(
+        &askpass_path,
+        "#!/bin/bash\nosascript -e 'display dialog \"RunPodFarm needs your password to install macFUSE:\" default answer \"\" with hidden answer buttons {\"OK\",\"Cancel\"} default button \"OK\" with icon caution with title \"RunPodFarm\"' -e 'text returned of result' 2>/dev/null\n",
+    )
+    .map_err(|e| format!("Failed to create askpass script: {}", e))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&askpass_path, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("Failed to chmod askpass: {}", e))?;
+    }
+
+    // Run brew install with SUDO_ASKPASS — shows native macOS password dialog if needed
+    let output = Command::new(&brew)
+        .args(["install", "--cask", "macfuse"])
+        .env("SUDO_ASKPASS", &askpass_path)
+        .output()
+        .map_err(|e| format!("Failed to run brew: {}", e))?;
+
+    // Clean up askpass script
+    let _ = std::fs::remove_file(&askpass_path);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    if output.status.success() || stdout.contains("already installed") || stderr.contains("already installed") {
+        return Ok("macFUSE installed. You may need to approve the system extension in System Settings > Privacy & Security.".to_string());
+    }
+
+    Err(format!(
+        "brew install failed (exit {}): {}",
+        output.status.code().unwrap_or(-1),
+        stderr.chars().take(300).collect::<String>()
+    ))
+}
+
+fn install_fuse_linux() -> Result<String, String> {
+    let output = Command::new("pkexec")
+        .args(["apt", "install", "-y", "fuse3"])
+        .output()
+        .map_err(|e| format!("Failed to install fuse3: {}", e))?;
+
+    if output.status.success() {
+        Ok("FUSE installed successfully.".to_string())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(format!(
+            "Failed to install FUSE: {}. Try manually: sudo apt install -y fuse3",
+            stderr
+        ))
+    }
+}
+
+async fn install_fuse_windows() -> Result<String, String> {
+    let msi_url =
+        "https://github.com/winfsp/winfsp/releases/download/v2.0/winfsp-2.0.23075.msi";
+
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .build()
+        .map_err(|e| format!("HTTP client error: {}", e))?;
+
+    let resp = client
+        .get(msi_url)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to download WinFsp: {}", e))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("Download failed: HTTP {}", resp.status()));
+    }
+
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| format!("Failed to read download: {}", e))?;
+
+    let tmp_path = std::env::temp_dir().join("winfsp-install.msi");
+    std::fs::write(&tmp_path, &bytes)
+        .map_err(|e| format!("Failed to save installer: {}", e))?;
+
+    Command::new("msiexec")
+        .args(["/i", &tmp_path.to_string_lossy(), "/passive"])
+        .output()
+        .map_err(|e| format!("Failed to run installer: {}", e))?;
+
+    Ok("WinFsp installer launched. Please complete the installation, then reboot if prompted."
+        .to_string())
+}
+
 // ─── Houdini helpers ────────────────────────────────────────────────
 
 fn find_houdini() -> Option<String> {
@@ -420,6 +542,20 @@ async fn check_fuse_installed() -> Result<bool, String> {
 }
 
 #[tauri::command]
+async fn install_fuse() -> Result<String, String> {
+    if cfg!(target_os = "macos") {
+        install_fuse_macos().await
+    } else if cfg!(target_os = "linux") {
+        // Wrap sync fn in async context
+        install_fuse_linux()
+    } else if cfg!(target_os = "windows") {
+        install_fuse_windows().await
+    } else {
+        Err("Unsupported platform".to_string())
+    }
+}
+
+#[tauri::command]
 async fn ensure_dependencies() -> Result<DependencyStatus, String> {
     let juicefs_installed = check_juicefs_installed_sync();
     let juicefs_path = get_juicefs_path_sync();
@@ -468,15 +604,14 @@ async fn connect(
         download_juicefs_impl().await?;
     }
 
-    // 3. Auth API call — verify connection by calling GET /api/projects
+    // 3. Auth API call — GET /api/artist/config with X-API-Key
     let client = reqwest::Client::new();
     let resp = client
-        .get(format!("{}/api/projects", api_url))
-        .header("Authorization", format!("Bearer {}", api_key))
+        .get(format!("{}/api/artist/config", api_url))
         .header("X-API-Key", &api_key)
         .send()
         .await
-        .map_err(|e| format!("Request failed: {}", e))?;
+        .map_err(|e| format!("Connection failed: {}", e))?;
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -484,52 +619,22 @@ async fn connect(
         return Err(format!("Auth failed ({}): {}", status, body));
     }
 
-    // Parse the projects list to get the first project's config
-    let projects_body: serde_json::Value = resp
+    let body: serde_json::Value = resp
         .json()
         .await
-        .map_err(|e| format!("Failed to parse projects response: {}", e))?;
+        .map_err(|e| format!("Failed to parse response: {}", e))?;
 
-    // Try to extract JuiceFS config from the first project, or use defaults
-    let config = if let Some(projects) = projects_body.as_array() {
-        if let Some(first_project) = projects.first() {
-            // Try to get config from the project's juicefs_config or storage_config
-            let project_id = first_project
-                .get("id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("default")
-                .to_string();
+    let cfg = body.get("config").ok_or("No config in server response")?;
 
-            let storage = first_project.get("storage_config").or(first_project.get("juicefs_config"));
-
-            if let Some(storage) = storage {
-                JuiceFSConfig {
-                    redis_url: storage.get("redis_url").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                    b2_endpoint: storage.get("b2_endpoint").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                    b2_access_key: storage.get("b2_access_key").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                    b2_secret_key: storage.get("b2_secret_key").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                    b2_bucket: storage.get("b2_bucket").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                    rsa_key: storage.get("rsa_key").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                    project_id,
-                    mount_path: storage.get("mount_path").and_then(|v| v.as_str()).unwrap_or("/project").to_string(),
-                }
-            } else {
-                JuiceFSConfig {
-                    redis_url: String::new(),
-                    b2_endpoint: String::new(),
-                    b2_access_key: String::new(),
-                    b2_secret_key: String::new(),
-                    b2_bucket: String::new(),
-                    rsa_key: String::new(),
-                    project_id,
-                    mount_path: "/project".to_string(),
-                }
-            }
-        } else {
-            return Err("No projects found on the server".to_string());
-        }
-    } else {
-        return Err("Unexpected response format from server".to_string());
+    let config = JuiceFSConfig {
+        redis_url: cfg.get("redis_url").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        b2_endpoint: cfg.get("b2_endpoint").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        b2_access_key: cfg.get("b2_access_key").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        b2_secret_key: cfg.get("b2_secret_key").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        b2_bucket: cfg.get("b2_bucket").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        rsa_key: cfg.get("rsa_key").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        project_id: cfg.get("project_id").and_then(|v| v.as_str()).unwrap_or("default").to_string(),
+        mount_path: cfg.get("mount_path").and_then(|v| v.as_str()).unwrap_or("/project").to_string(),
     };
 
     let project_id = config.project_id.clone();
@@ -779,7 +884,7 @@ fn find_hda_source() -> Option<PathBuf> {
 }
 
 #[tauri::command]
-async fn install_hda() -> Result<String, String> {
+async fn install_hda(app: tauri::AppHandle) -> Result<String, String> {
     let houdini_path =
         find_houdini().ok_or_else(|| "Houdini installation not found".to_string())?;
 
@@ -787,9 +892,34 @@ async fn install_hda() -> Result<String, String> {
     std::fs::create_dir_all(&otls_dir)
         .map_err(|e| format!("Failed to create otls dir: {}", e))?;
 
-    let hda_source = find_hda_source().ok_or_else(|| {
-        "HDA source not found. Please ensure the runpodfarm_scheduler.hda directory exists in the repository (hda/ folder).".to_string()
-    })?;
+    // Try bundled resources first (production build), then fall back to disk search (dev)
+    // Tauri converts ../../ to _up_/_up_/ in the resource path
+    let hda_source = app
+        .path()
+        .resource_dir()
+        .ok()
+        .and_then(|r| {
+            // Try the Tauri-mangled path first (_up_/_up_/hda/...)
+            let mangled = r.join("_up_/_up_/hda/runpodfarm_scheduler.hda");
+            if mangled.is_dir() {
+                return Some(mangled);
+            }
+            // Try direct path
+            let direct = r.join("runpodfarm_scheduler.hda");
+            if direct.is_dir() {
+                return Some(direct);
+            }
+            // Try hda/ subdirectory
+            let hda_sub = r.join("hda/runpodfarm_scheduler.hda");
+            if hda_sub.is_dir() {
+                return Some(hda_sub);
+            }
+            None
+        })
+        .or_else(find_hda_source)
+        .ok_or_else(|| {
+            "HDA not found in app resources or on disk".to_string()
+        })?;
 
     let hda_dest = PathBuf::from(&otls_dir).join("runpodfarm_scheduler.hda");
 
@@ -887,6 +1017,7 @@ fn main() {
             get_juicefs_path,
             download_juicefs,
             check_fuse_installed,
+            install_fuse,
             ensure_dependencies,
         ])
         .run(tauri::generate_context!())

@@ -53,6 +53,50 @@ app.get("/health", (c) => {
   });
 });
 
+// --- Artist connect endpoint (API key auth, for desktop app) ---
+app.get("/api/artist/config", (c) => {
+  const apiKey = c.req.header("X-API-Key");
+  if (!apiKey) {
+    return c.json({ error: "X-API-Key header is required" }, 401);
+  }
+
+  const artist = store.getArtistByApiKey(apiKey);
+  if (!artist) {
+    return c.json({ error: "Invalid API key" }, 401);
+  }
+
+  if (artist.revokedAt) {
+    return c.json({ error: "API key has been revoked" }, 403);
+  }
+
+  const project = store.getProject(artist.projectId);
+  if (!project) {
+    return c.json({ error: "Project not found" }, 404);
+  }
+
+  return c.json({
+    artist: {
+      id: artist.id,
+      name: artist.name,
+      email: artist.email,
+    },
+    project: {
+      id: project.id,
+      name: project.name,
+    },
+    config: {
+      redis_url: project.redisUrl,
+      b2_endpoint: project.b2Endpoint,
+      b2_access_key: project.b2AccessKey,
+      b2_secret_key: project.b2SecretKey,
+      b2_bucket: project.b2Bucket,
+      rsa_key: project.juicefsRsaKey,
+      project_id: project.id,
+      mount_path: `/mnt/juicefs/${project.id}`,
+    },
+  });
+});
+
 // --- API routes ---
 app.route("/api/auth", createAuthRoutes(store, jwtSecret));
 app.route("/api/projects", createProjectRoutes(store, jwtSecret));
