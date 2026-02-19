@@ -48,12 +48,16 @@ if [ -d "/workspace/houdini" ]; then
     export HFS="/workspace/houdini"
     source "$HFS/houdini_setup_bash" 2>/dev/null || true
 
-    # Houdini licensing via SideFX Online
-    if [ -n "${SIDEFX_CLIENT_ID:-}" ] && [ -n "${SIDEFX_CLIENT_SECRET:-}" ]; then
-        echo "Configuring SideFX Online licensing..."
-        # hserver handles license checkout automatically when client credentials are set
-        export HOUDINI_CLIENT_ID="${SIDEFX_CLIENT_ID}"
-        export HOUDINI_CLIENT_SECRET="${SIDEFX_CLIENT_SECRET}"
+    # Houdini licensing via sesinetd license server
+    if [ -n "${SESINETD_HOST:-}" ]; then
+        SESINETD_PORT="${SESINETD_PORT:-1715}"
+        echo "Configuring license server: ${SESINETD_HOST}:${SESINETD_PORT}"
+        mkdir -p /root/.sesi_licenses.d
+        echo "serverhost=${SESINETD_HOST}" > /root/.sesi_licenses.d/sesinetd_licenses.pref
+        echo "serverport=${SESINETD_PORT}" >> /root/.sesi_licenses.d/sesinetd_licenses.pref
+        # Also set via environment for hserver
+        export SESI_LMHOST="${SESINETD_HOST}"
+        export SESI_LMPORT="${SESINETD_PORT}"
     fi
 
     # Set project-specific Houdini env
