@@ -1,0 +1,17 @@
+version: '3.8'
+services:
+  server:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      - JWT_SECRET=dev-secret-change-in-production
+      - PORT=3000
+      - DATABASE_PATH=/app/data/runpodfarm.db
+      - CORS_ORIGIN=*
+      - REDIS_URL=${REDIS_URL:-}
+    volumes:
+      - server-data:/app/data
+
+volumes:
+  server-data:
