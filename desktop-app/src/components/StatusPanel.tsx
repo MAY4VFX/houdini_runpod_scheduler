@@ -1,10 +1,12 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import {
   disconnect,
   mountJuicefs,
   unmountJuicefs,
   installHda,
+  ensureDependencies,
   type AppStatus,
+  type DependencyStatus,
 } from "../lib/tauri";
 
 interface StatusPanelProps {
@@ -56,6 +58,13 @@ export default function StatusPanel({
   const [loading, setLoading] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
+  const [deps, setDeps] = useState<DependencyStatus | null>(null);
+
+  useEffect(() => {
+    ensureDependencies()
+      .then(setDeps)
+      .catch(() => {});
+  }, []);
 
   const handleDisconnect = async () => {
     setLoading("disconnect");
@@ -157,6 +166,31 @@ export default function StatusPanel({
             Connected
           </span>
         </div>
+
+        {/* Dependencies info */}
+        {deps && (
+          <div className="card mb-4">
+            <h2 className="mb-1 text-sm font-semibold uppercase tracking-wider text-gray-400">
+              Dependencies
+            </h2>
+            <div className="divide-y divide-surface-800">
+              <StatusRow
+                label="FUSE Driver"
+                value={deps.fuse_installed ? "Installed" : "Not installed"}
+                active={deps.fuse_installed}
+              />
+              <StatusRow
+                label="JuiceFS Client"
+                value={
+                  deps.juicefs_installed
+                    ? deps.juicefs_path || "Installed"
+                    : "Not installed"
+                }
+                active={deps.juicefs_installed}
+              />
+            </div>
+          </div>
+        )}
 
         {/* Status Cards */}
         <div className="card mb-4">
