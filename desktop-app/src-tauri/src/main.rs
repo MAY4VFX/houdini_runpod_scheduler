@@ -785,17 +785,19 @@ async fn mount_juicefs_inner(
         .map_err(|e| format!("Failed to create mount dir: {}", e))?;
 
     // JuiceFS mount reads storage config from Redis metadata (set during juicefs format).
-    // Credentials are passed via environment variables, not command-line flags.
-    let output = Command::new(&juicefs_path)
-        .args([
-            "mount",
-            &config.redis_url,
-            &config.mount_path,
-            "-d",
-        ])
-        .env("ACCESS_KEY", &config.b2_access_key)
-        .env("SECRET_KEY", &config.b2_secret_key)
-        .output()
+    // Only pass credentials as env vars if they look real (not placeholders).
+    let mut cmd = Command::new(&juicefs_path);
+    cmd.args(["mount", &config.redis_url, &config.mount_path, "-d"]);
+
+    let is_real_key = |k: &str| !k.is_empty() && !k.starts_with("test-") && k.len() > 10;
+    if is_real_key(&config.b2_access_key) {
+        cmd.env("ACCESS_KEY", &config.b2_access_key);
+    }
+    if is_real_key(&config.b2_secret_key) {
+        cmd.env("SECRET_KEY", &config.b2_secret_key);
+    }
+
+    let output = cmd.output()
         .map_err(|e| format!("Failed to run juicefs: {}", e))?;
 
     if output.status.success() {
