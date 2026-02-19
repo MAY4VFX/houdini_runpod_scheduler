@@ -1,0 +1,10 @@
+.worktrees/
+logs/
+__pycache__/
+*.pyc
+.env
+.env.*
+node_modules/
+dist/
+target/
+.DS_Store
