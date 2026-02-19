@@ -1,0 +1,15 @@
+Operator:     runpodfarmscheduler
+Label:        RunPodFarm Scheduler
+Path:         oplib:/Top/runpodfarmscheduler?Top/runpodfarmscheduler
+Icon:         TOP_scheduler
+Table:        Top
+License:
+Extra:        pdgtype='scheduler' subtype=runpodfarmscheduler visibleoutputs=0
+User:
+Inputs:       0 to 0
+Outputs:      0
+Subnet:       false
+Python:       false
+Empty:        false
+Modified:     Wed Feb 19 12:00:00 2026
+
