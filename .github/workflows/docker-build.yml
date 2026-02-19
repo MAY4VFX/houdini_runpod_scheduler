@@ -54,9 +54,21 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Update RunPod template to new image tag
+        env:
+          RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
+          TEMPLATE_ID: ${{ vars.RUNPOD_TEMPLATE_ID }}
+          NEW_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.short_sha }}
         run: |
-          curl -s -X POST "https://api.runpod.io/graphql?api_key=${{ secrets.RUNPOD_API_KEY }}" \
+          RESPONSE=$(curl -s -X POST "https://api.runpod.io/graphql?api_key=${RUNPOD_API_KEY}" \
             -H "Content-Type: application/json" \
-            -d '{
-              "query": "mutation { saveTemplate(input: { id: \"${{ vars.RUNPOD_TEMPLATE_ID }}\", name: \"RunPodFarm Worker\", imageName: \"${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.short_sha }}\", dockerArgs: \"\", containerDiskInGb: 10, volumeInGb: 0, isPublic: false, startJupyter: false, startSsh: false }) { id imageName } }"
-            }' | python3 -c "import sys,json; d=json.load(sys.stdin); print(f'Template updated: {d[\"data\"][\"saveTemplate\"][\"imageName\"]}')" || echo "Warning: Failed to update RunPod template"
+            -d "{\"query\": \"mutation { saveTemplate(input: { id: \\\"${TEMPLATE_ID}\\\", name: \\\"RunPodFarm Worker\\\", imageName: \\\"${NEW_IMAGE}\\\", dockerArgs: \\\"\\\", containerDiskInGb: 10, volumeInGb: 0, isPublic: false, startJupyter: false, startSsh: false }) { id imageName } }\"}")
+          echo "RunPod API response: ${RESPONSE}"
+          echo "${RESPONSE}" | python3 -c "
+          import sys, json
+          d = json.load(sys.stdin)
+          if 'data' in d and d['data'].get('saveTemplate'):
+              print(f\"Template updated: {d['data']['saveTemplate']['imageName']}\")
+          else:
+              print(f\"Warning: Unexpected response: {d}\")
+              sys.exit(1)
+          " || echo "Warning: Failed to update RunPod template"
