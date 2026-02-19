@@ -1,6 +1,7 @@
 # RunPodFarm Worker Image
-# Ubuntu 22.04 + CUDA 12.x + JuiceFS + Worker daemon
+# Ubuntu 22.04 + CUDA 12.x + Worker daemon
 # Houdini is NOT included - it comes from Network Volume at /workspace
+# Project files are on Network Volume at /workspace/projects
 
 FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04
 
