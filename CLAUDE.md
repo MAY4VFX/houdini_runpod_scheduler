@@ -148,9 +148,19 @@ No automated tests yet. Test flow:
 3. HDA: Houdini → TOP Network → RunPodFarm Scheduler → cook → frames render on pods → results in /project/renders/
 ### Dokploy Server
 - **Host**: 192.168.2.140
-- порт апи 3001
+- **Dokploy API**: порт 3001
 - **SSH Access**: `ssh -o StrictHostKeyChecking=no root@192.168.2.140`
-- **Auto-deploy**: Enabled - пуш в правильную ветку автоматически запускает деплой
-- **Dokploy API Key** x-api-key : XdVofMdOfAlneojMFpBWplFeYWbxFzcUpuPBlQLYuBxmfWmjARKNyXwDEnsgMrZc
-- делай коммит  и пуш после правок
-- никогда не собирать докер композы в ручную только через докплой и репозиторий
+- **Auto-deploy**: Enabled — пуш в ветку `feature/runpodfarm-full-stack` автоматически запускает деплой
+- **Dokploy API Key** x-api-key: XdVofMdOfAlneojMFpBWplFeYWbxFzcUpuPBlQLYuBxmfWmjARKNyXwDEnsgMrZc
+- делай коммит и пуш после правок
+- никогда не собирать докер композы в ручную, только через Dokploy и репозиторий
+
+### Deployed RunPodFarm Server
+- **URL**: http://192.168.2.140:3200
+- **Health**: http://192.168.2.140:3200/health
+- **Dashboard**: http://192.168.2.140:3200/
+- **API**: http://192.168.2.140:3200/api/
+- **Dokploy Project ID**: jCFMhgtnykHDGvETwx4Vr
+- **Dokploy Application ID**: vX-EGp8IGf_-8ATUf_Ehp
+- **Build**: multi-stage Docker (dashboard + server), Dockerfile at `server/Dockerfile`, context: repo root
+- **Branch**: feature/runpodfarm-full-stack
