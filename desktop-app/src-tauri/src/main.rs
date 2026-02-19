@@ -427,78 +427,166 @@ async fn install_fuse_windows() -> Result<String, String> {
 
 // ─── Houdini helpers ────────────────────────────────────────────────
 
-fn find_houdini() -> Option<String> {
-    let paths = if cfg!(target_os = "macos") {
-        vec![
-            "/Applications/Houdini/Current/Frameworks/Houdini.framework/Versions/Current/Resources",
-            "/Applications/Houdini/Houdini20.5/Frameworks/Houdini.framework/Versions/20.5/Resources",
-            "/Applications/Houdini/Houdini20.0/Frameworks/Houdini.framework/Versions/20.0/Resources",
-        ]
-    } else if cfg!(target_os = "linux") {
-        vec!["/opt/hfs20.5", "/opt/hfs20.0", "/opt/hfs19.5"]
-    } else {
-        vec![
-            "C:\\Program Files\\Side Effects Software\\Houdini 20.5",
-            "C:\\Program Files\\Side Effects Software\\Houdini 20.0",
-        ]
-    };
-
-    paths
-        .into_iter()
-        .find(|p| std::path::Path::new(p).exists())
-        .map(|p| p.to_string())
+/// Scan for Houdini installations dynamically (macOS: /Applications/Houdini/Houdini*).
+/// Returns (resources_path, major_minor_version) pairs sorted newest-first.
+fn scan_houdini_macos() -> Vec<(String, String)> {
+    let base = std::path::Path::new("/Applications/Houdini");
+    if !base.exists() {
+        return vec![];
+    }
+    let mut found: Vec<(String, String)> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(base) {
+        let mut dirs: Vec<String> = entries
+            .filter_map(|e| e.ok())
+            .filter_map(|e| {
+                let name = e.file_name().to_string_lossy().to_string();
+                if name.starts_with("Houdini") && name != "Houdini" && e.path().is_dir() {
+                    Some(name)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        dirs.sort_by(|a, b| b.cmp(a));
+        for dir_name in &dirs {
+            let version_str = dir_name.trim_start_matches("Houdini");
+            let parts: Vec<&str> = version_str.splitn(3, '.').collect();
+            let major_minor = if parts.len() >= 2 {
+                format!("{}.{}", parts[0], parts[1])
+            } else {
+                version_str.to_string()
+            };
+            if major_minor.is_empty() {
+                continue;
+            }
+            let resources = base
+                .join(dir_name)
+                .join("Frameworks/Houdini.framework/Versions")
+                .join(&major_minor)
+                .join("Resources");
+            if resources.exists() {
+                found.push((resources.to_string_lossy().to_string(), major_minor));
+            }
+        }
+    }
+    // Also check "Current" symlink
+    let current = base.join("Current/Frameworks/Houdini.framework/Versions/Current/Resources");
+    if current.exists() {
+        let current_str = current.to_string_lossy().to_string();
+        if !found.iter().any(|(p, _)| p == &current_str) {
+            found.push((current_str, "Current".to_string()));
+        }
+    }
+    found
 }
 
-fn find_all_houdini() -> Vec<String> {
-    let paths = if cfg!(target_os = "macos") {
-        vec![
-            "/Applications/Houdini/Current/Frameworks/Houdini.framework/Versions/Current/Resources",
-            "/Applications/Houdini/Houdini20.5/Frameworks/Houdini.framework/Versions/20.5/Resources",
-            "/Applications/Houdini/Houdini20.0/Frameworks/Houdini.framework/Versions/20.0/Resources",
-        ]
-    } else if cfg!(target_os = "linux") {
-        vec!["/opt/hfs20.5", "/opt/hfs20.0", "/opt/hfs19.5"]
-    } else {
-        vec![
-            "C:\\Program Files\\Side Effects Software\\Houdini 20.5",
-            "C:\\Program Files\\Side Effects Software\\Houdini 20.0",
-        ]
-    };
-
-    paths
-        .into_iter()
-        .filter(|p| std::path::Path::new(p).exists())
-        .map(|p| p.to_string())
-        .collect()
+fn scan_houdini_linux() -> Vec<(String, String)> {
+    let base = std::path::Path::new("/opt");
+    if !base.exists() {
+        return vec![];
+    }
+    let mut found: Vec<(String, String)> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(base) {
+        let mut dirs: Vec<String> = entries
+            .filter_map(|e| e.ok())
+            .filter_map(|e| {
+                let name = e.file_name().to_string_lossy().to_string();
+                if name.starts_with("hfs") && e.path().is_dir() {
+                    Some(name)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        dirs.sort_by(|a, b| b.cmp(a));
+        for dir_name in &dirs {
+            let version = dir_name.trim_start_matches("hfs").to_string();
+            let path = base.join(dir_name).to_string_lossy().to_string();
+            found.push((path, version));
+        }
+    }
+    found
 }
 
-fn get_otls_dir(_houdini_path: &str) -> String {
+fn scan_houdini_windows() -> Vec<(String, String)> {
+    let base = std::path::Path::new("C:\\Program Files\\Side Effects Software");
+    if !base.exists() {
+        return vec![];
+    }
+    let mut found: Vec<(String, String)> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(base) {
+        let mut dirs: Vec<String> = entries
+            .filter_map(|e| e.ok())
+            .filter_map(|e| {
+                let name = e.file_name().to_string_lossy().to_string();
+                if name.starts_with("Houdini ") && e.path().is_dir() {
+                    Some(name)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        dirs.sort_by(|a, b| b.cmp(a));
+        for dir_name in &dirs {
+            let version = dir_name.trim_start_matches("Houdini ").to_string();
+            let path = base.join(dir_name).to_string_lossy().to_string();
+            found.push((path, version));
+        }
+    }
+    found
+}
+
+/// Scan all Houdini installations, returns (path, version) pairs newest-first.
+fn scan_all_houdini() -> Vec<(String, String)> {
     if cfg!(target_os = "macos") {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/unknown".to_string());
-        format!("{}/Library/Preferences/houdini/20.5/otls", home)
+        scan_houdini_macos()
     } else if cfg!(target_os = "linux") {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/home/unknown".to_string());
-        format!("{}/houdini20.5/otls", home)
+        scan_houdini_linux()
     } else {
-        let userprofile =
-            std::env::var("USERPROFILE").unwrap_or_else(|_| "C:\\Users\\unknown".to_string());
-        format!("{}\\Documents\\houdini20.5\\otls", userprofile)
+        scan_houdini_windows()
     }
 }
 
-fn check_hda_installed(_houdini_path: &str) -> bool {
-    let otls_dir = if cfg!(target_os = "macos") {
+fn find_houdini() -> Option<String> {
+    scan_all_houdini().into_iter().next().map(|(path, _)| path)
+}
+
+/// Find Houdini and return (path, version).
+fn find_houdini_with_version() -> Option<(String, String)> {
+    scan_all_houdini().into_iter().next()
+}
+
+fn find_all_houdini() -> Vec<String> {
+    scan_all_houdini().into_iter().map(|(path, _)| path).collect()
+}
+
+/// Get the otls directory for a given Houdini version.
+fn get_otls_dir_for_version(version: &str) -> String {
+    if cfg!(target_os = "macos") {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/unknown".to_string());
-        format!("{}/Library/Preferences/houdini/20.5/otls", home)
+        format!("{}/Library/Preferences/houdini/{}/otls", home, version)
     } else if cfg!(target_os = "linux") {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/home/unknown".to_string());
-        format!("{}/houdini20.5/otls", home)
+        format!("{}/houdini{}/otls", home, version)
     } else {
         let userprofile =
             std::env::var("USERPROFILE").unwrap_or_else(|_| "C:\\Users\\unknown".to_string());
-        format!("{}\\Documents\\houdini20.5\\otls", userprofile)
-    };
+        format!("{}\\Documents\\houdini{}\\otls", userprofile, version)
+    }
+}
 
+fn get_otls_dir(houdini_path: &str) -> String {
+    // Extract version from the Houdini path
+    let version = scan_all_houdini()
+        .into_iter()
+        .find(|(p, _)| p == houdini_path)
+        .map(|(_, v)| v)
+        .unwrap_or_else(|| "20.5".to_string());
+    get_otls_dir_for_version(&version)
+}
+
+fn check_hda_installed(houdini_path: &str) -> bool {
+    let otls_dir = get_otls_dir(houdini_path);
     std::path::Path::new(&format!("{}/runpodfarm_scheduler.hda", otls_dir)).exists()
 }
 
