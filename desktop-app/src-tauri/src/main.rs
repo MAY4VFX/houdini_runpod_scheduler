@@ -660,7 +660,7 @@ async fn connect(
         app_state.api_url = Some(api_url);
     }
 
-    // 4. Auto-mount JuiceFS (only if storage config is available)
+    // 4. Auto-mount JuiceFS with retry (only if storage config is available)
     let has_storage_config = {
         let app_state = state.lock().map_err(|e| e.to_string())?;
         app_state
@@ -669,11 +669,27 @@ async fn connect(
             .map(|c| !c.redis_url.is_empty())
             .unwrap_or(false)
     };
-    let mounted = if has_storage_config {
-        mount_juicefs_inner(&state).await.is_ok()
-    } else {
-        false
-    };
+    let mut mounted = false;
+    let mut mount_error = String::new();
+    if has_storage_config {
+        for attempt in 1..=3 {
+            match mount_juicefs_inner(&state).await {
+                Ok(_) => {
+                    mounted = true;
+                    break;
+                }
+                Err(e) => {
+                    mount_error = e;
+                    if attempt < 3 {
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    }
+                }
+            }
+        }
+        if !mounted {
+            return Err(format!("Connected but mount failed: {}", mount_error));
+        }
+    }
 
     // 5. Check Houdini and HDA
     let houdini_found = find_houdini().is_some();
