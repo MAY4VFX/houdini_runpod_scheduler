@@ -1,5 +1,5 @@
-import { useState } from "react";
-import { connect, type AppStatus } from "../lib/tauri";
+import { useState, useEffect } from "react";
+import { connect, ensureDependencies, type AppStatus, type DependencyStatus } from "../lib/tauri";
 
 interface ConnectFormProps {
   onConnected: (status: AppStatus) => void;
@@ -9,8 +9,16 @@ export default function ConnectForm({ onConnected }: ConnectFormProps) {
   const [apiKey, setApiKey] = useState("");
   const [apiUrl, setApiUrl] = useState("https://api.runpodfarm.com");
   const [loading, setLoading] = useState(false);
+  const [loadingMessage, setLoadingMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [showAdvanced, setShowAdvanced] = useState(false);
+  const [deps, setDeps] = useState<DependencyStatus | null>(null);
+
+  useEffect(() => {
+    ensureDependencies()
+      .then(setDeps)
+      .catch(() => {});
+  }, []);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -21,14 +29,32 @@ export default function ConnectForm({ onConnected }: ConnectFormProps) {
 
     setLoading(true);
     setError(null);
+    setLoadingMessage("Connecting...");
 
     try {
+      // The connect command handles the full flow:
+      // 1. Check FUSE -> error if missing
+      // 2. Auto-download JuiceFS if missing
+      // 3. Auth API call
+      // 4. Auto-mount JuiceFS
+      // 5. Check Houdini
+      setLoadingMessage("Authenticating...");
       const status = await connect(apiKey.trim(), apiUrl.trim());
+      if (status.mounted) {
+        setLoadingMessage("Connected and mounted!");
+      }
       onConnected(status);
     } catch (err) {
-      setError(typeof err === "string" ? err : "Connection failed");
+      const errMsg = typeof err === "string" ? err : "Connection failed";
+      // Provide more helpful messages for FUSE-related errors
+      if (errMsg.includes("FUSE")) {
+        setError(errMsg);
+      } else {
+        setError(errMsg);
+      }
     } finally {
       setLoading(false);
+      setLoadingMessage(null);
     }
   };
 
@@ -60,6 +86,30 @@ export default function ConnectForm({ onConnected }: ConnectFormProps) {
         </div>
 
         <form onSubmit={handleSubmit} className="card space-y-5">
+          {/* Dependency status mini-bar */}
+          {deps && (
+            <div className="flex items-center gap-3 rounded-lg bg-surface-800/50 px-3 py-2">
+              <div className="flex items-center gap-2 text-xs">
+                <span
+                  className={`inline-block h-1.5 w-1.5 rounded-full ${deps.fuse_installed ? "bg-emerald-400" : "bg-red-400"}`}
+                />
+                <span className="text-gray-500">FUSE</span>
+              </div>
+              <div className="flex items-center gap-2 text-xs">
+                <span
+                  className={`inline-block h-1.5 w-1.5 rounded-full ${deps.juicefs_installed ? "bg-emerald-400" : "bg-amber-400"}`}
+                />
+                <span className="text-gray-500">JuiceFS</span>
+              </div>
+              <div className="flex items-center gap-2 text-xs">
+                <span
+                  className={`inline-block h-1.5 w-1.5 rounded-full ${deps.houdini_found ? "bg-emerald-400" : "bg-gray-600"}`}
+                />
+                <span className="text-gray-500">Houdini</span>
+              </div>
+            </div>
+          )}
+
           <div>
             <label
               htmlFor="apiKey"
@@ -150,7 +200,7 @@ export default function ConnectForm({ onConnected }: ConnectFormProps) {
                     d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"
                   />
                 </svg>
-                Connecting...
+                {loadingMessage || "Connecting..."}
               </span>
             ) : (
               "Connect"
