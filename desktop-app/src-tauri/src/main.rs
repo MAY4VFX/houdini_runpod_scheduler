@@ -468,23 +468,69 @@ async fn connect(
         download_juicefs_impl().await?;
     }
 
-    // 3. Auth API call to get JuiceFS config
+    // 3. Auth API call — verify connection by calling GET /api/projects
     let client = reqwest::Client::new();
     let resp = client
-        .get(format!("{}/projects/default/config", api_url))
+        .get(format!("{}/api/projects", api_url))
+        .header("Authorization", format!("Bearer {}", api_key))
         .header("X-API-Key", &api_key)
         .send()
         .await
         .map_err(|e| format!("Request failed: {}", e))?;
 
     if !resp.status().is_success() {
-        return Err(format!("Auth failed: {}", resp.status()));
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("Auth failed ({}): {}", status, body));
     }
 
-    let config: JuiceFSConfig = resp
+    // Parse the projects list to get the first project's config
+    let projects_body: serde_json::Value = resp
         .json()
         .await
-        .map_err(|e| format!("Failed to parse config: {}", e))?;
+        .map_err(|e| format!("Failed to parse projects response: {}", e))?;
+
+    // Try to extract JuiceFS config from the first project, or use defaults
+    let config = if let Some(projects) = projects_body.as_array() {
+        if let Some(first_project) = projects.first() {
+            // Try to get config from the project's juicefs_config or storage_config
+            let project_id = first_project
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("default")
+                .to_string();
+
+            let storage = first_project.get("storage_config").or(first_project.get("juicefs_config"));
+
+            if let Some(storage) = storage {
+                JuiceFSConfig {
+                    redis_url: storage.get("redis_url").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    b2_endpoint: storage.get("b2_endpoint").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    b2_access_key: storage.get("b2_access_key").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    b2_secret_key: storage.get("b2_secret_key").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    b2_bucket: storage.get("b2_bucket").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    rsa_key: storage.get("rsa_key").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    project_id,
+                    mount_path: storage.get("mount_path").and_then(|v| v.as_str()).unwrap_or("/project").to_string(),
+                }
+            } else {
+                JuiceFSConfig {
+                    redis_url: String::new(),
+                    b2_endpoint: String::new(),
+                    b2_access_key: String::new(),
+                    b2_secret_key: String::new(),
+                    b2_bucket: String::new(),
+                    rsa_key: String::new(),
+                    project_id,
+                    mount_path: "/project".to_string(),
+                }
+            }
+        } else {
+            return Err("No projects found on the server".to_string());
+        }
+    } else {
+        return Err("Unexpected response format from server".to_string());
+    };
 
     let project_id = config.project_id.clone();
     let mount_path = config.mount_path.clone();
@@ -496,9 +542,20 @@ async fn connect(
         app_state.api_url = Some(api_url);
     }
 
-    // 4. Auto-mount JuiceFS
-    let mount_result = mount_juicefs_inner(&state).await;
-    let mounted = mount_result.is_ok();
+    // 4. Auto-mount JuiceFS (only if storage config is available)
+    let has_storage_config = {
+        let app_state = state.lock().map_err(|e| e.to_string())?;
+        app_state
+            .config
+            .as_ref()
+            .map(|c| !c.redis_url.is_empty())
+            .unwrap_or(false)
+    };
+    let mounted = if has_storage_config {
+        mount_juicefs_inner(&state).await.is_ok()
+    } else {
+        false
+    };
 
     // 5. Check Houdini and HDA
     let houdini_found = find_houdini().is_some();
@@ -593,10 +650,12 @@ async fn mount_juicefs_inner(
     std::fs::create_dir_all(&config.mount_path)
         .map_err(|e| format!("Failed to create mount dir: {}", e))?;
 
-    let storage_url = format!(
-        "{}://{}/{}",
-        "s3", config.b2_endpoint, config.b2_bucket
-    );
+    // JuiceFS --bucket expects https:// URL, e.g. https://s3.eu-central-003.backblazeb2.com/runpodfarm-juicefs
+    let storage_url = if config.b2_endpoint.starts_with("https://") || config.b2_endpoint.starts_with("http://") {
+        format!("{}/{}", config.b2_endpoint, config.b2_bucket)
+    } else {
+        format!("https://{}/{}", config.b2_endpoint, config.b2_bucket)
+    };
 
     let output = Command::new(&juicefs_path)
         .args([
@@ -656,6 +715,69 @@ async fn unmount_juicefs(state: tauri::State<'_, Mutex<AppState>>) -> Result<(),
     }
 }
 
+/// Recursively copy a directory and all its contents.
+fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<(), String> {
+    if !src.is_dir() {
+        return Err(format!("Source is not a directory: {}", src.display()));
+    }
+    std::fs::create_dir_all(dst)
+        .map_err(|e| format!("Failed to create directory {}: {}", dst.display(), e))?;
+
+    let entries = std::fs::read_dir(src)
+        .map_err(|e| format!("Failed to read directory {}: {}", src.display(), e))?;
+
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("Failed to read dir entry: {}", e))?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+
+        if src_path.is_dir() {
+            copy_dir_recursive(&src_path, &dst_path)?;
+        } else {
+            std::fs::copy(&src_path, &dst_path).map_err(|e| {
+                format!(
+                    "Failed to copy {} -> {}: {}",
+                    src_path.display(),
+                    dst_path.display(),
+                    e
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+/// Find the HDA source directory by checking known locations.
+fn find_hda_source() -> Option<PathBuf> {
+    let hda_name = "runpodfarm_scheduler.hda";
+
+    // 1. Check relative to the executable (in a repo checkout: ../../../hda/)
+    if let Ok(exe_path) = std::env::current_exe() {
+        // Walk up from the executable to find the repo root
+        let mut dir = exe_path.parent().map(|p| p.to_path_buf());
+        for _ in 0..6 {
+            if let Some(ref d) = dir {
+                let candidate = d.join("hda").join(hda_name);
+                if candidate.is_dir() {
+                    return Some(candidate);
+                }
+                dir = d.parent().map(|p| p.to_path_buf());
+            }
+        }
+    }
+
+    // 2. Check common repo locations relative to home directory
+    let home = dirs::home_dir()?;
+    let candidates = vec![
+        home.join("houdini_runpod_scheduler/hda").join(hda_name),
+        home.join("houdini_runpod_scheduler/.worktrees/runpodfarm/hda").join(hda_name),
+        home.join("Projects/houdini_runpod_scheduler/hda").join(hda_name),
+        home.join("dev/houdini_runpod_scheduler/hda").join(hda_name),
+    ];
+
+    candidates.into_iter().find(|p| p.is_dir())
+}
+
 #[tauri::command]
 async fn install_hda() -> Result<String, String> {
     let houdini_path =
@@ -665,14 +787,23 @@ async fn install_hda() -> Result<String, String> {
     std::fs::create_dir_all(&otls_dir)
         .map_err(|e| format!("Failed to create otls dir: {}", e))?;
 
-    // HDA source path relative to app resources
-    let hda_source = "runpodfarm_scheduler.hda";
-    let hda_dest = format!("{}/runpodfarm_scheduler.hda", otls_dir);
+    let hda_source = find_hda_source().ok_or_else(|| {
+        "HDA source not found. Please ensure the runpodfarm_scheduler.hda directory exists in the repository (hda/ folder).".to_string()
+    })?;
 
-    // For now, return info about where HDA would be installed
+    let hda_dest = PathBuf::from(&otls_dir).join("runpodfarm_scheduler.hda");
+
+    // Remove existing HDA if present, to ensure a clean copy
+    if hda_dest.exists() {
+        std::fs::remove_dir_all(&hda_dest)
+            .map_err(|e| format!("Failed to remove existing HDA: {}", e))?;
+    }
+
+    copy_dir_recursive(&hda_source, &hda_dest)?;
+
     Ok(format!(
-        "HDA would be installed to: {} (source: {})",
-        hda_dest, hda_source
+        "HDA installed successfully to: {}",
+        hda_dest.display()
     ))
 }
 
