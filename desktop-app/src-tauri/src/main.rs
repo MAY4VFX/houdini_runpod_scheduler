@@ -551,10 +551,6 @@ fn find_houdini() -> Option<String> {
     scan_all_houdini().into_iter().next().map(|(path, _)| path)
 }
 
-/// Find Houdini and return (path, version).
-fn find_houdini_with_version() -> Option<(String, String)> {
-    scan_all_houdini().into_iter().next()
-}
 
 fn find_all_houdini() -> Vec<String> {
     scan_all_houdini().into_iter().map(|(path, _)| path).collect()
