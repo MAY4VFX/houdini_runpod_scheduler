@@ -1,7 +1,6 @@
 .git
 .worktrees
 .gitignore
-.dockerignore
 *.md
 logs/
 __pycache__
@@ -18,6 +17,8 @@ auth-api/
 infrastructure/
 worker/
 docker/
+.github/
+hda/
 server/data/
 server/node_modules/
 server/dist/
