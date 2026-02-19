@@ -42,13 +42,24 @@ docker/                    — Docker image for RunPod pods
   docker-compose.dev.yml     Local dev environment with Redis
   .dockerignore
 
-auth-api/                  — Auth API (Cloudflare Workers + Hono + KV)
+auth-api/                  — Auth API (Cloudflare Workers + Hono + KV) [LEGACY]
   src/index.ts               Main entry, CORS, routing
   src/types.ts               TypeScript interfaces
   src/auth.ts                JWT, password hashing, API key generation
   src/routes/auth.ts         POST /auth/login, /auth/register
   src/routes/projects.ts     CRUD projects, artists, config endpoint
   wrangler.toml              Cloudflare Workers config
+
+server/                    — Node.js server (Hono + SQLite) — replaces auth-api for Dokploy
+  src/index.ts               Main entry, CORS, routing, static file serving
+  src/types.ts               TypeScript interfaces
+  src/db.ts                  SQLite storage layer (better-sqlite3)
+  src/auth.ts                JWT, password hashing (Node.js crypto), API key generation
+  src/routes/auth.ts         POST /api/auth/login, /api/auth/register
+  src/routes/projects.ts     CRUD projects, artists, config endpoint
+  src/routes/monitoring.ts   GET /api/monitoring/jobs|pods|costs|logs (Redis read-only)
+  Dockerfile                 Production Docker image
+  docker-compose.yml         Local dev with Docker
 
 dashboard/                 — Monitoring Web UI (React + TypeScript + Vite + Tailwind)
   src/pages/Dashboard.tsx    Active jobs, pods, cost overview
@@ -80,13 +91,20 @@ AWSECS/                    — Original AWS ECS Scheduler (reference)
 # Worker (local dev)
 cd docker && docker compose -f docker-compose.dev.yml up
 
-# Auth API
+# Auth API (legacy CF Workers)
 cd auth-api && npm install && npm run dev    # Local dev
 cd auth-api && npm run deploy                # Deploy to CF Workers
+
+# Server (Node.js — for Dokploy deployment)
+cd server && npm install && npm run dev      # Local dev (tsx watch)
+cd server && npm run build && npm start      # Production build + start
 
 # Dashboard
 cd dashboard && npm install && npm run dev   # Dev server
 cd dashboard && npm run build                # Production build
+
+# Deploy to Dokploy
+./infrastructure/deploy-dokploy.sh           # Full build + deploy
 
 # Desktop App
 cd desktop-app && npm install
@@ -117,7 +135,8 @@ juicefs:*                          — JuiceFS metadata (managed by JuiceFS)
 
 - **Worker**: Python 3.10+, redis, psutil
 - **HDA**: Houdini 20.0+ with PDG, redis (pip install to hython)
-- **Auth API**: Node.js 18+, hono, jose
+- **Auth API (legacy)**: Node.js 18+, hono, jose
+- **Server**: Node.js 20+, hono, @hono/node-server, jose, better-sqlite3, ioredis
 - **Dashboard**: Node.js 18+, React 18, Vite, Tailwind
 - **Desktop App**: Rust 1.70+, Node.js 18+, Tauri 2.0
 
@@ -127,3 +146,11 @@ No automated tests yet. Test flow:
 1. Infrastructure: `juicefs mount` locally → write file → mount on pod → file visible
 2. Worker: start pod → worker connects to Redis → heartbeat visible → push test task → result in Redis
 3. HDA: Houdini → TOP Network → RunPodFarm Scheduler → cook → frames render on pods → results in /project/renders/
+### Dokploy Server
+- **Host**: 192.168.2.140
+- порт апи 3001
+- **SSH Access**: `ssh -o StrictHostKeyChecking=no root@192.168.2.140`
+- **Auto-deploy**: Enabled - пуш в правильную ветку автоматически запускает деплой
+- **Dokploy API Key** x-api-key : XdVofMdOfAlneojMFpBWplFeYWbxFzcUpuPBlQLYuBxmfWmjARKNyXwDEnsgMrZc
+- делай коммит  и пуш после правок
+- никогда не собирать докер композы в ручную только через докплой и репозиторий
