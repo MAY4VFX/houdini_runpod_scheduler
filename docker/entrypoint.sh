@@ -1,14 +1,26 @@
 #!/bin/bash
-set -euo pipefail
+set -uo pipefail
 
 echo "=== RunPodFarm Worker Starting ==="
 echo "Pod ID: ${RUNPOD_POD_ID:-unknown}"
 echo "GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo 'N/A')"
 
+# Normalize env var names (support both JUICEFS_META_URL and JUICEFS_REDIS_URL)
+JUICEFS_META="${JUICEFS_META_URL:-${JUICEFS_REDIS_URL:-}}"
+JUICEFS_STORAGE="${JUICEFS_BUCKET_URL:-${JUICEFS_BUCKET:-}}"
+
 # --- Step 1: Mount JuiceFS ---
-if [ -n "${JUICEFS_REDIS_URL:-}" ] && [ -n "${JUICEFS_BUCKET_URL:-}" ]; then
+JUICEFS_MOUNTED=false
+if [ -n "${JUICEFS_META}" ]; then
     echo "Mounting JuiceFS at /project..."
     mkdir -p /project
+
+    # Ensure FUSE is available
+    if [ ! -e /dev/fuse ]; then
+        echo "Creating /dev/fuse..."
+        mknod /dev/fuse c 10 229 2>/dev/null || true
+    fi
+    modprobe fuse 2>/dev/null || true
 
     # Write RSA key if provided
     if [ -n "${JUICEFS_RSA_KEY:-}" ]; then
@@ -17,30 +29,35 @@ if [ -n "${JUICEFS_REDIS_URL:-}" ] && [ -n "${JUICEFS_BUCKET_URL:-}" ]; then
     fi
 
     juicefs mount \
-        "${JUICEFS_REDIS_URL}" \
+        "${JUICEFS_META}" \
         /project \
         --background \
         --cache-dir /tmp/jfs-cache \
         --cache-size 51200 \
+        --no-bgjob \
         ${JUICEFS_CACHE_GROUP:+--cache-group "$JUICEFS_CACHE_GROUP"} \
-        -o allow_other
+        -o allow_other 2>&1 || true
 
     # Wait for mount
     for i in $(seq 1 30); do
         if mountpoint -q /project; then
             echo "JuiceFS mounted successfully"
+            JUICEFS_MOUNTED=true
             break
         fi
         sleep 1
     done
 
-    if ! mountpoint -q /project; then
-        echo "ERROR: JuiceFS mount failed"
-        exit 1
+    if [ "$JUICEFS_MOUNTED" = "false" ]; then
+        echo "WARNING: JuiceFS mount failed, continuing without shared filesystem"
+        echo "Check /var/log/juicefs.log for details"
+        cat /var/log/juicefs.log 2>/dev/null | tail -20 || true
     fi
 else
-    echo "WARNING: JuiceFS not configured, skipping mount"
+    echo "WARNING: JuiceFS not configured (JUICEFS_META_URL not set), skipping mount"
 fi
+
+export JUICEFS_MOUNTED
 
 # --- Step 2: Setup Houdini environment ---
 if [ -d "/workspace/houdini" ]; then
