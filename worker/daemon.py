@@ -129,11 +129,11 @@ def run() -> None:
             # Push result
             result_key = f"rp:results:{task_id}"
             try:
-                rc.set(
+                rc.rpush(
                     result_key,
                     json.dumps(task_result.to_dict()),
-                    ex=86400,  # expire after 24 h
                 )
+                rc.expire(result_key, 86400)  # expire after 24 h
                 logger.info(
                     "Result for task %s pushed to %s: %s",
                     task_id,
