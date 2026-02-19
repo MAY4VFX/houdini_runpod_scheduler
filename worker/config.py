@@ -31,7 +31,7 @@ class WorkerConfig:
     user_id: str
     pod_id: str
     houdini_path: str = "/workspace/houdini"
-    juicefs_mount: str = "/project"
+    project_dir: str = "/workspace/projects"
     heartbeat_interval: int = 10
     log_level: str = "INFO"
     max_retries: int = 3
@@ -68,7 +68,7 @@ class WorkerConfig:
             user_id=user_id,
             pod_id=_resolve_pod_id(),
             houdini_path=os.environ.get("HOUDINI_PATH", "/workspace/houdini"),
-            juicefs_mount=os.environ.get("JUICEFS_MOUNT", "/project"),
+            project_dir=os.environ.get("PROJECT_DIR", "/workspace/projects"),
             heartbeat_interval=int(
                 os.environ.get("HEARTBEAT_INTERVAL", "10")
             ),
@@ -82,7 +82,7 @@ class WorkerConfig:
         logger.info("  project_id      = %s", config.project_id)
         logger.info("  user_id         = %s", config.user_id)
         logger.info("  houdini_path    = %s", config.houdini_path)
-        logger.info("  juicefs_mount   = %s", config.juicefs_mount)
+        logger.info("  project_dir     = %s", config.project_dir)
         logger.info("  heartbeat_interval = %ds", config.heartbeat_interval)
         logger.info("  task_timeout    = %ds", config.task_timeout)
         logger.info("  max_retries     = %d", config.max_retries)
