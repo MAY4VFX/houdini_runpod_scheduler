@@ -1039,6 +1039,46 @@ async fn install_hda(app: tauri::AppHandle) -> Result<String, String> {
 
     copy_dir_recursive(&hda_source, &hda_dest)?;
 
+    // Auto-install Python dependencies (redis) via hython -m pip install
+    let hython_path = if cfg!(target_os = "macos") {
+        format!("{}/bin/hython", houdini_path)
+    } else if cfg!(target_os = "linux") {
+        format!("{}/bin/hython", houdini_path)
+    } else {
+        format!("{}\\bin\\hython.exe", houdini_path)
+    };
+
+    if std::path::Path::new(&hython_path).exists() {
+        let pip_output = Command::new(&hython_path)
+            .args(["-m", "pip", "install", "redis"])
+            .output();
+        match pip_output {
+            Ok(out) if out.status.success() => {
+                let msg = String::from_utf8_lossy(&out.stdout);
+                if msg.contains("already satisfied") {
+                    // redis already installed, no action needed
+                } else {
+                    // redis was installed
+                }
+            }
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                return Ok(format!(
+                    "HDA installed to {}. Warning: failed to install redis package for hython: {}",
+                    hda_dest.display(),
+                    stderr.chars().take(200).collect::<String>()
+                ));
+            }
+            Err(e) => {
+                return Ok(format!(
+                    "HDA installed to {}. Warning: could not run hython to install redis: {}",
+                    hda_dest.display(),
+                    e
+                ));
+            }
+        }
+    }
+
     Ok(format!(
         "HDA installed successfully to: {}",
         hda_dest.display()
