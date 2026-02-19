@@ -19,7 +19,8 @@
       }
     ],
     "trayIcon": {
-      "tooltip": "RunPodFarm"
+      "tooltip": "RunPodFarm",
+      "iconPath": "icons/icon.png"
     },
     "security": {
       "csp": null

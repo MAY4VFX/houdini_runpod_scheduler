@@ -2,13 +2,30 @@ import { useState, useEffect, useCallback } from "react";
 import ConnectForm from "./components/ConnectForm";
 import StatusPanel from "./components/StatusPanel";
 import Settings from "./components/Settings";
-import { getStatus, type AppStatus } from "./lib/tauri";
+import SetupScreen from "./components/SetupScreen";
+import {
+  getStatus,
+  ensureDependencies,
+  type AppStatus,
+  type DependencyStatus,
+} from "./lib/tauri";
 
-type View = "connect" | "status" | "settings";
+type View = "setup" | "connect" | "status" | "settings";
 
 export default function App() {
-  const [view, setView] = useState<View>("connect");
+  const [view, setView] = useState<View>("setup");
   const [status, setStatus] = useState<AppStatus | null>(null);
+  const [deps, setDeps] = useState<DependencyStatus | null>(null);
+
+  const checkDeps = useCallback(async () => {
+    try {
+      const depStatus = await ensureDependencies();
+      setDeps(depStatus);
+      return depStatus;
+    } catch {
+      return null;
+    }
+  }, []);
 
   const checkStatus = useCallback(async () => {
     try {
@@ -16,11 +33,20 @@ export default function App() {
       setStatus(currentStatus);
       if (currentStatus.connected) {
         setView("status");
+        return;
       }
     } catch {
-      // Backend not ready yet or error -- stay on connect view
+      // Backend not ready yet
     }
-  }, []);
+
+    // Not connected -- check deps
+    const depStatus = await checkDeps();
+    if (depStatus?.all_ready) {
+      setView("connect");
+    } else {
+      setView("setup");
+    }
+  }, [checkDeps]);
 
   useEffect(() => {
     checkStatus();
@@ -37,6 +63,10 @@ export default function App() {
       delete (window as unknown as Record<string, unknown>).__trayDisconnect;
     };
   }, []);
+
+  const handleDepsReady = () => {
+    setView("connect");
+  };
 
   const handleConnected = (newStatus: AppStatus) => {
     setStatus(newStatus);
@@ -55,7 +85,7 @@ export default function App() {
   return (
     <div className="min-h-screen bg-surface-950">
       {/* Navigation bar for connected state */}
-      {view !== "connect" && (
+      {(view === "status" || view === "settings") && (
         <nav className="sticky top-0 z-10 flex items-center justify-between border-b border-surface-800 bg-surface-950/80 px-6 py-3 backdrop-blur-sm">
           <div className="flex items-center gap-2">
             <button
@@ -83,6 +113,9 @@ export default function App() {
       )}
 
       {/* Views */}
+      {view === "setup" && (
+        <SetupScreen deps={deps} onRecheck={checkDeps} onReady={handleDepsReady} />
+      )}
       {view === "connect" && <ConnectForm onConnected={handleConnected} />}
       {view === "status" && status && (
         <StatusPanel

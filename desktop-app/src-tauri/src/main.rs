@@ -1,6 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use serde::{Deserialize, Serialize};
+use std::io::Read as IoRead;
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Mutex;
 use tauri::{
@@ -8,6 +10,8 @@ use tauri::{
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     Manager,
 };
+
+// ─── Data structures ────────────────────────────────────────────────
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct JuiceFSConfig {
@@ -44,6 +48,18 @@ impl Default for AppStatus {
     }
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct DependencyStatus {
+    pub juicefs_installed: bool,
+    pub juicefs_path: Option<String>,
+    pub juicefs_downloading: bool,
+    pub fuse_installed: bool,
+    pub fuse_install_url: Option<String>,
+    pub fuse_install_instructions: Option<String>,
+    pub houdini_found: bool,
+    pub all_ready: bool,
+}
+
 #[derive(Default)]
 struct AppState {
     config: Option<JuiceFSConfig>,
@@ -51,201 +67,243 @@ struct AppState {
     api_url: Option<String>,
 }
 
-#[tauri::command]
-async fn connect(
-    api_key: String,
-    api_url: String,
-    state: tauri::State<'_, Mutex<AppState>>,
-) -> Result<AppStatus, String> {
+// ─── JuiceFS binary management ──────────────────────────────────────
+
+/// Return the base directory for RunPodFarm app data: ~/.runpodfarm
+fn app_data_dir() -> PathBuf {
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    home.join(".runpodfarm")
+}
+
+/// Return the path where juicefs binary should live: ~/.runpodfarm/bin/juicefs
+fn juicefs_bin_path() -> PathBuf {
+    let bin_dir = app_data_dir().join("bin");
+    if cfg!(target_os = "windows") {
+        bin_dir.join("juicefs.exe")
+    } else {
+        bin_dir.join("juicefs")
+    }
+}
+
+/// Check if juicefs binary is available (in our app dir or on PATH).
+fn check_juicefs_installed_sync() -> bool {
+    // First check our own managed binary
+    if juicefs_bin_path().exists() {
+        return true;
+    }
+    // Then check system PATH
+    if cfg!(target_os = "windows") {
+        Command::new("where")
+            .arg("juicefs")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    } else {
+        Command::new("which")
+            .arg("juicefs")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+}
+
+/// Return the path to the juicefs binary (prefer managed, then system).
+fn get_juicefs_path_sync() -> Option<String> {
+    let managed = juicefs_bin_path();
+    if managed.exists() {
+        return Some(managed.to_string_lossy().to_string());
+    }
+    // Try system PATH
+    let cmd = if cfg!(target_os = "windows") {
+        "where"
+    } else {
+        "which"
+    };
+    Command::new(cmd)
+        .arg("juicefs")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| {
+            String::from_utf8(o.stdout)
+                .ok()
+                .map(|s| s.trim().to_string())
+        })
+}
+
+/// Return the download URL for the current platform.
+fn juicefs_download_url() -> &'static str {
+    if cfg!(target_os = "macos") && cfg!(target_arch = "aarch64") {
+        "https://github.com/juicedata/juicefs/releases/download/v1.2.0/juicefs-1.2.0-darwin-arm64.tar.gz"
+    } else if cfg!(target_os = "macos") && cfg!(target_arch = "x86_64") {
+        "https://github.com/juicedata/juicefs/releases/download/v1.2.0/juicefs-1.2.0-darwin-amd64.tar.gz"
+    } else if cfg!(target_os = "linux") && cfg!(target_arch = "x86_64") {
+        "https://github.com/juicedata/juicefs/releases/download/v1.2.0/juicefs-1.2.0-linux-amd64.tar.gz"
+    } else if cfg!(target_os = "windows") && cfg!(target_arch = "x86_64") {
+        "https://github.com/juicedata/juicefs/releases/download/v1.2.0/juicefs-1.2.0-windows-amd64.zip"
+    } else {
+        // Fallback to linux amd64
+        "https://github.com/juicedata/juicefs/releases/download/v1.2.0/juicefs-1.2.0-linux-amd64.tar.gz"
+    }
+}
+
+/// Download and install the JuiceFS binary into ~/.runpodfarm/bin/
+async fn download_juicefs_impl() -> Result<String, String> {
+    let url = juicefs_download_url();
+    let bin_dir = app_data_dir().join("bin");
+    std::fs::create_dir_all(&bin_dir)
+        .map_err(|e| format!("Failed to create bin dir: {}", e))?;
+
+    // Download the archive
     let client = reqwest::Client::new();
     let resp = client
-        .get(format!("{}/projects/default/config", api_url))
-        .header("X-API-Key", &api_key)
+        .get(url)
         .send()
         .await
-        .map_err(|e| format!("Request failed: {}", e))?;
+        .map_err(|e| format!("Download failed: {}", e))?;
 
     if !resp.status().is_success() {
-        return Err(format!("Auth failed: {}", resp.status()));
+        return Err(format!("Download failed with status: {}", resp.status()));
     }
 
-    let config: JuiceFSConfig = resp
-        .json()
+    let bytes = resp
+        .bytes()
         .await
-        .map_err(|e| format!("Failed to parse config: {}", e))?;
+        .map_err(|e| format!("Failed to read download: {}", e))?;
 
-    let project_id = config.project_id.clone();
-    let mount_path = config.mount_path.clone();
+    let dest = juicefs_bin_path();
+    let is_zip = url.ends_with(".zip");
 
-    {
-        let mut app_state = state.lock().map_err(|e| e.to_string())?;
-        app_state.config = Some(config);
-        app_state.api_key = Some(api_key);
-        app_state.api_url = Some(api_url);
-    }
-
-    Ok(AppStatus {
-        connected: true,
-        mounted: false,
-        project_id: Some(project_id),
-        mount_path: Some(mount_path),
-        houdini_found: find_houdini().is_some(),
-        hda_installed: false,
-    })
-}
-
-#[tauri::command]
-async fn disconnect(state: tauri::State<'_, Mutex<AppState>>) -> Result<(), String> {
-    let mount_path = {
-        let app_state = state.lock().map_err(|e| e.to_string())?;
-        app_state
-            .config
-            .as_ref()
-            .map(|c| c.mount_path.clone())
-            .unwrap_or_else(|| "/project".to_string())
-    };
-
-    let _ = Command::new("juicefs")
-        .args(["umount", &mount_path])
-        .output();
-
-    {
-        let mut app_state = state.lock().map_err(|e| e.to_string())?;
-        app_state.config = None;
-        app_state.api_key = None;
-        app_state.api_url = None;
-    }
-
-    Ok(())
-}
-
-#[tauri::command]
-async fn get_status(state: tauri::State<'_, Mutex<AppState>>) -> Result<AppStatus, String> {
-    let app_state = state.lock().map_err(|e| e.to_string())?;
-
-    let (connected, project_id, mount_path_str) = match &app_state.config {
-        Some(config) => (true, Some(config.project_id.clone()), config.mount_path.clone()),
-        None => (false, None, "/project".to_string()),
-    };
-
-    let mounted = check_mount(&mount_path_str);
-    let houdini_path = find_houdini();
-    let hda_installed = houdini_path
-        .as_ref()
-        .map(|p| check_hda_installed(p))
-        .unwrap_or(false);
-
-    Ok(AppStatus {
-        connected,
-        mounted,
-        project_id,
-        mount_path: if mounted {
-            Some(mount_path_str)
-        } else {
-            None
-        },
-        houdini_found: houdini_path.is_some(),
-        hda_installed,
-    })
-}
-
-#[tauri::command]
-async fn mount_juicefs(state: tauri::State<'_, Mutex<AppState>>) -> Result<String, String> {
-    let config = {
-        let app_state = state.lock().map_err(|e| e.to_string())?;
-        app_state
-            .config
-            .clone()
-            .ok_or_else(|| "Not connected".to_string())?
-    };
-
-    // Create mount directory if it doesn't exist
-    std::fs::create_dir_all(&config.mount_path)
-        .map_err(|e| format!("Failed to create mount dir: {}", e))?;
-
-    let storage_url = format!(
-        "{}://{}/{}",
-        "s3", config.b2_endpoint, config.b2_bucket
-    );
-
-    let output = Command::new("juicefs")
-        .args([
-            "mount",
-            &config.redis_url,
-            &config.mount_path,
-            "--storage",
-            "s3",
-            "--bucket",
-            &storage_url,
-            "--access-key",
-            &config.b2_access_key,
-            "--secret-key",
-            &config.b2_secret_key,
-            "-d",
-        ])
-        .output()
-        .map_err(|e| format!("Failed to run juicefs: {}", e))?;
-
-    if output.status.success() {
-        Ok(config.mount_path)
+    if is_zip {
+        // Windows: extract from zip
+        extract_juicefs_from_zip(&bytes, &dest)?;
     } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(format!("JuiceFS mount failed: {}", stderr))
+        // Unix: extract from tar.gz
+        extract_juicefs_from_targz(&bytes, &dest)?;
     }
+
+    // Make executable on Unix
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("Failed to set permissions: {}", e))?;
+    }
+
+    Ok(dest.to_string_lossy().to_string())
 }
 
-#[tauri::command]
-async fn unmount_juicefs(state: tauri::State<'_, Mutex<AppState>>) -> Result<(), String> {
-    let mount_path = {
-        let app_state = state.lock().map_err(|e| e.to_string())?;
-        app_state
-            .config
-            .as_ref()
-            .map(|c| c.mount_path.clone())
-            .unwrap_or_else(|| "/project".to_string())
-    };
+/// Extract the juicefs binary from a tar.gz archive.
+fn extract_juicefs_from_targz(data: &[u8], dest: &PathBuf) -> Result<(), String> {
+    let gz = flate2::read::GzDecoder::new(data);
+    let mut archive = tar::Archive::new(gz);
 
-    let output = Command::new("juicefs")
-        .args(["umount", &mount_path])
-        .output()
-        .map_err(|e| format!("Failed to run juicefs umount: {}", e))?;
+    let entries = archive
+        .entries()
+        .map_err(|e| format!("Failed to read tar entries: {}", e))?;
 
-    if output.status.success() {
-        Ok(())
+    for entry_result in entries {
+        let mut entry = entry_result.map_err(|e| format!("Failed to read entry: {}", e))?;
+        let path = entry
+            .path()
+            .map_err(|e| format!("Failed to read entry path: {}", e))?
+            .to_path_buf();
+
+        let file_name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        if file_name == "juicefs" {
+            let mut contents = Vec::new();
+            entry
+                .read_to_end(&mut contents)
+                .map_err(|e| format!("Failed to read juicefs from archive: {}", e))?;
+            std::fs::write(dest, &contents)
+                .map_err(|e| format!("Failed to write juicefs binary: {}", e))?;
+            return Ok(());
+        }
+    }
+
+    Err("juicefs binary not found in archive".to_string())
+}
+
+/// Extract the juicefs binary from a zip archive (Windows).
+fn extract_juicefs_from_zip(data: &[u8], dest: &PathBuf) -> Result<(), String> {
+    let reader = std::io::Cursor::new(data);
+    let mut archive =
+        zip::ZipArchive::new(reader).map_err(|e| format!("Failed to open zip: {}", e))?;
+
+    for i in 0..archive.len() {
+        let mut file = archive
+            .by_index(i)
+            .map_err(|e| format!("Failed to read zip entry: {}", e))?;
+        let name = file.name().to_string();
+
+        if name.ends_with("juicefs.exe") || name.ends_with("juicefs") {
+            let mut contents = Vec::new();
+            file.read_to_end(&mut contents)
+                .map_err(|e| format!("Failed to read juicefs from zip: {}", e))?;
+            std::fs::write(dest, &contents)
+                .map_err(|e| format!("Failed to write juicefs binary: {}", e))?;
+            return Ok(());
+        }
+    }
+
+    Err("juicefs binary not found in zip archive".to_string())
+}
+
+// ─── FUSE driver check ──────────────────────────────────────────────
+
+fn check_fuse_installed_sync() -> bool {
+    if cfg!(target_os = "macos") {
+        // Check for macFUSE
+        std::path::Path::new("/Library/Filesystems/macfuse.fs").exists()
+            || std::path::Path::new("/usr/local/lib/libfuse.dylib").exists()
+            || std::path::Path::new("/Library/Frameworks/macFUSE.framework").exists()
+    } else if cfg!(target_os = "linux") {
+        // Check for fuse3 / fuse
+        std::path::Path::new("/dev/fuse").exists()
+            || Command::new("which")
+                .arg("fusermount3")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+            || Command::new("which")
+                .arg("fusermount")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+    } else if cfg!(target_os = "windows") {
+        // Check for WinFsp
+        std::path::Path::new("C:\\Program Files\\WinFsp").exists()
+            || std::path::Path::new("C:\\Program Files (x86)\\WinFsp").exists()
     } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(format!("JuiceFS unmount failed: {}", stderr))
+        false
     }
 }
 
-#[tauri::command]
-async fn install_hda() -> Result<String, String> {
-    let houdini_path =
-        find_houdini().ok_or_else(|| "Houdini installation not found".to_string())?;
-
-    let otls_dir = get_otls_dir(&houdini_path);
-    std::fs::create_dir_all(&otls_dir)
-        .map_err(|e| format!("Failed to create otls dir: {}", e))?;
-
-    // HDA source path relative to app resources
-    let hda_source = "runpodfarm_scheduler.hda";
-    let hda_dest = format!("{}/runpodfarm_scheduler.hda", otls_dir);
-
-    // For now, return info about where HDA would be installed
-    Ok(format!(
-        "HDA would be installed to: {} (source: {})",
-        hda_dest, hda_source
-    ))
+fn get_fuse_install_url() -> String {
+    if cfg!(target_os = "macos") {
+        "https://github.com/osxfuse/osxfuse/releases".to_string()
+    } else if cfg!(target_os = "windows") {
+        "https://github.com/winfsp/winfsp/releases".to_string()
+    } else {
+        "https://packages.ubuntu.com/fuse3".to_string()
+    }
 }
 
-#[tauri::command]
-async fn get_houdini_info() -> Result<serde_json::Value, String> {
-    let installations = find_all_houdini();
-    Ok(serde_json::json!({
-        "installations": installations,
-        "primary": find_houdini(),
-    }))
+fn get_fuse_install_instructions() -> String {
+    if cfg!(target_os = "macos") {
+        "Install macFUSE from the link above. After installing, you may need to allow the kernel extension in System Settings > Privacy & Security, then restart your Mac.".to_string()
+    } else if cfg!(target_os = "windows") {
+        "Install WinFsp from the link above. Run the installer and follow the prompts. A reboot may be required.".to_string()
+    } else {
+        "Install FUSE with: sudo apt install -y fuse3".to_string()
+    }
 }
+
+// ─── Houdini helpers ────────────────────────────────────────────────
 
 fn find_houdini() -> Option<String> {
     let paths = if cfg!(target_os = "macos") {
@@ -292,7 +350,7 @@ fn find_all_houdini() -> Vec<String> {
         .collect()
 }
 
-fn get_otls_dir(houdini_path: &str) -> String {
+fn get_otls_dir(_houdini_path: &str) -> String {
     if cfg!(target_os = "macos") {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/unknown".to_string());
         format!("{}/Library/Preferences/houdini/20.5/otls", home)
@@ -339,6 +397,296 @@ fn check_mount(path: &str) -> bool {
     }
 }
 
+// ─── Tauri commands ─────────────────────────────────────────────────
+
+#[tauri::command]
+async fn check_juicefs_installed() -> Result<bool, String> {
+    Ok(check_juicefs_installed_sync())
+}
+
+#[tauri::command]
+async fn get_juicefs_path() -> Result<Option<String>, String> {
+    Ok(get_juicefs_path_sync())
+}
+
+#[tauri::command]
+async fn download_juicefs() -> Result<String, String> {
+    download_juicefs_impl().await
+}
+
+#[tauri::command]
+async fn check_fuse_installed() -> Result<bool, String> {
+    Ok(check_fuse_installed_sync())
+}
+
+#[tauri::command]
+async fn ensure_dependencies() -> Result<DependencyStatus, String> {
+    let juicefs_installed = check_juicefs_installed_sync();
+    let juicefs_path = get_juicefs_path_sync();
+    let fuse_installed = check_fuse_installed_sync();
+    let houdini_found = find_houdini().is_some();
+
+    let (fuse_url, fuse_instructions) = if !fuse_installed {
+        (
+            Some(get_fuse_install_url()),
+            Some(get_fuse_install_instructions()),
+        )
+    } else {
+        (None, None)
+    };
+
+    let all_ready = juicefs_installed && fuse_installed;
+
+    Ok(DependencyStatus {
+        juicefs_installed,
+        juicefs_path,
+        juicefs_downloading: false,
+        fuse_installed,
+        fuse_install_url: fuse_url,
+        fuse_install_instructions: fuse_instructions,
+        houdini_found,
+        all_ready,
+    })
+}
+
+#[tauri::command]
+async fn connect(
+    api_key: String,
+    api_url: String,
+    state: tauri::State<'_, Mutex<AppState>>,
+) -> Result<AppStatus, String> {
+    // 1. Check FUSE
+    if !check_fuse_installed_sync() {
+        return Err(format!(
+            "FUSE driver not installed. Please install it first: {}",
+            get_fuse_install_url()
+        ));
+    }
+
+    // 2. Check JuiceFS -- auto-download if missing
+    if !check_juicefs_installed_sync() {
+        download_juicefs_impl().await?;
+    }
+
+    // 3. Auth API call to get JuiceFS config
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!("{}/projects/default/config", api_url))
+        .header("X-API-Key", &api_key)
+        .send()
+        .await
+        .map_err(|e| format!("Request failed: {}", e))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("Auth failed: {}", resp.status()));
+    }
+
+    let config: JuiceFSConfig = resp
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse config: {}", e))?;
+
+    let project_id = config.project_id.clone();
+    let mount_path = config.mount_path.clone();
+
+    {
+        let mut app_state = state.lock().map_err(|e| e.to_string())?;
+        app_state.config = Some(config);
+        app_state.api_key = Some(api_key);
+        app_state.api_url = Some(api_url);
+    }
+
+    // 4. Auto-mount JuiceFS
+    let mount_result = mount_juicefs_inner(&state).await;
+    let mounted = mount_result.is_ok();
+
+    // 5. Check Houdini and HDA
+    let houdini_found = find_houdini().is_some();
+    let hda_installed = find_houdini()
+        .as_ref()
+        .map(|p| check_hda_installed(p))
+        .unwrap_or(false);
+
+    Ok(AppStatus {
+        connected: true,
+        mounted,
+        project_id: Some(project_id),
+        mount_path: if mounted { Some(mount_path) } else { None },
+        houdini_found,
+        hda_installed,
+    })
+}
+
+#[tauri::command]
+async fn disconnect(state: tauri::State<'_, Mutex<AppState>>) -> Result<(), String> {
+    let (mount_path, juicefs_path) = {
+        let app_state = state.lock().map_err(|e| e.to_string())?;
+        let mp = app_state
+            .config
+            .as_ref()
+            .map(|c| c.mount_path.clone())
+            .unwrap_or_else(|| "/project".to_string());
+        let jp = get_juicefs_path_sync().unwrap_or_else(|| "juicefs".to_string());
+        (mp, jp)
+    };
+
+    let _ = Command::new(&juicefs_path)
+        .args(["umount", &mount_path])
+        .output();
+
+    {
+        let mut app_state = state.lock().map_err(|e| e.to_string())?;
+        app_state.config = None;
+        app_state.api_key = None;
+        app_state.api_url = None;
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+async fn get_status(state: tauri::State<'_, Mutex<AppState>>) -> Result<AppStatus, String> {
+    let app_state = state.lock().map_err(|e| e.to_string())?;
+
+    let (connected, project_id, mount_path_str) = match &app_state.config {
+        Some(config) => (true, Some(config.project_id.clone()), config.mount_path.clone()),
+        None => (false, None, "/project".to_string()),
+    };
+
+    let mounted = check_mount(&mount_path_str);
+    let houdini_path = find_houdini();
+    let hda_installed = houdini_path
+        .as_ref()
+        .map(|p| check_hda_installed(p))
+        .unwrap_or(false);
+
+    Ok(AppStatus {
+        connected,
+        mounted,
+        project_id,
+        mount_path: if mounted {
+            Some(mount_path_str)
+        } else {
+            None
+        },
+        houdini_found: houdini_path.is_some(),
+        hda_installed,
+    })
+}
+
+/// Internal helper for mount_juicefs that takes a reference to State
+async fn mount_juicefs_inner(
+    state: &tauri::State<'_, Mutex<AppState>>,
+) -> Result<String, String> {
+    let config = {
+        let app_state = state.lock().map_err(|e| e.to_string())?;
+        app_state
+            .config
+            .clone()
+            .ok_or_else(|| "Not connected".to_string())?
+    };
+
+    let juicefs_path = get_juicefs_path_sync()
+        .ok_or_else(|| "JuiceFS binary not found. Please download it first.".to_string())?;
+
+    // Create mount directory if it doesn't exist
+    std::fs::create_dir_all(&config.mount_path)
+        .map_err(|e| format!("Failed to create mount dir: {}", e))?;
+
+    let storage_url = format!(
+        "{}://{}/{}",
+        "s3", config.b2_endpoint, config.b2_bucket
+    );
+
+    let output = Command::new(&juicefs_path)
+        .args([
+            "mount",
+            &config.redis_url,
+            &config.mount_path,
+            "--storage",
+            "s3",
+            "--bucket",
+            &storage_url,
+            "--access-key",
+            &config.b2_access_key,
+            "--secret-key",
+            &config.b2_secret_key,
+            "-d",
+        ])
+        .output()
+        .map_err(|e| format!("Failed to run juicefs: {}", e))?;
+
+    if output.status.success() {
+        Ok(config.mount_path)
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(format!("JuiceFS mount failed: {}", stderr))
+    }
+}
+
+#[tauri::command]
+async fn mount_juicefs(state: tauri::State<'_, Mutex<AppState>>) -> Result<String, String> {
+    mount_juicefs_inner(&state).await
+}
+
+#[tauri::command]
+async fn unmount_juicefs(state: tauri::State<'_, Mutex<AppState>>) -> Result<(), String> {
+    let mount_path = {
+        let app_state = state.lock().map_err(|e| e.to_string())?;
+        app_state
+            .config
+            .as_ref()
+            .map(|c| c.mount_path.clone())
+            .unwrap_or_else(|| "/project".to_string())
+    };
+
+    let juicefs_path = get_juicefs_path_sync()
+        .ok_or_else(|| "JuiceFS binary not found".to_string())?;
+
+    let output = Command::new(&juicefs_path)
+        .args(["umount", &mount_path])
+        .output()
+        .map_err(|e| format!("Failed to run juicefs umount: {}", e))?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(format!("JuiceFS unmount failed: {}", stderr))
+    }
+}
+
+#[tauri::command]
+async fn install_hda() -> Result<String, String> {
+    let houdini_path =
+        find_houdini().ok_or_else(|| "Houdini installation not found".to_string())?;
+
+    let otls_dir = get_otls_dir(&houdini_path);
+    std::fs::create_dir_all(&otls_dir)
+        .map_err(|e| format!("Failed to create otls dir: {}", e))?;
+
+    // HDA source path relative to app resources
+    let hda_source = "runpodfarm_scheduler.hda";
+    let hda_dest = format!("{}/runpodfarm_scheduler.hda", otls_dir);
+
+    // For now, return info about where HDA would be installed
+    Ok(format!(
+        "HDA would be installed to: {} (source: {})",
+        hda_dest, hda_source
+    ))
+}
+
+#[tauri::command]
+async fn get_houdini_info() -> Result<serde_json::Value, String> {
+    let installations = find_all_houdini();
+    Ok(serde_json::json!({
+        "installations": installations,
+        "primary": find_houdini(),
+    }))
+}
+
+// ─── Entry point ────────────────────────────────────────────────────
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
@@ -348,8 +696,10 @@ fn main() {
         .setup(|app| {
             // Build tray menu
             let show_i = MenuItem::with_id(app, "show", "Show", true, None::<&str>)?;
-            let status_i = MenuItem::with_id(app, "status", "Status: Disconnected", false, None::<&str>)?;
-            let disconnect_i = MenuItem::with_id(app, "disconnect", "Disconnect", true, None::<&str>)?;
+            let status_i =
+                MenuItem::with_id(app, "status", "Status: Disconnected", false, None::<&str>)?;
+            let disconnect_i =
+                MenuItem::with_id(app, "disconnect", "Disconnect", true, None::<&str>)?;
             let quit_i = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
 
             let menu = Menu::with_items(app, &[&show_i, &status_i, &disconnect_i, &quit_i])?;
@@ -366,7 +716,9 @@ fn main() {
                     }
                     "disconnect" => {
                         if let Some(window) = app.get_webview_window("main") {
-                            let _ = window.eval("window.__trayDisconnect && window.__trayDisconnect()");
+                            let _ = window.eval(
+                                "window.__trayDisconnect && window.__trayDisconnect()",
+                            );
                         }
                     }
                     "quit" => {
@@ -400,6 +752,11 @@ fn main() {
             unmount_juicefs,
             install_hda,
             get_houdini_info,
+            check_juicefs_installed,
+            get_juicefs_path,
+            download_juicefs,
+            check_fuse_installed,
+            ensure_dependencies,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
