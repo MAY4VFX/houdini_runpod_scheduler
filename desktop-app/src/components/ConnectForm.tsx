@@ -8,6 +8,7 @@ interface ConnectFormProps {
 export default function ConnectForm({ onConnected }: ConnectFormProps) {
   const [apiKey, setApiKey] = useState("");
   const [apiUrl, setApiUrl] = useState("https://db.ai-vfx.com");
+  const [mountPath, setMountPath] = useState("");
   const [loading, setLoading] = useState(false);
   const [loadingMessage, setLoadingMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -39,7 +40,7 @@ export default function ConnectForm({ onConnected }: ConnectFormProps) {
       // 4. Auto-mount JuiceFS
       // 5. Check Houdini
       setLoadingMessage("Authenticating...");
-      const status = await connect(apiKey.trim(), apiUrl.trim());
+      const status = await connect(apiKey.trim(), apiUrl.trim(), mountPath.trim() || undefined);
       if (status.mounted) {
         setLoadingMessage("Connected and mounted!");
       }
@@ -152,22 +153,44 @@ export default function ConnectForm({ onConnected }: ConnectFormProps) {
             </button>
 
             {showAdvanced && (
-              <div className="mt-3">
-                <label
-                  htmlFor="apiUrl"
-                  className="mb-1.5 block text-sm font-medium text-gray-300"
-                >
-                  API URL
-                </label>
-                <input
-                  id="apiUrl"
-                  type="url"
-                  value={apiUrl}
-                  onChange={(e) => setApiUrl(e.target.value)}
-                  placeholder="https://db.ai-vfx.com"
-                  className="input-field"
-                  disabled={loading}
-                />
+              <div className="mt-3 space-y-3">
+                <div>
+                  <label
+                    htmlFor="apiUrl"
+                    className="mb-1.5 block text-sm font-medium text-gray-300"
+                  >
+                    API URL
+                  </label>
+                  <input
+                    id="apiUrl"
+                    type="url"
+                    value={apiUrl}
+                    onChange={(e) => setApiUrl(e.target.value)}
+                    placeholder="https://db.ai-vfx.com"
+                    className="input-field"
+                    disabled={loading}
+                  />
+                </div>
+                <div>
+                  <label
+                    htmlFor="mountPath"
+                    className="mb-1.5 block text-sm font-medium text-gray-300"
+                  >
+                    Mount Path
+                  </label>
+                  <input
+                    id="mountPath"
+                    type="text"
+                    value={mountPath}
+                    onChange={(e) => setMountPath(e.target.value)}
+                    placeholder="~/RunPodFarm (default)"
+                    className="input-field"
+                    disabled={loading}
+                  />
+                  <p className="mt-1 text-xs text-gray-500">
+                    Local directory where JuiceFS will be mounted
+                  </p>
+                </div>
               </div>
             )}
           </div>

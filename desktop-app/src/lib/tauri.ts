@@ -46,12 +46,17 @@ export async function checkFuseInstalled(): Promise<boolean> {
   return invoke("check_fuse_installed");
 }
 
+export async function installFuse(): Promise<string> {
+  return invoke("install_fuse");
+}
+
 // Connection
 export async function connect(
   apiKey: string,
-  apiUrl: string
+  apiUrl: string,
+  mountPath?: string
 ): Promise<AppStatus> {
-  return invoke("connect", { apiKey, apiUrl });
+  return invoke("connect", { apiKey, apiUrl, mountPath: mountPath || null });
 }
 
 export async function disconnect(): Promise<void> {
