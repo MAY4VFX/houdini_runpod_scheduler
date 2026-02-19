@@ -50,20 +50,17 @@ class WorkerConfig:
         if not redis_url:
             missing.append("REDIS_URL")
 
-        project_id = os.environ.get("PROJECT_ID", "")
-        if not project_id:
-            missing.append("PROJECT_ID")
-
-        user_id = os.environ.get("USER_ID", "")
-        if not user_id:
-            missing.append("USER_ID")
-
         if missing:
             logger.error(
                 "Required environment variables are not set: %s",
                 ", ".join(missing),
             )
             raise SystemExit(1)
+
+        # PROJECT_ID and USER_ID are set by the HDA when launching pods.
+        # Default to "default" for manual testing / template validation.
+        project_id = os.environ.get("PROJECT_ID", "default")
+        user_id = os.environ.get("USER_ID", "default")
 
         config = cls(
             redis_url=redis_url,
