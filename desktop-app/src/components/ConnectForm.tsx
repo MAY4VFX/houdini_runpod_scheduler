@@ -1,5 +1,8 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
+import { load } from "@tauri-apps/plugin-store";
 import { connect, ensureDependencies, type AppStatus, type DependencyStatus } from "../lib/tauri";
+
+const STORE_FILE = "settings.json";
 
 interface ConnectFormProps {
   onConnected: (status: AppStatus) => void;
@@ -14,8 +17,27 @@ export default function ConnectForm({ onConnected }: ConnectFormProps) {
   const [error, setError] = useState<string | null>(null);
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [deps, setDeps] = useState<DependencyStatus | null>(null);
+  const [loaded, setLoaded] = useState(false);
+  const storeRef = useRef<Awaited<ReturnType<typeof load>> | null>(null);
 
+  // Load saved settings on mount
   useEffect(() => {
+    async function init() {
+      try {
+        const store = await load(STORE_FILE);
+        storeRef.current = store;
+        const savedKey = await store.get<string>("apiKey");
+        const savedUrl = await store.get<string>("apiUrl");
+        const savedMount = await store.get<string>("mountPath");
+        if (savedKey) setApiKey(savedKey);
+        if (savedUrl) setApiUrl(savedUrl);
+        if (savedMount) setMountPath(savedMount);
+      } catch {
+        // store not available, use defaults
+      }
+      setLoaded(true);
+    }
+    init();
     ensureDependencies()
       .then(setDeps)
       .catch(() => {});
@@ -41,6 +63,15 @@ export default function ConnectForm({ onConnected }: ConnectFormProps) {
       // 5. Check Houdini
       setLoadingMessage("Authenticating...");
       const status = await connect(apiKey.trim(), apiUrl.trim(), mountPath.trim() || undefined);
+      // Save settings on successful connect
+      if (storeRef.current) {
+        await storeRef.current.set("apiKey", apiKey.trim());
+        await storeRef.current.set("apiUrl", apiUrl.trim());
+        if (mountPath.trim()) {
+          await storeRef.current.set("mountPath", mountPath.trim());
+        }
+        await storeRef.current.save();
+      }
       if (status.mounted) {
         setLoadingMessage("Connected and mounted!");
       }
@@ -58,6 +89,14 @@ export default function ConnectForm({ onConnected }: ConnectFormProps) {
       setLoadingMessage(null);
     }
   };
+
+  if (!loaded) {
+    return (
+      <div className="flex min-h-screen items-center justify-center p-8">
+        <p className="text-gray-500">Loading...</p>
+      </div>
+    );
+  }
 
   return (
     <div className="flex min-h-screen items-center justify-center p-8">
