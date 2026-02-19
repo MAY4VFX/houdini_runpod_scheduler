@@ -14,15 +14,12 @@ ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics
 # System dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 python3-pip python3-venv \
-    curl wget fuse3 libfuse3-dev \
+    curl wget \
     libgl1-mesa-glx libglu1-mesa libxi6 libxmu6 libxrandr2 \
     libxcursor1 libxinerama1 libxss1 libasound2 \
     xvfb \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
-
-# Install JuiceFS
-RUN curl -sSL https://d.juicefs.com/install | sh -
 
 # Create worker directory
 WORKDIR /opt/runpodfarm
