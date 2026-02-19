@@ -115,7 +115,8 @@ def _build_shell_command(config: WorkerConfig, command: str) -> str:
     setup_script = os.path.join(config.houdini_path, "houdini_setup_bash")
     # Source houdini_setup_bash only if it exists (Houdini may not be
     # installed yet, e.g. during initial setup tasks).
-    return f'[ -f "{setup_script}" ] && source "{setup_script}"; {command}'
+    # Must cd to houdini dir first — the script requires it to detect install location.
+    return f'[ -f "{setup_script}" ] && cd "{config.houdini_path}" && source houdini_setup_bash; {command}'
 
 
 # ---------------------------------------------------------------------------
