@@ -113,9 +113,9 @@ def _build_env(config: WorkerConfig, task_env: dict[str, str]) -> dict[str, str]
 def _build_shell_command(config: WorkerConfig, command: str) -> str:
     """Wrap the user command so Houdini environment is sourced first."""
     setup_script = os.path.join(config.houdini_path, "houdini_setup_bash")
-    # Use `source` inside bash; the command runs in the same shell so
-    # it inherits all Houdini env vars that houdini_setup_bash exports.
-    return f'source "{setup_script}" && {command}'
+    # Source houdini_setup_bash only if it exists (Houdini may not be
+    # installed yet, e.g. during initial setup tasks).
+    return f'[ -f "{setup_script}" ] && source "{setup_script}"; {command}'
 
 
 # ---------------------------------------------------------------------------
