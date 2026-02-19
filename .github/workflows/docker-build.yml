@@ -60,41 +60,37 @@ jobs:
           NEW_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.short_sha }}
           TEMPLATE_ENV: ${{ secrets.RUNPOD_TEMPLATE_ENV }}
         run: |
+          pip install -q requests
           python3 -c "
-          import json, urllib.request, os
+          import json, requests, os
           api_key = os.environ['RUNPOD_API_KEY']
           template_id = os.environ['TEMPLATE_ID']
           new_image = os.environ['NEW_IMAGE']
-          env_vars = os.environ['TEMPLATE_ENV']
+          env_vars = json.loads(os.environ['TEMPLATE_ENV'])
 
-          query = '''mutation {
-            saveTemplate(input: {
-              id: \"%s\"
-              name: \"RunPodFarm Worker\"
-              imageName: \"%s\"
-              dockerArgs: \"\"
-              containerDiskInGb: 10
-              volumeInGb: 0
-              isPublic: false
-              startJupyter: false
-              startSsh: false
-              env: %s
-            }) { id imageName }
-          }''' % (template_id, new_image, env_vars)
+          query = '''mutation(\$input: SaveTemplateInput!) { saveTemplate(input: \$input) { id imageName } }'''
+          variables = {
+              'input': {
+                  'id': template_id,
+                  'name': 'RunPodFarm Worker',
+                  'imageName': new_image,
+                  'dockerArgs': '',
+                  'containerDiskInGb': 10,
+                  'volumeInGb': 0,
+                  'isPublic': False,
+                  'startJupyter': False,
+                  'startSsh': False,
+                  'env': env_vars,
+              }
+          }
 
-          data = json.dumps({'query': query}).encode()
-          req = urllib.request.Request(
+          resp = requests.post(
               f'https://api.runpod.io/graphql?api_key={api_key}',
-              data=data,
-              headers={'Content-Type': 'application/json'}
+              json={'query': query, 'variables': variables}
           )
-          try:
-              resp = urllib.request.urlopen(req)
-              d = json.loads(resp.read())
-              if 'data' in d and d['data'].get('saveTemplate'):
-                  print(f\"Template updated: {d['data']['saveTemplate']['imageName']}\")
-              else:
-                  print(f'Warning: {d}')
-          except Exception as e:
-              print(f'Warning: Failed to update RunPod template: {e}')
+          d = resp.json()
+          if 'data' in d and d['data'].get('saveTemplate'):
+              print(f\"Template updated: {d['data']['saveTemplate']['imageName']}\")
+          else:
+              print(f'Warning: {json.dumps(d)}')
           "
