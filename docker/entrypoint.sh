@@ -24,15 +24,16 @@ if [ -d "/workspace/houdini" ]; then
     export HFS="/workspace/houdini"
     source "$HFS/houdini_setup_bash" 2>/dev/null || true
 
-    # Houdini licensing via sesinetd license server
+    # Houdini licensing via remote sesinetd license server
     if [ -n "${SESINETD_HOST:-}" ]; then
         SESINETD_PORT="${SESINETD_PORT:-1715}"
         echo "Configuring license server: ${SESINETD_HOST}:${SESINETD_PORT}"
-        mkdir -p /root/.sesi_licenses.d
-        echo "serverhost=${SESINETD_HOST}" > /root/.sesi_licenses.d/sesinetd_licenses.pref
-        echo "serverport=${SESINETD_PORT}" >> /root/.sesi_licenses.d/sesinetd_licenses.pref
-        export SESI_LMHOST="${SESINETD_HOST}"
-        export SESI_LMPORT="${SESINETD_PORT}"
+        # Kill any existing hserver and restart pointing to remote license server
+        hserver -q 2>/dev/null || true
+        sleep 1
+        hserver --host "${SESINETD_HOST}" &
+        sleep 2
+        echo "License server connected: $(hserver -l 2>&1 | grep 'Connected To' || echo 'check failed')"
     fi
 
     # Set project-specific Houdini env
