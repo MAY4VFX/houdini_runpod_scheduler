@@ -55,34 +55,19 @@ class TaskResult:
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _run_juicefs_warmup(
+def _verify_paths(
     paths: list[str],
     redis_client: redis.Redis,
     task_id: str,
 ) -> None:
-    """Pre-fetch JuiceFS paths so that I/O during the render is fast."""
+    """Verify that required paths exist on the Network Volume before rendering."""
     for path in paths:
-        logger.info("JuiceFS warmup: %s", path)
-        _push_log(redis_client, task_id, f"[warmup] juicefs warmup {path}")
-        try:
-            result = subprocess.run(
-                ["juicefs", "warmup", path],
-                capture_output=True,
-                text=True,
-                timeout=120,
-            )
-            if result.stdout.strip():
-                _push_log(redis_client, task_id, f"[warmup] {result.stdout.strip()}")
-            if result.returncode != 0 and result.stderr.strip():
-                logger.warning("juicefs warmup failed for %s: %s", path, result.stderr.strip())
-                _push_log(redis_client, task_id, f"[warmup] WARNING: {result.stderr.strip()}")
-        except FileNotFoundError:
-            logger.warning("juicefs binary not found, skipping warmup")
-            _push_log(redis_client, task_id, "[warmup] juicefs binary not found, skipping")
-            break
-        except subprocess.TimeoutExpired:
-            logger.warning("juicefs warmup timed out for %s", path)
-            _push_log(redis_client, task_id, f"[warmup] TIMEOUT for {path}")
+        if os.path.exists(path):
+            logger.info("Path verified: %s", path)
+            _push_log(redis_client, task_id, f"[verify] OK: {path}")
+        else:
+            logger.warning("Path not found: %s", path)
+            _push_log(redis_client, task_id, f"[verify] MISSING: {path}")
 
 
 def _push_log(
@@ -113,7 +98,7 @@ def _build_env(config: WorkerConfig, task_env: dict[str, str]) -> dict[str, str]
     # Houdini baseline
     env["HOUDINI_PATH"] = config.houdini_path
     env["HFS"] = config.houdini_path
-    env["JUICEFS_MOUNT"] = config.juicefs_mount
+    env["PROJECT_DIR"] = config.project_dir
 
     # Ensure Houdini binaries are on PATH
     houdini_bin = os.path.join(config.houdini_path, "bin")
@@ -173,9 +158,9 @@ def execute_task(
     _push_log(redis_client, task_id, f"[worker] Starting task {task_id}")
     _push_log(redis_client, task_id, f"[worker] Command: {command}")
 
-    # ---- JuiceFS warmup ------------------------------------------------
+    # ---- Verify required paths on Network Volume -----------------------
     if warmup_paths:
-        _run_juicefs_warmup(warmup_paths, redis_client, task_id)
+        _verify_paths(warmup_paths, redis_client, task_id)
 
     # ---- Prepare environment -------------------------------------------
     env = _build_env(config, task_env)
