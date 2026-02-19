@@ -96,7 +96,6 @@ def _build_env(config: WorkerConfig, task_env: dict[str, str]) -> dict[str, str]
     env = os.environ.copy()
 
     # Houdini baseline
-    env["HOUDINI_PATH"] = config.houdini_path
     env["HFS"] = config.houdini_path
     env["PROJECT_DIR"] = config.project_dir
 
