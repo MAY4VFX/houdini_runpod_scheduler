@@ -768,28 +768,17 @@ async fn mount_juicefs_inner(
     std::fs::create_dir_all(&config.mount_path)
         .map_err(|e| format!("Failed to create mount dir: {}", e))?;
 
-    // JuiceFS --bucket expects https:// URL, e.g. https://s3.eu-central-003.backblazeb2.com/runpodfarm-juicefs
-    let storage_url = if config.b2_endpoint.starts_with("https://") || config.b2_endpoint.starts_with("http://") {
-        format!("{}/{}", config.b2_endpoint, config.b2_bucket)
-    } else {
-        format!("https://{}/{}", config.b2_endpoint, config.b2_bucket)
-    };
-
+    // JuiceFS mount reads storage config from Redis metadata (set during juicefs format).
+    // Credentials are passed via environment variables, not command-line flags.
     let output = Command::new(&juicefs_path)
         .args([
             "mount",
             &config.redis_url,
             &config.mount_path,
-            "--storage",
-            "s3",
-            "--bucket",
-            &storage_url,
-            "--access-key",
-            &config.b2_access_key,
-            "--secret-key",
-            &config.b2_secret_key,
             "-d",
         ])
+        .env("ACCESS_KEY", &config.b2_access_key)
+        .env("SECRET_KEY", &config.b2_secret_key)
         .output()
         .map_err(|e| format!("Failed to run juicefs: {}", e))?;
 

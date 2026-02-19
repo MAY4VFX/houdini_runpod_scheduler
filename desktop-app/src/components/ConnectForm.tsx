@@ -131,6 +131,27 @@ export default function ConnectForm({ onConnected }: ConnectFormProps) {
           </div>
 
           <div>
+            <label
+              htmlFor="mountPath"
+              className="mb-1.5 block text-sm font-medium text-gray-300"
+            >
+              Project Folder
+            </label>
+            <input
+              id="mountPath"
+              type="text"
+              value={mountPath}
+              onChange={(e) => setMountPath(e.target.value)}
+              placeholder="~/RunPodFarm (default)"
+              className="input-field"
+              disabled={loading}
+            />
+            <p className="mt-1 text-xs text-gray-500">
+              Local directory where project files will be mounted
+            </p>
+          </div>
+
+          <div>
             <button
               type="button"
               onClick={() => setShowAdvanced(!showAdvanced)}
@@ -153,44 +174,22 @@ export default function ConnectForm({ onConnected }: ConnectFormProps) {
             </button>
 
             {showAdvanced && (
-              <div className="mt-3 space-y-3">
-                <div>
-                  <label
-                    htmlFor="apiUrl"
-                    className="mb-1.5 block text-sm font-medium text-gray-300"
-                  >
-                    API URL
-                  </label>
-                  <input
-                    id="apiUrl"
-                    type="url"
-                    value={apiUrl}
-                    onChange={(e) => setApiUrl(e.target.value)}
-                    placeholder="https://db.ai-vfx.com"
-                    className="input-field"
-                    disabled={loading}
-                  />
-                </div>
-                <div>
-                  <label
-                    htmlFor="mountPath"
-                    className="mb-1.5 block text-sm font-medium text-gray-300"
-                  >
-                    Mount Path
-                  </label>
-                  <input
-                    id="mountPath"
-                    type="text"
-                    value={mountPath}
-                    onChange={(e) => setMountPath(e.target.value)}
-                    placeholder="~/RunPodFarm (default)"
-                    className="input-field"
-                    disabled={loading}
-                  />
-                  <p className="mt-1 text-xs text-gray-500">
-                    Local directory where JuiceFS will be mounted
-                  </p>
-                </div>
+              <div className="mt-3">
+                <label
+                  htmlFor="apiUrl"
+                  className="mb-1.5 block text-sm font-medium text-gray-300"
+                >
+                  API URL
+                </label>
+                <input
+                  id="apiUrl"
+                  type="url"
+                  value={apiUrl}
+                  onChange={(e) => setApiUrl(e.target.value)}
+                  placeholder="https://db.ai-vfx.com"
+                  className="input-field"
+                  disabled={loading}
+                />
               </div>
             )}
           </div>
