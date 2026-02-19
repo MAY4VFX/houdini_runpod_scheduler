@@ -589,6 +589,7 @@ async fn ensure_dependencies() -> Result<DependencyStatus, String> {
 async fn connect(
     api_key: String,
     api_url: String,
+    mount_path: Option<String>,
     state: tauri::State<'_, Mutex<AppState>>,
 ) -> Result<AppStatus, String> {
     // 1. Check FUSE
@@ -626,6 +627,18 @@ async fn connect(
 
     let cfg = body.get("config").ok_or("No config in server response")?;
 
+    let project_id_str = cfg.get("project_id").and_then(|v| v.as_str()).unwrap_or("default").to_string();
+
+    // Use user-provided mount_path, or default to ~/RunPodFarm/{project_id}
+    let local_mount_path = mount_path.unwrap_or_else(|| {
+        dirs::home_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+            .join("RunPodFarm")
+            .join(&project_id_str)
+            .to_string_lossy()
+            .to_string()
+    });
+
     let config = JuiceFSConfig {
         redis_url: cfg.get("redis_url").and_then(|v| v.as_str()).unwrap_or("").to_string(),
         b2_endpoint: cfg.get("b2_endpoint").and_then(|v| v.as_str()).unwrap_or("").to_string(),
@@ -633,8 +646,8 @@ async fn connect(
         b2_secret_key: cfg.get("b2_secret_key").and_then(|v| v.as_str()).unwrap_or("").to_string(),
         b2_bucket: cfg.get("b2_bucket").and_then(|v| v.as_str()).unwrap_or("").to_string(),
         rsa_key: cfg.get("rsa_key").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-        project_id: cfg.get("project_id").and_then(|v| v.as_str()).unwrap_or("default").to_string(),
-        mount_path: cfg.get("mount_path").and_then(|v| v.as_str()).unwrap_or("/project").to_string(),
+        project_id: project_id_str,
+        mount_path: local_mount_path,
     };
 
     let project_id = config.project_id.clone();
