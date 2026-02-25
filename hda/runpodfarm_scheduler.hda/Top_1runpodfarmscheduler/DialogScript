@@ -85,6 +85,13 @@
             help    "Secure Cloud is more reliable. Community Cloud is cheaper"
         }
         parm {
+            name    "rpfarm_licenseserver"
+            label   "License Server"
+            type    string
+            default { "lic.ai-vfx.com" }
+            help    "Houdini sesinetd license server hostname (e.g. lic.ai-vfx.com). Leave empty to skip."
+        }
+        parm {
             name    "rpfarm_verbose"
             label   "Verbose Logging"
             type    toggle
