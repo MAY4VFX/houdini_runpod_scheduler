@@ -36,6 +36,11 @@ class WorkerConfig:
     log_level: str = "INFO"
     max_retries: int = 3
     task_timeout: int = 3600
+    # JuiceFS sync settings
+    juicefs_meta_url: str = ""
+    juicefs_bin: str = "/usr/local/bin/juicefs"
+    nv_cache_max_pct: int = 80
+    nv_cache_cold_days: int = 7
 
     @classmethod
     def from_env(cls) -> WorkerConfig:
@@ -75,6 +80,16 @@ class WorkerConfig:
             log_level=os.environ.get("LOG_LEVEL", "INFO"),
             max_retries=int(os.environ.get("MAX_RETRIES", "3")),
             task_timeout=int(os.environ.get("TASK_TIMEOUT", "3600")),
+            juicefs_meta_url=os.environ.get("JUICEFS_META_URL", ""),
+            juicefs_bin=os.environ.get(
+                "JUICEFS_BIN", "/usr/local/bin/juicefs"
+            ),
+            nv_cache_max_pct=int(
+                os.environ.get("NV_CACHE_MAX_PCT", "80")
+            ),
+            nv_cache_cold_days=int(
+                os.environ.get("NV_CACHE_COLD_DAYS", "7")
+            ),
         )
 
         logger.info("Worker configuration loaded:")
@@ -87,5 +102,10 @@ class WorkerConfig:
         logger.info("  task_timeout    = %ds", config.task_timeout)
         logger.info("  max_retries     = %d", config.max_retries)
         logger.info("  log_level       = %s", config.log_level)
+        if config.juicefs_meta_url:
+            logger.info("  juicefs_meta_url = <configured>")
+            logger.info("  juicefs_bin    = %s", config.juicefs_bin)
+            logger.info("  nv_cache_max_pct = %d%%", config.nv_cache_max_pct)
+            logger.info("  nv_cache_cold_days = %dd", config.nv_cache_cold_days)
 
         return config

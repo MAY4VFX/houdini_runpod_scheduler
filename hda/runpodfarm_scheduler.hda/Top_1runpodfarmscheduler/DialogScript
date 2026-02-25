@@ -599,5 +599,27 @@
                 help    "Space-separated paths to pre-cache on pods"
             }
         }
+
+        groupsimple {
+            name    "folder7_sync"
+            label   "JuiceFS Sync"
+
+            parm {
+                name    "rpfarm_juicefs_meta_url"
+                label   "JuiceFS Meta URL"
+                type    string
+                default { "" }
+                help    "Redis URL for JuiceFS metadata (e.g. redis://:pass@host:6381/1). When set, enables automatic B2-to-NV sync via juicefs sync before each task."
+            }
+            parm {
+                name    "rpfarm_nv_cache_max_pct"
+                label   "NV Cache Max %"
+                type    integer
+                default { "80" }
+                range   { 50 95 }
+                disablewhen "{ rpfarm_juicefs_meta_url == \"\" }"
+                help    "Maximum NV disk usage percentage. Cold asset groups are evicted when exceeded."
+            }
+        }
     }
 }
