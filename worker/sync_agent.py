@@ -198,76 +198,86 @@ def pre_task_sync(
 ) -> bool:
     """Download project files from JuiceFS to Network Volume before task execution.
 
-    Reads the ``manifest`` field from the task dict to determine which files
-    are needed.  Skips files already present on the NV (with matching size).
+    Handles two sync sources:
+
+    1. ``sync_dirs`` — explicit directories to sync (e.g. pdgtemp scripts).
+       These are always synced unconditionally.
+    2. ``manifest`` — file-level manifest for selective asset sync.
+       Only missing files are downloaded.
 
     Returns True on success, False on failure.
     """
     task_id = task.get("task_id", "unknown")
     manifest: Manifest | None = task.get("manifest")
+    sync_dirs: list[str] = task.get("sync_dirs", [])
     meta_url = config.juicefs_meta_url
 
     if not meta_url:
         logger.debug("JUICEFS_META_URL not configured, skipping pre-task sync")
         return True
 
-    if not manifest:
-        logger.debug("No manifest in task %s, skipping pre-task sync", task_id)
+    if not manifest and not sync_dirs:
+        logger.debug("No manifest or sync_dirs in task %s, skipping pre-task sync", task_id)
         return True
-
-    _push_log(redis_client, task_id, f"[sync] Pre-task sync: {len(manifest)} files in manifest")
 
     project_dir = config.project_dir
-    present, missing = _check_files_present(project_dir, manifest)
-
-    _push_log(
-        redis_client, task_id,
-        f"[sync] NV cache: {len(present)} present, {len(missing)} missing",
-    )
-    logger.info(
-        "Pre-task sync for %s: %d present, %d missing",
-        task_id, len(present), len(missing),
-    )
-
-    if not missing:
-        _push_log(redis_client, task_id, "[sync] All files cached, skip download")
-        return True
-
-    # Group missing files by directory for efficient syncing
-    missing_manifest = {p: manifest[p] for p in missing}
-    groups = _group_manifest_by_directory(missing_manifest)
-
-    # Ensure enough free space on NV before downloading
-    total_missing_bytes = sum(
-        manifest[p].get("size", 0) for p in missing
-    )
-    if total_missing_bytes > 0:
-        ensure_free_space(total_missing_bytes, config, redis_client, task_id)
-
     start = time.monotonic()
-    failed_groups: list[str] = []
+    failed: list[str] = []
 
-    for group_path, files in groups.items():
-        # Mark group as used in cache tracking
-        mark_group_used(project_dir, group_path, redis_client)
+    # ---- Phase 1: sync explicit directories (pdgtemp, etc.) ----
+    if sync_dirs:
+        _push_log(
+            redis_client, task_id,
+            f"[sync] Syncing {len(sync_dirs)} directories: {sync_dirs}",
+        )
+        for rel_dir in sync_dirs:
+            src = _jfs_uri(meta_url, rel_dir)
+            dst = _local_path(project_dir, rel_dir)
+            os.makedirs(dst, exist_ok=True)
+            ok = _run_juicefs_sync(config, src, dst, task_id, redis_client)
+            if not ok:
+                failed.append(rel_dir)
 
-        # Sync entire group directory at once
-        src = _jfs_uri(meta_url, group_path)
-        dst = _local_path(project_dir, group_path)
-        os.makedirs(dst, exist_ok=True)
+    # ---- Phase 2: manifest-based selective sync ----
+    if manifest:
+        _push_log(redis_client, task_id, f"[sync] Pre-task sync: {len(manifest)} files in manifest")
 
-        ok = _run_juicefs_sync(config, src, dst, task_id, redis_client)
-        if not ok:
-            failed_groups.append(group_path)
+        present, missing = _check_files_present(project_dir, manifest)
+        _push_log(
+            redis_client, task_id,
+            f"[sync] NV cache: {len(present)} present, {len(missing)} missing",
+        )
+        logger.info(
+            "Pre-task sync for %s: %d present, %d missing",
+            task_id, len(present), len(missing),
+        )
+
+        if missing:
+            missing_manifest = {p: manifest[p] for p in missing}
+            groups = _group_manifest_by_directory(missing_manifest)
+
+            total_missing_bytes = sum(
+                manifest[p].get("size", 0) for p in missing
+            )
+            if total_missing_bytes > 0:
+                ensure_free_space(total_missing_bytes, config, redis_client, task_id)
+
+            for group_path, files in groups.items():
+                mark_group_used(project_dir, group_path, redis_client)
+                src = _jfs_uri(meta_url, group_path)
+                dst = _local_path(project_dir, group_path)
+                os.makedirs(dst, exist_ok=True)
+                ok = _run_juicefs_sync(config, src, dst, task_id, redis_client)
+                if not ok:
+                    failed.append(group_path)
 
     elapsed = time.monotonic() - start
 
-    if failed_groups:
-        msg = f"[sync] Pre-task sync PARTIAL ({len(failed_groups)} groups failed) in {elapsed:.1f}s"
+    if failed:
+        msg = f"[sync] Pre-task sync PARTIAL ({len(failed)} groups failed) in {elapsed:.1f}s"
         _push_log(redis_client, task_id, msg)
         logger.warning(msg)
-        # Partial sync is not fatal — some files may still work
-        return True
+        return True  # partial sync is not fatal
 
     msg = f"[sync] Pre-task sync complete in {elapsed:.1f}s"
     _push_log(redis_client, task_id, msg)
