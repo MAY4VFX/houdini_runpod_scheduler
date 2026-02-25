@@ -158,7 +158,7 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
                 },
                 {
                     "name": "rpfarm_gputype",
-                    "type": "String"
+                    "type": "Integer"
                 },
                 {
                     "name": "rpfarm_gputypeid",
@@ -498,8 +498,12 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
             env_vars["JUICEFS_META_URL"] = juicefs_meta_url
             env_vars["NV_CACHE_MAX_PCT"] = str(nv_cache_max_pct)
 
-        # Build environment as a list of key=value entries for the API
-        env_list = [{"key": k, "value": v} for k, v in env_vars.items()]
+        # Build environment as GraphQL-formatted list (unquoted keys)
+        env_entries = ", ".join(
+            '{key: "%s", value: "%s"}' % (k, v.replace('"', '\\"'))
+            for k, v in env_vars.items()
+        )
+        env_gql = "[%s]" % env_entries
 
         # Construct the GraphQL mutation
         mutation = """
@@ -510,7 +514,7 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
                 templateId: "{template_id}"
                 {volume_clause}
                 {datacenter_clause}
-                env: {env_json}
+                env: {env_gql}
             }}) {{
                 id
                 desiredStatus
@@ -533,7 +537,7 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
                 f'dataCenterId: "{datacenter}"'
                 if datacenter else ""
             ),
-            env_json=json.dumps(env_list),
+            env_gql=env_gql,
         )
 
         self._verboseLog(f"Creating RunPod pod with GPU type: {gpu_type_id}")
