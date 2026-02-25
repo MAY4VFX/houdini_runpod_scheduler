@@ -1,0 +1,625 @@
+# Dialog script for runpodfarmscheduler automatically generated
+
+{
+    name	runpodfarmscheduler
+    script	runpodfarmscheduler
+    label	"RunPodFarm Scheduler"
+
+    help {
+	""
+    }
+
+    group {
+        name    "folder0"
+        label   "RunPod"
+
+        parm {
+            name    "rpfarm_apikey"
+            label   "API Key"
+            type    string
+            default { "" }
+            help    "RunPod API key for authentication. Get it from https://www.runpod.io/console/user/settings"
+        }
+        parm {
+            name    "rpfarm_gputype"
+            label   "GPU Type"
+            type    ordinal
+            default { "0" }
+            menu {
+                "0" "NVIDIA RTX 4090"
+                "1" "NVIDIA RTX A5000"
+                "2" "NVIDIA A100 80GB"
+                "3" "NVIDIA RTX 4080"
+                "4" "NVIDIA RTX 3090"
+                "5" "NVIDIA L40S"
+                "6" "NVIDIA RTX 5090"
+            }
+            help    "GPU model for worker pods"
+        }
+        parm {
+            name    "rpfarm_gputypeid"
+            label   "GPU Type ID"
+            type    string
+            default { "NVIDIA GeForce RTX 4090" }
+            help    "RunPod GPU type identifier. Auto-filled from GPU Type dropdown, or override manually"
+        }
+        parm {
+            name    "rpfarm_templateid"
+            label   "Template ID"
+            type    string
+            default { "" }
+            help    "RunPod template ID for the worker Docker image"
+        }
+        parm {
+            name    "rpfarm_networkvolumeid"
+            label   "Network Volume ID"
+            type    string
+            default { "" }
+            help    "RunPod Network Volume ID containing Houdini installation"
+        }
+        parm {
+            name    "rpfarm_datacenter"
+            label   "Datacenter"
+            type    string
+            default { "EU-RO-1" }
+            menu {
+                "EU-RO-1"   "EU Romania"
+                "EU-CZ-1"   "EU Czech Republic"
+                "EU-SE-1"   "EU Sweden"
+                "US-TX-3"   "US Texas"
+                "CA-MTL-1"  "CA Montreal"
+            }
+            help    "Preferred datacenter region for pods"
+        }
+        parm {
+            name    "rpfarm_cloudtype"
+            label   "Cloud Type"
+            type    ordinal
+            default { "0" }
+            menu {
+                "0" "Secure Cloud"
+                "1" "Community Cloud"
+            }
+            help    "Secure Cloud is more reliable. Community Cloud is cheaper"
+        }
+        parm {
+            name    "rpfarm_verbose"
+            label   "Verbose Logging"
+            type    toggle
+            default { "0" }
+        }
+    }
+
+    group {
+        name    "folder1"
+        label   "Scaling"
+
+        parm {
+            name    "rpfarm_minpods"
+            label   "Min Pods"
+            type    integer
+            default { "2" }
+            range   { 1 20 }
+            help    "Minimum number of pods to keep running during cook"
+        }
+        parm {
+            name    "rpfarm_maxpods"
+            label   "Max Pods"
+            type    integer
+            default { "8" }
+            range   { 1 50 }
+            help    "Maximum number of pods (budget limit)"
+        }
+        parm {
+            name    "rpfarm_targetqueuedepth"
+            label   "Target Queue Depth"
+            type    integer
+            default { "4" }
+            range   { 1 20 }
+            help    "Target number of tasks per pod in queue. Scale up when exceeded"
+        }
+        parm {
+            name    "rpfarm_scaleupthreshold"
+            label   "Scale Up After (min)"
+            type    integer
+            default { "5" }
+            range   { 1 30 }
+            help    "Minutes of estimated remaining time before scaling up"
+        }
+        parm {
+            name    "rpfarm_scalebatchsize"
+            label   "Scale Batch Size"
+            type    integer
+            default { "2" }
+            range   { 1 8 }
+            help    "Number of pods to add per scale-up event"
+        }
+        parm {
+            name    "rpfarm_idletimeout"
+            label   "Idle Timeout (sec)"
+            type    integer
+            default { "120" }
+            range   { 30 600 }
+            help    "Seconds of idle time before terminating a pod"
+        }
+    }
+
+    group {
+        name    "folder2"
+        label   "Budget"
+
+        parm {
+            name    "rpfarm_maxcost"
+            label   "Max Cost ($)"
+            type    float
+            default { "50.0" }
+            range   { 1 500 }
+            help    "Maximum allowed cost for this cook session"
+        }
+        parm {
+            name    "rpfarm_currentcost"
+            label   "Current Cost ($)"
+            type    float
+            default { "0.0" }
+            range   { 0 500 }
+            help    "Current accumulated cost (read-only, updated during cook)"
+            parmtag { "script_callback_language" "python" }
+        }
+        parm {
+            name    "rpfarm_costperhour"
+            label   "Cost Per Hour ($)"
+            type    float
+            default { "0.0" }
+            range   { 0 100 }
+            help    "Current hourly burn rate (read-only)"
+        }
+        parm {
+            name    "rpfarm_estimatedtotal"
+            label   "Estimated Total ($)"
+            type    float
+            default { "0.0" }
+            range   { 0 500 }
+            help    "Estimated total cost at completion (read-only)"
+        }
+    }
+
+    group {
+        name    "folder3"
+        label   "Project"
+
+        parm {
+            name    "rpfarm_redisurl"
+            label   "Redis URL"
+            type    string
+            default { "" }
+            help    "Redis connection URL (rediss://default:xxx@xxx.upstash.io:6379)"
+        }
+        parm {
+            name    "rpfarm_projectid"
+            label   "Project ID"
+            type    string
+            default { "default" }
+            help    "Unique project identifier for Redis namespace isolation"
+        }
+        parm {
+            name    "rpfarm_userid"
+            label   "User ID"
+            type    string
+            default { "" }
+            help    "Artist identifier for Redis namespace isolation"
+        }
+        groupsimple {
+            name    "folder3_paths"
+            label   "Paths"
+
+            parm {
+                name    "pdg_workingdir"
+                label   "Local Shared Path"
+                type    string
+                default { "/project" }
+            }
+            parm {
+                name    "rpfarm_mountinfo"
+                label   "Label"
+                type    label
+                nolabel
+                default { "Ensure the Network Volume is mounted at the Local Shared Path\nbefore starting the cook." }
+            }
+            parm {
+                name    "rpfarm_overrideremoteworkingdir"
+                label   "Override Remote Shared Path"
+                type    toggle
+                nolabel
+                joinnext
+                default { "0" }
+            }
+            parm {
+                name    "rpfarm_remoteworkingdir"
+                label   "Remote Shared Path"
+                type    string
+                default { "/project" }
+                disablewhen "{ rpfarm_overrideremoteworkingdir == 0 }"
+            }
+            parm {
+                name    "pdg_workitemdatasource"
+                label   "Load Item Data From"
+                type    ordinal
+                default { "0" }
+                menu {
+                    "0" "Temporary JSON File"
+                    "1" "RPC Message"
+                }
+                parmtag { "script_callback_language" "python" }
+            }
+            parm {
+                name    "pdg_deletetempdir"
+                label   "Delete Temp Dir"
+                type    ordinal
+                default { "0" }
+                menu {
+                    "0" "Never"
+                    "1" "When Scheduler is Deleted"
+                    "2" "When Cook Completes"
+                }
+                parmtag { "script_callback_language" "python" }
+            }
+            parm {
+                name    "pdg_compressworkitemdata"
+                label   "Compress Work Item Data"
+                type    toggle
+                default { "1" }
+                disablewhen "{ pdg_workitemdatasource == 1 }"
+                parmtag { "script_callback_language" "python" }
+            }
+            parm {
+                name    "pdg_validateoutputs"
+                label   "Validate Outputs When Recooking"
+                type    toggle
+                default { "1" }
+                parmtag { "script_callback_language" "python" }
+            }
+            parm {
+                name    "pdg_checkexpectedoutputs"
+                label   "Check Expected Outputs on Disk"
+                type    toggle
+                default { "1" }
+                parmtag { "script_callback_language" "python" }
+            }
+            parm {
+                name    "sepparm"
+                label   "Separator"
+                type    separator
+                default { "" }
+            }
+            parm {
+                name    "pdg_mapmode"
+                label   "Path Mapping"
+                type    ordinal
+                default { "0" }
+                menu {
+                    "0" "Global"
+                    "1" "None"
+                }
+                parmtag { "script_callback_language" "python" }
+            }
+            parm {
+                name    "pdg_usemapzone"
+                label   "Zone"
+                type    toggle
+                nolabel
+                joinnext
+                default { "0" }
+                disablewhen "{ pdg_mapmode == 1 }"
+                parmtag { "script_callback_language" "python" }
+            }
+            parm {
+                name    "pdg_mapzone"
+                label   "Path Map Zone"
+                type    string
+                default { "$PDG_PATHMAP_ZONE" }
+                disablewhen "{ pdg_usemapzone == 0 }"
+                menureplace {
+                    "LINUX" "LINUX"
+                    "WIN"   "WIN"
+                    "MAC"   "MAC"
+                }
+                parmtag { "script_callback_language" "python" }
+            }
+        }
+    }
+
+    group {
+        name    "folder4"
+        label   "Submit As Job"
+
+        parm {
+            name    "submitjob"
+            label   "Submit"
+            type    button
+            default { "0" }
+            parmtag { "script_callback" "hou.pwd().hm().submitGraphAsJob(kwargs, hou.pwd())" }
+            parmtag { "script_callback_language" "python" }
+        }
+        parm {
+            name    "usesubmitjobnode"
+            label   "Use Output Node"
+            type    toggle
+            nolabel
+            joinnext
+            default { "0" }
+            parmtag { "script_callback_language" "python" }
+        }
+        parm {
+            name    "submitjobnode"
+            label   "Output Node"
+            type    oppath
+            default { "" }
+            disablewhen "{ usesubmitjobnode == 0 }"
+            parmtag { "opfilter" "!!TOP!!" }
+            parmtag { "oprelative" "." }
+            parmtag { "script_callback_language" "python" }
+        }
+        parm {
+            name    "submitjobfile"
+            label   "Save Task Graph File"
+            type    toggle
+            default { "0" }
+            parmtag { "script_callback_language" "python" }
+        }
+    }
+
+    group {
+        name    "folder5"
+        label   "Message Queue"
+
+        parm {
+            name    "mqusage"
+            label   "Type"
+            type    integer
+            default { "1" }
+            menu {
+                "0" "Farm"
+                "1" "Local"
+                "2" "Connect"
+            }
+            range   { 0 10 }
+            parmtag { "script_callback_language" "python" }
+        }
+        parm {
+            name    "mqaddr"
+            label   "Address"
+            type    string
+            default { "" }
+            disablewhen "{ mqusage != 2 }"
+            parmtag { "script_callback_language" "python" }
+        }
+        parm {
+            name    "usetaskcallbackport"
+            label   "usetaskcallbackport"
+            type    toggle
+            nolabel
+            joinnext
+            default { "0" }
+            disablewhen "{ mqusage == 2 }"
+        }
+        parm {
+            name    "taskcallbackport"
+            label   "Task Callback Port"
+            type    integer
+            default { "1024" }
+            disablewhen "{ usetaskcallbackport == 0 mqusage != 2 }"
+            range   { 0 65535 }
+        }
+        parm {
+            name    "usemqrelayport"
+            label   "usemqrelayport"
+            type    toggle
+            nolabel
+            joinnext
+            default { "0" }
+            disablewhen "{ mqusage == 2 }"
+        }
+        parm {
+            name    "mqrelayport"
+            label   "Relay Port"
+            type    integer
+            default { "1025" }
+            disablewhen "{ usemqrelayport == 0 mqusage != 2 }"
+            range   { 1024 49151 }
+        }
+    }
+
+    group {
+        name    "folder6"
+        label   "RPC Server"
+
+        parm {
+            name    "pdg_rpcignoreerrors"
+            label   "Ignore RPC Errors"
+            type    ordinal
+            default { "1" }
+            menu {
+                "0" "Never"
+                "1" "When Cooking Batches"
+                "2" "Always"
+            }
+            parmtag { "script_callback_language" "python" }
+        }
+        parm {
+            name    "pdg_rpcmaxerrors"
+            label   "Max RPC Errors"
+            type    integer
+            default { "5" }
+            range   { 0 10 }
+            parmtag { "script_callback_language" "python" }
+        }
+        parm {
+            name    "pdg_rpctimeout"
+            label   "Connection Timeout"
+            type    integer
+            default { "4" }
+            range   { 0 10 }
+            parmtag { "script_callback_language" "python" }
+        }
+        parm {
+            name    "pdg_rpcretries"
+            label   "Connection Retries"
+            type    integer
+            default { "2" }
+            range   { 0 10 }
+            parmtag { "script_callback_language" "python" }
+        }
+        parm {
+            name    "pdg_rpcbackoff"
+            label   "Retry Backoff"
+            type    integer
+            default { "2" }
+            range   { 0 10 }
+            parmtag { "script_callback_language" "python" }
+        }
+        parm {
+            name    "pdg_rpcbatch"
+            label   "Batch Poll Rate"
+            type    float
+            default { "1" }
+            range   { 0 10 }
+            parmtag { "script_callback_language" "python" }
+        }
+        parm {
+            name    "pdg_rpcrelease"
+            label   "Release Job Slot When Polling"
+            type    toggle
+            default { "1" }
+            parmtag { "script_callback_language" "python" }
+        }
+    }
+
+    group {
+        name    "folder7"
+        label   "Job Parms"
+
+        groupsimple {
+            name    "folder7_cmds"
+            label   "Commands"
+
+            parm {
+                name    "rpfarm_pretaskcmd"
+                label   "Pre Task Command"
+                type    string
+                default { "" }
+                parmtag { "pdg::scheduler" "" }
+            }
+            parm {
+                name    "rpfarm_posttaskcmd"
+                label   "Post Task Command"
+                type    string
+                default { "" }
+                parmtag { "pdg::scheduler" "" }
+            }
+        }
+
+        groupsimple {
+            name    "folder7_env"
+            label   "Task Environment"
+
+            parm {
+                name    "rpfarm_inheritlocalenv"
+                label   "Inherit Local Environment"
+                type    toggle
+                default { "0" }
+                parmtag { "pdg::scheduler" "" }
+            }
+            parm {
+                name    "rpfarm_envunset"
+                label   "Unset Variables"
+                type    string
+                default { "" }
+                parmtag { "pdg::scheduler" "" }
+                parmtag { "script_callback_language" "python" }
+            }
+            multiparm {
+                name    "rpfarm_envmulti"
+                label    "Environment Variables"
+
+                parm {
+                    name    "rpfarm_envname#"
+                    label   "Name"
+                    type    string
+                    default { "" }
+                    parmtag { "pdg::nocopy" "" }
+                    parmtag { "pdg::scheduler" "" }
+                }
+                parm {
+                    name    "rpfarm_envvalue#"
+                    label   "Value"
+                    type    string
+                    default { "" }
+                    parmtag { "pdg::nocopy" "" }
+                    parmtag { "pdg::scheduler" "" }
+                }
+            }
+
+            parm {
+                name    "rpfarm_usehoudinimaxthreads"
+                label   "Use Max Threads"
+                type    toggle
+                nolabel
+                joinnext
+                default { "0" }
+                parmtag { "pdg::scheduler" "" }
+            }
+            parm {
+                name    "rpfarm_houdinimaxthreads"
+                label   "Max Threads"
+                type    integer
+                default { "0" }
+                disablewhen "{ rpfarm_usehoudinimaxthreads == 0 }"
+                range   { 0 10 }
+                parmtag { "pdg::scheduler" "" }
+            }
+        }
+
+        groupsimple {
+            name    "folder7_warmup"
+            label   "JuiceFS Warmup"
+
+            parm {
+                name    "rpfarm_enablewarmup"
+                label   "Enable Warmup"
+                type    toggle
+                default { "1" }
+                help    "Pre-cache files on pods before rendering"
+            }
+            parm {
+                name    "rpfarm_warmuppaths"
+                label   "Warmup Paths"
+                type    string
+                default { "/project/textures/ /project/hdri/" }
+                disablewhen "{ rpfarm_enablewarmup == 0 }"
+                help    "Space-separated paths to pre-cache on pods"
+            }
+        }
+
+        groupsimple {
+            name    "folder7_sync"
+            label   "JuiceFS Sync"
+
+            parm {
+                name    "rpfarm_juicefs_meta_url"
+                label   "JuiceFS Meta URL"
+                type    string
+                default { "" }
+                help    "Redis URL for JuiceFS metadata (e.g. redis://:pass@host:6381/1). When set, enables automatic B2-to-NV sync via juicefs sync before each task."
+            }
+            parm {
+                name    "rpfarm_nv_cache_max_pct"
+                label   "NV Cache Max %"
+                type    integer
+                default { "80" }
+                range   { 50 95 }
+                disablewhen "{ rpfarm_juicefs_meta_url == \"\" }"
+                help    "Maximum NV disk usage percentage. Cold asset groups are evicted when exceeded."
+            }
+        }
+    }
+}

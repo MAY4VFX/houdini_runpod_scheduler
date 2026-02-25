@@ -1,0 +1,4 @@
+import pdg
+pdg.TypeRegistry.types().registerScheduler(
+    kwargs['type'].hdaModule().RunPodFarmScheduler,
+    label='RunPodFarm Scheduler')
