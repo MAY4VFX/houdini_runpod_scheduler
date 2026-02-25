@@ -3,6 +3,7 @@ name: Build and Push Worker Docker Image
 on:
   push:
     branches:
+      - main
       - feature/runpodfarm-full-stack
     paths:
       - 'docker/**'
