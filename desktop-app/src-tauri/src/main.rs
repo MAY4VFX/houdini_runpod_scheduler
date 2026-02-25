@@ -868,10 +868,30 @@ async fn mount_juicefs_inner(
     std::fs::create_dir_all(&config.mount_path)
         .map_err(|e| format!("Failed to create mount dir: {}", e))?;
 
+    // Create local cache directory for JuiceFS data blocks
+    let cache_dir = dirs::home_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+        .join(".juicefs")
+        .join("cache");
+    let _ = std::fs::create_dir_all(&cache_dir);
+
     // JuiceFS mount reads storage config from Redis metadata (set during juicefs format).
     // Only pass credentials as env vars if they look real (not placeholders).
     let mut cmd = Command::new(&juicefs_path);
-    cmd.args(["mount", &config.redis_url, &config.mount_path, "-d"]);
+    cmd.args([
+        "mount",
+        &config.redis_url,
+        &config.mount_path,
+        "-d",
+        "--cache-dir", &cache_dir.to_string_lossy(),
+        "--cache-size", "20480",        // 20 GB local data cache
+        "--prefetch", "3",              // prefetch 3 blocks ahead
+        "--buffer-size", "300",         // 300 MB read buffer
+        "--attr-cache", "60",           // cache file attributes 60s
+        "--entry-cache", "60",          // cache directory entries 60s
+        "--dir-entry-cache", "60",      // cache directory listings 60s
+        "--open-cache", "60",           // cache open() results 60s
+    ]);
 
     let is_real_key = |k: &str| !k.is_empty() && !k.starts_with("test-") && k.len() > 10;
     if is_real_key(&config.b2_access_key) {
@@ -885,6 +905,16 @@ async fn mount_juicefs_inner(
         .map_err(|e| format!("Failed to run juicefs: {}", e))?;
 
     if output.status.success() {
+        // Warmup metadata cache in background — pre-fetches all directory
+        // listings so Houdini file browser doesn't lag on first visit.
+        let warmup_path = config.mount_path.clone();
+        let warmup_bin = juicefs_path.clone();
+        std::thread::spawn(move || {
+            let _ = Command::new(&warmup_bin)
+                .args(["warmup", &warmup_path, "--threads", "4"])
+                .output();
+        });
+
         Ok(config.mount_path)
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
