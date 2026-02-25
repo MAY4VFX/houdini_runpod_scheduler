@@ -887,10 +887,10 @@ async fn mount_juicefs_inner(
         "--cache-size", "20480",        // 20 GB local data cache
         "--prefetch", "3",              // prefetch 3 blocks ahead
         "--buffer-size", "300",         // 300 MB read buffer
-        "--attr-cache", "3600",         // cache file attributes 1 hour
-        "--entry-cache", "3600",        // cache directory entries 1 hour
-        "--dir-entry-cache", "3600",    // cache directory listings 1 hour
-        "--open-cache", "3600",         // cache open() results 1 hour
+        "--attr-cache", "60",           // cache file attributes 60s
+        "--entry-cache", "60",          // cache directory entries 60s
+        "--dir-entry-cache", "60",      // cache directory listings 60s
+        "--open-cache", "60",           // cache open() results 60s
     ]);
 
     let is_real_key = |k: &str| !k.is_empty() && !k.starts_with("test-") && k.len() > 10;
@@ -905,6 +905,16 @@ async fn mount_juicefs_inner(
         .map_err(|e| format!("Failed to run juicefs: {}", e))?;
 
     if output.status.success() {
+        // Warmup metadata cache in background — pre-fetches all directory
+        // listings so Houdini file browser doesn't lag on first visit.
+        let warmup_path = config.mount_path.clone();
+        let warmup_bin = juicefs_path.clone();
+        std::thread::spawn(move || {
+            let _ = Command::new(&warmup_bin)
+                .args(["warmup", &warmup_path, "--threads", "4"])
+                .output();
+        });
+
         Ok(config.mount_path)
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
