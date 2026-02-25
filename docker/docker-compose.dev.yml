@@ -1,0 +1,30 @@
+version: '3.8'
+
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+
+  worker:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - PROJECT_ID=test
+      - USER_ID=dev
+      - POD_ID=local-dev
+    depends_on:
+      - redis
+    # No GPU in dev mode
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - capabilities: [gpu]
+
+volumes:
+  redis-data:

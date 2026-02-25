@@ -1,65 +1,175 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to Claude Code when working with code in this repository.
 
 ## Project Overview
 
-RunPod scheduler for SideFX Houdini PDG (Procedural Dependency Graph), based on the AWS ECS Scheduler from a SideFX content library example (MIT license, 2024). The original implementation dispatches PDG work items to AWS ECS; this project adapts it for RunPod.
-
-## Repository Structure
-
-- `AWSECS/awsecsscheduler.hda/` — The main HDA (Houdini Digital Asset) containing the scheduler. This is an expanded HDA directory; Python code lives in `Top_1awsecsscheduler/PythonModule` (702 lines) and UI definition in `DialogScript` (515 lines).
-- `AWSECS/awsecs_example.hip` — Example Houdini scene with a TOP network using the scheduler.
-- `AWSECS/container/Dockerfile` — Docker image: Ubuntu 20.04, headless Houdini, boto3, Intel OpenCL, xvfb. Requires `houdini*.tar.gz` installer placed in `container/` before building.
-- `AWSECS/container/run.sh` — Entrypoint: sources Houdini env, executes `$COMMAND`.
-- `AWSECS/backup/` — Backup of the original HDA.
-- `AWS ECS Scheduler.html` — Help documentation (exported HTML).
-
-## Working with the HDA Code
-
-The HDA is in expanded directory format. Key editable files:
-
-```
-AWSECS/awsecsscheduler.hda/Top_1awsecsscheduler/
-├── PythonModule      # Core scheduler Python code (edit directly)
-├── DialogScript      # Parameter UI definition
-├── Help              # Help card content
-├── CreateScript      # Node creation script
-└── Tools.shelf       # Shelf tool definition
-```
-
-To read/edit the scheduler logic, work with `PythonModule` directly. No need to use `strings` or Houdini Type Properties.
+RunPodFarm — distributed VFX rendering/simulation pipeline on RunPod GPU Pods for SideFX Houdini. Based on the AWS ECS Scheduler from a SideFX content library example (MIT license, 2024), adapted for RunPod with Redis-based task queue, Network Volume shared storage, and a full management stack.
 
 ## Architecture
 
-`AWSECSScheduler` class hierarchy:
-- `PyScheduler` — Base PDG scheduler
-- `SimpleMQSchedulerMixin` — Message queue polling for work item results (`startPollingClient`/`stopPollingClient`)
-- `EventDispatchMixin` — Event handling
+PDG-native scheduling: no separate Scheduler Server. Each Houdini instance runs its own RunPodFarm Scheduler HDA which manages pods directly via RunPod API and distributes tasks via Redis queue.
 
-Lifecycle: `onStartCook` (validate params, create boto3 client) → `onSetupCook` (init working dir on EFS, copy job files, start MQ) → `onSchedule` (serialize work item, expand `__PDG_*__` tokens, call `_runTask` via boto3) → `onTick` (poll task status every 2s via `_describeTasks`) → `onStopCook` (stop tasks, stop MQ)
+```
+Houdini (Scheduler HDA) → Redis queue → RunPod Pods (Worker daemon)
+                                      ↕
+                              Network Volume (/workspace)
+                         (shared NVMe storage between pods)
+                                      ↕
+Desktop App → Auth API → project config → upload to Network Volume (S3 API / rsync)
+                                      ↕
+Dashboard (Web UI) ← Monitoring API ← Redis (read-only)
+```
 
-`submitAsJob` submits entire TOP graph cook as a single task.
+### Storage Architecture
+- **Network Volume** (RunPod NVMe): Primary shared storage between pods. Houdini install + project files + render output.
+- **Backblaze B2**: Archive for completed projects. NOT used during active rendering.
+- **JuiceFS**: Optional, artist-side only (local FUSE mount). NOT available on RunPod (no FUSE support).
+- FUSE is not supported on RunPod — confirmed platform limitation.
 
-ECS tasks receive commands via the `COMMAND` environment variable, which `run.sh` executes.
+## Repository Structure
+
+```
+worker/                    — Worker daemon (Python) running on RunPod pods
+  config.py                  Config from env vars
+  daemon.py                  Main loop: BRPOP tasks, execute, push results
+  executor.py                Task execution (hython/husk subprocess)
+  heartbeat.py               Heartbeat thread (Redis SET with TTL)
+  requirements.txt           redis>=5.0.0, psutil>=5.9.0
+
+hda/runpodfarm_scheduler.hda/  — Houdini Digital Asset (expanded format)
+  Top_1runpodfarmscheduler/
+    PythonModule             RunPodFarmScheduler class (1635 lines)
+    DialogScript             Parameter UI definition (603 lines)
+    CreateScript             Node creation script
+    Help                     Help card (274 lines)
+    Tools.shelf              Shelf tool definition
+
+docker/                    — Docker image for RunPod pods
+  Dockerfile                 Ubuntu 22.04 + CUDA 12.4 + Worker daemon
+  entrypoint.sh              Setup project dir → setup Houdini from Network Volume → start worker
+  docker-compose.dev.yml     Local dev environment with Redis
+  .dockerignore
+
+auth-api/                  — Auth API (Cloudflare Workers + Hono + KV) [LEGACY]
+  src/index.ts               Main entry, CORS, routing
+  src/types.ts               TypeScript interfaces
+  src/auth.ts                JWT, password hashing, API key generation
+  src/routes/auth.ts         POST /auth/login, /auth/register
+  src/routes/projects.ts     CRUD projects, artists, config endpoint
+  wrangler.toml              Cloudflare Workers config
+
+server/                    — Node.js server (Hono + SQLite) — replaces auth-api for Dokploy
+  src/index.ts               Main entry, CORS, routing, static file serving
+  src/types.ts               TypeScript interfaces
+  src/db.ts                  SQLite storage layer (better-sqlite3)
+  src/auth.ts                JWT, password hashing (Node.js crypto), API key generation
+  src/routes/auth.ts         POST /api/auth/login, /api/auth/register
+  src/routes/projects.ts     CRUD projects, artists, config endpoint
+  src/routes/monitoring.ts   GET /api/monitoring/jobs|pods|costs|logs (Redis read-only)
+  Dockerfile                 Production Docker image
+  docker-compose.yml         Local dev with Docker
+
+dashboard/                 — Monitoring Web UI (React + TypeScript + Vite + Tailwind)
+  src/pages/Dashboard.tsx    Active jobs, pods, cost overview
+  src/pages/Projects.tsx     Project management
+  src/pages/ProjectDetail.tsx  Jobs, pods, artists per project
+  src/pages/Login.tsx        Authentication
+  src/components/Layout.tsx  Sidebar navigation
+  src/lib/api.ts             API client
+  src/store/auth.ts          Zustand auth store
+
+desktop-app/               — Desktop App (Tauri 2.0 + React + TypeScript)
+  src-tauri/src/main.rs      Rust backend: JuiceFS mount, system tray, Houdini detection
+  src-tauri/tauri.conf.json  App configuration
+  src/App.tsx                Connect/Status/Settings views
+  src/components/            ConnectForm, StatusPanel, Settings
+  src/lib/tauri.ts           Typed Tauri command wrappers
+
+infrastructure/            — Setup scripts and configs
+  setup-redis.sh             Upstash Redis provisioning guide
+  setup-juicefs.sh           JuiceFS format with B2 backend
+  example.env                Template for all env vars
+
+AWSECS/                    — Original AWS ECS Scheduler (reference)
+```
+
+## Key Commands
+
+```bash
+# Worker (local dev)
+cd docker && docker compose -f docker-compose.dev.yml up
+
+# Auth API (legacy CF Workers)
+cd auth-api && npm install && npm run dev    # Local dev
+cd auth-api && npm run deploy                # Deploy to CF Workers
+
+# Server (Node.js — for Dokploy deployment)
+cd server && npm install && npm run dev      # Local dev (tsx watch)
+cd server && npm run build && npm start      # Production build + start
+
+# Dashboard
+cd dashboard && npm install && npm run dev   # Dev server
+cd dashboard && npm run build                # Production build
+
+# Deploy to Dokploy
+./infrastructure/deploy-dokploy.sh           # Full build + deploy
+
+# Desktop App
+cd desktop-app && npm install
+cd desktop-app && cargo tauri dev            # Dev mode
+cd desktop-app && cargo tauri build          # Production build
+
+# Docker image
+docker build -f docker/Dockerfile -t runpodfarm-worker .
+```
+
+## HDA Parameter Prefix
+
+All scheduler parameters use `rpfarm_` prefix (e.g., `rpfarm_apikey`, `rpfarm_redisurl`).
+
+## Redis Key Namespace
+
+```
+rp:tasks:{project_id}:{user_id}   — Task queue (BRPOP)
+rp:results:{task_id}               — Task results (SET with TTL)
+rp:heartbeat:{pod_id}              — Pod heartbeats (SET with 30s TTL)
+rp:logs:{task_id}                  — Task logs (RPUSH with TTL)
+rp:pods:{project_id}:{user_id}    — Pod registry
+rp:metrics:*                       — Metrics and cost tracking
+juicefs:*                          — JuiceFS metadata (managed by JuiceFS)
+```
 
 ## Dependencies
 
-- `boto3` — AWS SDK (install: `hython -m pip install boto3`)
-- Houdini PDG framework: `pdg`, `pdg.scheduler`, `pdg.job.eventdispatch`, `pdg.utils.simple_mq`
-
-## Docker Build
-
-```bash
-cd AWSECS/container
-# Place houdini*.tar.gz installer first
-docker build --build-arg EULA_DATE=yyyy-mm-dd --build-arg SESINETD=hostname:1715 -t aws-ecs-scheduler .
-```
+- **Worker**: Python 3.10+, redis, psutil
+- **HDA**: Houdini 20.0+ with PDG, redis (pip install to hython)
+- **Auth API (legacy)**: Node.js 18+, hono, jose
+- **Server**: Node.js 20+, hono, @hono/node-server, jose, better-sqlite3, ioredis
+- **Dashboard**: Node.js 18+, React 18, Vite, Tailwind
+- **Desktop App**: Rust 1.70+, Node.js 18+, Tauri 2.0
 
 ## Manual Testing
 
-No automated tests. Test by opening `awsecs_example.hip`, configuring the scheduler parameters, and cooking `ropgeometry1` in `obj/topnet1`.
+No automated tests yet. Test flow:
+1. Infrastructure: upload files to Network Volume → start pod → files visible at /workspace/projects
+2. Worker: start pod → worker connects to Redis → heartbeat visible → push test task → result in Redis
+3. HDA: Houdini → TOP Network → RunPodFarm Scheduler → cook → frames render on pods → results in /project/renders/
+### Dokploy Server
+- **Host**: 192.168.2.140
+- **Dokploy API**: порт 3001
+- **SSH Access**: `ssh -o StrictHostKeyChecking=no root@192.168.2.140`
+- **Auto-deploy**: Enabled — пуш в ветку `feature/runpodfarm-full-stack` автоматически запускает деплой
+- **Dokploy API Key** x-api-key: XdVofMdOfAlneojMFpBWplFeYWbxFzcUpuPBlQLYuBxmfWmjARKNyXwDEnsgMrZc
+- делай коммит и пуш после правок
+- никогда не собирать докер композы в ручную, только через Dokploy и репозиторий
 
-## Key Parameters (awsecs_ prefix)
-
-`regionname`, `taskdefinition`, `cluster`, `containername`, `platformversion`, `subnet`, `securitygroup`, `launchtype` (EC2/FARGATE/EXTERNAL), `assignpublicip`, `verbose`, `overrideremoteworkingdir`, `remoteworkingdir`, `pretaskcmd`, `posttaskcmd`
+### Deployed RunPodFarm Server
+- **URL**: http://192.168.2.140:3200
+- **Health**: http://192.168.2.140:3200/health
+- **Dashboard**: http://192.168.2.140:3200/
+- **API**: http://192.168.2.140:3200/api/
+- **Dokploy Project ID**: jCFMhgtnykHDGvETwx4Vr
+- **Dokploy Application ID**: vX-EGp8IGf_-8ATUf_Ehp
+- **Build**: multi-stage Docker (dashboard + server), Dockerfile at `server/Dockerfile`, context: repo root
+- **Branch**: feature/runpodfarm-full-stack
