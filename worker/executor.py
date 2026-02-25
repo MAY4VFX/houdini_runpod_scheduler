@@ -12,6 +12,7 @@ from typing import Any, Optional
 import redis
 
 from .config import WorkerConfig
+from . import sync_agent
 
 logger = logging.getLogger(__name__)
 
@@ -162,6 +163,21 @@ def execute_task(
     if warmup_paths:
         _verify_paths(warmup_paths, redis_client, task_id)
 
+    # ---- Pre-task JuiceFS sync ----------------------------------------
+    if config.juicefs_meta_url:
+        _push_log(redis_client, task_id, "[worker] Starting pre-task sync...")
+        sync_ok = sync_agent.pre_task_sync(task, config, redis_client)
+        if not sync_ok:
+            duration = time.monotonic() - time.monotonic()
+            _push_log(redis_client, task_id, "[worker] Pre-task sync failed")
+            return TaskResult(
+                task_id=task_id,
+                status="failed",
+                exit_code=-2,
+                duration_seconds=0.0,
+                error="Pre-task JuiceFS sync failed",
+            )
+
     # ---- Prepare environment -------------------------------------------
     env = _build_env(config, task_env)
     shell_cmd = _build_shell_command(config, command)
@@ -197,6 +213,12 @@ def execute_task(
                 task_id,
                 f"[worker] Task succeeded in {duration:.1f}s",
             )
+
+            # ---- Post-task JuiceFS sync ----------------------------
+            if config.juicefs_meta_url:
+                _push_log(redis_client, task_id, "[worker] Starting post-task sync...")
+                sync_agent.post_task_sync(task, config, redis_client)
+
             return TaskResult(
                 task_id=task_id,
                 status="succeeded",

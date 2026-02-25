@@ -22,6 +22,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
+# Install JuiceFS binary (used for B2<->NV sync without FUSE)
+RUN curl -sSL https://github.com/juicedata/juicefs/releases/download/v1.2.1/juicefs-1.2.1-linux-amd64.tar.gz \
+    | tar -xz -C /usr/local/bin juicefs \
+    && chmod +x /usr/local/bin/juicefs
+
 # Create worker directory
 WORKDIR /opt/runpodfarm
 COPY worker/ ./worker/

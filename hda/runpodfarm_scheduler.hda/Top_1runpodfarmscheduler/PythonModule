@@ -454,12 +454,20 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         project_id = self["rpfarm_projectid"].evaluateString()
         user_id = self["rpfarm_userid"].evaluateString()
 
+        # JuiceFS meta URL for sync agent
+        juicefs_meta_url = self["rpfarm_juicefs_meta_url"].evaluateString()
+        nv_cache_max_pct = self["rpfarm_nv_cache_max_pct"].evaluateInt()
+
         # Build the environment variables for the pod
         env_vars = {
             "REDIS_URL": redis_url,
             "PROJECT_ID": project_id,
             "USER_ID": user_id,
         }
+
+        if juicefs_meta_url:
+            env_vars["JUICEFS_META_URL"] = juicefs_meta_url
+            env_vars["NV_CACHE_MAX_PCT"] = str(nv_cache_max_pct)
 
         # Build environment as a list of key=value entries for the API
         env_list = [{"key": k, "value": v} for k, v in env_vars.items()]
@@ -896,6 +904,117 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
             os.makedirs(self.tempDir(True))
 
     # -------------------------------------------------------------------------
+    # Asset Manifest
+    # -------------------------------------------------------------------------
+
+    def _create_manifest(self, work_item):
+        """
+        Build a file manifest for JuiceFS sync from the work item's
+        file dependencies.
+
+        Uses hou.fileReferences() to discover all referenced files,
+        resolves $HIP, $JOB, $F4 etc., and filters to project-local paths.
+
+        Returns:
+            A dict mapping relative paths to {size, type} dicts, or None
+            if JuiceFS sync is not configured.
+        """
+        juicefs_meta_url = self["rpfarm_juicefs_meta_url"].evaluateString()
+        if not juicefs_meta_url:
+            return None
+
+        import hou
+
+        manifest = {}
+        job_dir = os.environ.get("JOB", "")
+        hip_dir = os.environ.get("HIP", os.path.dirname(hou.hipFile.path()))
+
+        # Gather file references from the scene
+        try:
+            refs = hou.fileReferences()
+        except Exception:
+            self._verboseLog("Warning: could not gather file references")
+            return None
+
+        # Extension-based type classification
+        tex_exts = {".exr", ".rat", ".tex", ".png", ".jpg", ".jpeg", ".tif",
+                    ".tiff", ".hdr", ".tga", ".bmp"}
+        geo_exts = {".bgeo", ".bgeo.sc", ".abc", ".obj", ".fbx", ".usd",
+                    ".usda", ".usdc", ".usdz", ".vdb"}
+        cache_exts = {".sim", ".simdata", ".gz"}
+        scene_exts = {".hip", ".hipnc", ".hiplc", ".py"}
+
+        for parm_ref, file_path in refs:
+            if not file_path:
+                continue
+
+            # Resolve variables
+            resolved = file_path
+            resolved = resolved.replace("$HIP", hip_dir)
+            resolved = resolved.replace("$JOB", job_dir)
+            resolved = resolved.replace("${HIP}", hip_dir)
+            resolved = resolved.replace("${JOB}", job_dir)
+
+            # Skip frame tokens — they'll be resolved at render time
+            if "$F" in resolved or "%(UDIM)" in resolved:
+                # Replace frame/UDIM tokens with wildcards for directory-level sync
+                import re
+                resolved = re.sub(r'\$F\d*', '*', resolved)
+                resolved = re.sub(r'%\(UDIM\)d', '*', resolved)
+                # Use the directory instead
+                resolved = os.path.dirname(resolved)
+                if not resolved:
+                    continue
+
+            resolved = os.path.normpath(resolved)
+
+            # Filter: only include project-local paths
+            if job_dir and resolved.startswith(job_dir):
+                rel_path = os.path.relpath(resolved, job_dir)
+            elif hip_dir and resolved.startswith(hip_dir):
+                rel_path = os.path.relpath(resolved, hip_dir)
+            else:
+                continue
+
+            # Skip paths that escape the project
+            if rel_path.startswith(".."):
+                continue
+
+            # Normalize separators
+            rel_path = rel_path.replace("\\", "/")
+
+            # Determine file type
+            lower = rel_path.lower()
+            if any(lower.endswith(ext) for ext in tex_exts):
+                file_type = "texture"
+            elif any(lower.endswith(ext) for ext in geo_exts):
+                file_type = "geo"
+            elif any(lower.endswith(ext) for ext in cache_exts):
+                file_type = "cache"
+            elif any(lower.endswith(ext) for ext in scene_exts):
+                file_type = "scene"
+            else:
+                file_type = "other"
+
+            # Get file size if the file exists locally
+            full_path = os.path.join(job_dir or hip_dir, rel_path)
+            try:
+                size = os.path.getsize(full_path) if os.path.isfile(full_path) else 0
+            except OSError:
+                size = 0
+
+            manifest[rel_path] = {"size": size, "type": file_type}
+
+        self._verboseLog(
+            f"Manifest created: {len(manifest)} files "
+            f"({sum(1 for v in manifest.values() if v['type'] == 'texture')} tex, "
+            f"{sum(1 for v in manifest.values() if v['type'] == 'geo')} geo, "
+            f"{sum(1 for v in manifest.values() if v['type'] == 'scene')} scene)"
+        )
+
+        return manifest if manifest else None
+
+    # -------------------------------------------------------------------------
     # PDG Scheduler Interface
     # -------------------------------------------------------------------------
 
@@ -1120,6 +1239,9 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         task_id = str(uuid.uuid4())
         warmup_paths = self["rpfarm_warmuppaths"].evaluateString()
 
+        # Build asset manifest for JuiceFS sync
+        manifest = self._create_manifest(work_item)
+
         task_data = {
             "task_id": task_id,
             "work_item_id": work_item.id,
@@ -1129,6 +1251,9 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
             "warmup_paths": warmup_paths.split() if warmup_paths else [],
             "created_at": datetime.datetime.now().isoformat(),
         }
+
+        if manifest:
+            task_data["manifest"] = manifest
 
         # 6. Push to Redis queue
         self._push_task(task_data)
