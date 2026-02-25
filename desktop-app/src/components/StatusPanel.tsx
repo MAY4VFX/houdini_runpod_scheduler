@@ -224,7 +224,15 @@ export default function StatusPanel({
                   >
                     {loading === "unmount" ? "..." : "Unmount"}
                   </button>
-                ) : undefined
+                ) : (
+                  <button
+                    className="btn-secondary text-xs"
+                    onClick={handleMount}
+                    disabled={loading === "mount"}
+                  >
+                    {loading === "mount" ? "..." : "Mount"}
+                  </button>
+                )
               }
             />
             <StatusRow
