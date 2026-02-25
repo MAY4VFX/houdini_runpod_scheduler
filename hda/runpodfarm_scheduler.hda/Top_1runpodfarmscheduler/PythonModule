@@ -176,6 +176,10 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
                     "name": "rpfarm_datacenter",
                     "type": "String"
                 },
+                {
+                    "name": "rpfarm_licenseserver",
+                    "type": "String"
+                },
                 # -- Scaling --
                 {
                     "name": "rpfarm_minpods",
@@ -394,6 +398,38 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
     # RunPod API methods
     # -------------------------------------------------------------------------
 
+    def _get_nv_datacenter(self, network_volume_id):
+        """
+        Look up the dataCenterId for a given Network Volume.
+
+        RunPod API requires explicit dataCenterId when using a Network Volume,
+        otherwise podFindAndDeployOnDemand returns SUPPLY_CONSTRAINT.
+
+        Args:
+            network_volume_id: The Network Volume ID.
+
+        Returns:
+            The dataCenterId string, or empty string if not found.
+        """
+        try:
+            result = self._runpod_api("POST", _RUNPOD_API_URL, {
+                "query": "{ myself { networkVolumes { id dataCenterId } } }"
+            })
+            volumes = (
+                result.get("data", {}).get("myself", {})
+                .get("networkVolumes", [])
+            )
+            for vol in volumes:
+                if vol.get("id") == network_volume_id:
+                    dc = vol.get("dataCenterId", "")
+                    self._verboseLog(
+                        f"Auto-resolved dataCenterId from NV: {dc}"
+                    )
+                    return dc
+        except CookError:
+            pass
+        return ""
+
     def _runpod_api(self, method, endpoint, data=None):
         """
         Helper to call the RunPod GraphQL API.
@@ -479,6 +515,12 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         template_id = self["rpfarm_templateid"].evaluateString()
         network_volume_id = self["rpfarm_networkvolumeid"].evaluateString()
         datacenter = self["rpfarm_datacenter"].evaluateString()
+        cloud_type_idx = self["rpfarm_cloudtype"].evaluateInt()
+        cloud_type = "SECURE" if cloud_type_idx == 0 else "COMMUNITY"
+
+        # Auto-resolve datacenter from Network Volume if not explicitly set
+        if not datacenter and network_volume_id:
+            datacenter = self._get_nv_datacenter(network_volume_id)
         redis_url = self["rpfarm_redisurl"].evaluateString()
         project_id = self["rpfarm_projectid"].evaluateString()
         user_id = self["rpfarm_userid"].evaluateString()
@@ -487,12 +529,18 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         juicefs_meta_url = self["rpfarm_juicefs_meta_url"].evaluateString()
         nv_cache_max_pct = self["rpfarm_nv_cache_max_pct"].evaluateInt()
 
+        # License server for Houdini on pods
+        license_server = self["rpfarm_licenseserver"].evaluateString()
+
         # Build the environment variables for the pod
         env_vars = {
             "REDIS_URL": redis_url,
             "PROJECT_ID": project_id,
             "USER_ID": user_id,
         }
+
+        if license_server:
+            env_vars["SESINETD_HOST"] = license_server
 
         if juicefs_meta_url:
             env_vars["JUICEFS_META_URL"] = juicefs_meta_url
@@ -512,6 +560,10 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
                 name: "rpfarm-{project_id}-{unique_id}"
                 gpuTypeId: "{gpu_type_id}"
                 templateId: "{template_id}"
+                cloudType: {cloud_type}
+                supportPublicIp: true
+                startSsh: true
+                gpuCount: 1
                 {volume_clause}
                 {datacenter_clause}
                 env: {env_gql}
@@ -535,8 +587,9 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
             ),
             datacenter_clause=(
                 f'dataCenterId: "{datacenter}"'
-                if datacenter else ""
+                if datacenter else "dataCenterId: null"
             ),
+            cloud_type=cloud_type,
             env_gql=env_gql,
         )
 
