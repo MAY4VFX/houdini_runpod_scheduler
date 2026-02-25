@@ -22,7 +22,7 @@ fi
 if [ -d "/workspace/houdini" ]; then
     echo "Setting up Houdini from Network Volume..."
     export HFS="/workspace/houdini"
-    source "$HFS/houdini_setup_bash" 2>/dev/null || true
+    cd "$HFS" && source houdini_setup_bash 2>/dev/null || true
 
     # Houdini licensing via remote sesinetd license server
     if [ -n "${SESINETD_HOST:-}" ]; then
