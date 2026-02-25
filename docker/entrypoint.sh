@@ -24,7 +24,8 @@ if [ -d "/workspace/houdini" ]; then
     export HFS="/workspace/houdini"
     # Must cd first — houdini_setup_bash requires being in the install dir.
     # Disable set -u because houdini_setup_bash uses unset variables.
-    cd "$HFS" && { set +u; source houdini_setup_bash; set -u; } 2>/dev/null || true
+    # Save and restore working dir so worker module can be found.
+    pushd "$HFS" > /dev/null && { set +u; source houdini_setup_bash; set -u; } 2>/dev/null; popd > /dev/null || true
 
     # Houdini licensing via remote sesinetd license server
     if [ -n "${SESINETD_HOST:-}" ]; then
