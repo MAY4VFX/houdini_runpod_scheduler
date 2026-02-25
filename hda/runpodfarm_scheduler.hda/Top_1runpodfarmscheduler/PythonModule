@@ -382,6 +382,33 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         # Writes the PDG path map info to the environment
         self.resolvePathMapping(task_env)
 
+        # Auto-inject path mapping from local working dir to remote working dir.
+        # Without this, work item file attributes (e.g. HIP path) stored as
+        # absolute local paths won't resolve on the pod.
+        local_wd = self.workingDir(True)
+        remote_wd = self.workingDir(False)
+        if local_wd and remote_wd and local_wd != remote_wd:
+            import json as _json
+            existing_map = task_env.get("PDG_PATHMAP", "")
+            if existing_map:
+                try:
+                    pm = _json.loads(existing_map)
+                except Exception:
+                    pm = {"paths": []}
+            else:
+                pm = {"paths": []}
+
+            # Add local → remote mapping for LINUX zone (RunPod pods)
+            pm["paths"].append({
+                local_wd.rstrip("/"): {
+                    "zone": "LINUX",
+                    "path": remote_wd.rstrip("/")
+                }
+            })
+            task_env["PDG_PATHMAP"] = _json.dumps(pm)
+            if "PDG_PATHMAP_ZONE" not in task_env:
+                task_env["PDG_PATHMAP_ZONE"] = "LINUX"
+
         # Resolves the environment specified in the Job Parms scheduler section
         add_env, remove_env = self.resolveEnvParams(
             self.parmprefix, work_item, True)
