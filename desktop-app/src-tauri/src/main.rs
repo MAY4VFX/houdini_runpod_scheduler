@@ -884,12 +884,13 @@ async fn mount_juicefs_inner(
         &config.mount_path,
         "-d",
         "--cache-dir", &cache_dir.to_string_lossy(),
-        "--cache-size", "20480",       // 20 GB local cache
-        "--prefetch", "3",             // prefetch 3 blocks ahead
-        "--buffer-size", "300",        // 300 MB read buffer
-        "--attr-cache", "60",          // cache file attributes 60s
-        "--entry-cache", "60",         // cache directory entries 60s
-        "--dir-entry-cache", "60",     // cache directory listings 60s
+        "--cache-size", "20480",        // 20 GB local data cache
+        "--prefetch", "3",              // prefetch 3 blocks ahead
+        "--buffer-size", "300",         // 300 MB read buffer
+        "--attr-cache", "3600",         // cache file attributes 1 hour
+        "--entry-cache", "3600",        // cache directory entries 1 hour
+        "--dir-entry-cache", "3600",    // cache directory listings 1 hour
+        "--open-cache", "3600",         // cache open() results 1 hour
     ]);
 
     let is_real_key = |k: &str| !k.is_empty() && !k.starts_with("test-") && k.len() > 10;
