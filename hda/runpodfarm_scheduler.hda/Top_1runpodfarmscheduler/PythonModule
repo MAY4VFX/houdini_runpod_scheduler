@@ -83,6 +83,31 @@ _POD_HEARTBEAT_TIMEOUT_SECONDS = 120
 # RunPod API base URL
 _RUNPOD_API_URL = "https://api.runpod.io/graphql"
 
+# GPU type ordinal index -> RunPod gpuTypeId mapping
+_GPU_TYPE_MAP = {
+    0: "NVIDIA GeForce RTX 4090",
+    1: "NVIDIA RTX A5000 24GB",
+    2: "NVIDIA A100 80GB PCIe",
+    3: "NVIDIA GeForce RTX 4080",
+    4: "NVIDIA GeForce RTX 3090",
+    5: "NVIDIA L40S",
+    6: "NVIDIA GeForce RTX 5090",
+}
+
+
+def onGpuTypeChanged(kwargs):
+    """
+    Callback when rpfarm_gputype ordinal changes.
+    Syncs the value to rpfarm_gputypeid string parameter.
+    """
+    node = kwargs.get("node")
+    if node is None:
+        return
+    idx = node.parm("rpfarm_gputype").eval()
+    gpu_id = _GPU_TYPE_MAP.get(idx, "")
+    if gpu_id:
+        node.parm("rpfarm_gputypeid").set(gpu_id)
+
 
 class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PyScheduler):
     """
@@ -133,6 +158,10 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
                 },
                 {
                     "name": "rpfarm_gputype",
+                    "type": "String"
+                },
+                {
+                    "name": "rpfarm_gputypeid",
                     "type": "String"
                 },
                 {
@@ -445,7 +474,7 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
             CookError: If pod creation fails.
         """
         if gpu_type_id is None:
-            gpu_type_id = self["rpfarm_gputype"].evaluateString()
+            gpu_type_id = self["rpfarm_gputypeid"].evaluateString()
 
         template_id = self["rpfarm_templateid"].evaluateString()
         network_volume_id = self["rpfarm_networkvolumeid"].evaluateString()
