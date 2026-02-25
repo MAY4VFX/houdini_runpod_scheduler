@@ -116,7 +116,18 @@ def _build_shell_command(config: WorkerConfig, command: str) -> str:
     # Source houdini_setup_bash only if it exists (Houdini may not be
     # installed yet, e.g. during initial setup tasks).
     # Must cd to houdini dir first — the script requires it to detect install location.
-    return f'[ -f "{setup_script}" ] && cd "{config.houdini_path}" && source houdini_setup_bash; {command}'
+    # After sourcing, reconfigure hserver for remote license if SESINETD_HOST is set,
+    # because houdini_setup_bash may restart hserver locally and drop the remote config.
+    parts = [
+        f'[ -f "{setup_script}" ] && cd "{config.houdini_path}" && source houdini_setup_bash',
+    ]
+    sesinetd_host = os.environ.get("SESINETD_HOST", "")
+    if sesinetd_host:
+        parts.append(
+            f'hserver -q 2>/dev/null; sleep 1; hserver --host "{sesinetd_host}" & sleep 2'
+        )
+    parts.append(command)
+    return "; ".join(parts)
 
 
 # ---------------------------------------------------------------------------
