@@ -111,22 +111,19 @@ def _build_env(config: WorkerConfig, task_env: dict[str, str]) -> dict[str, str]
 
 
 def _build_shell_command(config: WorkerConfig, command: str) -> str:
-    """Wrap the user command so Houdini environment is sourced first."""
+    """Wrap the user command so Houdini environment is sourced first.
+
+    The entrypoint.sh already sources houdini_setup_bash and configures
+    hserver with the remote license.  All env vars (HFS, PATH,
+    LD_LIBRARY_PATH, etc.) are inherited via os.environ.  We only
+    re-source houdini_setup_bash here as a safety net — but skip
+    the hserver restart to avoid 3+ second overhead per task.
+    """
     setup_script = os.path.join(config.houdini_path, "houdini_setup_bash")
-    # Source houdini_setup_bash only if it exists (Houdini may not be
-    # installed yet, e.g. during initial setup tasks).
-    # Must cd to houdini dir first — the script requires it to detect install location.
-    # After sourcing, reconfigure hserver for remote license if SESINETD_HOST is set,
-    # because houdini_setup_bash may restart hserver locally and drop the remote config.
     parts = [
-        f'[ -f "{setup_script}" ] && cd "{config.houdini_path}" && source houdini_setup_bash',
+        f'[ -f "{setup_script}" ] && {{ cd "{config.houdini_path}" && source houdini_setup_bash; }}',
+        command,
     ]
-    sesinetd_host = os.environ.get("SESINETD_HOST", "")
-    if sesinetd_host:
-        parts.append(
-            f'hserver -q 2>/dev/null; sleep 1; hserver --host "{sesinetd_host}" & sleep 2'
-        )
-    parts.append(command)
     return "; ".join(parts)
 
 
@@ -179,7 +176,6 @@ def execute_task(
         _push_log(redis_client, task_id, "[worker] Starting pre-task sync...")
         sync_ok = sync_agent.pre_task_sync(task, config, redis_client)
         if not sync_ok:
-            duration = time.monotonic() - time.monotonic()
             _push_log(redis_client, task_id, "[worker] Pre-task sync failed")
             return TaskResult(
                 task_id=task_id,

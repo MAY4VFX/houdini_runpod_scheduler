@@ -59,19 +59,28 @@ def _run_juicefs_sync(
     Parameters
     ----------
     src, dst:
-        Source and destination URIs.  For JuiceFS objects use the
-        ``jfs://META_URL/path/`` scheme.  For local files use a plain path.
+        Source and destination paths.  For JuiceFS side, use a relative
+        path (trailing-slash normalised by ``_jfs_uri``).  Paths that do
+        NOT start with ``/`` are treated as JuiceFS-relative and wrapped
+        with ``jfs://JFSMETA/``.  The actual meta URL is passed via the
+        ``JFSMETA`` environment variable (Go's ``url.Parse`` cannot handle
+        nested ``jfs://redis://…`` URIs).
     extra_args:
         Additional CLI flags forwarded to ``juicefs sync``.
     """
+    # JuiceFS sync resolves jfs://NAME/path/ by reading os.Getenv(NAME).
+    # We set JFSMETA=<redis://...> and reference it as jfs://JFSMETA/path/.
+    env_name = "JFSMETA"
+    jfs_src = f"jfs://{env_name}/{src}" if not src.startswith("/") else src
+    jfs_dst = dst if dst.startswith("/") else f"jfs://{env_name}/{dst}"
+
     cmd = [
         config.juicefs_bin,
         "sync",
-        src,
-        dst,
+        jfs_src,
+        jfs_dst,
         "--threads", "10",
         "--update",
-        "--perms",
     ]
     if extra_args:
         cmd.extend(extra_args)
@@ -79,12 +88,16 @@ def _run_juicefs_sync(
     _push_log(redis_client, task_id, f"[sync] {src} -> {dst}")
     logger.info("juicefs sync: %s -> %s", src, dst)
 
+    env = os.environ.copy()
+    env[env_name] = config.juicefs_meta_url
+
     try:
         result = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
             timeout=1800,  # 30 min max per sync operation
+            env=env,
         )
         if result.returncode == 0:
             logger.info("juicefs sync succeeded")
@@ -107,16 +120,16 @@ def _run_juicefs_sync(
 
 
 def _jfs_uri(meta_url: str, path: str) -> str:
-    """Build a ``jfs://`` URI for juicefs sync.
+    """Normalise a relative path for use with ``_run_juicefs_sync``.
 
-    Ensures the path ends with ``/`` (directory semantics) and strips a
-    leading slash from *path* so it becomes relative inside the JuiceFS
-    volume.
+    Returns the path stripped of leading ``/`` and with a trailing ``/``.
+    The ``meta_url`` argument is accepted for API compatibility but unused
+    — the actual meta URL is injected as an env var by ``_run_juicefs_sync``.
     """
     path = path.lstrip("/")
     if not path.endswith("/"):
         path += "/"
-    return f"jfs://{meta_url}/{path}"
+    return path
 
 
 def _local_path(base: str, rel: str) -> str:
