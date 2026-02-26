@@ -326,23 +326,18 @@ def post_task_sync(
 
     project_dir = config.project_dir
 
-    # Collect output directories to sync
+    # Collect output directories to sync back to JuiceFS.
+    # No hardcoded paths — use sync_dirs from the task (same hierarchy
+    # as the artist's local project, only the root differs) and any
+    # explicit output_files reported by the render process.
     output_dirs: set[str] = set()
 
     if output_files:
         for fpath in output_files:
             if os.path.exists(fpath):
                 output_dirs.add(os.path.dirname(fpath))
-    else:
-        # Check common output locations
-        for subdir in ("renders", "output", "sim_output"):
-            candidate = os.path.join(project_dir, subdir)
-            if os.path.isdir(candidate) and os.listdir(candidate):
-                output_dirs.add(candidate)
 
-    # Also sync back directories that were synced pre-task (e.g. the project
-    # subdirectory containing rendered EXRs).  Skip pdgtemp — it only has
-    # scripts and doesn't contain render output.
+    # Sync back project directories from sync_dirs (skip pdgtemp — scripts only).
     sync_dirs: list[str] = task.get("sync_dirs", [])
     for rel_dir in sync_dirs:
         if rel_dir.startswith("pdgtemp"):
