@@ -18,6 +18,9 @@ if [ ! -e /project ]; then
     ln -s "$PROJECT_DIR" /project 2>/dev/null || true
 fi
 
+# Refresh ldconfig to ensure injected NVIDIA libs are findable
+ldconfig 2>/dev/null || true
+
 # --- Step 2: Setup Houdini environment ---
 if [ -d "/workspace/houdini" ]; then
     echo "Setting up Houdini from Network Volume..."
