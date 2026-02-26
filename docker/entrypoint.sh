@@ -18,27 +18,59 @@ if [ ! -e /project ]; then
     ln -s "$PROJECT_DIR" /project 2>/dev/null || true
 fi
 
-# --- Ensure OptiX (libnvoptix.so) is available for Karma XPU ---
-# nvidia-container-toolkit should inject it, but some RunPod hosts don't.
-# If missing, download the matching version from NVIDIA's apt repo.
+# --- Ensure OptiX libraries are available for Karma XPU ---
+# nvidia-container-toolkit should inject libnvoptix.so, libnvidia-rtcore.so,
+# and nvoptix.bin from the host driver, but some RunPod hosts have old
+# container-toolkit (< 1.14.4) that doesn't inject these.
+# If missing, extract them from the matching NVIDIA driver package.
+export OPTIX_CACHE_PATH="/tmp/optix_cache"
+mkdir -p "$OPTIX_CACHE_PATH" 2>/dev/null || true
+
+DRIVER_VER=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1)
+DRIVER_BRANCH="${DRIVER_VER%%.*}"
+NEED_OPTIX=false
+
 if ! ldconfig -p 2>/dev/null | grep -q libnvoptix; then
-    DRIVER_VER=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1)
-    DRIVER_BRANCH="${DRIVER_VER%%.*}"
-    echo "OptiX (libnvoptix.so) not found. Driver: ${DRIVER_VER}. Fetching..."
+    NEED_OPTIX=true
+    echo "OptiX: libnvoptix.so NOT found"
+fi
+if ! ldconfig -p 2>/dev/null | grep -q libnvidia-rtcore; then
+    NEED_OPTIX=true
+    echo "OptiX: libnvidia-rtcore.so NOT found"
+fi
+if [ ! -f /usr/share/nvidia/nvoptix.bin ]; then
+    NEED_OPTIX=true
+    echo "OptiX: nvoptix.bin NOT found"
+fi
+
+if [ "$NEED_OPTIX" = true ] && [ -n "$DRIVER_BRANCH" ]; then
+    echo "Fetching OptiX libs from libnvidia-gl-${DRIVER_BRANCH} (driver ${DRIVER_VER})..."
     cd /tmp
     apt-get update -qq 2>/dev/null
     if apt-get download "libnvidia-gl-${DRIVER_BRANCH}" 2>/dev/null; then
         mkdir -p /tmp/nvgl
         dpkg-deb -x libnvidia-gl-${DRIVER_BRANCH}_*.deb /tmp/nvgl
-        if [ -f /tmp/nvgl/usr/lib/x86_64-linux-gnu/libnvoptix.so.${DRIVER_VER} ]; then
-            cp /tmp/nvgl/usr/lib/x86_64-linux-gnu/libnvoptix.so.${DRIVER_VER} /usr/lib/x86_64-linux-gnu/
-            ln -sf libnvoptix.so.${DRIVER_VER} /usr/lib/x86_64-linux-gnu/libnvoptix.so.1
-            echo "Installed libnvoptix.so.${DRIVER_VER}"
-        else
-            # Try any libnvoptix in the package
-            find /tmp/nvgl -name 'libnvoptix.so.*' -exec cp {} /usr/lib/x86_64-linux-gnu/ \;
-            ls /usr/lib/x86_64-linux-gnu/libnvoptix.so.* 2>/dev/null | head -1 | xargs -I{} ln -sf {} /usr/lib/x86_64-linux-gnu/libnvoptix.so.1
-            echo "Installed libnvoptix (fallback)"
+
+        # Copy only missing files (don't overwrite host-injected libs)
+        for lib in libnvoptix libnvidia-rtcore libnvidia-glcore; do
+            for f in /tmp/nvgl/usr/lib/x86_64-linux-gnu/${lib}.so.*; do
+                [ -f "$f" ] || continue
+                dest="/usr/lib/x86_64-linux-gnu/$(basename "$f")"
+                if [ ! -f "$dest" ]; then
+                    cp "$f" "$dest"
+                    echo "  Installed $(basename "$f")"
+                fi
+            done
+        done
+        # Create symlinks if missing
+        if [ ! -f /usr/lib/x86_64-linux-gnu/libnvoptix.so.1 ]; then
+            ls /usr/lib/x86_64-linux-gnu/libnvoptix.so.* 2>/dev/null | head -1 | \
+                xargs -I{} ln -sf "$(basename {})" /usr/lib/x86_64-linux-gnu/libnvoptix.so.1
+        fi
+        # Copy nvoptix.bin (precompiled OptiX kernels)
+        if [ ! -f /usr/share/nvidia/nvoptix.bin ]; then
+            find /tmp/nvgl -name 'nvoptix.bin' -exec cp {} /usr/share/nvidia/ \; 2>/dev/null
+            [ -f /usr/share/nvidia/nvoptix.bin ] && echo "  Installed nvoptix.bin"
         fi
         rm -rf /tmp/nvgl /tmp/libnvidia-gl-*.deb
     else
@@ -48,6 +80,7 @@ if ! ldconfig -p 2>/dev/null | grep -q libnvoptix; then
     cd /opt/runpodfarm
 fi
 ldconfig 2>/dev/null || true
+echo "OptiX: driver=${DRIVER_VER}, libnvoptix=$(ldconfig -p 2>/dev/null | grep -c libnvoptix), rtcore=$(ldconfig -p 2>/dev/null | grep -c libnvidia-rtcore), nvoptix.bin=$([ -f /usr/share/nvidia/nvoptix.bin ] && echo YES || echo NO)"
 
 # --- Step 2: Setup Houdini environment ---
 if [ -d "/workspace/houdini" ]; then
