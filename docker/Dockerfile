@@ -12,7 +12,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 ENV NVIDIA_VISIBLE_DEVICES=all
 ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics
 
-# System dependencies
+# System dependencies + CUDA NVRTC (required by Karma XPU for shader compilation)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 python3-pip python3-venv \
     curl wget \
@@ -20,6 +20,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxcursor1 libxinerama1 libxss1 libasound2 \
     xvfb \
     ca-certificates \
+    cuda-nvrtc-12-4 \
     && rm -rf /var/lib/apt/lists/*
 
 # Install JuiceFS binary (used for B2<->NV sync without FUSE)
