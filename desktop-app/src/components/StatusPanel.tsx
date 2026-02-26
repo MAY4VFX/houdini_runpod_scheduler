@@ -3,6 +3,11 @@ import {
   disconnect,
   mountJuicefs,
   unmountJuicefs,
+  startGateway,
+  stopGateway,
+  gatewayStatus,
+  registerFileProviderDomain,
+  removeFileProviderDomain,
   installHda,
   ensureDependencies,
   type AppStatus,
@@ -59,10 +64,18 @@ export default function StatusPanel({
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [deps, setDeps] = useState<DependencyStatus | null>(null);
+  const [gwRunning, setGwRunning] = useState(false);
+  const [fpRegistered, setFpRegistered] = useState(false);
+  const isMacOS = navigator.platform.toLowerCase().includes("mac");
 
   useEffect(() => {
     ensureDependencies()
       .then(setDeps)
+      .catch(() => {});
+
+    // Check gateway status
+    gatewayStatus()
+      .then(setGwRunning)
       .catch(() => {});
   }, []);
 
@@ -112,6 +125,66 @@ export default function StatusPanel({
       setMessage("Unmounted successfully");
     } catch (err) {
       setError(typeof err === "string" ? err : "Unmount failed");
+    } finally {
+      setLoading(null);
+    }
+  };
+
+  const handleStartGateway = async () => {
+    setLoading("gateway");
+    setError(null);
+    setMessage(null);
+    try {
+      const result = await startGateway();
+      setGwRunning(true);
+      setMessage(result);
+    } catch (err) {
+      setError(typeof err === "string" ? err : "Failed to start gateway");
+    } finally {
+      setLoading(null);
+    }
+  };
+
+  const handleStopGateway = async () => {
+    setLoading("gateway");
+    setError(null);
+    setMessage(null);
+    try {
+      const result = await stopGateway();
+      setGwRunning(false);
+      setMessage(result);
+    } catch (err) {
+      setError(typeof err === "string" ? err : "Failed to stop gateway");
+    } finally {
+      setLoading(null);
+    }
+  };
+
+  const handleRegisterFP = async () => {
+    setLoading("fileprovider");
+    setError(null);
+    setMessage(null);
+    try {
+      const result = await registerFileProviderDomain();
+      setFpRegistered(true);
+      setMessage(result);
+    } catch (err) {
+      setError(typeof err === "string" ? err : "Failed to register File Provider");
+    } finally {
+      setLoading(null);
+    }
+  };
+
+  const handleRemoveFP = async () => {
+    setLoading("fileprovider");
+    setError(null);
+    setMessage(null);
+    try {
+      const result = await removeFileProviderDomain();
+      setFpRegistered(false);
+      setMessage(result);
+    } catch (err) {
+      setError(typeof err === "string" ? err : "Failed to remove File Provider");
     } finally {
       setLoading(null);
     }
@@ -174,11 +247,13 @@ export default function StatusPanel({
               Dependencies
             </h2>
             <div className="divide-y divide-surface-800">
-              <StatusRow
-                label="FUSE Driver"
-                value={deps.fuse_installed ? "Installed" : "Not installed"}
-                active={deps.fuse_installed}
-              />
+              {!isMacOS && (
+                <StatusRow
+                  label="FUSE Driver"
+                  value={deps.fuse_installed ? "Installed" : "Not installed"}
+                  active={deps.fuse_installed}
+                />
+              )}
               <StatusRow
                 label="JuiceFS Client"
                 value={
@@ -207,34 +282,93 @@ export default function StatusPanel({
               }
               active={status.connected}
             />
-            <StatusRow
-              label="JuiceFS Mount"
-              value={
-                status.mounted
-                  ? status.mount_path || "Mounted"
-                  : "Not mounted"
-              }
-              active={status.mounted}
-              action={
-                status.mounted ? (
-                  <button
-                    className="btn-secondary text-xs"
-                    onClick={handleUnmount}
-                    disabled={loading === "unmount"}
-                  >
-                    {loading === "unmount" ? "..." : "Unmount"}
-                  </button>
-                ) : (
-                  <button
-                    className="btn-secondary text-xs"
-                    onClick={handleMount}
-                    disabled={loading === "mount"}
-                  >
-                    {loading === "mount" ? "..." : "Mount"}
-                  </button>
-                )
-              }
-            />
+
+            {/* JuiceFS Gateway (macOS File Provider mode) */}
+            {isMacOS && (
+              <>
+                <StatusRow
+                  label="JuiceFS Gateway"
+                  value={gwRunning ? "Running (S3 gateway)" : "Stopped"}
+                  active={gwRunning}
+                  action={
+                    gwRunning ? (
+                      <button
+                        className="btn-secondary text-xs"
+                        onClick={handleStopGateway}
+                        disabled={loading === "gateway"}
+                      >
+                        {loading === "gateway" ? "..." : "Stop Gateway"}
+                      </button>
+                    ) : (
+                      <button
+                        className="btn-secondary text-xs"
+                        onClick={handleStartGateway}
+                        disabled={loading === "gateway"}
+                      >
+                        {loading === "gateway" ? "..." : "Start Gateway"}
+                      </button>
+                    )
+                  }
+                />
+                <StatusRow
+                  label="File Provider"
+                  value={fpRegistered ? "Registered in Finder" : "Not registered"}
+                  active={fpRegistered}
+                  action={
+                    fpRegistered ? (
+                      <button
+                        className="btn-secondary text-xs"
+                        onClick={handleRemoveFP}
+                        disabled={loading === "fileprovider"}
+                      >
+                        {loading === "fileprovider" ? "..." : "Remove"}
+                      </button>
+                    ) : (
+                      <button
+                        className="btn-primary text-xs"
+                        onClick={handleRegisterFP}
+                        disabled={loading === "fileprovider"}
+                      >
+                        {loading === "fileprovider" ? "..." : "Register"}
+                      </button>
+                    )
+                  }
+                />
+              </>
+            )}
+
+            {/* FUSE mount (Linux / fallback) */}
+            {!isMacOS && (
+              <StatusRow
+                label="JuiceFS Mount"
+                value={
+                  status.mounted
+                    ? status.mount_path || "Mounted"
+                    : "Not mounted"
+                }
+                active={status.mounted}
+                action={
+                  status.mounted ? (
+                    <button
+                      className="btn-secondary text-xs"
+                      onClick={handleUnmount}
+                      disabled={loading === "unmount"}
+                    >
+                      {loading === "unmount" ? "..." : "Unmount"}
+                    </button>
+                  ) : (
+                    <button
+                      className="btn-secondary text-xs"
+                      onClick={handleMount}
+                      disabled={loading === "mount"}
+                    >
+                      {loading === "mount" ? "..." : "Mount"}
+                    </button>
+                  )
+                }
+              />
+            )}
+
             <StatusRow
               label="Houdini"
               value={status.houdini_found ? "Detected" : "Not found"}

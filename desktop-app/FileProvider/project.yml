@@ -1,0 +1,44 @@
+name: RunPodFarmFileProvider
+options:
+  bundleIdPrefix: com.runpodfarm
+  deploymentTarget:
+    macOS: "13.0"
+  xcodeVersion: "15.0"
+  generateEmptyDirectories: true
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    MACOSX_DEPLOYMENT_TARGET: "13.0"
+
+targets:
+  RunPodFarmFileProvider:
+    type: app-extension
+    platform: macOS
+    sources:
+      - Extension
+    info:
+      path: Extension/Info.plist
+      properties:
+        CFBundleDisplayName: RunPodFarm File Provider
+        NSExtension:
+          NSExtensionFileProviderDocumentGroup: group.com.runpodfarm.desktop
+          NSExtensionPointIdentifier: com.apple.fileprovider-nonui
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).FileProviderExtension
+    entitlements:
+      path: Extension/Extension.entitlements
+      properties:
+        com.apple.security.app-sandbox: true
+        com.apple.security.network.client: true
+        com.apple.security.application-groups:
+          - group.com.runpodfarm.desktop
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.runpodfarm.desktop.fileprovider
+        PRODUCT_NAME: RunPodFarmFileProvider
+        SKIP_INSTALL: YES
+        LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/../Frameworks @executable_path/../../../../Frameworks"
+        CODE_SIGN_STYLE: Automatic
+    dependencies:
+      - framework: FileProvider.framework
+        embed: false
