@@ -35,20 +35,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Install ONLY libnvoptix.so from NVIDIA driver package (fallback for hosts
-# where nvidia-container-toolkit doesn't inject OptiX). Extract just the
-# OptiX library without installing the full driver package to avoid version
-# conflicts with host-injected libs (libcuda, libnvidia-ml, etc.).
-RUN apt-get update -qq \
-    && cd /tmp \
-    && apt-get download libnvidia-gl-550 2>/dev/null \
-    && dpkg-deb -x libnvidia-gl-550_*.deb /tmp/nvidia-gl \
-    && cp /tmp/nvidia-gl/usr/lib/x86_64-linux-gnu/libnvoptix.so.* /usr/lib/x86_64-linux-gnu/ \
-    && ln -sf libnvoptix.so.550.* /usr/lib/x86_64-linux-gnu/libnvoptix.so.1 \
-    && rm -rf /tmp/nvidia-gl /tmp/libnvidia-gl-550_*.deb \
-    && ldconfig \
-    && rm -rf /var/lib/apt/lists/*
-
 # Install JuiceFS binary (used for B2<->NV sync without FUSE)
 RUN curl -sSL https://github.com/juicedata/juicefs/releases/download/v1.2.1/juicefs-1.2.1-linux-amd64.tar.gz \
     | tar -xz -C /usr/local/bin juicefs \
