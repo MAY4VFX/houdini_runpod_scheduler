@@ -920,7 +920,13 @@ async fn mount_juicefs_inner(
         "--dir-entry-cache", "1h",      // cache directory listings 1hr
         "--open-cache", "1h",           // cache open() results 1hr
         "--free-space-ratio", "0.05",   // use up to 95% of disk for cache
+        "--max-fuse-io", "1M",          // max FUSE request size (default 128K)
     ]);
+
+    // macOS FUSE options: increase iosize to reduce FUSE round-trips per file,
+    // noappledouble to avoid .DS_Store creation on FUSE mount
+    #[cfg(target_os = "macos")]
+    cmd.args(["-o", "iosize=1048576,noappledouble"]);
 
     let is_real_key = |k: &str| !k.is_empty() && !k.starts_with("test-") && k.len() > 10;
     if is_real_key(&config.b2_access_key) {
