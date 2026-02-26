@@ -340,6 +340,17 @@ def post_task_sync(
             if os.path.isdir(candidate) and os.listdir(candidate):
                 output_dirs.add(candidate)
 
+    # Also sync back directories that were synced pre-task (e.g. the project
+    # subdirectory containing rendered EXRs).  Skip pdgtemp — it only has
+    # scripts and doesn't contain render output.
+    sync_dirs: list[str] = task.get("sync_dirs", [])
+    for rel_dir in sync_dirs:
+        if rel_dir.startswith("pdgtemp"):
+            continue
+        candidate = os.path.join(project_dir, rel_dir)
+        if os.path.isdir(candidate):
+            output_dirs.add(candidate)
+
     if not output_dirs:
         logger.debug("No output files to sync for task %s", task_id)
         return True
