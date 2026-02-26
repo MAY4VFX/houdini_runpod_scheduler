@@ -25,6 +25,12 @@ export interface HoudiniInfo {
   primary: string | null;
 }
 
+export interface GatewayStatus {
+  running: boolean;
+  port: number;
+  pid: number | null;
+}
+
 // Dependency management
 export async function ensureDependencies(): Promise<DependencyStatus> {
   return invoke("ensure_dependencies");
@@ -83,4 +89,26 @@ export async function installHda(): Promise<string> {
 
 export async function getHoudiniInfo(): Promise<HoudiniInfo> {
   return invoke("get_houdini_info");
+}
+
+// JuiceFS Gateway (S3-compatible, no FUSE needed)
+export async function startGateway(): Promise<string> {
+  return invoke<string>('start_gateway');
+}
+
+export async function stopGateway(): Promise<string> {
+  return invoke<string>('stop_gateway');
+}
+
+export async function gatewayStatus(): Promise<boolean> {
+  return invoke<boolean>('gateway_status');
+}
+
+// File Provider Extension (macOS)
+export async function registerFileProviderDomain(): Promise<string> {
+  return invoke<string>('register_fileprovider_domain');
+}
+
+export async function removeFileProviderDomain(): Promise<string> {
+  return invoke<string>('remove_fileprovider_domain');
 }

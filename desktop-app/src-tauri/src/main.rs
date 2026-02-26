@@ -1,6 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use serde::{Deserialize, Serialize};
+#[cfg(target_os = "macos")]
+use std::ffi::CString;
 use std::io::Read as IoRead;
 use std::path::PathBuf;
 use std::process::Command;
@@ -65,6 +67,9 @@ struct AppState {
     config: Option<JuiceFSConfig>,
     api_key: Option<String>,
     api_url: Option<String>,
+    gateway_process: Option<u32>,
+    gateway_access_key: String,
+    gateway_secret_key: String,
 }
 
 // ─── JuiceFS binary management ──────────────────────────────────────
@@ -676,8 +681,10 @@ async fn connect(
     mount_path: Option<String>,
     state: tauri::State<'_, Mutex<AppState>>,
 ) -> Result<AppStatus, String> {
-    // 1. Check FUSE
-    if !check_fuse_installed_sync() {
+    // 1. Check FUSE (on macOS, gateway+FileProvider is an alternative so don't hard-fail)
+    let _fuse_available = check_fuse_installed_sync();
+    #[cfg(not(target_os = "macos"))]
+    if !_fuse_available {
         return Err(format!(
             "FUSE driver not installed. Please install it first: {}",
             get_fuse_install_url()
@@ -771,11 +778,36 @@ async fn connect(
             }
         }
         if !mounted {
-            return Err(format!("Connected but mount failed: {}", mount_error));
+            // FUSE mount failed — try gateway + File Provider as fallback on macOS
+            #[cfg(target_os = "macos")]
+            {
+                // Try starting JuiceFS gateway as S3-compatible backend
+                let gateway_result = start_gateway_inner(&state).await;
+                if gateway_result.is_ok() {
+                    // Register File Provider domain for Finder integration
+                    let _ = register_fileprovider_domain_inner();
+                    // Consider it "mounted" via File Provider
+                    mounted = true;
+                }
+            }
+
+            if !mounted {
+                return Err(format!("Connected but mount failed: {}", mount_error));
+            }
+        } else {
+            // FUSE mount succeeded — also start gateway + File Provider on macOS
+            #[cfg(target_os = "macos")]
+            {
+                // Start gateway in background for File Provider extension (non-fatal if fails)
+                let gateway_result = start_gateway_inner(&state).await;
+                if gateway_result.is_ok() {
+                    let _ = register_fileprovider_domain_inner();
+                }
+            }
         }
     }
 
-    // 5. Check Houdini and HDA
+    // 6. Check Houdini and HDA
     let houdini_found = find_houdini().is_some();
     let hda_installed = find_houdini()
         .as_ref()
@@ -794,6 +826,31 @@ async fn connect(
 
 #[tauri::command]
 async fn disconnect(state: tauri::State<'_, Mutex<AppState>>) -> Result<(), String> {
+    // 1. Remove File Provider domain (macOS)
+    #[cfg(target_os = "macos")]
+    {
+        let _ = remove_fileprovider_domain_inner();
+    }
+
+    // 2. Stop JuiceFS gateway
+    let gateway_pid = {
+        let s = state.lock().map_err(|e| e.to_string())?;
+        s.gateway_process
+    };
+    if let Some(pid) = gateway_pid {
+        #[cfg(unix)]
+        {
+            let _ = Command::new("kill").arg(pid.to_string()).status();
+        }
+        #[cfg(windows)]
+        {
+            let _ = Command::new("taskkill")
+                .args(["/F", "/PID", &pid.to_string()])
+                .status();
+        }
+    }
+
+    // 3. Unmount FUSE
     let (mount_path, juicefs_path) = {
         let app_state = state.lock().map_err(|e| e.to_string())?;
         let mp = app_state
@@ -809,11 +866,15 @@ async fn disconnect(state: tauri::State<'_, Mutex<AppState>>) -> Result<(), Stri
         .args(["umount", &mount_path])
         .output();
 
+    // 4. Clear state
     {
         let mut app_state = state.lock().map_err(|e| e.to_string())?;
         app_state.config = None;
         app_state.api_key = None;
         app_state.api_url = None;
+        app_state.gateway_process = None;
+        app_state.gateway_access_key.clear();
+        app_state.gateway_secret_key.clear();
     }
 
     Ok(())
@@ -1120,6 +1181,344 @@ async fn get_houdini_info() -> Result<serde_json::Value, String> {
     }))
 }
 
+// ─── File Provider FFI ───────────────────────────────────────────────
+
+#[cfg(target_os = "macos")]
+extern "C" {
+    fn register_file_provider_domain(
+        identifier: *const std::os::raw::c_char,
+        display_name: *const std::os::raw::c_char,
+    ) -> bool;
+    fn remove_file_provider_domain(identifier: *const std::os::raw::c_char) -> bool;
+}
+
+// ─── Gateway & File Provider helpers (used by connect/disconnect) ────
+
+/// Inner helper to register File Provider domain (non-command version).
+#[cfg(target_os = "macos")]
+fn register_fileprovider_domain_inner() -> Result<String, String> {
+    let id = CString::new("com.runpodfarm.desktop.fileprovider").map_err(|e| e.to_string())?;
+    let name = CString::new("RunPodFarm").map_err(|e| e.to_string())?;
+
+    let success = unsafe { register_file_provider_domain(id.as_ptr(), name.as_ptr()) };
+    if success {
+        Ok("File Provider domain registered".to_string())
+    } else {
+        Err("Failed to register File Provider domain".to_string())
+    }
+}
+
+/// Inner helper to remove File Provider domain (non-command version).
+#[cfg(target_os = "macos")]
+fn remove_fileprovider_domain_inner() -> Result<String, String> {
+    let id = CString::new("com.runpodfarm.desktop.fileprovider").map_err(|e| e.to_string())?;
+
+    let success = unsafe { remove_file_provider_domain(id.as_ptr()) };
+    if success {
+        Ok("File Provider domain removed".to_string())
+    } else {
+        Err("Failed to remove File Provider domain".to_string())
+    }
+}
+
+/// Inner helper to start the JuiceFS gateway (called from connect).
+async fn start_gateway_inner(
+    state: &tauri::State<'_, Mutex<AppState>>,
+) -> Result<String, String> {
+    let juicefs_path = juicefs_bin_path();
+    if !juicefs_path.exists() {
+        return Err("JuiceFS binary not found".to_string());
+    }
+
+    let config = {
+        let s = state.lock().map_err(|e| e.to_string())?;
+        s.config.clone()
+    };
+
+    let config = config.ok_or("Not connected — no JuiceFS config")?;
+
+    let secret = generate_secret(32);
+    let port: u16 = 9000;
+    let access_key = "runpodfarm".to_string();
+
+    write_shared_config(&access_key, &secret, port, &config.project_id)
+        .map_err(|e| format!("Failed to write shared config: {}", e))?;
+
+    let mut cmd = tokio::process::Command::new(&juicefs_path);
+    cmd.args(["gateway", &config.redis_url, &format!("localhost:{}", port)]);
+    cmd.args([
+        "--cache-dir",
+        &format!(
+            "{}/.juicefs/cache",
+            dirs::home_dir().unwrap().display()
+        ),
+    ]);
+    cmd.args(["--cache-size", "102400"]);
+    cmd.args(["--writeback"]);
+    cmd.args(["--buffer-size", "300"]);
+    cmd.args(["--prefetch", "10"]);
+    cmd.args(["--attr-cache", "3600"]);
+    cmd.args(["--entry-cache", "3600"]);
+    cmd.args(["--dir-entry-cache", "3600"]);
+    cmd.args([
+        "--log",
+        &format!(
+            "{}/.runpodfarm/gateway.log",
+            dirs::home_dir().unwrap().display()
+        ),
+    ]);
+    cmd.args(["--no-usage-report"]);
+
+    cmd.env("MINIO_ROOT_USER", &access_key);
+    cmd.env("MINIO_ROOT_PASSWORD", &secret);
+
+    if !config.b2_access_key.is_empty() {
+        cmd.env("ACCESS_KEY", &config.b2_access_key);
+        cmd.env("SECRET_KEY", &config.b2_secret_key);
+    }
+
+    let child = cmd
+        .spawn()
+        .map_err(|e| format!("Failed to start gateway: {}", e))?;
+    let pid = child.id().unwrap_or(0);
+
+    {
+        let mut s = state.lock().map_err(|e| e.to_string())?;
+        s.gateway_process = Some(pid);
+        s.gateway_access_key = access_key.clone();
+        s.gateway_secret_key = secret;
+    }
+
+    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+
+    Ok(format!("Gateway started on port {} (PID: {})", port, pid))
+}
+
+// ─── Gateway & File Provider commands ────────────────────────────────
+
+fn write_shared_config(
+    access_key: &str,
+    secret_key: &str,
+    port: u16,
+    project_id: &str,
+) -> Result<(), String> {
+    let group_container = dirs::home_dir()
+        .ok_or("No home dir")?
+        .join("Library/Group Containers/group.com.runpodfarm.desktop");
+
+    std::fs::create_dir_all(&group_container).map_err(|e| e.to_string())?;
+
+    let config = serde_json::json!({
+        "gateway_url": format!("http://localhost:{}", port),
+        "gateway_access_key": access_key,
+        "gateway_secret_key": secret_key,
+        "project_id": project_id
+    });
+
+    let config_path = group_container.join("config.json");
+    std::fs::write(
+        &config_path,
+        serde_json::to_string_pretty(&config).unwrap(),
+    )
+    .map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
+/// Generate a simple pseudo-random alphanumeric string using system time as seed.
+fn generate_secret(len: usize) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    use std::time::SystemTime;
+
+    let mut hasher = DefaultHasher::new();
+    SystemTime::now().hash(&mut hasher);
+    std::process::id().hash(&mut hasher);
+
+    let chars: Vec<char> = "abcdefghijklmnopqrstuvwxyz0123456789".chars().collect();
+    let mut result = String::with_capacity(len);
+    let mut h = hasher.finish();
+
+    for _ in 0..len {
+        let idx = (h % chars.len() as u64) as usize;
+        result.push(chars[idx]);
+        // Mix the hash for next character
+        h = h.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    }
+    result
+}
+
+#[tauri::command]
+async fn start_gateway(state: tauri::State<'_, Mutex<AppState>>) -> Result<String, String> {
+    let juicefs_path = juicefs_bin_path();
+    if !juicefs_path.exists() {
+        return Err("JuiceFS binary not found".to_string());
+    }
+
+    let (config, _) = {
+        let s = state.lock().map_err(|e| e.to_string())?;
+        (s.config.clone(), s.api_key.clone())
+    };
+
+    let config = config.ok_or("Not connected — no JuiceFS config")?;
+
+    // Generate a random secret for MinIO auth
+    let secret = generate_secret(32);
+
+    let port: u16 = 9000;
+    let access_key = "runpodfarm".to_string();
+
+    // Write shared config for File Provider Extension
+    write_shared_config(&access_key, &secret, port, &config.project_id)
+        .map_err(|e| format!("Failed to write shared config: {}", e))?;
+
+    let mut cmd = tokio::process::Command::new(&juicefs_path);
+    cmd.args(["gateway", &config.redis_url, &format!("localhost:{}", port)]);
+    cmd.args([
+        "--cache-dir",
+        &format!(
+            "{}/.juicefs/cache",
+            dirs::home_dir().unwrap().display()
+        ),
+    ]);
+    cmd.args(["--cache-size", "102400"]);
+    cmd.args(["--writeback"]);
+    cmd.args(["--buffer-size", "300"]);
+    cmd.args(["--prefetch", "10"]);
+    cmd.args(["--attr-cache", "3600"]);
+    cmd.args(["--entry-cache", "3600"]);
+    cmd.args(["--dir-entry-cache", "3600"]);
+    cmd.args([
+        "--log",
+        &format!(
+            "{}/.runpodfarm/gateway.log",
+            dirs::home_dir().unwrap().display()
+        ),
+    ]);
+    cmd.args(["--no-usage-report"]);
+
+    cmd.env("MINIO_ROOT_USER", &access_key);
+    cmd.env("MINIO_ROOT_PASSWORD", &secret);
+
+    // Pass B2 credentials if available
+    if !config.b2_access_key.is_empty() {
+        cmd.env("ACCESS_KEY", &config.b2_access_key);
+        cmd.env("SECRET_KEY", &config.b2_secret_key);
+    }
+
+    let child = cmd
+        .spawn()
+        .map_err(|e| format!("Failed to start gateway: {}", e))?;
+    let pid = child.id().unwrap_or(0);
+
+    {
+        let mut s = state.lock().map_err(|e| e.to_string())?;
+        s.gateway_process = Some(pid);
+        s.gateway_access_key = access_key.clone();
+        s.gateway_secret_key = secret;
+    }
+
+    // Wait a bit for gateway to start
+    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+
+    Ok(format!("Gateway started on port {} (PID: {})", port, pid))
+}
+
+#[tauri::command]
+async fn stop_gateway(state: tauri::State<'_, Mutex<AppState>>) -> Result<String, String> {
+    let pid = {
+        let s = state.lock().map_err(|e| e.to_string())?;
+        s.gateway_process
+    };
+
+    if let Some(pid) = pid {
+        // Kill the gateway process
+        #[cfg(unix)]
+        {
+            let _ = Command::new("kill").arg(pid.to_string()).status();
+        }
+        #[cfg(windows)]
+        {
+            let _ = Command::new("taskkill")
+                .args(["/F", "/PID", &pid.to_string()])
+                .status();
+        }
+
+        let mut s = state.lock().map_err(|e| e.to_string())?;
+        s.gateway_process = None;
+        s.gateway_access_key.clear();
+        s.gateway_secret_key.clear();
+
+        Ok("Gateway stopped".to_string())
+    } else {
+        Ok("Gateway was not running".to_string())
+    }
+}
+
+#[tauri::command]
+async fn gateway_status(state: tauri::State<'_, Mutex<AppState>>) -> Result<bool, String> {
+    let pid = {
+        let s = state.lock().map_err(|e| e.to_string())?;
+        s.gateway_process
+    };
+
+    if let Some(pid) = pid {
+        // Check if process is alive
+        #[cfg(unix)]
+        {
+            let output = Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .status();
+            Ok(output.map(|s| s.success()).unwrap_or(false))
+        }
+        #[cfg(windows)]
+        {
+            Ok(true) // Simplified for Windows
+        }
+    } else {
+        Ok(false)
+    }
+}
+
+#[tauri::command]
+async fn register_fileprovider_domain() -> Result<String, String> {
+    #[cfg(target_os = "macos")]
+    {
+        let id = CString::new("com.runpodfarm.desktop.fileprovider").map_err(|e| e.to_string())?;
+        let name = CString::new("RunPodFarm").map_err(|e| e.to_string())?;
+
+        let success = unsafe { register_file_provider_domain(id.as_ptr(), name.as_ptr()) };
+        if success {
+            Ok("File Provider domain registered".to_string())
+        } else {
+            Err("Failed to register File Provider domain".to_string())
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err("File Provider is only available on macOS".to_string())
+    }
+}
+
+#[tauri::command]
+async fn remove_fileprovider_domain() -> Result<String, String> {
+    #[cfg(target_os = "macos")]
+    {
+        let id = CString::new("com.runpodfarm.desktop.fileprovider").map_err(|e| e.to_string())?;
+
+        let success = unsafe { remove_file_provider_domain(id.as_ptr()) };
+        if success {
+            Ok("File Provider domain removed".to_string())
+        } else {
+            Err("Failed to remove File Provider domain".to_string())
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err("File Provider is only available on macOS".to_string())
+    }
+}
+
 // ─── Entry point ────────────────────────────────────────────────────
 
 fn main() {
@@ -1193,6 +1592,11 @@ fn main() {
             check_fuse_installed,
             install_fuse,
             ensure_dependencies,
+            start_gateway,
+            stop_gateway,
+            gateway_status,
+            register_fileprovider_domain,
+            remove_fileprovider_domain,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
