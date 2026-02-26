@@ -785,7 +785,7 @@ async fn connect(
                 let gateway_result = start_gateway_inner(&state).await;
                 if gateway_result.is_ok() {
                     // Register File Provider domain for Finder integration
-                    let _ = register_fileprovider_domain_inner();
+                    let _ = register_fileprovider_domain_inner().await;
                     // Consider it "mounted" via File Provider
                     mounted = true;
                 }
@@ -801,7 +801,7 @@ async fn connect(
                 // Start gateway in background for File Provider extension (non-fatal if fails)
                 let gateway_result = start_gateway_inner(&state).await;
                 if gateway_result.is_ok() {
-                    let _ = register_fileprovider_domain_inner();
+                    let _ = register_fileprovider_domain_inner().await;
                 }
             }
         }
@@ -829,7 +829,7 @@ async fn disconnect(state: tauri::State<'_, Mutex<AppState>>) -> Result<(), Stri
     // 1. Remove File Provider domain (macOS)
     #[cfg(target_os = "macos")]
     {
-        let _ = remove_fileprovider_domain_inner();
+        let _ = remove_fileprovider_domain_inner().await;
     }
 
     // 2. Stop JuiceFS gateway
@@ -1195,33 +1195,47 @@ extern "C" {
 // ─── Gateway & File Provider helpers (used by connect/disconnect) ────
 
 /// Inner helper to register File Provider domain (non-command version).
+/// Runs on a background thread to avoid blocking the async runtime
+/// (Swift FFI uses DispatchSemaphore internally).
 #[cfg(target_os = "macos")]
-fn register_fileprovider_domain_inner() -> Result<String, String> {
-    let id = CString::new("com.runpodfarm.desktop.fileprovider").map_err(|e| e.to_string())?;
-    let name = CString::new("RunPodFarm").map_err(|e| e.to_string())?;
+async fn register_fileprovider_domain_inner() -> Result<String, String> {
+    tokio::task::spawn_blocking(|| {
+        let id = CString::new("com.runpodfarm.desktop.fileprovider").map_err(|e| e.to_string())?;
+        let name = CString::new("RunPodFarm").map_err(|e| e.to_string())?;
 
-    let success = unsafe { register_file_provider_domain(id.as_ptr(), name.as_ptr()) };
-    if success {
-        Ok("File Provider domain registered".to_string())
-    } else {
-        Err("Failed to register File Provider domain".to_string())
-    }
+        let success = unsafe { register_file_provider_domain(id.as_ptr(), name.as_ptr()) };
+        if success {
+            Ok("File Provider domain registered".to_string())
+        } else {
+            Err("Failed to register File Provider domain".to_string())
+        }
+    })
+    .await
+    .map_err(|e| format!("Thread join error: {}", e))?
 }
 
 /// Inner helper to remove File Provider domain (non-command version).
+/// Runs on a background thread to avoid blocking the async runtime.
 #[cfg(target_os = "macos")]
-fn remove_fileprovider_domain_inner() -> Result<String, String> {
-    let id = CString::new("com.runpodfarm.desktop.fileprovider").map_err(|e| e.to_string())?;
+async fn remove_fileprovider_domain_inner() -> Result<String, String> {
+    tokio::task::spawn_blocking(|| {
+        let id = CString::new("com.runpodfarm.desktop.fileprovider").map_err(|e| e.to_string())?;
 
-    let success = unsafe { remove_file_provider_domain(id.as_ptr()) };
-    if success {
-        Ok("File Provider domain removed".to_string())
-    } else {
-        Err("Failed to remove File Provider domain".to_string())
-    }
+        let success = unsafe { remove_file_provider_domain(id.as_ptr()) };
+        if success {
+            Ok("File Provider domain removed".to_string())
+        } else {
+            Err("Failed to remove File Provider domain".to_string())
+        }
+    })
+    .await
+    .map_err(|e| format!("Thread join error: {}", e))?
 }
 
 /// Inner helper to start the JuiceFS gateway (called from connect).
+/// Uses std::process::Command (not tokio) so the child process survives
+/// even if the future is dropped. The child handle is intentionally leaked
+/// because the gateway must run for the lifetime of the connection.
 async fn start_gateway_inner(
     state: &tauri::State<'_, Mutex<AppState>>,
 ) -> Result<String, String> {
@@ -1244,15 +1258,17 @@ async fn start_gateway_inner(
     write_shared_config(&access_key, &secret, port, &config.project_id)
         .map_err(|e| format!("Failed to write shared config: {}", e))?;
 
-    let mut cmd = tokio::process::Command::new(&juicefs_path);
-    cmd.args(["gateway", &config.redis_url, &format!("localhost:{}", port)]);
-    cmd.args([
-        "--cache-dir",
-        &format!(
-            "{}/.juicefs/cache",
-            dirs::home_dir().unwrap().display()
-        ),
-    ]);
+    let home = dirs::home_dir().unwrap();
+    let cache_dir = format!("{}/.juicefs/cache", home.display());
+    let log_file = format!("{}/.runpodfarm/gateway.log", home.display());
+    let listen_addr = format!("localhost:{}", port);
+
+    // Ensure log directory exists
+    let _ = std::fs::create_dir_all(format!("{}/.runpodfarm", home.display()));
+
+    let mut cmd = Command::new(&juicefs_path);
+    cmd.args(["gateway", &config.redis_url, &listen_addr]);
+    cmd.args(["--cache-dir", &cache_dir]);
     cmd.args(["--cache-size", "102400"]);
     cmd.args(["--writeback"]);
     cmd.args(["--buffer-size", "300"]);
@@ -1260,13 +1276,7 @@ async fn start_gateway_inner(
     cmd.args(["--attr-cache", "3600"]);
     cmd.args(["--entry-cache", "3600"]);
     cmd.args(["--dir-entry-cache", "3600"]);
-    cmd.args([
-        "--log",
-        &format!(
-            "{}/.runpodfarm/gateway.log",
-            dirs::home_dir().unwrap().display()
-        ),
-    ]);
+    cmd.args(["--log", &log_file]);
     cmd.args(["--no-usage-report"]);
 
     cmd.env("MINIO_ROOT_USER", &access_key);
@@ -1277,10 +1287,18 @@ async fn start_gateway_inner(
         cmd.env("SECRET_KEY", &config.b2_secret_key);
     }
 
+    // Detach stdout/stderr so they don't block
+    cmd.stdout(std::process::Stdio::null());
+    cmd.stderr(std::process::Stdio::null());
+
     let child = cmd
         .spawn()
         .map_err(|e| format!("Failed to start gateway: {}", e))?;
-    let pid = child.id().unwrap_or(0);
+    let pid = child.id();
+
+    // Intentionally leak the child handle — gateway must outlive this function.
+    // We track it by PID and kill it in stop_gateway/disconnect.
+    std::mem::forget(child);
 
     {
         let mut s = state.lock().map_err(|e| e.to_string())?;
@@ -1289,6 +1307,7 @@ async fn start_gateway_inner(
         s.gateway_secret_key = secret;
     }
 
+    // Wait for gateway to start listening
     tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
 
     Ok(format!("Gateway started on port {} (PID: {})", port, pid))
@@ -1350,78 +1369,8 @@ fn generate_secret(len: usize) -> String {
 
 #[tauri::command]
 async fn start_gateway(state: tauri::State<'_, Mutex<AppState>>) -> Result<String, String> {
-    let juicefs_path = juicefs_bin_path();
-    if !juicefs_path.exists() {
-        return Err("JuiceFS binary not found".to_string());
-    }
-
-    let (config, _) = {
-        let s = state.lock().map_err(|e| e.to_string())?;
-        (s.config.clone(), s.api_key.clone())
-    };
-
-    let config = config.ok_or("Not connected — no JuiceFS config")?;
-
-    // Generate a random secret for MinIO auth
-    let secret = generate_secret(32);
-
-    let port: u16 = 9000;
-    let access_key = "runpodfarm".to_string();
-
-    // Write shared config for File Provider Extension
-    write_shared_config(&access_key, &secret, port, &config.project_id)
-        .map_err(|e| format!("Failed to write shared config: {}", e))?;
-
-    let mut cmd = tokio::process::Command::new(&juicefs_path);
-    cmd.args(["gateway", &config.redis_url, &format!("localhost:{}", port)]);
-    cmd.args([
-        "--cache-dir",
-        &format!(
-            "{}/.juicefs/cache",
-            dirs::home_dir().unwrap().display()
-        ),
-    ]);
-    cmd.args(["--cache-size", "102400"]);
-    cmd.args(["--writeback"]);
-    cmd.args(["--buffer-size", "300"]);
-    cmd.args(["--prefetch", "10"]);
-    cmd.args(["--attr-cache", "3600"]);
-    cmd.args(["--entry-cache", "3600"]);
-    cmd.args(["--dir-entry-cache", "3600"]);
-    cmd.args([
-        "--log",
-        &format!(
-            "{}/.runpodfarm/gateway.log",
-            dirs::home_dir().unwrap().display()
-        ),
-    ]);
-    cmd.args(["--no-usage-report"]);
-
-    cmd.env("MINIO_ROOT_USER", &access_key);
-    cmd.env("MINIO_ROOT_PASSWORD", &secret);
-
-    // Pass B2 credentials if available
-    if !config.b2_access_key.is_empty() {
-        cmd.env("ACCESS_KEY", &config.b2_access_key);
-        cmd.env("SECRET_KEY", &config.b2_secret_key);
-    }
-
-    let child = cmd
-        .spawn()
-        .map_err(|e| format!("Failed to start gateway: {}", e))?;
-    let pid = child.id().unwrap_or(0);
-
-    {
-        let mut s = state.lock().map_err(|e| e.to_string())?;
-        s.gateway_process = Some(pid);
-        s.gateway_access_key = access_key.clone();
-        s.gateway_secret_key = secret;
-    }
-
-    // Wait a bit for gateway to start
-    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-
-    Ok(format!("Gateway started on port {} (PID: {})", port, pid))
+    // Delegate to inner helper which handles the actual gateway startup
+    start_gateway_inner(&state).await
 }
 
 #[tauri::command]
@@ -1484,15 +1433,7 @@ async fn gateway_status(state: tauri::State<'_, Mutex<AppState>>) -> Result<bool
 async fn register_fileprovider_domain() -> Result<String, String> {
     #[cfg(target_os = "macos")]
     {
-        let id = CString::new("com.runpodfarm.desktop.fileprovider").map_err(|e| e.to_string())?;
-        let name = CString::new("RunPodFarm").map_err(|e| e.to_string())?;
-
-        let success = unsafe { register_file_provider_domain(id.as_ptr(), name.as_ptr()) };
-        if success {
-            Ok("File Provider domain registered".to_string())
-        } else {
-            Err("Failed to register File Provider domain".to_string())
-        }
+        register_fileprovider_domain_inner().await
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -1504,14 +1445,7 @@ async fn register_fileprovider_domain() -> Result<String, String> {
 async fn remove_fileprovider_domain() -> Result<String, String> {
     #[cfg(target_os = "macos")]
     {
-        let id = CString::new("com.runpodfarm.desktop.fileprovider").map_err(|e| e.to_string())?;
-
-        let success = unsafe { remove_file_provider_domain(id.as_ptr()) };
-        if success {
-            Ok("File Provider domain removed".to_string())
-        } else {
-            Err("Failed to remove File Provider domain".to_string())
-        }
+        remove_fileprovider_domain_inner().await
     }
     #[cfg(not(target_os = "macos"))]
     {
