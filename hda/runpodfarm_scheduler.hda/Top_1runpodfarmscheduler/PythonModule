@@ -1613,13 +1613,14 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
             try:
                 heartbeat = self._redis_client.get(heartbeat_key)
                 if heartbeat:
-                    pod_info["last_heartbeat"] = datetime.datetime.fromisoformat(
-                        heartbeat
-                    )
+                    # Worker sends JSON: {"pod_id":..., "status":..., "timestamp": <unix float>}
+                    hb_data = json.loads(heartbeat)
+                    ts = hb_data.get("timestamp", 0)
+                    pod_info["last_heartbeat"] = datetime.datetime.fromtimestamp(ts)
                 else:
                     # No heartbeat key found -- could be normal during startup
                     pass
-            except (redis.exceptions.RedisError, ValueError):
+            except (redis.exceptions.RedisError, ValueError, json.JSONDecodeError):
                 pass
 
             # Check if heartbeat is stale
