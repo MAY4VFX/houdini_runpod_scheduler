@@ -1327,6 +1327,17 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
 
         _dlog(f"onSchedule START for {work_item.name}")
 
+        # 0. Check if this work item was already scheduled (re-called after Deferred)
+        for tid, tinfo in self.task_map.items():
+            if tinfo["work_item"].id == work_item.id:
+                _dlog(f"  work_item {work_item.id} already scheduled as {tid}, skip duplicate")
+                # Still apply backpressure if needed
+                queue_depth = self._get_queue_depth()
+                active_pods = self._get_active_pod_count()
+                if active_pods > 0 and queue_depth > active_pods * 3:
+                    return scheduleResult.Deferred
+                return scheduleResult.Succeeded
+
         # 1. Ensure directories exist and serialize the work item
         _dlog("  step 1: createJobDirsAndSerializeWorkItems...")
         self.createJobDirsAndSerializeWorkItems(work_item)
