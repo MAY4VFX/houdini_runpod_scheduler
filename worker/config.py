@@ -72,7 +72,7 @@ class WorkerConfig:
             project_id=project_id,
             user_id=user_id,
             pod_id=_resolve_pod_id(),
-            houdini_path=os.environ.get("HOUDINI_PATH", "/workspace/houdini"),
+            houdini_path=os.environ.get("HFS", "/workspace/houdini"),
             project_dir=os.environ.get("PROJECT_DIR", "/workspace/projects"),
             heartbeat_interval=int(
                 os.environ.get("HEARTBEAT_INTERVAL", "10")
