@@ -131,25 +131,51 @@ fn get_juicefs_path_sync() -> Option<String> {
         })
 }
 
-/// Return the download URL for the current platform.
-fn juicefs_download_url() -> &'static str {
-    if cfg!(target_os = "macos") && cfg!(target_arch = "aarch64") {
-        "https://github.com/juicedata/juicefs/releases/download/v1.2.0/juicefs-1.2.0-darwin-arm64.tar.gz"
+/// Build the download URL for a given JuiceFS version and current platform.
+fn juicefs_download_url_for_version(version: &str) -> String {
+    let v = version.trim_start_matches('v');
+    let (os, arch, ext) = if cfg!(target_os = "macos") && cfg!(target_arch = "aarch64") {
+        ("darwin", "arm64", "tar.gz")
     } else if cfg!(target_os = "macos") && cfg!(target_arch = "x86_64") {
-        "https://github.com/juicedata/juicefs/releases/download/v1.2.0/juicefs-1.2.0-darwin-amd64.tar.gz"
+        ("darwin", "amd64", "tar.gz")
     } else if cfg!(target_os = "linux") && cfg!(target_arch = "x86_64") {
-        "https://github.com/juicedata/juicefs/releases/download/v1.2.0/juicefs-1.2.0-linux-amd64.tar.gz"
+        ("linux", "amd64", "tar.gz")
     } else if cfg!(target_os = "windows") && cfg!(target_arch = "x86_64") {
-        "https://github.com/juicedata/juicefs/releases/download/v1.2.0/juicefs-1.2.0-windows-amd64.zip"
+        ("windows", "amd64", "zip")
     } else {
-        // Fallback to linux amd64
-        "https://github.com/juicedata/juicefs/releases/download/v1.2.0/juicefs-1.2.0-linux-amd64.tar.gz"
-    }
+        ("linux", "amd64", "tar.gz")
+    };
+    format!(
+        "https://github.com/juicedata/juicefs/releases/download/v{}/juicefs-{}-{}-{}.{}",
+        v, v, os, arch, ext
+    )
+}
+
+/// Fetch the latest JuiceFS release version from GitHub API.
+async fn fetch_latest_juicefs_version() -> Result<String, String> {
+    let client = reqwest::Client::builder()
+        .user_agent("RunPodFarm")
+        .build()
+        .map_err(|e| format!("HTTP client error: {}", e))?;
+    let resp: serde_json::Value = client
+        .get("https://api.github.com/repos/juicedata/juicefs/releases/latest")
+        .send()
+        .await
+        .map_err(|e| format!("GitHub API request failed: {}", e))?
+        .json()
+        .await
+        .map_err(|e| format!("GitHub API parse failed: {}", e))?;
+    resp["tag_name"]
+        .as_str()
+        .map(|s| s.trim_start_matches('v').to_string())
+        .ok_or_else(|| "No tag_name in GitHub response".to_string())
 }
 
 /// Download and install the JuiceFS binary into ~/.runpodfarm/bin/
 async fn download_juicefs_impl() -> Result<String, String> {
-    let url = juicefs_download_url();
+    // Always fetch the latest version from GitHub
+    let version = fetch_latest_juicefs_version().await.unwrap_or_else(|_| "1.3.1".to_string());
+    let url = juicefs_download_url_for_version(&version);
     let bin_dir = app_data_dir().join("bin");
     std::fs::create_dir_all(&bin_dir)
         .map_err(|e| format!("Failed to create bin dir: {}", e))?;
@@ -884,13 +910,16 @@ async fn mount_juicefs_inner(
         &config.mount_path,
         "-d",
         "--cache-dir", &cache_dir.to_string_lossy(),
-        "--cache-size", "20480",        // 20 GB local data cache
-        "--prefetch", "3",              // prefetch 3 blocks ahead
-        "--buffer-size", "300",         // 300 MB read buffer
-        "--attr-cache", "60",           // cache file attributes 60s
-        "--entry-cache", "60",          // cache directory entries 60s
-        "--dir-entry-cache", "60",      // cache directory listings 60s
-        "--open-cache", "60",           // cache open() results 60s
+        "--cache-size", "100G",         // 100 GB local data cache
+        "--prefetch", "10",             // prefetch 10 blocks ahead (sequential frames)
+        "--buffer-size", "300M",        // 300 MB read buffer
+        "--writeback",                  // async writes — cached locally then uploaded in background
+        "--cache-large-write",          // cache full blocks after uploading
+        "--attr-cache", "1h",           // cache file attributes 1hr
+        "--entry-cache", "1h",          // cache directory entries 1hr
+        "--dir-entry-cache", "1h",      // cache directory listings 1hr
+        "--open-cache", "1h",           // cache open() results 1hr
+        "--free-space-ratio", "0.05",   // use up to 95% of disk for cache
     ]);
 
     let is_real_key = |k: &str| !k.is_empty() && !k.starts_with("test-") && k.len() > 10;
