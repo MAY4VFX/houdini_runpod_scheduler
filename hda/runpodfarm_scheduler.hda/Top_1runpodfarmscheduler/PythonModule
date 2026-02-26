@@ -1432,8 +1432,8 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         # If the queue is significantly deeper than the number of active pods,
         # signal busy to apply backpressure
         if active_pods > 0 and queue_depth > active_pods * 3:
-            _dlog(f"  step 8: SchedulerBusy (q={queue_depth}, pods={active_pods})")
-            return scheduleResult.SchedulerBusy
+            _dlog(f"  step 8: Deferred (q={queue_depth}, pods={active_pods})")
+            return scheduleResult.Deferred
 
         _dlog(f"onSchedule DONE for {work_item.name} -> Succeeded")
         return scheduleResult.Succeeded
