@@ -78,6 +78,7 @@ jobs:
                   'dockerArgs': '',
                   'containerDiskInGb': 10,
                   'volumeInGb': 0,
+                  'volumeMountPath': '/workspace',
                   'isPublic': False,
                   'startJupyter': False,
                   'startSsh': False,
