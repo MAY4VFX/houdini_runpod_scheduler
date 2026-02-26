@@ -19,6 +19,8 @@ type SetupPhase =
   | "fuse_pending"
   | "ready";
 
+const isMacOS = navigator.platform.toLowerCase().includes("mac");
+
 function Spinner() {
   return (
     <svg className="h-5 w-5 animate-spin text-indigo-400" viewBox="0 0 24 24" fill="none">
@@ -48,6 +50,14 @@ function WarningIcon() {
   return (
     <svg className="h-5 w-5 text-amber-400" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor">
       <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126ZM12 15.75h.007v.008H12v-.008Z" />
+    </svg>
+  );
+}
+
+function FileProviderIcon() {
+  return (
+    <svg className="h-5 w-5 text-indigo-400" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor">
+      <path strokeLinecap="round" strokeLinejoin="round" d="M2.25 12.75V12A2.25 2.25 0 0 1 4.5 9.75h15A2.25 2.25 0 0 1 21.75 12v.75m-8.69-6.44-2.12-2.12a1.5 1.5 0 0 0-1.061-.44H4.5A2.25 2.25 0 0 0 2.25 6v12a2.25 2.25 0 0 0 2.25 2.25h15A2.25 2.25 0 0 0 21.75 18V9a2.25 2.25 0 0 0-2.25-2.25h-5.379a1.5 1.5 0 0 1-1.06-.44Z" />
     </svg>
   );
 }
@@ -96,10 +106,17 @@ export default function SetupScreen({
       }
     }
 
-    // Step 3: Auto-install FUSE if missing
+    // Step 3: FUSE check — skip on macOS (File Provider mode, no FUSE needed)
+    if (isMacOS) {
+      // macOS uses File Provider extension instead of FUSE mount
+      setPhase("ready");
+      return;
+    }
+
+    // Step 3 (Linux): Auto-install FUSE if missing
     if (!currentDeps || !currentDeps.fuse_installed) {
       setPhase("installing_fuse");
-      setStatusMsg("Installing macFUSE (you may be prompted for your password)...");
+      setStatusMsg("Installing FUSE (you may be prompted for your password)...");
       try {
         const msg = await installFuse();
         setStatusMsg(msg);
@@ -114,7 +131,7 @@ export default function SetupScreen({
         }
       } catch (err) {
         setPhase("fuse_pending");
-        setFuseError(typeof err === "string" ? err : "macFUSE installation failed.");
+        setFuseError(typeof err === "string" ? err : "FUSE installation failed.");
         return;
       }
     }
@@ -142,12 +159,12 @@ export default function SetupScreen({
       const newDeps = await onRecheck();
       if (newDeps) {
         setDeps(newDeps);
-        if (newDeps.all_ready) {
+        if (newDeps.all_ready || (isMacOS && newDeps.juicefs_installed)) {
           setPhase("ready");
-        } else if (!newDeps.fuse_installed) {
+        } else if (!isMacOS && !newDeps.fuse_installed) {
           setError("FUSE still not detected.");
         } else {
-          // FUSE now OK, re-run full setup
+          // Re-run full setup
           runSetup();
         }
       }
@@ -162,7 +179,7 @@ export default function SetupScreen({
     setPhase("installing_fuse");
     setFuseError("");
     setError(null);
-    setStatusMsg("Installing macFUSE...");
+    setStatusMsg("Installing FUSE...");
     try {
       const msg = await installFuse();
       setStatusMsg(msg);
@@ -184,6 +201,8 @@ export default function SetupScreen({
     }
   };
 
+  const modeLabel = isMacOS ? "File Provider mode" : "FUSE mount mode";
+
   return (
     <div className="flex min-h-screen items-center justify-center p-8">
       <div className="w-full max-w-md">
@@ -198,11 +217,12 @@ export default function SetupScreen({
             </div>
           </div>
           <h1 className="text-2xl font-bold text-white">RunPodFarm Setup</h1>
+          <p className="mt-1 text-xs text-gray-500">{modeLabel}</p>
           <p className="mt-2 text-sm text-gray-400">
             {phase === "ready"
               ? "All set!"
               : phase === "installing_fuse"
-                ? "Installing macFUSE..."
+                ? "Installing FUSE..."
                 : phase === "downloading_juicefs"
                   ? "Downloading JuiceFS..."
                   : "Checking dependencies..."}
@@ -211,30 +231,47 @@ export default function SetupScreen({
 
         {/* Dependency checklist */}
         <div className="card space-y-1">
-          {/* FUSE driver */}
-          <div className="flex items-center gap-3 rounded-lg px-3 py-3">
-            <div className="flex-shrink-0">
-              {phase === "checking" || phase === "installing_fuse" ? (
-                <Spinner />
-              ) : deps?.fuse_installed ? (
-                <CheckIcon />
-              ) : (
-                <CrossIcon />
-              )}
+          {/* Storage mode indicator (macOS) */}
+          {isMacOS && (
+            <div className="flex items-center gap-3 rounded-lg px-3 py-3">
+              <div className="flex-shrink-0">
+                <FileProviderIcon />
+              </div>
+              <div className="min-w-0 flex-1">
+                <p className="text-sm font-medium text-gray-200">File Provider Extension</p>
+                <p className="text-xs text-gray-500">
+                  Native Finder integration (no FUSE required)
+                </p>
+              </div>
             </div>
-            <div className="min-w-0 flex-1">
-              <p className="text-sm font-medium text-gray-200">FUSE Driver</p>
-              <p className="text-xs text-gray-500">
-                {phase === "checking"
-                  ? "Checking..."
-                  : phase === "installing_fuse"
-                    ? statusMsg || "Installing..."
-                    : deps?.fuse_installed
-                      ? "Installed"
-                      : "Not installed"}
-              </p>
+          )}
+
+          {/* FUSE driver — only shown on Linux */}
+          {!isMacOS && (
+            <div className="flex items-center gap-3 rounded-lg px-3 py-3">
+              <div className="flex-shrink-0">
+                {phase === "checking" || phase === "installing_fuse" ? (
+                  <Spinner />
+                ) : deps?.fuse_installed ? (
+                  <CheckIcon />
+                ) : (
+                  <CrossIcon />
+                )}
+              </div>
+              <div className="min-w-0 flex-1">
+                <p className="text-sm font-medium text-gray-200">FUSE Driver</p>
+                <p className="text-xs text-gray-500">
+                  {phase === "checking"
+                    ? "Checking..."
+                    : phase === "installing_fuse"
+                      ? statusMsg || "Installing..."
+                      : deps?.fuse_installed
+                        ? "Installed"
+                        : "Not installed"}
+                </p>
+              </div>
             </div>
-          </div>
+          )}
 
           {/* JuiceFS */}
           <div className="flex items-center gap-3 rounded-lg px-3 py-3">
@@ -294,15 +331,15 @@ export default function SetupScreen({
           </div>
         )}
 
-        {/* FUSE pending — installed but needs approval or retry */}
-        {phase === "fuse_pending" && (
+        {/* FUSE pending — only on Linux (macOS skips FUSE entirely) */}
+        {!isMacOS && phase === "fuse_pending" && (
           <div className="mt-4 space-y-3">
             <div className="rounded-lg border border-amber-800/50 bg-amber-900/20 px-4 py-4">
               <p className="mb-2 text-sm font-medium text-amber-300">
-                macFUSE needs attention
+                FUSE needs attention
               </p>
               <p className="text-xs text-amber-400/80">
-                {fuseError || "macFUSE was installed but may need system extension approval. Go to System Settings > Privacy & Security and approve macFUSE, then click Check again."}
+                {fuseError || "FUSE was installed but may need additional configuration. Check system settings and click Check again."}
               </p>
             </div>
 

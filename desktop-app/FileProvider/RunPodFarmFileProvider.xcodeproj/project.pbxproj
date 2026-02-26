@@ -1,0 +1,336 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		0FACC0A6489A564B4D89D543 /* SharedConfig.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1B5DA40FA026C68B49D22214 /* SharedConfig.swift */; };
+		2D4D4949DEF2EFBD5534ED94 /* MetadataDB.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5CB37BEE1DCD969851A201DB /* MetadataDB.swift */; };
+		4B47E24FCA3D211EB7330536 /* FileProvider.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 27B2E080EBE27B99EF74263C /* FileProvider.framework */; };
+		54BDAE61D1F70E6F14048FD2 /* FileProviderItem.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6C9E5A0A2D898A4E7BB6BFD4 /* FileProviderItem.swift */; };
+		5997FEF5F257FA023818B234 /* FileProviderExtension.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3128944B23DDE42FA4B1948D /* FileProviderExtension.swift */; };
+		90F9ABA7664446D5BFCF66C3 /* S3Backend.swift in Sources */ = {isa = PBXBuildFile; fileRef = 25D0BDFCD2542DCCA08E2CDB /* S3Backend.swift */; };
+		BDFD2CF09AD52CDC5A27C42E /* FileProviderEnumerator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 21BBDBAE6E3C505ACAA1622B /* FileProviderEnumerator.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		0C718061FC4A93B1A4CC1F43 /* RunPodFarmFileProvider.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = RunPodFarmFileProvider.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		1B5DA40FA026C68B49D22214 /* SharedConfig.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SharedConfig.swift; sourceTree = "<group>"; };
+		21BBDBAE6E3C505ACAA1622B /* FileProviderEnumerator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileProviderEnumerator.swift; sourceTree = "<group>"; };
+		25D0BDFCD2542DCCA08E2CDB /* S3Backend.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = S3Backend.swift; sourceTree = "<group>"; };
+		27B2E080EBE27B99EF74263C /* FileProvider.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; path = FileProvider.framework; sourceTree = "<group>"; };
+		3128944B23DDE42FA4B1948D /* FileProviderExtension.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileProviderExtension.swift; sourceTree = "<group>"; };
+		5637429BA213D1C667FF36D2 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
+		5CB37BEE1DCD969851A201DB /* MetadataDB.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetadataDB.swift; sourceTree = "<group>"; };
+		6C9E5A0A2D898A4E7BB6BFD4 /* FileProviderItem.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileProviderItem.swift; sourceTree = "<group>"; };
+		FB1F76FE1414EE155B140DB9 /* Extension.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = Extension.entitlements; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		10450CDA53C1DCA827E38B8E /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				4B47E24FCA3D211EB7330536 /* FileProvider.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		83E9CA19C3A574DE7970AB42 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				0C718061FC4A93B1A4CC1F43 /* RunPodFarmFileProvider.appex */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		85F521FA36A880953A7E0215 /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				27B2E080EBE27B99EF74263C /* FileProvider.framework */,
+			);
+			name = Frameworks;
+			sourceTree = "<group>";
+		};
+		A367B7EBE932AF619B7FD6C8 /* Extension */ = {
+			isa = PBXGroup;
+			children = (
+				FB1F76FE1414EE155B140DB9 /* Extension.entitlements */,
+				21BBDBAE6E3C505ACAA1622B /* FileProviderEnumerator.swift */,
+				3128944B23DDE42FA4B1948D /* FileProviderExtension.swift */,
+				6C9E5A0A2D898A4E7BB6BFD4 /* FileProviderItem.swift */,
+				5637429BA213D1C667FF36D2 /* Info.plist */,
+				5CB37BEE1DCD969851A201DB /* MetadataDB.swift */,
+				25D0BDFCD2542DCCA08E2CDB /* S3Backend.swift */,
+				1B5DA40FA026C68B49D22214 /* SharedConfig.swift */,
+			);
+			path = Extension;
+			sourceTree = "<group>";
+		};
+		AA0902138E12CA106E5FA63C = {
+			isa = PBXGroup;
+			children = (
+				A367B7EBE932AF619B7FD6C8 /* Extension */,
+				85F521FA36A880953A7E0215 /* Frameworks */,
+				83E9CA19C3A574DE7970AB42 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		1056261428FF2037B7F1796E /* RunPodFarmFileProvider */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 95BEAF2E0A4526CF3E49FF34 /* Build configuration list for PBXNativeTarget "RunPodFarmFileProvider" */;
+			buildPhases = (
+				9EA828F7490898869F77699F /* Sources */,
+				10450CDA53C1DCA827E38B8E /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = RunPodFarmFileProvider;
+			packageProductDependencies = (
+			);
+			productName = RunPodFarmFileProvider;
+			productReference = 0C718061FC4A93B1A4CC1F43 /* RunPodFarmFileProvider.appex */;
+			productType = "com.apple.product-type.app-extension";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		3B09C26DEB559946AAF6A827 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = YES;
+				LastUpgradeCheck = 1500;
+				TargetAttributes = {
+					1056261428FF2037B7F1796E = {
+						ProvisioningStyle = Automatic;
+					};
+				};
+			};
+			buildConfigurationList = 2066BC5501EFB1630FEE81B8 /* Build configuration list for PBXProject "RunPodFarmFileProvider" */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				Base,
+				en,
+			);
+			mainGroup = AA0902138E12CA106E5FA63C;
+			minimizedProjectReferenceProxies = 1;
+			preferredProjectObjectVersion = 77;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				1056261428FF2037B7F1796E /* RunPodFarmFileProvider */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXSourcesBuildPhase section */
+		9EA828F7490898869F77699F /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				BDFD2CF09AD52CDC5A27C42E /* FileProviderEnumerator.swift in Sources */,
+				5997FEF5F257FA023818B234 /* FileProviderExtension.swift in Sources */,
+				54BDAE61D1F70E6F14048FD2 /* FileProviderItem.swift in Sources */,
+				2D4D4949DEF2EFBD5534ED94 /* MetadataDB.swift in Sources */,
+				90F9ABA7664446D5BFCF66C3 /* S3Backend.swift in Sources */,
+				0FACC0A6489A564B4D89D543 /* SharedConfig.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		03969597F7E994D630A71D0C /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					"DEBUG=1",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 13.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 5.9;
+			};
+			name = Debug;
+		};
+		6D4FF3FC50C1EB0AFF0F6DD2 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = Extension/Extension.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				FRAMEWORK_SEARCH_PATHS = (
+					"$(inherited)",
+					"\".\"",
+				);
+				INFOPLIST_FILE = Extension/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/../Frameworks @executable_path/../../../../Frameworks";
+				PRODUCT_BUNDLE_IDENTIFIER = com.runpodfarm.desktop.fileprovider;
+				PRODUCT_NAME = RunPodFarmFileProvider;
+				SDKROOT = macosx;
+				SKIP_INSTALL = YES;
+			};
+			name = Debug;
+		};
+		87DA3873737289C3D467F8C5 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 13.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_VERSION = 5.9;
+			};
+			name = Release;
+		};
+		AA1FA2AFF369EEC72A979FAD /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = Extension/Extension.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				FRAMEWORK_SEARCH_PATHS = (
+					"$(inherited)",
+					"\".\"",
+				);
+				INFOPLIST_FILE = Extension/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/../Frameworks @executable_path/../../../../Frameworks";
+				PRODUCT_BUNDLE_IDENTIFIER = com.runpodfarm.desktop.fileprovider;
+				PRODUCT_NAME = RunPodFarmFileProvider;
+				SDKROOT = macosx;
+				SKIP_INSTALL = YES;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		2066BC5501EFB1630FEE81B8 /* Build configuration list for PBXProject "RunPodFarmFileProvider" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				03969597F7E994D630A71D0C /* Debug */,
+				87DA3873737289C3D467F8C5 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		95BEAF2E0A4526CF3E49FF34 /* Build configuration list for PBXNativeTarget "RunPodFarmFileProvider" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				6D4FF3FC50C1EB0AFF0F6DD2 /* Debug */,
+				AA1FA2AFF369EEC72A979FAD /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = 3B09C26DEB559946AAF6A827 /* Project object */;
+}
