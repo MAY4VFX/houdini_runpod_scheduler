@@ -1539,36 +1539,46 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
                 else:
                     pod_info["idle_since"] = None
 
-        # Scale up: compute estimated remaining time
-        if self._render_times and active_pods > 0 and remaining_tasks > 0:
-            avg_time = sum(self._render_times) / len(self._render_times)
-            remaining_time_seconds = (avg_time * remaining_tasks) / active_pods
-            remaining_time_minutes = remaining_time_seconds / 60.0
-
-            if (
-                remaining_time_minutes > _AUTOSCALE_THRESHOLD_MINUTES
-                and active_pods < max_pods
-            ):
-                # Determine batch size based on how far over threshold
-                ratio = remaining_time_minutes / _AUTOSCALE_THRESHOLD_MINUTES
-                batch_size = min(
-                    _AUTOSCALE_BATCH_MAX,
-                    max(_AUTOSCALE_BATCH_MIN, int(ratio)),
-                )
+        # Scale up logic
+        if active_pods < max_pods and remaining_tasks > 0:
+            # Budget check before any scaling
+            if self._cost_tracker.get("over_budget", False):
                 self._verboseLog(
-                    f"Autoscale: estimated {remaining_time_minutes:.1f}min "
-                    f"remaining with {active_pods} pod(s). "
-                    f"Scaling up by {batch_size}."
+                    "Autoscale: over budget, not scaling up."
                 )
+                return
 
-                # Budget check before scaling
-                if self._cost_tracker.get("over_budget", False):
-                    self._verboseLog(
-                        "Autoscale: over budget, not scaling up."
+            if self._render_times and active_pods > 0:
+                # Data-driven: estimate remaining time from render history
+                avg_time = sum(self._render_times) / len(self._render_times)
+                remaining_time_seconds = (avg_time * remaining_tasks) / active_pods
+                remaining_time_minutes = remaining_time_seconds / 60.0
+
+                if remaining_time_minutes > _AUTOSCALE_THRESHOLD_MINUTES:
+                    ratio = remaining_time_minutes / _AUTOSCALE_THRESHOLD_MINUTES
+                    batch_size = min(
+                        _AUTOSCALE_BATCH_MAX,
+                        max(_AUTOSCALE_BATCH_MIN, int(ratio)),
                     )
-                    return
+                    self._verboseLog(
+                        f"Autoscale: estimated {remaining_time_minutes:.1f}min "
+                        f"remaining with {active_pods} pod(s). "
+                        f"Scaling up by {batch_size}."
+                    )
+                    self._scale_up(batch_size)
 
-                self._scale_up(batch_size)
+            elif active_pods > 0 and queue_depth > active_pods:
+                # Proactive: queue deeper than pod count, scale up immediately
+                needed = min(queue_depth, max_pods) - active_pods
+                if needed > 0:
+                    batch_size = min(needed, _AUTOSCALE_BATCH_MAX)
+                    self._verboseLog(
+                        f"Autoscale: queue depth {queue_depth} > "
+                        f"{active_pods} pod(s), no render history yet. "
+                        f"Scaling up by {batch_size}."
+                    )
+                    self._scale_up(batch_size)
+
         elif active_pods == 0 and remaining_tasks > 0:
             # No active pods but we have tasks -- scale up to minimum
             min_pods = self["rpfarm_minpods"].evaluateInt()
