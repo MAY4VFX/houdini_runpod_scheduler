@@ -1317,11 +1317,24 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         Schedules the work item by serializing it and pushing a task to the
         Redis queue for pod workers to consume.
         """
+        import time as _time
+
+        def _dlog(msg):
+            """Debug log to file — survives GUI hangs."""
+            with open("/tmp/rpfarm_onschedule.log", "a") as f:
+                f.write(f"{_time.strftime('%H:%M:%S')} {msg}\n")
+            self._verboseLog(msg)
+
+        _dlog(f"onSchedule START for {work_item.name}")
+
         # 1. Ensure directories exist and serialize the work item
+        _dlog("  step 1: createJobDirsAndSerializeWorkItems...")
         self.createJobDirsAndSerializeWorkItems(work_item)
+        _dlog("  step 1: done")
 
         # 2. Expand the special __PDG__* tokens in the work item command and
         #    pre/post task commands
+        _dlog("  step 2: expandCommandTokens...")
         pre_task_command = self.expandCommandTokens(
             self.evaluateStringOverride(
                 work_item.node, self.parmprefix, "pretaskcmd", work_item, ""
@@ -1337,6 +1350,7 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         item_command = self.expandCommandTokens(
             work_item.command, work_item
         )
+        _dlog(f"  step 2: done, cmd={item_command[:80]}")
 
         # 3. Build full command with pre/post task commands
         full_command = item_command
@@ -1346,23 +1360,32 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
             full_command = f"{full_command} && {post_task_command}"
 
         # 4. Prepare task env
+        _dlog("  step 4: _prepareTaskEnv...")
         task_env = self._prepareTaskEnv(work_item.node, work_item)
+        _dlog(f"  step 4: done, {len(task_env)} env vars")
 
         # 5. Create task dict
         task_id = str(uuid.uuid4())
         warmup_paths = self["rpfarm_warmuppaths"].evaluateString()
 
-        # Build asset manifest for JuiceFS sync
-        manifest = self._create_manifest(work_item)
+        # Build asset manifest for JuiceFS sync.
+        # NOTE: _create_manifest uses hou.fileReferences() which may deadlock
+        # when called from the PDG cook thread.  Disabled for now — sync_dirs
+        # handles the critical pdgtemp/HIP sync.  Re-enable once we confirm
+        # the core pipeline works.
+        _dlog("  step 5a: _create_manifest SKIPPED (thread-safety)")
+        manifest = None
 
         # Compute sync_dirs: directories that must be synced from JuiceFS
         # to the NV before the task runs (e.g. pdgtemp scripts/data, HIP file).
+        _dlog("  step 5b: sync_dirs...")
         sync_dirs = []
         juicefs_meta_url = self["rpfarm_juicefs_meta_url"].evaluateString()
         if juicefs_meta_url:
             import hou
             local_working = self.workingDir(True)
             local_temp = self.tempDir(True)
+            _dlog(f"    local_working={local_working}, local_temp={local_temp}")
             # Always sync pdgtemp directory (contains PDG scripts and data)
             if local_working and local_temp and local_temp.startswith(local_working):
                 rel_temp = os.path.relpath(local_temp, local_working)
@@ -1374,6 +1397,7 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
                 rel_hip = os.path.relpath(hip_dir, local_working)
                 if rel_hip != "." and rel_hip not in sync_dirs:
                     sync_dirs.append(rel_hip)
+        _dlog(f"  step 5b: done, sync_dirs={sync_dirs}")
 
         task_data = {
             "task_id": task_id,
@@ -1390,13 +1414,16 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
             task_data["manifest"] = manifest
 
         # 6. Push to Redis queue
+        _dlog(f"  step 6: _push_task {task_id}...")
         self._push_task(task_data)
+        _dlog("  step 6: done")
 
         # 7. Store mapping: task_id -> work_item info
         self.task_map[task_id] = {
             "work_item": work_item,
             "start_time": datetime.datetime.now(),
         }
+        _dlog("  step 7: task_map updated")
 
         # 8. Check queue depth for backpressure
         queue_depth = self._get_queue_depth()
@@ -1405,12 +1432,10 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         # If the queue is significantly deeper than the number of active pods,
         # signal busy to apply backpressure
         if active_pods > 0 and queue_depth > active_pods * 3:
-            self._verboseLog(
-                f"Queue depth ({queue_depth}) exceeds threshold, "
-                f"signaling SchedulerBusy"
-            )
+            _dlog(f"  step 8: SchedulerBusy (q={queue_depth}, pods={active_pods})")
             return scheduleResult.SchedulerBusy
 
+        _dlog(f"onSchedule DONE for {work_item.name} -> Succeeded")
         return scheduleResult.Succeeded
 
     def onTick(self):
