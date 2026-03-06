@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 _PROTECTED_PREFIXES = (
     "/workspace/houdini",
     "/workspace/.juicefs",
+    "/workspace/tasks",
 )
 
 _CACHE_USED_PREFIX = "rp:cache:used:"
@@ -32,6 +33,15 @@ _CACHE_USED_PREFIX = "rp:cache:used:"
 # ---------------------------------------------------------------------------
 # Redis-backed usage tracking
 # ---------------------------------------------------------------------------
+
+def mark_cache_used(sha256: str, redis_client: redis.Redis) -> None:
+    """Mark a SHA-256 cache entry as recently used."""
+    key = f"{_CACHE_USED_PREFIX}{sha256}"
+    try:
+        redis_client.set(key, str(time.time()))
+    except redis.RedisError as exc:
+        logger.debug("Failed to mark cache entry used: %s", exc)
+
 
 def mark_group_used(
     project_dir: str,
@@ -183,7 +193,9 @@ def ensure_free_space(
     redis_client: redis.Redis,
     task_id: str = "",
 ) -> None:
-    """Ensure at least *needed_bytes* of free space on the Network Volume.
+    """DEPRECATED: use ensure_free_space_cache instead.
+
+    Ensure at least *needed_bytes* of free space on the Network Volume.
 
     If the NV disk usage exceeds ``config.nv_cache_max_pct`` after accounting
     for the requested space, cold asset groups are evicted oldest-first until
@@ -234,6 +246,123 @@ def ensure_free_space(
                 pass
 
         # Re-check disk usage
+        current_usage = shutil.disk_usage("/workspace")
+        current_free = current_usage.total - current_usage.used
+        if current_free > needed_bytes:
+            break
+
+    if freed > 0:
+        logger.info("Cache eviction freed %d MB total", freed // (1024 * 1024))
+
+
+# ---------------------------------------------------------------------------
+# SHA-256 cache eviction
+# ---------------------------------------------------------------------------
+
+def _enumerate_cache_entries(cache_dir: str = "/workspace/cache") -> list[str]:
+    """List SHA-256 cache entries under *cache_dir*.
+
+    Layout: /workspace/cache/ab/abc123.../filename
+    Returns SHA-256 directory names (e.g. "ab/abc123...").
+    """
+    entries: list[str] = []
+    if not os.path.isdir(cache_dir):
+        return entries
+
+    for prefix_entry in os.scandir(cache_dir):
+        if not prefix_entry.is_dir() or len(prefix_entry.name) != 2:
+            continue
+        try:
+            for sha_entry in os.scandir(prefix_entry.path):
+                if sha_entry.is_dir():
+                    entries.append(f"{prefix_entry.name}/{sha_entry.name}")
+        except OSError:
+            pass
+
+    return entries
+
+
+def _get_cache_last_used(sha256: str, redis_client: redis.Redis) -> float:
+    """Return last-used timestamp for a SHA-256 cache entry, or 0.0 if unknown."""
+    key = f"{_CACHE_USED_PREFIX}{sha256}"
+    try:
+        val = redis_client.get(key)
+        if val:
+            return float(val)
+    except (redis.RedisError, ValueError):
+        pass
+    return 0.0
+
+
+def ensure_free_space_cache(
+    needed_bytes: int,
+    config: WorkerConfig,
+    redis_client: redis.Redis,
+    task_id: str = "",
+) -> None:
+    """Ensure at least *needed_bytes* of free space by evicting cold cache entries.
+
+    Scans /workspace/cache/ for SHA-256 prefixed directories and evicts
+    oldest-used entries until enough space is available.
+    Protected paths (/workspace/houdini, /workspace/tasks) are never touched.
+    """
+    cache_dir = "/workspace/cache"
+    usage = shutil.disk_usage("/workspace")
+    free = usage.total - usage.used
+    threshold_bytes = int(usage.total * config.nv_cache_max_pct / 100.0)
+    used_after = usage.used + needed_bytes
+
+    if used_after < threshold_bytes and free > needed_bytes:
+        return
+
+    logger.info(
+        "Cache space: %.1f%% used, need %d MB, threshold %d%%",
+        (usage.used / usage.total) * 100,
+        needed_bytes // (1024 * 1024),
+        config.nv_cache_max_pct,
+    )
+
+    entries = _enumerate_cache_entries(cache_dir)
+    scored: list[tuple[float, str]] = []
+    for entry in entries:
+        # Use the sha256 hash (second component) for Redis lookup
+        sha256 = entry.split("/", 1)[1] if "/" in entry else entry
+        last_used = _get_cache_last_used(sha256, redis_client)
+        scored.append((last_used, entry))
+
+    scored.sort(key=lambda x: x[0])  # oldest first
+
+    freed = 0
+    for last_used, entry_path in scored:
+        age_days = (time.time() - last_used) / 86400 if last_used > 0 else float("inf")
+        if age_days < config.nv_cache_cold_days:
+            logger.debug("Skipping hot cache entry %s (%.1f days old)", entry_path, age_days)
+            continue
+
+        full = os.path.join(cache_dir, entry_path)
+        if _is_protected(full):
+            continue
+
+        size = _dir_size_bytes(full)
+        try:
+            shutil.rmtree(full)
+            sha256 = entry_path.split("/", 1)[1] if "/" in entry_path else entry_path
+            try:
+                redis_client.delete(f"{_CACHE_USED_PREFIX}{sha256}")
+            except redis.RedisError:
+                pass
+            freed += size
+            log_msg = f"[cache] Evicted {entry_path}, freed {freed // (1024 * 1024)} MB total"
+            logger.info(log_msg)
+            if task_id:
+                try:
+                    redis_client.rpush(f"rp:logs:{task_id}", log_msg)
+                except redis.RedisError:
+                    pass
+        except OSError as exc:
+            logger.error("Failed to evict %s: %s", full, exc)
+            continue
+
         current_usage = shutil.disk_usage("/workspace")
         current_free = current_usage.total - current_usage.used
         if current_free > needed_bytes:

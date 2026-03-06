@@ -232,10 +232,32 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
                     "name": "submitjobfile",
                     "type": "Integer"
                 },
-                # -- Warmup --
+                # -- B2 Storage --
                 {
-                    "name": "rpfarm_warmuppaths",
+                    "name": "rpfarm_b2_enabled",
+                    "type": "Integer"
+                },
+                {
+                    "name": "rpfarm_b2_key_id",
+                    "type": "String",
+                    "tag": ["pdg::scheduler"]
+                },
+                {
+                    "name": "rpfarm_b2_app_key",
+                    "type": "String",
+                    "tag": ["pdg::scheduler"]
+                },
+                {
+                    "name": "rpfarm_b2_bucket",
                     "type": "String"
+                },
+                {
+                    "name": "rpfarm_compression_enabled",
+                    "type": "Integer"
+                },
+                {
+                    "name": "rpfarm_compression_level",
+                    "type": "Integer"
                 }
             ]
         })
@@ -483,10 +505,6 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         project_id = self["rpfarm_projectid"].evaluateString()
         user_id = self["rpfarm_userid"].evaluateString()
 
-        # JuiceFS meta URL for sync agent
-        juicefs_meta_url = self["rpfarm_juicefs_meta_url"].evaluateString()
-        nv_cache_max_pct = self["rpfarm_nv_cache_max_pct"].evaluateInt()
-
         # Build the environment variables for the pod
         env_vars = {
             "REDIS_URL": redis_url,
@@ -494,9 +512,13 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
             "USER_ID": user_id,
         }
 
-        if juicefs_meta_url:
-            env_vars["JUICEFS_META_URL"] = juicefs_meta_url
-            env_vars["NV_CACHE_MAX_PCT"] = str(nv_cache_max_pct)
+        # B2 sync settings
+        if self["rpfarm_b2_enabled"].evaluateInt():
+            env_vars["B2_KEY_ID"] = self["rpfarm_b2_key_id"].evaluateString()
+            env_vars["B2_APP_KEY"] = self["rpfarm_b2_app_key"].evaluateString()
+            env_vars["B2_BUCKET"] = self["rpfarm_b2_bucket"].evaluateString()
+            env_vars["COMPRESSION_ENABLED"] = str(self["rpfarm_compression_enabled"].evaluateInt())
+            env_vars["COMPRESSION_LEVEL"] = str(self["rpfarm_compression_level"].evaluateInt())
 
         # Build environment as GraphQL-formatted list (unquoted keys)
         env_entries = ", ".join(
@@ -942,34 +964,57 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
 
     def _create_manifest(self, work_item):
         """
-        Build a file manifest for JuiceFS sync from the work item's
-        file dependencies.
-
-        Uses hou.fileReferences() to discover all referenced files,
-        resolves $HIP, $JOB, $F4 etc., and filters to project-local paths.
-
-        Returns:
-            A dict mapping relative paths to {size, type} dicts, or None
-            if JuiceFS sync is not configured.
+        Build a file manifest for B2 sync from the work item's file dependencies.
+        Includes SHA-256 checksums and compression strategy for each file.
         """
-        juicefs_meta_url = self["rpfarm_juicefs_meta_url"].evaluateString()
-        if not juicefs_meta_url:
+        b2_enabled = self["rpfarm_b2_enabled"].evaluateInt()
+        if not b2_enabled:
             return None
 
+        import hashlib
         import hou
+
+        # Compression strategy classification (inline — can't import worker modules)
+        _SKIP_EXTS = {".bgeo.sc", ".rat", ".tex"}
+        _ZSTD_EXTS = {".abc", ".usd", ".usdc", ".bgeo", ".geo",
+                       ".hip", ".hipnc", ".hda", ".py", ".json", ".txt"}
+        _TAR_ZSTD_EXTS = {".vdb"}
+
+        def _classify(path):
+            lower = path.lower()
+            for ext in _SKIP_EXTS:
+                if lower.endswith(ext):
+                    return "SKIP"
+            if lower.endswith(".exr"):
+                return "ZSTD"  # simplified — worker will re-check EXR header
+            for ext in _TAR_ZSTD_EXTS:
+                if lower.endswith(ext):
+                    return "TAR_ZSTD"
+            for ext in _ZSTD_EXTS:
+                if lower.endswith(ext):
+                    return "ZSTD"
+            return "PROBE"
+
+        def _sha256(filepath):
+            h = hashlib.sha256()
+            try:
+                with open(filepath, "rb") as f:
+                    for chunk in iter(lambda: f.read(1048576), b""):
+                        h.update(chunk)
+                return h.hexdigest()
+            except OSError:
+                return ""
 
         manifest = {}
         job_dir = os.environ.get("JOB", "")
         hip_dir = os.environ.get("HIP", os.path.dirname(hou.hipFile.path()))
 
-        # Gather file references from the scene
         try:
             refs = hou.fileReferences()
         except Exception:
             self._verboseLog("Warning: could not gather file references")
             return None
 
-        # Extension-based type classification
         tex_exts = {".exr", ".rat", ".tex", ".png", ".jpg", ".jpeg", ".tif",
                     ".tiff", ".hdr", ".tga", ".bmp"}
         geo_exts = {".bgeo", ".bgeo.sc", ".abc", ".obj", ".fbx", ".usd",
@@ -981,27 +1026,22 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
             if not file_path:
                 continue
 
-            # Resolve variables
             resolved = file_path
             resolved = resolved.replace("$HIP", hip_dir)
             resolved = resolved.replace("$JOB", job_dir)
             resolved = resolved.replace("${HIP}", hip_dir)
             resolved = resolved.replace("${JOB}", job_dir)
 
-            # Skip frame tokens — they'll be resolved at render time
             if "$F" in resolved or "%(UDIM)" in resolved:
-                # Replace frame/UDIM tokens with wildcards for directory-level sync
                 import re
                 resolved = re.sub(r'\$F\d*', '*', resolved)
                 resolved = re.sub(r'%\(UDIM\)d', '*', resolved)
-                # Use the directory instead
                 resolved = os.path.dirname(resolved)
                 if not resolved:
                     continue
 
             resolved = os.path.normpath(resolved)
 
-            # Filter: only include project-local paths
             if job_dir and resolved.startswith(job_dir):
                 rel_path = os.path.relpath(resolved, job_dir)
             elif hip_dir and resolved.startswith(hip_dir):
@@ -1009,14 +1049,11 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
             else:
                 continue
 
-            # Skip paths that escape the project
             if rel_path.startswith(".."):
                 continue
 
-            # Normalize separators
             rel_path = rel_path.replace("\\", "/")
 
-            # Determine file type
             lower = rel_path.lower()
             if any(lower.endswith(ext) for ext in tex_exts):
                 file_type = "texture"
@@ -1029,14 +1066,21 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
             else:
                 file_type = "other"
 
-            # Get file size if the file exists locally
             full_path = os.path.join(job_dir or hip_dir, rel_path)
             try:
                 size = os.path.getsize(full_path) if os.path.isfile(full_path) else 0
             except OSError:
                 size = 0
 
-            manifest[rel_path] = {"size": size, "type": file_type}
+            sha256 = _sha256(full_path) if os.path.isfile(full_path) else ""
+            strategy = _classify(rel_path)
+
+            manifest[rel_path] = {
+                "size": size,
+                "type": file_type,
+                "sha256": sha256,
+                "strategy": strategy,
+            }
 
         self._verboseLog(
             f"Manifest created: {len(manifest)} files "
@@ -1046,6 +1090,147 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         )
 
         return manifest if manifest else None
+
+    def _upload_project_to_b2(self):
+        """Upload project files to B2 via rclone with compression."""
+        if not self["rpfarm_b2_enabled"].evaluateInt():
+            return
+
+        import hou
+        b2_key_id = self["rpfarm_b2_key_id"].evaluateString()
+        b2_app_key = self["rpfarm_b2_app_key"].evaluateString()
+        b2_bucket = self["rpfarm_b2_bucket"].evaluateString()
+        project_id = self["rpfarm_projectid"].evaluateString()
+        compression = self["rpfarm_compression_enabled"].evaluateInt()
+        comp_level = self["rpfarm_compression_level"].evaluateInt()
+
+        job_dir = os.environ.get("JOB", os.path.dirname(hou.hipFile.path()))
+
+        # Write rclone config
+        rclone_conf = os.path.join(job_dir, ".rclone_rpfarm.conf")
+        with open(rclone_conf, "w") as f:
+            f.write(f"[b2]\ntype = b2\naccount = {b2_key_id}\nkey = {b2_app_key}\n")
+
+        # Build and save manifest
+        manifest = {}
+        # Use the scene manifest we already built
+        if hasattr(self, '_current_manifest') and self._current_manifest:
+            manifest = self._current_manifest
+
+        if not manifest:
+            self._verboseLog("No manifest to upload")
+            return
+
+        # Upload files to B2
+        remote = f"b2:{b2_bucket}/projects/{project_id}/"
+        local = job_dir + "/"
+
+        start = time.time()
+        try:
+            cmd = [
+                "rclone", "copy", local, remote,
+                "--config", rclone_conf,
+                "--checksum",
+                "--transfers", "8",
+                "--checkers", "16",
+                "--stats-one-line", "-q",
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+            elapsed = time.time() - start
+
+            if result.returncode == 0:
+                self._verboseLog(f"Project uploaded to B2 in {elapsed:.1f}s")
+            else:
+                self._verboseLog(f"B2 upload warning (rc={result.returncode}): {result.stderr[:200]}")
+        except Exception as e:
+            self._verboseLog(f"B2 upload failed: {e}")
+
+        # Upload manifest
+        import json as _json
+        manifest_path = os.path.join(job_dir, ".manifest.json")
+        with open(manifest_path, "w") as f:
+            _json.dump(manifest, f, indent=2)
+
+        try:
+            manifest_remote = f"b2:{b2_bucket}/projects/{project_id}/.manifest.json"
+            subprocess.run(
+                ["rclone", "copyto", manifest_path, manifest_remote,
+                 "--config", rclone_conf, "-q"],
+                capture_output=True, text=True, timeout=60,
+            )
+        except Exception as e:
+            self._verboseLog(f"Manifest upload failed: {e}")
+
+        # Also publish manifest to Redis
+        try:
+            user_id = self["rpfarm_userid"].evaluateString()
+            key = f"rp:manifest:{project_id}:{user_id}"
+            self._redis_client.set(key, _json.dumps(manifest), ex=86400)
+        except Exception as e:
+            self._verboseLog(f"Redis manifest publish failed: {e}")
+
+    def _download_results_from_b2(self, task_id, result_data):
+        """Download render results from B2 to local workstation."""
+        if not self["rpfarm_b2_enabled"].evaluateInt():
+            return
+
+        import hou
+        b2_key_id = self["rpfarm_b2_key_id"].evaluateString()
+        b2_app_key = self["rpfarm_b2_app_key"].evaluateString()
+        b2_bucket = self["rpfarm_b2_bucket"].evaluateString()
+        project_id = self["rpfarm_projectid"].evaluateString()
+
+        job_dir = os.environ.get("JOB", os.path.dirname(hou.hipFile.path()))
+
+        rclone_conf = os.path.join(job_dir, ".rclone_rpfarm.conf")
+        if not os.path.exists(rclone_conf):
+            with open(rclone_conf, "w") as f:
+                f.write(f"[b2]\ntype = b2\naccount = {b2_key_id}\nkey = {b2_app_key}\n")
+
+        remote = f"b2:{b2_bucket}/projects/{project_id}/results/"
+        local = os.path.join(job_dir, "results") + "/"
+        os.makedirs(local, exist_ok=True)
+
+        start = time.time()
+        try:
+            cmd = [
+                "rclone", "copy", remote, local,
+                "--config", rclone_conf,
+                "--checksum",
+                "--transfers", "8",
+                "--stats-one-line", "-q",
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+            elapsed = time.time() - start
+
+            if result.returncode == 0:
+                self._verboseLog(f"Results downloaded from B2 in {elapsed:.1f}s")
+                self._update_transfer_metrics({"download_time": elapsed})
+            else:
+                self._verboseLog(f"B2 download error: {result.stderr[:200]}")
+        except Exception as e:
+            self._verboseLog(f"B2 download failed: {e}")
+
+    def _update_transfer_metrics(self, metrics):
+        """Update transfer metrics UI parameters."""
+        try:
+            node = self.node()
+            if not node:
+                return
+            if "upload_size" in metrics:
+                node.parm("rpfarm_metrics_upload_size").set(
+                    metrics["upload_size"] / (1024 * 1024))
+            if "upload_compressed" in metrics:
+                node.parm("rpfarm_metrics_upload_compressed").set(
+                    metrics["upload_compressed"] / (1024 * 1024))
+            if "upload_ratio" in metrics:
+                node.parm("rpfarm_metrics_upload_ratio").set(metrics["upload_ratio"])
+            if "upload_time" in metrics:
+                node.parm("rpfarm_metrics_upload_time").set(metrics["upload_time"])
+            if "download_time" in metrics:
+                node.parm("rpfarm_metrics_download_time").set(metrics["download_time"])
+        except Exception:
+            pass
 
     # -------------------------------------------------------------------------
     # PDG Scheduler Interface
@@ -1095,6 +1280,17 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
                 "parameter before starting a cook."
             )
 
+        # 1.5 Validate B2 settings if enabled
+        b2_enabled = self["rpfarm_b2_enabled"].evaluateInt()
+        if b2_enabled:
+            b2_key = self["rpfarm_b2_key_id"].evaluateString()
+            b2_secret = self["rpfarm_b2_app_key"].evaluateString()
+            if not b2_key or not b2_secret:
+                raise CookError(
+                    "B2 sync is enabled but credentials are missing. "
+                    "Set rpfarm_b2_key_id and rpfarm_b2_app_key."
+                )
+
         # 2. Set up RunPod API headers
         self._runpod_headers = {
             "Content-Type": "application/json",
@@ -1122,6 +1318,12 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         self.pod_infos = []
         self.task_map = {}
         self._render_times = []
+
+        # 6. Build and upload project manifest to B2
+        self._current_manifest = None
+        if self["rpfarm_b2_enabled"].evaluateInt():
+            self._current_manifest = self._create_manifest(None)
+            self._upload_project_to_b2()
 
         self._verboseLog(
             f"RunPodFarm Scheduler started. Max cost: "
@@ -1270,9 +1472,8 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
 
         # 5. Create task dict
         task_id = str(uuid.uuid4())
-        warmup_paths = self["rpfarm_warmuppaths"].evaluateString()
 
-        # Build asset manifest for JuiceFS sync
+        # Build asset manifest for B2 sync
         manifest = self._create_manifest(work_item)
 
         task_data = {
@@ -1281,12 +1482,30 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
             "work_item_name": work_item.name,
             "command": full_command,
             "env": task_env,
-            "warmup_paths": warmup_paths.split() if warmup_paths else [],
             "created_at": datetime.datetime.now().isoformat(),
         }
 
         if manifest:
             task_data["manifest"] = manifest
+
+        # Determine output type for sync agent
+        # intermediate: if work item has downstream dependencies
+        # final: if work item is a leaf (no downstream)
+        try:
+            has_downstream = len(work_item.dependents) > 0
+        except Exception:
+            has_downstream = False
+        task_data["output_type"] = "intermediate" if has_downstream else "final"
+
+        # Include B2 config in task data
+        if self["rpfarm_b2_enabled"].evaluateInt():
+            task_data["b2_config"] = {
+                "key_id": self["rpfarm_b2_key_id"].evaluateString(),
+                "app_key": self["rpfarm_b2_app_key"].evaluateString(),
+                "bucket": self["rpfarm_b2_bucket"].evaluateString(),
+                "compression_enabled": bool(self["rpfarm_compression_enabled"].evaluateInt()),
+                "compression_level": self["rpfarm_compression_level"].evaluateInt(),
+            }
 
         # 6. Push to Redis queue
         self._push_task(task_data)
@@ -1347,6 +1566,23 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
                     f"duration={total_render_time}s)"
                 )
                 self.workItemSucceeded(work_item.id, -1, total_render_time)
+
+                # Download results from B2 if sync is enabled
+                output_type = result_data.get("output_type", "final")
+                if output_type == "final":
+                    self._download_results_from_b2(task_id, result_data)
+                elif output_type == "intermediate":
+                    # Update manifest for downstream tasks
+                    try:
+                        intermediate_manifest = result_data.get("intermediate_manifest")
+                        if intermediate_manifest:
+                            import json as _json
+                            project_id = self["rpfarm_projectid"].evaluateString()
+                            key = f"rp:manifest:intermediate:{task_id}"
+                            self._redis_client.set(key, _json.dumps(intermediate_manifest), ex=86400)
+                    except Exception:
+                        pass
+
                 self._render_times.append(total_render_time)
                 # Keep only the last N render times
                 if len(self._render_times) > _AUTOSCALE_HISTORY_SIZE:

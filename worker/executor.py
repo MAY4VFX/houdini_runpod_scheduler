@@ -163,20 +163,22 @@ def execute_task(
     if warmup_paths:
         _verify_paths(warmup_paths, redis_client, task_id)
 
-    # ---- Pre-task JuiceFS sync ----------------------------------------
-    if config.juicefs_meta_url:
+    # ---- Pre-task B2 sync ---------------------------------------------
+    if config.b2_key_id:
         _push_log(redis_client, task_id, "[worker] Starting pre-task sync...")
+        sync_start = time.monotonic()
         sync_ok = sync_agent.pre_task_sync(task, config, redis_client)
+        sync_download_ms = int((time.monotonic() - sync_start) * 1000)
         if not sync_ok:
-            duration = time.monotonic() - time.monotonic()
             _push_log(redis_client, task_id, "[worker] Pre-task sync failed")
             return TaskResult(
                 task_id=task_id,
                 status="failed",
                 exit_code=-2,
                 duration_seconds=0.0,
-                error="Pre-task JuiceFS sync failed",
+                error="Pre-task B2 sync failed",
             )
+        _push_log(redis_client, task_id, f"[worker] Pre-task sync completed in {sync_download_ms}ms")
 
     # ---- Prepare environment -------------------------------------------
     env = _build_env(config, task_env)
@@ -214,10 +216,13 @@ def execute_task(
                 f"[worker] Task succeeded in {duration:.1f}s",
             )
 
-            # ---- Post-task JuiceFS sync ----------------------------
-            if config.juicefs_meta_url:
+            # ---- Post-task B2 sync ---------------------------------
+            if config.b2_key_id:
                 _push_log(redis_client, task_id, "[worker] Starting post-task sync...")
+                sync_upload_start = time.monotonic()
                 sync_agent.post_task_sync(task, config, redis_client)
+                sync_upload_ms = int((time.monotonic() - sync_upload_start) * 1000)
+                _push_log(redis_client, task_id, f"[worker] Post-task sync completed in {sync_upload_ms}ms")
 
             return TaskResult(
                 task_id=task_id,
