@@ -582,45 +582,98 @@
         }
 
         groupsimple {
-            name    "folder7_warmup"
-            label   "JuiceFS Warmup"
+            name    "folder7_b2"
+            label   "B2 Storage & Compression"
 
             parm {
-                name    "rpfarm_enablewarmup"
-                label   "Enable Warmup"
+                name    "rpfarm_b2_enabled"
+                label   "Enable B2 Sync"
                 type    toggle
                 default { "1" }
-                help    "Pre-cache files on pods before rendering"
+                help    "Enable file sync via Backblaze B2 + rclone"
             }
             parm {
-                name    "rpfarm_warmuppaths"
-                label   "Warmup Paths"
+                name    "rpfarm_b2_key_id"
+                label   "B2 Key ID"
                 type    string
-                default { "/project/textures/ /project/hdri/" }
-                disablewhen "{ rpfarm_enablewarmup == 0 }"
-                help    "Space-separated paths to pre-cache on pods"
+                default { "" }
+                disablewhen "{ rpfarm_b2_enabled == 0 }"
+                help    "Backblaze B2 application key ID"
+            }
+            parm {
+                name    "rpfarm_b2_app_key"
+                label   "B2 App Key"
+                type    string
+                default { "" }
+                disablewhen "{ rpfarm_b2_enabled == 0 }"
+                help    "Backblaze B2 application key"
+            }
+            parm {
+                name    "rpfarm_b2_bucket"
+                label   "B2 Bucket"
+                type    string
+                default { "runpodfarm-juicefs" }
+                disablewhen "{ rpfarm_b2_enabled == 0 }"
+                help    "B2 bucket name for project storage"
+            }
+            parm {
+                name    "rpfarm_compression_enabled"
+                label   "Enable Compression"
+                type    toggle
+                default { "1" }
+                disablewhen "{ rpfarm_b2_enabled == 0 }"
+                help    "Enable smart compression by file type. Disable for benchmarking"
+            }
+            parm {
+                name    "rpfarm_compression_level"
+                label   "Compression Level"
+                type    integer
+                default { "3" }
+                range   { 1 19 }
+                disablewhen "{ rpfarm_b2_enabled == 0 }"
+                disablewhen "{ rpfarm_compression_enabled == 0 }"
+                help    "Zstd compression level (1=fastest, 19=best ratio, 3=default)"
             }
         }
 
         groupsimple {
-            name    "folder7_sync"
-            label   "JuiceFS Sync"
+            name    "folder7_metrics"
+            label   "Transfer Metrics"
 
             parm {
-                name    "rpfarm_juicefs_meta_url"
-                label   "JuiceFS Meta URL"
-                type    string
-                default { "" }
-                help    "Redis URL for JuiceFS metadata (e.g. redis://:pass@host:6381/1). When set, enables automatic B2-to-NV sync via juicefs sync before each task."
+                name    "rpfarm_metrics_upload_size"
+                label   "Upload Size (MB)"
+                type    float
+                default { "0.0" }
+                help    "Total original upload size (read-only)"
             }
             parm {
-                name    "rpfarm_nv_cache_max_pct"
-                label   "NV Cache Max %"
-                type    integer
-                default { "80" }
-                range   { 50 95 }
-                disablewhen "{ rpfarm_juicefs_meta_url == \"\" }"
-                help    "Maximum NV disk usage percentage. Cold asset groups are evicted when exceeded."
+                name    "rpfarm_metrics_upload_compressed"
+                label   "Compressed Size (MB)"
+                type    float
+                default { "0.0" }
+                help    "Total compressed upload size (read-only)"
+            }
+            parm {
+                name    "rpfarm_metrics_upload_ratio"
+                label   "Compression Ratio"
+                type    float
+                default { "0.0" }
+                help    "Average compression ratio (read-only)"
+            }
+            parm {
+                name    "rpfarm_metrics_upload_time"
+                label   "Upload Time (s)"
+                type    float
+                default { "0.0" }
+                help    "Total upload time in seconds (read-only)"
+            }
+            parm {
+                name    "rpfarm_metrics_download_time"
+                label   "Download Time (s)"
+                type    float
+                default { "0.0" }
+                help    "Total download time in seconds (read-only)"
             }
         }
     }

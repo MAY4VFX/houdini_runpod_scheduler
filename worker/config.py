@@ -36,11 +36,20 @@ class WorkerConfig:
     log_level: str = "INFO"
     max_retries: int = 3
     task_timeout: int = 3600
-    # JuiceFS sync settings
+    # DEPRECATED: use B2 settings instead
     juicefs_meta_url: str = ""
     juicefs_bin: str = "/usr/local/bin/juicefs"
     nv_cache_max_pct: int = 80
     nv_cache_cold_days: int = 7
+    # B2 + rclone sync settings
+    b2_key_id: str = ""
+    b2_app_key: str = ""
+    b2_bucket: str = "runpodfarm-juicefs"
+    b2_endpoint: str = ""
+    rclone_bin: str = "/usr/local/bin/rclone"
+    compression_enabled: bool = True
+    compression_level: int = 3
+    staging_dir: str = "/tmp/rpfarm_staging"
 
     @classmethod
     def from_env(cls) -> WorkerConfig:
@@ -90,6 +99,14 @@ class WorkerConfig:
             nv_cache_cold_days=int(
                 os.environ.get("NV_CACHE_COLD_DAYS", "7")
             ),
+            b2_key_id=os.environ.get("B2_KEY_ID", ""),
+            b2_app_key=os.environ.get("B2_APP_KEY", ""),
+            b2_bucket=os.environ.get("B2_BUCKET", "runpodfarm-juicefs"),
+            b2_endpoint=os.environ.get("B2_ENDPOINT", ""),
+            rclone_bin=os.environ.get("RCLONE_BIN", "/usr/local/bin/rclone"),
+            compression_enabled=os.environ.get("COMPRESSION_ENABLED", "true").lower() in ("true", "1", "yes"),
+            compression_level=int(os.environ.get("COMPRESSION_LEVEL", "3")),
+            staging_dir=os.environ.get("STAGING_DIR", "/tmp/rpfarm_staging"),
         )
 
         logger.info("Worker configuration loaded:")
@@ -107,5 +124,9 @@ class WorkerConfig:
             logger.info("  juicefs_bin    = %s", config.juicefs_bin)
             logger.info("  nv_cache_max_pct = %d%%", config.nv_cache_max_pct)
             logger.info("  nv_cache_cold_days = %dd", config.nv_cache_cold_days)
+        if config.b2_key_id:
+            logger.info("  b2_bucket      = %s", config.b2_bucket)
+            logger.info("  compression    = %s (level %d)", config.compression_enabled, config.compression_level)
+            logger.info("  rclone_bin     = %s", config.rclone_bin)
 
         return config
