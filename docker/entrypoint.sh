@@ -47,6 +47,21 @@ else
     echo "  Install Houdini to the Network Volume first."
 fi
 
+# --- Step 2.5: Setup rclone for B2 ---
+if [ -n "${B2_KEY_ID:-}" ]; then
+    mkdir -p /root/.config/rclone
+    cat > /root/.config/rclone/rclone.conf << EOF
+[b2]
+type = b2
+account = ${B2_KEY_ID}
+key = ${B2_APP_KEY}
+EOF
+    echo "rclone configured for B2 bucket: ${B2_BUCKET:-runpodfarm-juicefs}"
+fi
+
+# Setup shared cache and task directories
+mkdir -p /workspace/cache /workspace/tasks
+
 # --- Step 3: Start worker daemon ---
 echo "Starting RunPodFarm Worker daemon..."
 exec python3 -m worker.daemon

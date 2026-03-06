@@ -20,12 +20,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxcursor1 libxinerama1 libxss1 libasound2 \
     xvfb \
     ca-certificates \
+    zstd \
     && rm -rf /var/lib/apt/lists/*
 
-# Install JuiceFS binary (used for B2<->NV sync without FUSE)
-RUN curl -sSL https://github.com/juicedata/juicefs/releases/download/v1.2.1/juicefs-1.2.1-linux-amd64.tar.gz \
-    | tar -xz -C /usr/local/bin juicefs \
-    && chmod +x /usr/local/bin/juicefs
+# Install rclone for B2 sync
+RUN curl -sSL https://rclone.org/install.sh | bash
 
 # Create worker directory
 WORKDIR /opt/runpodfarm
