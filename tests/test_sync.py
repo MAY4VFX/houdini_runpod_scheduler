@@ -180,38 +180,63 @@ def test_compress_stage_compresses_compressible_and_skips_bgeo_sc(tmp_path):
     bgeo = job / "cache.bgeo.sc"
     bgeo.write_bytes(b"\x00\x01" * 64)
 
+    # Ruling R10: FileEntry.remote is always a full remote-side path (never
+    # bare-relative — see the module docstring / R8), so compress_stage takes
+    # remote_root explicitly and returns (raw_package, staged_package, post_command).
+    remote_root = "/workspace/projects/may/shot"
     package = [
-        FileEntry(local=str(txt), remote="projects/may/shot/notes.txt", size=txt.stat().st_size),
-        FileEntry(local=str(bgeo), remote="projects/may/shot/cache.bgeo.sc", size=bgeo.stat().st_size),
+        FileEntry(local=str(txt), remote=f"{remote_root}/notes.txt", size=txt.stat().st_size),
+        FileEntry(local=str(bgeo), remote=f"{remote_root}/cache.bgeo.sc", size=bgeo.stat().st_size),
     ]
     staging = tmp_path / "staging"
-    upload, post_command = compress_stage(package, staging, level=3)
-    by_remote = {e.remote: e for e in upload}
+    raw, staged, post_command = compress_stage(package, staging, remote_root, level=3)
+    raw_by_remote = {e.remote: e for e in raw}
+    staged_by_remote = {e.remote: e for e in staged}
 
-    # cache.bgeo.sc is SKIP-classified: always left untouched.
-    assert "projects/may/shot/cache.bgeo.sc" in by_remote
-    assert by_remote["projects/may/shot/cache.bgeo.sc"].local == str(bgeo)
-    assert "projects/may/shot/cache.bgeo.sc.zst" not in by_remote
-    assert "zstd -d --rm projects/may/shot/cache.bgeo.sc.zst" not in post_command
+    # cache.bgeo.sc is SKIP-classified: always left untouched, in raw_package.
+    assert f"{remote_root}/cache.bgeo.sc" in raw_by_remote
+    assert raw_by_remote[f"{remote_root}/cache.bgeo.sc"].local == str(bgeo)
+    assert f"{remote_root}/cache.bgeo.sc.zst" not in staged_by_remote
+    assert "cache.bgeo.sc" not in post_command
 
     # notes.txt is classified ZSTD (compressible text). Whether it actually
     # ends up compressed depends on compress_file succeeding, which in turn
     # depends on a working `zstd` binary being reachable (compress_file
     # itself always shells out to the `zstd` CLI, never the optional
     # `zstandard` python package) — some minimal/CLI-restricted zstd builds
-    # reject flags like `--level=3` and compress_file returns False in that
+    # reject certain level flags and compress_file returns False in that
     # case. Either outcome is correct; assert whichever one happened is
     # internally consistent.
-    if "projects/may/shot/notes.txt.zst" in by_remote:
-        staged = by_remote["projects/may/shot/notes.txt.zst"]
-        assert os.path.exists(staged.local)
-        assert staged.local != str(txt)
-        assert "zstd -d --rm projects/may/shot/notes.txt.zst" in post_command
+    notes_remote = f"{remote_root}/notes.txt"
+    if f"{notes_remote}.zst" in staged_by_remote:
+        staged_entry = staged_by_remote[f"{notes_remote}.zst"]
+        assert os.path.exists(staged_entry.local)
+        # CRITICAL fix this replaces: the staged file must actually live
+        # under staging_dir (previously os.path.join silently discarded
+        # staging_dir whenever e.remote was absolute, per R8's convention).
+        assert staged_entry.local.startswith(str(staging) + os.sep)
+        assert staged_entry.local != str(txt)
+        assert "zstd -d --rm notes.txt.zst" in post_command
+        assert f"cd {remote_root}" in post_command
+
+        # R8 invariant must hold for staged_package too: uploading it with
+        # local_root=staging_dir, remote_root=remote_root must not raise.
+        args, files_from = build_rclone_args(
+            staged, SftpTarget(host="h", port=22, key_path="/k"), "up", str(staging), remote_root, tmp_path
+        )
+        assert open(files_from).read().strip() == "notes.txt.zst"
     else:
-        # compress_file failed (no zstd, or a restricted build): leave uncompressed.
-        assert "projects/may/shot/notes.txt" in by_remote
-        assert by_remote["projects/may/shot/notes.txt"].local == str(txt)
-        assert "notes.txt" not in post_command
+        # compress_file failed (no zstd, or a restricted build): stays in raw_package, uncompressed.
+        assert notes_remote in raw_by_remote
+        assert raw_by_remote[notes_remote].local == str(txt)
+        assert staged == []
+        assert post_command == ""
+
+
+def test_compress_stage_raises_for_entry_outside_remote_root(tmp_path):
+    package = [FileEntry(local="/job/x", remote="/workspace/other/x", size=1)]
+    with pytest.raises(SyncError):
+        compress_stage(package, tmp_path / "staging", "/workspace/projects/may/shot", level=3)
 
 
 def test_compress_stage_empty_post_command_when_nothing_compressed(tmp_path):
@@ -219,8 +244,10 @@ def test_compress_stage_empty_post_command_when_nothing_compressed(tmp_path):
     job.mkdir()
     bgeo = job / "cache.bgeo.sc"
     bgeo.write_bytes(b"\x00")
-    package = [FileEntry(local=str(bgeo), remote="projects/may/shot/cache.bgeo.sc", size=1)]
+    remote_root = "/workspace/projects/may/shot"
+    package = [FileEntry(local=str(bgeo), remote=f"{remote_root}/cache.bgeo.sc", size=1)]
     staging = tmp_path / "staging"
-    upload, post_command = compress_stage(package, staging, level=3)
+    raw, staged, post_command = compress_stage(package, staging, remote_root, level=3)
     assert post_command == ""
-    assert upload[0].local == str(bgeo)
+    assert staged == []
+    assert raw[0].local == str(bgeo)

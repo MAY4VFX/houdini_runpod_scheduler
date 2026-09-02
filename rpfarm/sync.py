@@ -16,6 +16,19 @@ Two ways to move files:
 Both share one private subprocess runner (``_run_rclone``) that parses
 rclone's ``--use-json-log`` stderr stream for progress and raises
 :class:`SyncError` on a non-zero exit.
+
+``FileEntry.remote`` is always a full path on the remote side (e.g.
+``/workspace/projects/<user>/<project>/...``), never a bare relative path.
+``build_rclone_args`` (ruling R8) and ``compress_stage`` (ruling R10) both
+enforce that every entry's ``remote`` actually lands under the
+``remote_root`` a caller passes in, raising :class:`SyncError` otherwise —
+callers are responsible for grouping entries by a consistent
+``(local_root, remote_root)`` pair before calling either.
+
+``compress_stage`` splits one package into two (``raw_package`` /
+``staged_package``, see its docstring) rather than compressing in place,
+because a compressed file physically lives under ``staging_dir`` and so
+needs its own ``local_root`` for R8 to hold.
 """
 
 from __future__ import annotations
@@ -23,6 +36,7 @@ from __future__ import annotations
 import json
 import os
 import posixpath
+import shlex
 import subprocess
 import tempfile
 import time
@@ -219,50 +233,72 @@ def rclone_copy_dir(local_dir, target, direction, rclone_bin, remote_root, progr
 # -- compression staging -------------------------------------------------------
 
 
-def compress_stage(package, staging_dir, level=3):
+def compress_stage(package, staging_dir, remote_root, level=3):
     """Compress a package's compressible entries into ``staging_dir``.
 
-    For each entry, classify it (``compression.classify_file``); entries
-    classified SKIP are left as-is. Entries classified ZSTD are compressed
-    into ``staging_dir`` at ``<remote>.zst`` (preserving the remote-relative
-    path) and the returned entry points at the staged file with ``.zst``
-    appended to ``remote``. TAR_ZSTD-classified entries (currently only
-    ``.vdb``) are left uncompressed here: batching them into a single tar
-    archive is a directory-level operation this per-package helper doesn't
-    do, so they upload uncompressed (worker/compression.py's
-    ``compress_directory`` handles VDB batching for the older bulk-sync
-    path). If ``zstd`` isn't available on this machine, ``compress_file``
-    returns False and the entry is likewise left uncompressed.
+    Ruling R10: staged files must actually live under ``staging_dir`` (not
+    wherever ``os.path.join`` happens to land when ``e.remote`` is an
+    absolute path — see the CRITICAL fix this replaces), and the result
+    must still satisfy R8's invariant for both halves of the package. So
+    this returns *two* packages instead of one:
 
-    Returns ``(package_for_upload, post_command)`` where ``post_command`` is
-    a single shell command that decompresses every staged ``.zst`` file on
-    the sync pod (each with ``zstd -d --rm``), or ``""`` if nothing was
-    compressed.
+    - ``raw_package``: entries left untouched (SKIP-classified,
+      TAR_ZSTD-classified, or compression failed) — upload these with the
+      original ``(local_root, remote_root)``.
+    - ``staged_package``: successfully compressed entries, staged at
+      ``staging_dir/<rel>.zst`` where ``rel = posixpath.relpath(e.remote,
+      remote_root)`` — upload these with ``local_root=staging_dir,
+      remote_root=remote_root`` (R8 then holds: ``relpath(staged_local,
+      staging_dir) == relpath(e.remote + ".zst", remote_root)``).
+
+    Every entry's ``remote`` must be under ``remote_root``; a
+    :class:`SyncError` is raised otherwise (same contract as
+    :func:`build_rclone_args`).
+
+    TAR_ZSTD-classified entries (currently only ``.vdb``) are left
+    uncompressed here: batching them into a single tar archive is a
+    directory-level operation this per-package helper doesn't do — known
+    limitation, they always go into ``raw_package`` uncompressed
+    (``worker/compression.py``'s ``compress_directory`` handles VDB batching
+    for the older bulk-sync path). If ``zstd`` isn't available on this
+    machine (or compression otherwise fails), ``compress_file`` returns
+    False and the entry likewise goes into ``raw_package`` uncompressed.
+
+    Returns ``(raw_package, staged_package, post_command)`` where
+    ``post_command`` is a single shell command that ``cd``s to
+    ``remote_root`` and decompresses every staged ``.zst`` file there
+    (``zstd -d --rm``, paths shell-quoted), or ``""`` if ``staged_package``
+    is empty.
     """
     staging_dir = str(staging_dir)
-    upload_entries = []
-    zst_remotes = []
+    raw_package = []
+    staged_package = []
+    zst_rels = []
 
     for e in package:
+        rel = posixpath.relpath(e.remote, remote_root)
+        if rel == "." or rel.startswith(".."):
+            raise SyncError(f"entry {e.remote} is not under remote_root {remote_root}")
+
         strategy = classify_file(e.local)
         if strategy in (CompressionStrategy.SKIP, CompressionStrategy.TAR_ZSTD):
-            upload_entries.append(e)
+            raw_package.append(e)
             continue
 
-        staged_path = os.path.join(staging_dir, e.remote) + ".zst"
+        staged_path = os.path.join(staging_dir, rel + ".zst")
         os.makedirs(os.path.dirname(staged_path), exist_ok=True)
         if compress_file(e.local, staged_path, strategy, level=level):
-            staged_remote = e.remote + ".zst"
-            upload_entries.append(
-                FileEntry(local=staged_path, remote=staged_remote, size=os.path.getsize(staged_path))
+            staged_package.append(
+                FileEntry(local=staged_path, remote=e.remote + ".zst", size=os.path.getsize(staged_path))
             )
-            zst_remotes.append(staged_remote)
+            zst_rels.append(rel + ".zst")
         else:
             # No zstd available (or compression failed): leave uncompressed.
-            upload_entries.append(e)
+            raw_package.append(e)
 
-    if not zst_remotes:
-        return upload_entries, ""
+    if not zst_rels:
+        return raw_package, staged_package, ""
 
-    post_command = "; ".join(f"zstd -d --rm {r}" for r in zst_remotes)
-    return upload_entries, post_command
+    decompress = " && ".join(f"zstd -d --rm {shlex.quote(r)}" for r in zst_rels)
+    post_command = f"cd {shlex.quote(remote_root)} && {decompress}"
+    return raw_package, staged_package, post_command
