@@ -9,6 +9,14 @@ stdlib only -- this file is deployed as-is to Ubuntu 22.04 / python3.10 pods,
 so it must not depend on anything outside the standard library and must not
 use syntax newer than 3.10 (``str | None`` annotations are fine only because
 of the ``from __future__ import annotations`` import below).
+
+``task_id`` is a one-shot key: ``POST /tasks`` rejects (409) any ``task_id``
+already present in this pod's registry, whether that earlier task is still
+running or has already finished. Callers must mint a fresh ``task_id`` for
+every run (e.g. include a retry counter) -- this registry never reuses or
+overwrites an entry, so a resubmitted id can't orphan an in-flight process,
+corrupt its log file, or let ``busy`` undercount the true number of running
+tasks against ``RPFARM_SLOTS``.
 """
 
 from __future__ import annotations
@@ -103,6 +111,10 @@ def build_shell_command(command):
     )
 
 
+class DuplicateTaskError(Exception):
+    """Raised by Registry.submit when task_id is already present in the registry."""
+
+
 class Task:
     """State for one submitted task."""
 
@@ -136,9 +148,11 @@ class Registry:
 
     def submit(self, body):
         with self.lock:
+            task_id = body["task_id"]
+            if task_id in self.tasks:
+                raise DuplicateTaskError(task_id)
             if self.busy() >= self.slots:
                 return None
-            task_id = body["task_id"]
             log_path = body.get("log_path") or os.path.join(self.log_dir, f"{task_id}.log")
             os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
             task = Task(task_id, body["command"], body.get("env") or {}, body.get("cwd"), log_path)
@@ -245,11 +259,18 @@ def make_server(host, port, log_dir="/workspace/ledger/logs"):
             self.wfile.write(body)
 
         def _read_json_body(self):
+            """Parse the request body as JSON. Returns None on malformed JSON
+            (caller must check for None and answer 400 instead of raising)."""
             length = int(self.headers.get("Content-Length") or 0)
             if length == 0:
                 return {}
             raw = self.rfile.read(length)
-            return json.loads(raw) if raw else {}
+            if not raw:
+                return {}
+            try:
+                return json.loads(raw)
+            except json.JSONDecodeError:
+                return None
 
         def _drain_body(self):
             # Discard any unread request body so a following request on the
@@ -317,7 +338,7 @@ def make_server(host, port, log_dir="/workspace/ledger/logs"):
                     "slots": slots,
                     "busy": registry.busy(),
                     "gpus": get_gpu_info(),
-                    "uptime_s": time.time() - START,
+                    "uptime_s": int(time.time() - START),
                     "hfs": hfs,
                     "houdini_ok": houdini_ok,
                 },
@@ -360,9 +381,14 @@ def make_server(host, port, log_dir="/workspace/ledger/logs"):
 
         def _handle_post_task(self):
             body = self._read_json_body()
+            if body is None:
+                return self._send_json(400, {"error": "invalid JSON"})
             if not body.get("task_id") or not body.get("command"):
                 return self._send_json(400, {"error": "task_id and command required"})
-            task = registry.submit(body)
+            try:
+                task = registry.submit(body)
+            except DuplicateTaskError:
+                return self._send_json(409, {"error": "task_id already exists"})
             if task is None:
                 return self._send_json(429, {"error": "busy"})
             self._send_json(202, {"task_id": task.id})
@@ -371,6 +397,8 @@ def make_server(host, port, log_dir="/workspace/ledger/logs"):
             body = self._read_json_body()
             if role != "sync":
                 return self._send_json(403, {"error": "exec only on sync pod"})
+            if body is None:
+                return self._send_json(400, {"error": "invalid JSON"})
             command = body.get("command", "")
             timeout_s = body.get("timeout_s", 600)
             try:
@@ -384,7 +412,11 @@ def make_server(host, port, log_dir="/workspace/ledger/logs"):
                 )
                 self._send_json(
                     200,
-                    {"exit_code": result.returncode, "stdout": result.stdout, "stderr": result.stderr},
+                    {
+                        "exit_code": result.returncode,
+                        "stdout": result.stdout[-200000:],
+                        "stderr": result.stderr[-20000:],
+                    },
                 )
             except subprocess.TimeoutExpired:
                 self._send_json(504, {"error": "timeout"})
