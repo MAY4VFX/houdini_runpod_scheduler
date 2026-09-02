@@ -184,7 +184,7 @@ def compress_file(src: str, dst: str, strategy: CompressionStrategy, level: int 
     if strategy == CompressionStrategy.ZSTD:
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         result = subprocess.run(
-            ["zstd", f"-T0", f"--level={level}", "-f", src, "-o", dst],
+            ["zstd", "-T0", f"-{level}", "-f", src, "-o", dst],
             capture_output=True,
             text=True,
         )
