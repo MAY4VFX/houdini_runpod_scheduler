@@ -21,7 +21,17 @@ export HFS="/workspace/houdini/${HOUDINI_VERSION}"
 if [ -d "$HFS" ]; then
   cd "$HFS" && source houdini_setup_bash >/dev/null 2>&1; cd /
 
-  if [ -n "${SESINETD_HOST:-}" ]; then
+  if [ -n "${SESINETD_HOST:-}" ] && ! command -v hserver >/dev/null 2>&1; then
+    # `hserver` ships inside $HFS/bin and is only on PATH once
+    # houdini_setup_bash above has actually set up a real Houdini install.
+    # Guard it explicitly instead of letting each call fail with "command
+    # not found" -- confirmed on mayfx02 (see task-4-report.md) that a
+    # missing hserver does NOT crash the script under `set -uo pipefail`
+    # (no `-e`), but the guard keeps the log clean and makes the "no
+    # licensing attempted" case explicit rather than four separate
+    # not-found lines.
+    echo "License: hserver not found on PATH (HFS=$HFS has no working Houdini install) -- skipping license setup"
+  elif [ -n "${SESINETD_HOST:-}" ]; then
     # v1 (docker/entrypoint.sh:34) pointed the local hserver at the remote
     # license server with `hserver --host "$SESINETD_HOST"`, silently
     # dropping SESINETD_PORT. That flag is documented (hserver --help,
