@@ -1,0 +1,193 @@
+"""``~/.rpfarm`` config store: config.toml, the rclone binary, the SSH key,
+and the shared worker session token.
+
+Stdlib only (runs inside Houdini's bundled Python and as a plain CLI).
+``tomllib`` (stdlib, read-only) parses config.toml; since the stdlib has no
+TOML writer, :func:`save` writes it by hand.
+
+Every path helper reads the ``RPFARM_HOME`` env var at call time (not at
+import time), so tests can point it at a tmp dir with ``monkeypatch.setenv``.
+"""
+
+from __future__ import annotations
+
+import io
+import json
+import os
+import platform
+import secrets
+import tempfile
+import tomllib
+import urllib.request
+import zipfile
+from dataclasses import dataclass, field, fields
+from pathlib import Path
+
+CONFIG_FILENAME = "config.toml"
+TOKEN_FILENAME = "token"
+
+
+class ConfigError(Exception):
+    pass
+
+
+def home() -> Path:
+    """``$RPFARM_HOME`` if set, else ``~/.rpfarm``."""
+    override = os.environ.get("RPFARM_HOME")
+    return Path(override) if override else Path.home() / ".rpfarm"
+
+
+def _rclone_name() -> str:
+    return "rclone.exe" if platform.system() == "Windows" else "rclone"
+
+
+def _default_rclone_path() -> str:
+    return str(home() / "bin" / _rclone_name())
+
+
+def _default_ssh_key_path() -> str:
+    return str(home() / "id_ed25519")
+
+
+@dataclass
+class Config:
+    api_key: str
+    user: str
+    volume_id: str
+    template_id: str
+    datacenter: str = "EU-RO-1"
+    houdini_version: str = "22.0.393"
+    sesinetd_host: str = "lic.ai-vfx.com"
+    sesinetd_port: int = 1715
+    sync_idle_min: int = 15
+    gpu_priority: list[str] = field(default_factory=list)
+    rclone_path: str = field(default_factory=_default_rclone_path)
+    ssh_key_path: str = field(default_factory=_default_ssh_key_path)
+
+
+# -- config.toml ----------------------------------------------------------
+
+
+def _toml_value(v):
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, int):
+        return str(v)
+    if isinstance(v, list):
+        return "[" + ", ".join(_toml_value(x) for x in v) + "]"
+    # json.dumps' string escaping (\", \\, \n, ...) is valid TOML basic-string
+    # escaping too — stdlib has no TOML writer, so this is the simplest
+    # correct option without a third-party dependency.
+    return json.dumps(str(v))
+
+
+def save(cfg: Config) -> None:
+    """Write ``cfg`` to ``$RPFARM_HOME/config.toml``, chmod 600, atomically."""
+    h = home()
+    h.mkdir(parents=True, exist_ok=True)
+    path = h / CONFIG_FILENAME
+
+    lines = [f"{f.name} = {_toml_value(getattr(cfg, f.name))}" for f in fields(cfg)]
+    text = "\n".join(lines) + "\n"
+
+    fd, tmp_path = tempfile.mkstemp(dir=str(h), prefix=".config-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        os.chmod(tmp_path, 0o600)
+        os.replace(tmp_path, path)
+    except BaseException:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise
+    os.chmod(path, 0o600)
+
+
+def load() -> Config:
+    """Read ``$RPFARM_HOME/config.toml``. Raises ConfigError if missing."""
+    path = home() / CONFIG_FILENAME
+    if not path.exists():
+        raise ConfigError(f"no config at {path}; run `rpfarm setup` first")
+    with open(path, "rb") as f:
+        data = tomllib.load(f)
+    known = {f.name for f in fields(Config)}
+    kwargs = {k: v for k, v in data.items() if k in known}
+    return Config(**kwargs)
+
+
+# -- session token ----------------------------------------------------------
+
+
+def session_token() -> str:
+    """Read (or create) the shared per-user worker token at
+    ``$RPFARM_HOME/token``: 32 hex chars, chmod 600."""
+    h = home()
+    h.mkdir(parents=True, exist_ok=True)
+    path = h / TOKEN_FILENAME
+    if path.exists():
+        return path.read_text().strip()
+    token = secrets.token_hex(16)
+    path.write_text(token)
+    os.chmod(path, 0o600)
+    return token
+
+
+# -- rclone binary ----------------------------------------------------------
+
+
+_ASSET_MAP = {
+    ("Darwin", "arm64"): "osx-arm64",
+    ("Darwin", "x86_64"): "osx-amd64",
+    ("Linux", "x86_64"): "linux-amd64",
+    ("Linux", "amd64"): "linux-amd64",
+    ("Windows", "AMD64"): "windows-amd64",
+    ("Windows", "x86_64"): "windows-amd64",
+}
+
+
+def _platform_asset() -> str:
+    key = (platform.system(), platform.machine())
+    if key not in _ASSET_MAP:
+        raise ConfigError(f"unsupported platform for rclone: {key[0]}/{key[1]}")
+    return _ASSET_MAP[key]
+
+
+def _rclone_url() -> str:
+    return f"https://downloads.rclone.org/rclone-current-{_platform_asset()}.zip"
+
+
+def _default_downloader(url: str) -> bytes:
+    with urllib.request.urlopen(url, timeout=120) as r:
+        return r.read()
+
+
+def _find_rclone_member(names: list[str]) -> str:
+    target = _rclone_name()
+    for n in names:
+        if n.rstrip("/").rsplit("/", 1)[-1] == target:
+            return n
+    raise ConfigError(f"'{target}' not found in rclone archive (contents: {names})")
+
+
+def rclone_bin(downloader=_default_downloader) -> str:
+    """Return the path to a working ``rclone`` binary under
+    ``$RPFARM_HOME/bin``, downloading and extracting the static build for
+    this platform if it isn't there yet.
+
+    ``downloader(url) -> bytes`` is injectable so tests never hit the
+    network; it defaults to a plain ``urllib`` GET.
+    """
+    h = home()
+    bin_dir = h / "bin"
+    dest = bin_dir / _rclone_name()
+    if dest.exists():
+        return str(dest)
+
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    data = downloader(_rclone_url())
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        member = _find_rclone_member(zf.namelist())
+        with zf.open(member) as src, open(dest, "wb") as out:
+            out.write(src.read())
+    os.chmod(dest, 0o755)
+    return str(dest)
