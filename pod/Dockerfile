@@ -1,18 +1,23 @@
 # RunPodFarm v2 pod image
-# Ubuntu 22.04 + CUDA runtime + sshd + worker daemon.
+# Ubuntu 22.04 + sshd + worker daemon. Deliberately thin.
+#
 # Houdini is NOT baked in -- it comes from the network volume at
 # /workspace/houdini/<HOUDINI_VERSION> (see pod/entrypoint.sh).
-# Same image runs on both the CPU sync pod and the GPU render pods; on a
-# CPU pod the CUDA runtime libs are simply unused.
+#
+# Base is plain `ubuntu:22.04`, NOT `nvidia/cuda:*-runtime`: on a GPU pod
+# RunPod's container runtime injects the host NVIDIA driver and libcuda into
+# the container, so the CUDA *runtime toolkit* in the image buys nothing and
+# Houdini does not need it. It cost 1310 MiB of compressed layers (image went
+# from ~1506 MiB to ~145 MiB), and that pull is paid on every cold pod start.
+#
+# Same image runs on the CPU sync pod and the GPU render pods.
 
-FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04
+FROM ubuntu:22.04
 
 LABEL maintainer="RunPodFarm"
 LABEL description="RunPodFarm v2 pod - sshd + worker daemon, Houdini from network volume"
 
 ENV DEBIAN_FRONTEND=noninteractive
-ENV NVIDIA_VISIBLE_DEVICES=all
-ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 openssh-server rsync curl ca-certificates zstd unzip \
