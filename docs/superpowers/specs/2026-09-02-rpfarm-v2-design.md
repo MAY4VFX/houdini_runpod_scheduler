@@ -88,10 +88,30 @@ idle-таймауту (параметр, по умолчанию 15 мин бе�
 `rpfarm farm kill`. Имя: `rpfarm-sync-<user>`. Одновременно один sync-под на
 пользователя; GPU-поды его не заменяют (заливка идёт на дешёвый CPU).
 
-Проверка при реализации (спайк): CPU-под с volume действительно создаётся в EU-RO-1
-через `POST /pods` с `computeType: CPU`; `hython` с volume запускает `mqserver` без
-GPU; публичные порты MQ (RunPod мапит внутренний порт на случайный внешний,
-`RUNPOD_TCP_PORT_<port>`) доступны и артисту, и GPU-подам.
+Факты спайка (2026-09-02, EU-RO-1, флейвор `cpu3c`, 2 vCPU, `cloudType: SECURE`,
+volume `2ze7qdwkt3`): `POST /v1/pods` с `computeType: "CPU"`, `cpuFlavorIds`,
+`vcpuCount`, `dataCenterIds: ["EU-RO-1"]`, `networkVolumeId`, `volumeMountPath`,
+`ports: ["22/tcp","4440/tcp","4442/tcp","8000/http"]`, `supportPublicIp: true`
+создаёт под и подключает volume без ошибок — CPU-поды с volume в EU-RO-1
+работают. Под стал `RUNNING` с присвоенным `publicIp` и заполненным
+`portMappings` за **19 секунд**. Ответ `GET /v1/pods/{id}` отдаёт публичный IP
+в поле `publicIp` (строка) и маппинг портов в `portMappings` — объекте вида
+`{"<internal-port>": <external-port int>}`, например
+`{"22": 21829, "4440": 21830, "4442": 21831}`; `8000/http` в `portMappings` не
+попадает (http-порты не мапятся напрямую, доступ только через
+`https://<podId>-8000.proxy.runpod.net/` — прокси подтверждён, `curl` вернул
+200 за 0.48с). `nc -vz <ip> <external-port>` подтвердил, что внешние TCP-порты
+4440/4442 открыты и достижимы с внешней машины. `costPerHr` для `cpu3c`/2vCPU —
+**$0.06/ч**.
+
+`mqserver` из `/workspace/houdini/bin/mqserver` (Houdini 20.5.684 с volume,
+`source houdini_setup_bash` из `/workspace/houdini`) запускается и слушает без
+GPU на CPU-поде; connection-файл (`-c /tmp/mq.txt`) содержит
+`PDG_MQ <internal-ip> 4440 4440 4442`. Единственная граница, на которую стоит
+обратить внимание в реализации: `source <file> | tail` (или любой пайп) в bash
+исполняет `source` в сабшелле — переменные окружения (`PATH`, `HFS`) теряются
+после пайпа; `rpfarm/pods.py` должен звать `source houdini_setup_bash` без
+пайпа в той же команде, что и `mqserver`/`hython`.
 
 ### 3.3 GPU-поды
 
