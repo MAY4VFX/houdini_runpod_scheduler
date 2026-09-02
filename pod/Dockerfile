@@ -19,7 +19,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1-mesa-glx libglu1-mesa libxi6 libxmu6 libxrandr2 libxcursor1 \
     libxinerama1 libxss1 libasound2 libxkbcommon0 libnss3 libdbus-1-3 \
     && rm -rf /var/lib/apt/lists/* \
-    && curl -sSL https://rclone.org/install.sh | bash
+    && curl -fsSL https://rclone.org/install.sh -o /tmp/rclone-install.sh \
+    && bash /tmp/rclone-install.sh \
+    && rm /tmp/rclone-install.sh
 
 RUN sed -i 's/#PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config
 
