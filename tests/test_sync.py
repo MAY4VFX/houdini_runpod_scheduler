@@ -20,6 +20,12 @@ def E(p, s):
     return FileEntry(local=f"/job/{p}", remote=f"projects/may/shot/{p}", size=s)
 
 
+def EE(p, s):
+    """A FileEntry consistent with local_root='/job', remote_root='/workspace'
+    (ruling R8: local_root/rel and remote_root/rel must be the same rel)."""
+    return FileEntry(local=f"/job/{p}", remote=f"/workspace/{p}", size=s)
+
+
 # -- plan_packages -----------------------------------------------------------
 
 
@@ -53,26 +59,42 @@ def test_plan_packages_never_exceeds_max_bytes_except_singletons():
 
 
 def test_rclone_args_upload(tmp_path):
+    # Ruling R8: local_root="/job", remote_root="/workspace/projects/may/shot".
+    # rel is computed from the local side (relpath(local, local_root)), and
+    # must land at the same place under remote_root.
     t = SftpTarget(host="1.2.3.4", port=40022, key_path="/k")
-    args, files_from = build_rclone_args([E("a", 1)], t, "up", "/job", "/workspace", tmp_path)
-    assert args[:2] == ["copy", "/job"] and args[2] == ":sftp:/workspace"
-    assert "--files-from" in args and open(files_from).read().strip() == "projects/may/shot/a"
+    entries = [FileEntry(local="/job/tex/a.rat", remote="/workspace/projects/may/shot/tex/a.rat", size=1)]
+    args, files_from = build_rclone_args(entries, t, "up", "/job", "/workspace/projects/may/shot", tmp_path)
+    assert args[:2] == ["copy", "/job"] and args[2] == ":sftp:/workspace/projects/may/shot"
+    assert "--files-from" in args and open(files_from).read().strip() == "tex/a.rat"
     assert "--sftp-host=1.2.3.4" in args and "--sftp-port=40022" in args
 
 
 def test_rclone_args_download_swaps_direction(tmp_path):
     t = SftpTarget(host="h", port=1, key_path="/k")
-    args, _ = build_rclone_args([E("a", 1)], t, "down", "/job", "/workspace", tmp_path)
-    assert args[1] == ":sftp:/workspace" and args[2] == "/job"
+    entries = [FileEntry(local="/job/tex/a.rat", remote="/workspace/projects/may/shot/tex/a.rat", size=1)]
+    args, _ = build_rclone_args(entries, t, "down", "/job", "/workspace/projects/may/shot", tmp_path)
+    assert args[1] == ":sftp:/workspace/projects/may/shot" and args[2] == "/job"
 
 
 def test_rclone_args_include_common_flags(tmp_path):
     t = SftpTarget(host="h", port=22, key_path="/k")
-    args, _ = build_rclone_args([E("a", 1)], t, "up", "/job", "/workspace", tmp_path)
+    args, _ = build_rclone_args([EE("a", 1)], t, "up", "/job", "/workspace", tmp_path)
     assert "--sftp-user=root" in args  # SftpTarget default user
     assert "--sftp-key-file=/k" in args
     assert "--sftp-set-modtime" in args
     assert "--use-json-log" in args
+
+
+def test_rclone_args_raises_when_entry_does_not_map_under_remote_root(tmp_path):
+    # local_root/rel = "tex/a.rat" would map to "/workspace/tex/a.rat" under
+    # remote_root, but the entry claims a different remote — inconsistent
+    # (local_root, remote_root, entry) grouping is a caller bug, not silently
+    # accepted.
+    t = SftpTarget(host="h", port=22, key_path="/k")
+    entries = [FileEntry(local="/job/tex/a.rat", remote="/workspace/somewhere/else.rat", size=1)]
+    with pytest.raises(SyncError):
+        build_rclone_args(entries, t, "up", "/job", "/workspace", tmp_path)
 
 
 # -- build_rclone_dir_args (whole-directory copy) -----------------------------
@@ -119,7 +141,7 @@ def test_rclone_copy_success_reports_stats_and_progress(tmp_path):
     t = SftpTarget(host="h", port=22, key_path="/k")
     seen = []
     stats = rclone_copy(
-        [E("a", 5), E("b", 5)],
+        [EE("a", 5), EE("b", 5)],
         t,
         "up",
         rclone_bin,
@@ -136,7 +158,7 @@ def test_rclone_copy_nonzero_exit_raises(tmp_path):
     rclone_bin = _write_fake_rclone(tmp_path, FAKE_RCLONE_FAIL)
     t = SftpTarget(host="h", port=22, key_path="/k")
     with pytest.raises(SyncError):
-        rclone_copy([E("a", 5)], t, "up", rclone_bin, "/job", "/workspace")
+        rclone_copy([EE("a", 5)], t, "up", rclone_bin, "/job", "/workspace")
 
 
 def test_rclone_copy_dir_reports_stats_from_rclone(tmp_path):

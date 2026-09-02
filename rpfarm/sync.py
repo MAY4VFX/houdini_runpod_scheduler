@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import posixpath
 import subprocess
 import tempfile
 import time
@@ -53,7 +54,7 @@ class SyncError(Exception):
 @dataclass
 class FileEntry:
     local: str
-    remote: str  # path relative to /workspace
+    remote: str  # full path on the remote side, e.g. "/workspace/projects/<user>/<project>/..."
     size: int
 
 
@@ -122,18 +123,26 @@ def _sftp_flags(target: SftpTarget):
 def build_rclone_args(package, target, direction, local_root, remote_root, tmp_dir):
     """Build args for an ``rclone copy --files-from`` of one package.
 
-    ``FileEntry.remote`` is already a path relative to /workspace, so when
-    ``remote_root`` is the sftp mount root the same string is exactly what
-    ``--files-from`` needs. ``local_root`` is the source (for uploads) or
-    destination (for downloads) directory on the local side; it must be laid
-    out so that ``local_root/<entry.remote>`` resolves to the right file.
+    Ruling R8: ``--files-from`` lines must be paths relative to BOTH the
+    source root and the destination root — that's how rclone's
+    ``src/<rel> -> dst/<rel>`` copy actually works. So ``rel`` is computed
+    from the LOCAL side (``os.path.relpath(e.local, local_root)``, POSIX
+    separators), and every entry is validated to land at the same place
+    under ``remote_root``: ``posixpath.join(remote_root, rel) == e.remote``.
+    A :class:`SyncError` is raised for any entry that doesn't line up.
+    Grouping entries by a consistent ``(local_root, remote_root)`` pair
+    before calling this is the caller's job (e.g. the upload node), not
+    this function's.
 
     Returns ``(args, files_from_path)``.
     """
     files_from = os.path.join(str(tmp_dir), f"files_{uuid.uuid4().hex[:8]}.txt")
     with open(files_from, "w") as f:
         for e in package:
-            f.write(e.remote + "\n")
+            rel = os.path.relpath(e.local, local_root).replace(os.sep, "/")
+            if posixpath.join(remote_root, rel) != e.remote:
+                raise SyncError(f"entry {e.local} does not map under {remote_root}")
+            f.write(rel + "\n")
 
     remote = f":sftp:{remote_root}"
     src, dst = (local_root, remote) if direction == "up" else (remote, local_root)
