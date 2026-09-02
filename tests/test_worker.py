@@ -69,6 +69,24 @@ def test_exec_sync_only(srv):
     assert st == 200 and r["stdout"].strip() == "ok" and r["exit_code"] == 0
 
 
+def test_duplicate_task_id_rejected(srv):
+    assert req(srv, "POST", "/tasks", {"task_id": "d1", "command": "sleep 5"})[0] == 202
+    st, r = req(srv, "POST", "/tasks", {"task_id": "d1", "command": "echo dup"})
+    assert st == 409
+    st, h = req(srv, "GET", "/health")
+    assert st == 200 and h["busy"] == 1
+    assert req(srv, "DELETE", "/tasks/d1")[0] == 200
+
+
+def test_exec_output_capped(srv):
+    payload = "0123456789" * 30000  # 300000 deterministic chars
+    cmd = "python3 -c \"import sys; sys.stdout.write('%s')\"" % payload
+    st, r = req(srv, "POST", "/exec", {"command": cmd})
+    assert st == 200
+    assert len(r["stdout"]) == 200000
+    assert r["stdout"] == payload[-200000:]
+
+
 def test_files_403_outside_workspace(srv, tmp_path, monkeypatch):
     monkeypatch.setattr(worker, "WORKSPACE_ROOT", str(tmp_path))
     outside = tmp_path.parent / f"outside-{os.getpid()}.txt"
