@@ -113,6 +113,48 @@ GPU на CPU-поде; connection-файл (`-c /tmp/mq.txt`) содержит
 после пайпа; `rpfarm/pods.py` должен звать `source houdini_setup_bash` без
 пайпа в той же команде, что и `mqserver`/`hython`.
 
+Факты по загрузке пода (2026-09-02, Task 4, образ `ghcr.io/may4vfx/rpfarm-pod`):
+
+- **`set -u` и `houdini_setup_bash` несовместимы.** Скрипт SideFX читает
+  переменные, которых сам не задаёт (на 21.0.792 это `SHFS`, на других сборках
+  `PYTHONPATH`/`LD_LIBRARY_PATH`), а так как его делают `source`, аборт по
+  unbound variable убивает **саму оболочку entrypoint**, а не сабшелл. Именно это
+  четыре раунда выглядело как «под не поднимается»: контейнер падал сразу после
+  запуска sshd, RunPod перезапускал его каждые ~17 секунд, а снаружи это читалось
+  как «`publicIp`/`portMappings` появились и исчезли, SSH refused, `/health` 404».
+  Любой код, который делает `source houdini_setup_bash`, обязан снимать `set -u`
+  на время вызова (`build_shell_command` в `worker.py` безопасен: он работает в
+  `bash -c` без `set -u`).
+- **Boot-лог живёт на volume.** Логи контейнера RunPod доступны только в его
+  веб-интерфейсе, программно их не прочитать. Поэтому entrypoint дублирует весь
+  свой stdout+stderr (включая вывод `worker.py` после `exec`) в
+  `/workspace/ledger/logs/boot-<podId>-<epoch>.log`. Volume переживает под, так
+  что следующий под или ssh-сессия читают, почему умер предыдущий — это
+  единственный способ диагностики недоступного пода. Крашлупящийся под пишет по
+  файлу на перезапуск, поэтому housekeeping (Task 12) должен чистить
+  `boot-*.log` по возрасту/количеству.
+- **Cloudflare перед `proxy.runpod.net` режет `Python-urllib/3.x`** — отдаёт
+  `403` там, где `curl` получает настоящий ответ. Любой HTTP-клиент к прокси
+  (в частности `WorkerClient`, Task 7) обязан слать браузерный `User-Agent`,
+  иначе он неверно прочитает каждый ответ.
+- **`lastStatusChange` не является признаком рестарта** — поле осталось на
+  «Rented by User» через 52 перезапуска контейнера. Здоровье пода определяется
+  только опросом `/health`, не полями пода в REST.
+- **Образ не должен нести CUDA runtime.** База переведена с
+  `nvidia/cuda:12.4.1-runtime-ubuntu22.04` на `ubuntu:22.04`: драйвер и `libcuda`
+  на GPU-подах инжектит контейнерный рантайм RunPod, а тулкит в образе стоил
+  1310 MiB, которые оплачивались при каждом холодном старте. Слои сжались с
+  1505.8 MiB до 137.5 MiB (−90.9%).
+- **Тайминги живого пода** (CPU, `HOUDINI_VERSION=.`, volume `2ze7qdwkt3`):
+  `/health` 200 через **43.5 секунды** после `POST /pods`, ровно один boot-лог.
+  `hserver -S lic.ai-vfx.com:1715` отработал (`Successfully changed server
+  listing.`), `hserver -l` показал `Connected To: http://lic.ai-vfx.com:1715`
+  (`sesinetd22.0.368`, Houdini 20.5.684), а `hou.licenseCategory()` вернул
+  `licenseCategoryType.Commercial` — лицензия реально берётся с фермы. Первый
+  запуск `hython` с volume занял **~104 секунды** (холодный кэш сетевого диска);
+  таймауты в `WorkerClient` должны это учитывать. Безобидный шум в логах:
+  `hserver` пишет `sh: 1: systemctl: not found` и всё равно работает.
+
 ### 3.3 GPU-поды
 
 Создаются шедулером через `POST /pods`: шаблон `rpfarm-pod`, volume, `supportPublicIp`,
