@@ -1,19 +1,18 @@
-name: Build and Push Worker Docker Image
+name: Build and Push Pod Docker Image
 
 on:
   push:
     branches:
       - main
-      - feature/runpodfarm-full-stack
+      - v2
     paths:
-      - 'docker/**'
-      - 'worker/**'
+      - 'pod/**'
       - '.github/workflows/docker-build.yml'
   workflow_dispatch:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: may4vfx/runpodfarm-worker
+  IMAGE_NAME: may4vfx/rpfarm-pod
 
 jobs:
   build-and-push:
@@ -45,7 +44,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: docker/Dockerfile
+          file: pod/Dockerfile
           platforms: linux/amd64
           push: true
           tags: |
@@ -54,44 +53,13 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Update RunPod template to new image tag
+      - name: Update RunPod template
         env:
           RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
-          TEMPLATE_ID: ${{ vars.RUNPOD_TEMPLATE_ID }}
-          NEW_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.short_sha }}
-          TEMPLATE_ENV: ${{ secrets.RUNPOD_TEMPLATE_ENV }}
+          TEMPLATE_ID: ${{ vars.RPFARM_TEMPLATE_ID }}
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.short_sha }}
         run: |
-          pip install -q requests
-          python3 -c "
-          import json, requests, os
-          api_key = os.environ['RUNPOD_API_KEY']
-          template_id = os.environ['TEMPLATE_ID']
-          new_image = os.environ['NEW_IMAGE']
-          env_vars = json.loads(os.environ['TEMPLATE_ENV'])
-
-          query = '''mutation(\$input: SaveTemplateInput!) { saveTemplate(input: \$input) { id imageName } }'''
-          variables = {
-              'input': {
-                  'id': template_id,
-                  'name': 'RunPodFarm Worker',
-                  'imageName': new_image,
-                  'dockerArgs': '',
-                  'containerDiskInGb': 10,
-                  'volumeInGb': 0,
-                  'isPublic': False,
-                  'startJupyter': False,
-                  'startSsh': False,
-                  'env': env_vars,
-              }
-          }
-
-          resp = requests.post(
-              f'https://api.runpod.io/graphql?api_key={api_key}',
-              json={'query': query, 'variables': variables}
-          )
-          d = resp.json()
-          if 'data' in d and d['data'].get('saveTemplate'):
-              print(f\"Template updated: {d['data']['saveTemplate']['imageName']}\")
-          else:
-              print(f'Warning: {json.dumps(d)}')
-          "
+          curl -sf -X PATCH "https://rest.runpod.io/v1/templates/$TEMPLATE_ID" \
+            -H "Authorization: Bearer $RUNPOD_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d "{\"imageName\":\"$IMAGE\"}"
