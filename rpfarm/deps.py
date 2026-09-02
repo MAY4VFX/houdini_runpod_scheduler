@@ -42,6 +42,11 @@ _SKIP_FILE_SUFFIXES = (".hip.bak", ".hiplc.bak", ".hipnc.bak", "~")
 # behaves the same regardless of which OS is actually running the code.
 _DRIVE_RE = re.compile(r"^([A-Za-z]):[\\/]")
 
+# A bare drive root with nothing after it, e.g. "C:\" or "C:/" (or "C:"
+# with no trailing separator, which os.path.dirname can produce). Used by
+# _pathmap_key to detect the same degenerate-root problem POSIX "/" has.
+_DRIVE_ROOT_RE = re.compile(r"^[A-Za-z]:[\\/]?$")
+
 
 def collect_refs():
     """Collect this hip file's own path plus every file reference in the scene.
@@ -99,6 +104,25 @@ def _is_skipped_file(path):
     return path.endswith(_SKIP_FILE_SUFFIXES)
 
 
+def _pathmap_key(parent_dir, fp):
+    """Pick the path-map key for an external file's parent directory.
+
+    Normally the key is just ``parent_dir`` -- one path-map entry per
+    external root, reused by every file discovered under that same
+    directory. But pdgcmd.py's ``_applyPathMapForZone`` (pdgcmd.py:926)
+    applies each path-map entry with an *unanchored* ``str.replace`` in a
+    fixed-point loop: a rule keyed on ``/`` (or a bare drive root like
+    ``C:\\``) would then rewrite the ``/`` inside every path the worker
+    touches, not just this one file's prefix -- silently corrupting the
+    whole path map. So when ``parent_dir`` is exactly ``/`` or a bare
+    drive root, the key is the file's own full path instead, which keeps
+    the rule specific to that single file.
+    """
+    if parent_dir == "/" or _DRIVE_ROOT_RE.match(parent_dir):
+        return fp
+    return parent_dir
+
+
 def resolve_entries(paths, job_dir, remote_project):
     """Turn a list of local paths into upload entries and a PDG path map.
 
@@ -128,34 +152,67 @@ def resolve_entries(paths, job_dir, remote_project):
     descended into (``os.walk(..., followlinks=False)``) -- this also
     guards against symlink loops, not just links that escape ``job_dir``.
 
+    A file is classified "inside job_dir" by a plain literal prefix check
+    first (so e.g. a file symlink that physically lives outside job_dir
+    but is *referenced* through a job-local path -- a common
+    linked-library pattern -- still uploads as a job-relative file, matching
+    what its reference path says). Only when that literal check fails does
+    it fall back to comparing ``os.path.realpath`` of both the file and
+    ``job_dir`` -- this is what makes a symlinked ``$JOB`` itself resolve
+    correctly regardless of whether a given path is expressed through the
+    symlink or already through its real target. Either way,
+    ``FileEntry.local`` keeps the original normalized (not realpath'd)
+    path -- only the inside/outside decision and the resulting ``rel``
+    path use the resolved form.
+
+    Skip rules apply to a directory passed directly in ``paths`` too, not
+    just to directories discovered while walking: ``resolve_entries(["/proj/backup"],
+    ...)`` yields nothing.
+
     Dedup is by normalized local path: the same path passed twice (or
     reachable both directly and via a directory walk) produces one entry.
 
     Returns ``(entries, path_map)`` where ``path_map`` always contains
     ``{job_dir: remote_project}`` plus one entry per distinct external
-    root directory (the immediate parent of each external file).
+    root directory (the immediate parent of each external file) -- except
+    when that parent is ``/`` or a bare drive root, where the file's own
+    full path is used as the key instead (see :func:`_pathmap_key`).
     """
     job_dir = os.path.normpath(job_dir)
+    job_dir_real = os.path.realpath(job_dir)
     seen = set()
     entries = []
     pmap = {job_dir: remote_project}
 
-    def add(fp):
-        fp = os.path.normpath(fp)
+    def add(raw_fp):
+        fp = os.path.normpath(raw_fp)
         if fp in seen or _is_skipped_file(fp) or not os.path.isfile(fp):
             return
         seen.add(fp)
+
         if fp == job_dir or fp.startswith(job_dir + os.sep):
-            rel = os.path.relpath(fp, job_dir).replace(os.sep, "/")
-            remote = f"{remote_project}/{rel}"
+            rel = os.path.relpath(fp, job_dir)
+        else:
+            fp_real = os.path.realpath(fp)
+            if fp_real == job_dir_real or fp_real.startswith(job_dir_real + os.sep):
+                rel = os.path.relpath(fp_real, job_dir_real)
+            else:
+                rel = None
+
+        if rel is not None:
+            remote = f"{remote_project}/{rel.replace(os.sep, '/')}"
         else:
             remote = f"{remote_project}/_ext{_ext_suffix(fp)}"
             root = os.path.dirname(fp)
-            pmap.setdefault(root, f"{remote_project}/_ext{_ext_suffix(root)}")
+            key = _pathmap_key(root, fp)
+            pmap.setdefault(key, f"{remote_project}/_ext{_ext_suffix(key)}")
+
         entries.append(FileEntry(local=fp, remote=remote, size=os.path.getsize(fp)))
 
     for p in paths:
         if os.path.isdir(p):
+            if os.path.basename(os.path.normpath(p)) in _SKIP_DIR_NAMES:
+                continue
             for root, dirs, files in os.walk(p, followlinks=False):
                 dirs[:] = [d for d in dirs if d not in _SKIP_DIR_NAMES]
                 for f in files:

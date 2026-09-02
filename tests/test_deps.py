@@ -4,7 +4,7 @@ import sys
 from types import SimpleNamespace
 
 from rpfarm import deps
-from rpfarm.deps import _ext_suffix, collect_refs, pathmap_env, resolve_entries
+from rpfarm.deps import _ext_suffix, _pathmap_key, collect_refs, pathmap_env, resolve_entries
 
 
 # -- from the task brief -------------------------------------------------------
@@ -27,6 +27,9 @@ def test_inside_job_and_external(tmp_path):
     assert remotes[1] == "/workspace/projects/may/shot/tex/a.rat"
     assert pmap[str(job)] == "/workspace/projects/may/shot"
     assert pmap[str(ext)] == "/workspace/projects/may/shot/_ext" + str(ext)
+    # no path-map rule keyed on a bare "/" (or drive root) -- see
+    # test_pathmap_key_avoids_root_and_drive_root_keys for the direct check
+    assert "/" not in pmap
 
 
 def test_dedup(tmp_path):
@@ -97,6 +100,36 @@ def test_follows_file_symlink(tmp_path):
     assert entries[0].size == 5
 
 
+def test_top_level_skip_dir_passed_directly_yields_nothing(tmp_path):
+    job = tmp_path / "job"
+    backup = job / "backup"
+    backup.mkdir(parents=True)
+    (backup / "junk.exr").write_bytes(b"j")
+    entries, _ = resolve_entries([str(backup)], str(job), "/w/p")
+    assert entries == []
+
+
+def test_symlinked_job_dir_resolves_before_prefix_check(tmp_path):
+    # job_dir passed as a symlink; the file is referenced via its already
+    # -resolved real path (e.g. as if hou.text.expandString had expanded
+    # $JOB through the symlink already). A plain literal prefix check would
+    # miss this and misclassify the file as external.
+    real_job = tmp_path / "real_job"
+    (real_job / "tex").mkdir(parents=True)
+    (real_job / "tex" / "a.rat").write_bytes(b"x")
+    job_link = tmp_path / "job_link"
+    try:
+        os.symlink(str(real_job), str(job_link), target_is_directory=True)
+    except (OSError, NotImplementedError):
+        return
+    entries, pmap = resolve_entries([str(real_job / "tex" / "a.rat")], str(job_link), "/w/p")
+    assert len(entries) == 1
+    assert entries[0].remote == "/w/p/tex/a.rat"
+    # FileEntry.local keeps the original (non-realpath'd) path as given
+    assert entries[0].local == str(real_job / "tex" / "a.rat")
+    assert pmap[str(job_link)] == "/w/p"
+
+
 # -- _ext_suffix ------------------------------------------------------------------
 
 
@@ -106,6 +139,22 @@ def test_ext_suffix_posix_passthrough():
 
 def test_ext_suffix_windows_drive_letter():
     assert _ext_suffix(r"C:\lib\b.abc") == "/C/lib/b.abc"
+
+
+# -- _pathmap_key -----------------------------------------------------------------
+
+
+def test_pathmap_key_avoids_root_and_drive_root_keys():
+    # a bare "/" (or drive root) key would be applied by pdgcmd.py's
+    # unanchored str.replace fixed-point loop to *every* path on the
+    # worker -- so these must fall back to the file's own full path.
+    assert _pathmap_key("/", "/b.abc") == "/b.abc"
+    assert _pathmap_key("C:\\", r"C:\b.abc") == r"C:\b.abc"
+    assert _pathmap_key("C:/", "C:/b.abc") == "C:/b.abc"
+    assert _pathmap_key("C:", r"C:\b.abc") == r"C:\b.abc"
+    # a normal (non-degenerate) parent directory is used as-is
+    assert _pathmap_key("/Users/may/lib", "/Users/may/lib/b.abc") == "/Users/may/lib"
+    assert _pathmap_key(r"C:\lib", r"C:\lib\b.abc") == r"C:\lib"
 
 
 # -- pathmap_env ------------------------------------------------------------------
