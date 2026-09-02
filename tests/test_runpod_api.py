@@ -1,0 +1,138 @@
+import json
+
+import pytest
+
+from rpfarm import runpod_api as ra
+
+
+class FakeTransport:
+    def __init__(self, responses):
+        self.responses, self.calls = responses, []
+
+    def __call__(self, method, url, body, headers):
+        self.calls.append((method, url, body, headers))
+        status, payload = self.responses.pop(0)
+        return status, json.dumps(payload).encode()
+
+
+def test_create_cpu_pod_builds_body():
+    t = FakeTransport([(200, {"id": "p1"})])
+    api = ra.RunPodAPI("k", transport=t)
+    pod = api.create_cpu_pod("rpfarm-sync-may", "tpl", "vol", {"A": "1"}, ["22/tcp"])
+    assert pod["id"] == "p1"
+    m, url, body, headers = t.calls[0]
+    assert (m, url) == ("POST", "https://rest.runpod.io/v1/pods")
+    assert body["computeType"] == "CPU" and body["networkVolumeId"] == "vol"
+    assert body["volumeMountPath"] == "/workspace" and body["env"] == {"A": "1"}
+    assert headers["Authorization"] == "Bearer k"
+
+
+def test_create_gpu_pod_builds_body():
+    t = FakeTransport([(200, {"id": "p1"})])
+    api = ra.RunPodAPI("k", transport=t)
+    pod = api.create_gpu_pod("rpfarm-gpu", "tpl", ["NVIDIA A40"], "vol", {"A": "1"}, ["22/tcp"])
+    assert pod["id"] == "p1"
+    m, url, body, headers = t.calls[0]
+    assert (m, url) == ("POST", "https://rest.runpod.io/v1/pods")
+    assert body["computeType"] == "GPU"
+    assert body["gpuTypeIds"] == ["NVIDIA A40"]
+    assert body["networkVolumeId"] == "vol"
+    assert body["volumeMountPath"] == "/workspace"
+
+
+def test_terminate_ignores_404():
+    api = ra.RunPodAPI("k", transport=FakeTransport([(404, {"error": "no"})]))
+    api.terminate_pod("gone")  # no raise
+
+
+def test_error_raises_with_status():
+    api = ra.RunPodAPI("k", transport=FakeTransport([(500, {"error": "boom"})]))
+    with pytest.raises(ra.RunPodError) as e:
+        api.get_pod("x")
+    assert e.value.status == 500
+
+
+def test_pod_public_endpoint():
+    pod = {"publicIp": "1.2.3.4", "portMappings": {"22": 40022, "4440": 40440}}
+    assert ra.pod_public_endpoint(pod, 4440) == ("1.2.3.4", 40440)
+
+
+def test_list_pods_filters_by_name_prefix():
+    t = FakeTransport([(200, [{"id": "p1", "name": "rpfarm-a"}, {"id": "p2", "name": "other"}])])
+    api = ra.RunPodAPI("k", transport=t)
+    pods = api.list_pods(name_prefix="rpfarm-")
+    assert [p["id"] for p in pods] == ["p1"]
+    m, url, body, headers = t.calls[0]
+    assert (m, url) == ("GET", "https://rest.runpod.io/v1/pods")
+
+
+def test_get_volume_and_resize_and_create_and_delete():
+    t = FakeTransport(
+        [
+            (200, {"id": "v1", "size": 20}),
+            (200, {"id": "v1", "size": 40}),
+            (200, {"id": "v2"}),
+            (204, {}),
+        ]
+    )
+    api = ra.RunPodAPI("k", transport=t)
+    v = api.get_volume("v1")
+    assert v["id"] == "v1"
+    assert t.calls[0][:2] == ("GET", "https://rest.runpod.io/v1/networkvolumes/v1")
+
+    v = api.resize_volume("v1", 40)
+    assert v["size"] == 40
+    assert t.calls[1][:2] == ("PATCH", "https://rest.runpod.io/v1/networkvolumes/v1")
+    assert t.calls[1][2] == {"size": 40}
+
+    v = api.create_volume("rpfarm-vol", 50, dc="EU-RO-1")
+    assert v["id"] == "v2"
+    m, url, body, headers = t.calls[2]
+    assert (m, url) == ("POST", "https://rest.runpod.io/v1/networkvolumes")
+    assert body == {"name": "rpfarm-vol", "size": 50, "dataCenterId": "EU-RO-1"}
+
+    api.delete_volume("v1")
+    assert t.calls[3][:2] == ("DELETE", "https://rest.runpod.io/v1/networkvolumes/v1")
+
+
+def test_save_template_create_vs_update():
+    t = FakeTransport([(200, {"id": "t1"}), (200, {"id": "t1"})])
+    api = ra.RunPodAPI("k", transport=t)
+
+    api.save_template("rpfarm-pod", "img:latest", ["22/tcp"], {"A": "1"})
+    m, url, body, headers = t.calls[0]
+    assert (m, url) == ("POST", "https://rest.runpod.io/v1/templates")
+    assert body["name"] == "rpfarm-pod" and body["imageName"] == "img:latest"
+
+    api.save_template("rpfarm-pod", "img:latest", ["22/tcp"], {"A": "1"}, template_id="t1")
+    m, url, body, headers = t.calls[1]
+    assert (m, url) == ("PATCH", "https://rest.runpod.io/v1/templates/t1")
+
+
+def test_billing_pods_and_volumes_query_params():
+    t = FakeTransport([(200, [{"id": "b1"}]), (200, [{"id": "b2"}])])
+    api = ra.RunPodAPI("k", transport=t)
+
+    pods = api.billing_pods("2026-01-01T00:00:00Z", "2026-01-31T23:59:59Z")
+    assert pods == [{"id": "b1"}]
+    m, url, body, headers = t.calls[0]
+    assert m == "GET"
+    assert url.startswith("https://rest.runpod.io/v1/billing/pods?")
+    assert "startTime=2026-01-01T00%3A00%3A00Z" in url
+    assert "endTime=2026-01-31T23%3A59%3A59Z" in url
+
+    vols = api.billing_volumes("2026-01-01T00:00:00Z", "2026-01-31T23:59:59Z")
+    assert vols == [{"id": "b2"}]
+    m, url, body, headers = t.calls[1]
+    assert url.startswith("https://rest.runpod.io/v1/billing/networkvolumes?")
+
+
+def test_balance_uses_graphql_endpoint():
+    t = FakeTransport([(200, {"data": {"myself": {"clientBalance": 21.67}}})])
+    api = ra.RunPodAPI("k", transport=t)
+    bal = api.balance()
+    assert bal == 21.67
+    m, url, body, headers = t.calls[0]
+    assert (m, url) == ("POST", "https://api.runpod.io/graphql")
+    assert "clientBalance" in body["query"]
+    assert headers["Authorization"] == "Bearer k"
