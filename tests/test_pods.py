@@ -78,6 +78,25 @@ def test_ensure_sync_pod_terminates_non_running_and_recreates():
     assert len(api.created) == 1
 
 
+def test_ensure_sync_pod_does_not_adopt_prefix_match():
+    # list_pods is a prefix match; sync_pod_name("may") == "rpfarm-sync-may"
+    # is a prefix of another user's "rpfarm-sync-mayakovsky" pod. That other
+    # user's RUNNING pod must never be adopted as "may"'s sync pod.
+    api = FakeAPI()
+    api.pods["alien1"] = {
+        "id": "alien1",
+        "name": "rpfarm-sync-mayakovsky",
+        "desiredStatus": "RUNNING",
+        "publicIp": "1.1.1.1",
+        "portMappings": {"22": 1000, "8000": 2000},
+    }
+    p = pods.ensure_sync_pod(api, cfg(), "tok", "ssh-ed25519 AAA", client_factory=lambda pid: FakeClient(), sleep=lambda s: None)
+    assert p["id"] == "sync1"
+    assert len(api.created) == 1
+    assert "alien1" in api.pods
+    assert api.terminated == []
+
+
 def test_start_mq_rewrites_public_address():
     c = FakeClient()
     pod = FakeAPI().create_cpu_pod("rpfarm-sync-may", "t", "v", {}, [])
@@ -155,6 +174,14 @@ def test_find_orphans_excludes_sync_pod():
     api.pods["other"] = {"id": "other", "name": "rpfarm-bob-shot-xxxxxxxx-1", "desiredStatus": "RUNNING"}
     orphans = pods.find_orphans(api, "may")
     assert {p["id"] for p in orphans} == {"gpu1", "gpu2"}
+
+
+def test_find_orphans_filters_to_running_only():
+    api = FakeAPI()
+    api.pods["gpu1"] = {"id": "gpu1", "name": "rpfarm-may-shot010-abcd1234-1", "desiredStatus": "RUNNING"}
+    api.pods["gpu2"] = {"id": "gpu2", "name": "rpfarm-may-shot010-abcd1234-2", "desiredStatus": "EXITED"}
+    orphans = pods.find_orphans(api, "may")
+    assert {p["id"] for p in orphans} == {"gpu1"}
 
 
 def test_terminate_all_calls_terminate_pod_for_each():

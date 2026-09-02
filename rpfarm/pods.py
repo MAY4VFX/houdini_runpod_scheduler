@@ -87,7 +87,10 @@ def ensure_sync_pod(
     ``EXITED``) is terminated and replaced."""
     client_factory = client_factory or (lambda pid: WorkerClient(pid, token))
     name = sync_pod_name(cfg.user)
-    existing = api.list_pods(name)
+    # list_pods is a prefix match, and sync_pod_name has no trailing
+    # delimiter, so "rpfarm-sync-may" would also match another user's
+    # "rpfarm-sync-mayakovsky" pod -- filter down to an exact name match.
+    existing = [p for p in api.list_pods(name) if p.get("name") == name]
     running = [p for p in existing if p.get("desiredStatus") == "RUNNING"]
     if running:
         pod = running[0]
@@ -149,7 +152,11 @@ def find_orphans(api, user):
     pod, whose lifecycle is managed separately by :func:`ensure_sync_pod`."""
     prefix = f"rpfarm-{user}-"
     sync_name = sync_pod_name(user)
-    return [p for p in api.list_pods(prefix) if p.get("name") != sync_name]
+    return [
+        p
+        for p in api.list_pods(prefix)
+        if p.get("name") != sync_name and p.get("desiredStatus") == "RUNNING"
+    ]
 
 
 def terminate_all(api, pod_ids: list[str]):
