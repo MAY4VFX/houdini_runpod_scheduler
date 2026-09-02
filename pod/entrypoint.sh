@@ -41,8 +41,25 @@ done
 #    builds can live side by side on the same volume).
 export HOUDINI_VERSION="${HOUDINI_VERSION:-22.0.393}"
 export HFS="/workspace/houdini/${HOUDINI_VERSION}"
-if [ -d "$HFS" ]; then
-  cd "$HFS" && source houdini_setup_bash >/dev/null 2>&1; cd /
+if [ -d "$HFS" ] && [ -f "$HFS/houdini_setup_bash" ]; then
+  # `set -u` MUST be off while sourcing houdini_setup_bash. SideFX's script
+  # reads unset variables (on Houdini 21.0.792 it is `SHFS` at line 30;
+  # other builds trip on PYTHONPATH/LD_LIBRARY_PATH), and because it is
+  # *sourced*, `set -u`'s unbound-variable abort kills THIS shell -- not a
+  # subshell. That is exactly what happened on RunPod: the boot log stopped
+  # dead after "sshd: started" and RunPod restarted the container roughly
+  # every 17 seconds (52 boot logs in 15 minutes on the volume), which is
+  # what produced the "ports appear then vanish / SSH refused / health 404"
+  # symptom across rounds 1-4. Reproduced directly against a real
+  # houdini_setup_bash: with `set -u` the shell dies at the source, without
+  # it the script continues normally.
+  echo "houdini: sourcing $HFS/houdini_setup_bash"
+  set +u
+  cd "$HFS" && source houdini_setup_bash >/tmp/houdini_setup.log 2>&1
+  _setup_rc=$?
+  cd /
+  set -u
+  echo "houdini: houdini_setup_bash rc=$_setup_rc, hython=$(command -v hython || echo 'not on PATH')"
 
   if [ -n "${SESINETD_HOST:-}" ] && ! command -v hserver >/dev/null 2>&1; then
     # `hserver` ships inside $HFS/bin and is only on PATH once
@@ -105,7 +122,7 @@ if [ -d "$HFS" ]; then
   mkdir -p "$HOUDINI_TEMP_DIR"
   echo "Houdini: $(hython --version 2>/dev/null || echo 'hython failed')"
 else
-  echo "WARNING: $HFS not found on volume (install with runpodfarm_upload preset or 'rpfarm houdini install')"
+  echo "WARNING: no Houdini at $HFS (need $HFS/houdini_setup_bash; install with the runpodfarm_upload preset or 'rpfarm houdini install')"
 fi
 
 # 4. Worker: RPFARM_TOKEN / RPFARM_ROLE / RPFARM_SLOTS / RPFARM_PORT / HFS /
