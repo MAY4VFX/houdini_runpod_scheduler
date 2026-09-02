@@ -1,12 +1,35 @@
 #!/bin/bash
 set -uo pipefail
 
+# 0. Boot log on the network volume.
+#    RunPod's own container logs are only visible in its web UI, which the
+#    automation here cannot read -- so every boot tees its whole stdout+stderr
+#    onto the shared volume, where any later pod (or an SSH session) can read
+#    it. This is the ONLY way we get to see why a pod did or did not come up.
+#    Everything below this point, including worker.py's own output after the
+#    final `exec`, lands both on stdout and in $BOOTLOG.
+#    If /workspace is missing or read-only (e.g. a plain `docker run` with no
+#    volume), fall back to stdout only -- never let logging kill the boot.
+BOOTLOG=""
+if mkdir -p /workspace/ledger/logs 2>/dev/null && [ -w /workspace/ledger/logs ]; then
+  BOOTLOG="/workspace/ledger/logs/boot-${RUNPOD_POD_ID:-unknown}-$(date +%s).log"
+  # Process substitution keeps a `tee` child alive for the life of the
+  # container; the final `exec python3 worker.py` still replaces this shell as
+  # PID 1's process, and inherits these fds.
+  exec > >(tee -a "$BOOTLOG") 2>&1
+  echo "boot log: $BOOTLOG"
+else
+  echo "boot log: /workspace/ledger/logs not writable -- stdout only"
+fi
+
 echo "=== rpfarm pod (${RPFARM_ROLE:-?}) $(hostname) pod=${RUNPOD_POD_ID:-?} ==="
+echo "boot: $(date -u +%Y-%m-%dT%H:%M:%SZ) image-entrypoint starting, uname=$(uname -a)"
 
 # 1. SSH: artist's key comes in via env (same convention as runpod/base images)
 mkdir -p ~/.ssh /run/sshd && chmod 700 ~/.ssh
 [ -n "${PUBLIC_KEY:-}" ] && echo "$PUBLIC_KEY" >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys
 /usr/sbin/sshd
+echo "sshd: started (rc=$?)"
 
 # 2. Volume zones (shared network volume mounted at /workspace)
 for d in houdini apps projects ledger/logs .rpfarm; do
@@ -89,4 +112,5 @@ fi
 #    RUNPOD_POD_ID are all read directly from the environment by worker.py
 #    (RunPod sets RUNPOD_POD_ID; RPFARM_PORT defaults to 8000 and
 #    RPFARM_SLOTS defaults to 1 inside worker.py itself).
+echo "worker: exec python3 /opt/rpfarm/worker.py"
 exec python3 /opt/rpfarm/worker.py
