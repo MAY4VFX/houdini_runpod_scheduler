@@ -1,0 +1,14 @@
+Operator:     runpodfarmstats
+Label:        RunPodFarm Stats
+Path:         oplib:/Top/runpodfarmstats?Top/runpodfarmstats
+Icon:         TOP_subnet
+Table:        Top
+License:      
+Extra:        
+User:         
+Inputs:       0 to 0
+Subnet:       true
+Python:       false
+Empty:        false
+Modified:     Thu Sep  3 18:28:14 2026
+

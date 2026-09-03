@@ -75,35 +75,43 @@ def test_append_cook_summary_derives_cost_from_pods(tmp_path):
 
 
 def test_merge_billing_prorates():
+    # GET /billing/pods returns one row PER POD PER DAY (verified live,
+    # 2026-09-03: {podId, amount, timeBilledMs, diskSpaceBilledGB, time} --
+    # no podName at all). Two daily rows for the same podId aggregate to
+    # amount=0.90, timeBilledMs=360000 (360s), matching the brief's single-row
+    # example numbers.
     recs = [
         {"cook_id": "abcd1234", "user": "may", "project": "shot", "pod": "p1", "duration_s": 60, "cost_est": 0.01},
         {"cook_id": "abcd1234", "user": "may", "project": "shot", "pod": "p1", "duration_s": 120, "cost_est": 0.02},
     ]
-    billing = [{"podId": "p1", "podName": "rpfarm-may-shot-abcd1234-1", "amount": 0.90, "timeBilledSeconds": 360}]
+    billing = [
+        {"podId": "p1", "amount": 0.50, "timeBilledMs": 200000, "diskSpaceBilledGB": 10, "time": "2026-09-01 00:00:00"},
+        {"podId": "p1", "amount": 0.40, "timeBilledMs": 160000, "diskSpaceBilledGB": 10, "time": "2026-09-02 00:00:00"},
+    ]
     out = ledger.merge_billing(recs, billing)
-    task = [r for r in out if r.get("kind") != "idle"]
+    task = [r for r in out if r.get("kind") == "task"]
     idle = [r for r in out if r.get("kind") == "idle"]
     assert abs(task[0]["cost"] - 0.15) < 1e-6
     assert abs(task[1]["cost"] - 0.30) < 1e-6
     assert abs(idle[0]["cost"] - 0.45) < 1e-6
 
 
-def test_merge_billing_skips_non_rpfarm_pods():
-    recs = [{"cook_id": "c", "user": "u", "project": "p", "pod": "p1", "duration_s": 60, "cost_est": 0.01}]
-    billing = [{"podId": "other", "podName": "some-other-tenant-pod", "amount": 5.0, "timeBilledSeconds": 100}]
-    out = ledger.merge_billing(recs, billing)
-    # The billing entry isn't ours (no rpfarm- prefix) -- ignored entirely,
-    # and our own record with no matching billing passes through untouched.
-    assert len(out) == 1 and out[0]["cost_est"] == 0.01 and "cost" not in out[0]
-
-
-def test_merge_billing_orphan_pod_with_no_local_records():
-    billing = [{"podId": "p9", "podName": "rpfarm-may-shot-deadbeef-1", "amount": 1.2, "timeBilledSeconds": 600}]
+def test_merge_billing_unattributed_pod_with_no_local_records():
+    # No podName in the real API -- a billed pod with no matching local
+    # record can't be attributed to a user/project, only surfaced honestly.
+    billing = [{"podId": "p9", "amount": 1.2, "timeBilledMs": 600000, "time": "2026-09-01 00:00:00"}]
     out = ledger.merge_billing([], billing)
     assert len(out) == 1
-    assert out[0]["kind"] == "idle"
-    assert out[0]["user"] == "may" and out[0]["project"] == "shot" and out[0]["cook_id"] == "deadbeef"
+    assert out[0]["kind"] == "unattributed"
+    assert out[0]["user"] == "(unattributed)" and out[0]["project"] == "(unattributed)"
     assert abs(out[0]["cost"] - 1.2) < 1e-9
+    assert abs(out[0]["duration_s"] - 600.0) < 1e-9
+
+
+def test_merge_billing_no_matching_billing_passes_through_untouched():
+    recs = [{"cook_id": "c", "user": "u", "project": "p", "pod": "p1", "duration_s": 60, "cost_est": 0.01}]
+    out = ledger.merge_billing(recs, [])
+    assert len(out) == 1 and out[0]["cost_est"] == 0.01 and "cost" not in out[0]
 
 
 def test_merge_billing_passes_through_cook_summary():

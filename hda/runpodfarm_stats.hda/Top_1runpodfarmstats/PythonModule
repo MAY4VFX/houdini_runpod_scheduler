@@ -1,0 +1,252 @@
+"""Shared logic for runpodfarm_stats: load+filter the local ledger, merge
+in RunPod's actual billing, and build the multiline summary text.
+
+Called from three places, all after the same ``RPFARM_ROOT`` bootstrap
+(this asset's ``generate``/``cooktask`` callbacks, and this module's own
+``onRefresh``/``onExportCsv`` button handlers): the pythonprocessor's
+``generate`` builds one work item per (filtered, billing-merged) ledger
+record via ``compute()`` + ``_set_attrib``, and writes ``rpfarm_summary``
+via ``build_summary_text()``; ``Refresh`` pulls new ledger files off the
+volume first, then re-cooks so ``generate`` runs again; ``Export CSV``
+calls ``compute()`` a second time (its own filters may have changed since
+the last cook) and writes the result with ``rpfarm.ledger.to_csv``.
+"""
+
+import datetime
+import os
+import pathlib
+import sys
+import time
+
+_RPFARM_ROOT = pathlib.Path(os.environ.get("RPFARM_ROOT", pathlib.Path.home() / ".rpfarm" / "src"))
+if str(_RPFARM_ROOT) not in sys.path:
+    sys.path.insert(0, str(_RPFARM_ROOT))
+
+from rpfarm import config as rpcfg
+from rpfarm import ledger as rpledger
+from rpfarm import pods as rppods
+from rpfarm.runpod_api import RunPodAPI, RunPodError
+from rpfarm.worker_client import WorkerClient
+
+# Projects with no cook in longer than this show up as cleanup candidates.
+# No config knob for it yet -- the same fixed-constant style dispatch.py
+# uses for its own thresholds (BUDGET_WARN etc).
+_STALE_DAYS = 30
+
+
+def _read_pubkey(cfg):
+    with open(cfg.ssh_key_path + ".pub", "r") as f:
+        return f.read().strip()
+
+
+def _parse_date(s, end_of_day=False):
+    """"YYYY-MM-DD" -> epoch seconds (UTC), or None for an empty string."""
+    s = (s or "").strip()
+    if not s:
+        return None
+    dt = datetime.datetime.strptime(s, "%Y-%m-%d")
+    if end_of_day:
+        dt = dt + datetime.timedelta(days=1) - datetime.timedelta(seconds=1)
+    return dt.replace(tzinfo=datetime.timezone.utc).timestamp()
+
+
+def _iso(epoch, fallback_days_ago=None):
+    if epoch is None:
+        if fallback_days_ago is not None:
+            dt = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=fallback_days_ago)
+        else:
+            dt = datetime.datetime.now(datetime.timezone.utc)
+    else:
+        dt = datetime.datetime.fromtimestamp(epoch, datetime.timezone.utc)
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _set_attrib(wi, key, value):
+    if value is None:
+        return
+    if isinstance(value, bool):
+        wi.setIntAttrib(key, int(value))
+    elif isinstance(value, int):
+        wi.setIntAttrib(key, value)
+    elif isinstance(value, float):
+        wi.setFloatAttrib(key, value)
+    else:
+        wi.setStringAttrib(key, str(value))
+
+
+def compute(node):
+    """Load, filter (project/user/since/until) and -- if Use Billing is on
+    -- billing-merge the local ledger for *node*'s current parameters.
+
+    Returns ``(filtered, by_project, by_user, cleanup, vol_total, usebilling)``.
+    ``vol_total`` is the sum of ``GET /billing/networkvolumes`` over the
+    period (``None`` when billing is off or unreachable). ``cleanup`` is
+    computed from the FULL local ledger (not the project/user filter --
+    the point is to surface stale projects the current filter might be
+    hiding), each entry a dict with ``project, last_cook, age_days``; the
+    per-project on-disk size and $/month are left as a TODO for Task 12's
+    housekeeping ``ls`` (not landed -- only ``du`` exists today, see
+    ``pod/housekeeping.py`` -- inventing that API here would just be a
+    second, divergent guess at its shape).
+    """
+    # rpcfg.home() needs no config.toml (it is just $RPFARM_HOME or
+    # ~/.rpfarm) -- config is only actually loaded below, and only when
+    # Use Billing is on, so the common local-only view works with no
+    # `rpfarm setup` at all.
+    local_dir = rpcfg.home() / "ledger"
+    records = rpledger.load_all(local_dir)
+
+    project_filter = (node.evalParm("rpfarm_project") or "").strip()
+    user_filter = (node.evalParm("rpfarm_user") or "").strip()
+    since_epoch = _parse_date(node.evalParm("rpfarm_since"))
+    until_epoch = _parse_date(node.evalParm("rpfarm_until"), end_of_day=True)
+    usebilling = bool(node.evalParm("rpfarm_usebilling"))
+
+    vol_total = None
+    merged = records
+    if usebilling:
+        try:
+            cfg = rpcfg.load()
+            api = RunPodAPI(cfg.api_key)
+            since_iso = _iso(since_epoch, fallback_days_ago=90)
+            until_iso = _iso(until_epoch)
+            billing_pods = api.billing_pods(since_iso, until_iso)
+            billing_volumes = api.billing_volumes(since_iso, until_iso)
+            vol_total = sum(float(v.get("amount") or 0.0) for v in billing_volumes)
+            merged = rpledger.merge_billing(records, billing_pods)
+        except (rpcfg.ConfigError, RunPodError) as e:
+            node.addWarning("billing unavailable, showing cost_est instead: {}".format(e))
+            usebilling = False
+            merged = records
+
+    def _keep(rec):
+        if rec.get("record") == "cook_summary":
+            return False
+        if project_filter and rec.get("project") != project_filter:
+            return False
+        if user_filter and rec.get("user") != user_filter:
+            return False
+        ts = rec.get("started", rec.get("ended"))
+        if ts is not None:
+            if since_epoch is not None and ts < since_epoch:
+                return False
+            if until_epoch is not None and ts > until_epoch:
+                return False
+        return True
+
+    filtered = [r for r in merged if _keep(r)]
+    by_project = rpledger.summarize(filtered, by="project")
+    by_user = rpledger.summarize(filtered, by="user")
+
+    now = time.time()
+    last_by_project = {}
+    for rec in records:
+        if rec.get("record") == "cook_summary":
+            continue
+        project = rec.get("project")
+        ts = rec.get("ended") or rec.get("started")
+        if not project or ts is None:
+            continue
+        if project not in last_by_project or ts > last_by_project[project]:
+            last_by_project[project] = ts
+    cleanup = []
+    for project, ts in sorted(last_by_project.items()):
+        age_days = (now - ts) / 86400.0
+        if age_days > _STALE_DAYS:
+            cleanup.append({
+                "project": project,
+                "last_cook": time.strftime("%Y-%m-%d", time.gmtime(ts)),
+                "age_days": age_days,
+            })
+
+    return filtered, by_project, by_user, cleanup, vol_total, usebilling
+
+
+def _fmt_money(x):
+    return "${:.4f}".format(x or 0.0)
+
+
+def _set_summary(node, text):
+    """Set rpfarm_summary, escaping "$" so Houdini's own parm expansion
+    (bare "$" reads as a channel/variable reference, same as $HIP etc)
+    doesn't eat the money signs the summary text is full of -- verified
+    live: an un-escaped "$0.0064" round-trips through evalAsString() as
+    just ".0064" (Houdini silently expands the undefined "$0" to nothing).
+    "\\$" is the same escape this codebase's own shell-command building
+    already relies on for $PDG_ITEM_NAME (see smoke_scheduler_headless.py).
+    """
+    node.parm("rpfarm_summary").set(text.replace("$", "\\$"))
+
+
+def build_summary_text(by_project, by_user, cleanup, vol_total, usebilling, n_records):
+    lines = []
+    total_cost = sum(g["cost"] for g in by_project)
+    total_gpu_hours = sum(g["gpu_hours"] for g in by_project)
+    total_tasks = sum(g["tasks"] for g in by_project)
+    lines.append("{} record(s) -- {} total, {:.2f} GPU-h, {} task(s), {} /task".format(
+        n_records, _fmt_money(total_cost), total_gpu_hours, total_tasks,
+        _fmt_money(total_cost / total_tasks) if total_tasks else "$0.0000",
+    ))
+    if not usebilling:
+        lines.append("(cost_est -- Use Billing is off; turn it on for RunPod's actual charge)")
+    lines.append("")
+    lines.append("By project:")
+    for g in by_project:
+        lines.append("  {:<24s} {:>10s}  {:>8.2f} GPU-h  {:>4d} task(s)  {} /task".format(
+            g["key"], _fmt_money(g["cost"]), g["gpu_hours"], g["tasks"], _fmt_money(g["cost_per_task"])))
+    if not by_project:
+        lines.append("  (no records match the current filters)")
+    lines.append("")
+    lines.append("By user:")
+    for g in by_user:
+        lines.append("  {:<24s} {:>10s}  {:>8.2f} GPU-h  {:>4d} task(s)  {} /task".format(
+            g["key"], _fmt_money(g["cost"]), g["gpu_hours"], g["tasks"], _fmt_money(g["cost_per_task"])))
+    if not by_user:
+        lines.append("  (no records match the current filters)")
+    if usebilling and vol_total is not None:
+        lines.append("")
+        lines.append("Volume storage (period): {}".format(_fmt_money(vol_total)))
+    lines.append("")
+    lines.append("Cleanup candidates (no cook in > {} days):".format(_STALE_DAYS))
+    if cleanup:
+        for c in cleanup:
+            lines.append("  {:<24s} last cook {}  ({:.0f}d ago)  size: TODO (Task 12 housekeeping ls)".format(
+                c["project"], c["last_cook"], c["age_days"]))
+    else:
+        lines.append("  (none)")
+    return "\n".join(lines)
+
+
+def onRefresh(kwargs):
+    """Pull new ledger files off the volume, then re-cook so `generate`
+    (which does the billing pull) runs again with fresh data."""
+    node = kwargs["node"]
+    try:
+        cfg = rpcfg.load()
+        token = rpcfg.session_token()
+        pubkey = _read_pubkey(cfg)
+        api = RunPodAPI(cfg.api_key)
+        pod = rppods.ensure_sync_pod(api, cfg, token, pubkey)
+        client = WorkerClient(pod["id"], token)
+        local_dir = rpcfg.home() / "ledger"
+        n = rpledger.sync_from_volume(client, local_dir, cfg.user)
+        node.cookWorkItems(block=True, save_prompt=False)
+        # evalAsString() un-escapes "\$" back to a real "$" -- re-escape
+        # before writing it back, or the next round-trip mangles it again.
+        current = node.parm("rpfarm_summary").evalAsString()
+        _set_summary(node, "Synced {} new ledger file(s).\n\n{}".format(n, current))
+    except (rpcfg.ConfigError, RunPodError, OSError) as e:
+        node.addWarning("refresh failed: {}".format(e))
+
+
+def onExportCsv(kwargs):
+    node = kwargs["node"]
+    try:
+        filtered, by_project, by_user, cleanup, vol_total, usebilling = compute(node)
+        out_dir = rpcfg.home() / "exports"
+        path = out_dir / "rpfarm_stats_{}.csv".format(time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()))
+        rpledger.to_csv(filtered, path)
+        current = node.parm("rpfarm_summary").evalAsString()
+        _set_summary(node, "Exported {} record(s) -> {}\n\n{}".format(len(filtered), path, current))
+    except (rpcfg.ConfigError, OSError) as e:
+        node.addWarning("CSV export failed: {}".format(e))

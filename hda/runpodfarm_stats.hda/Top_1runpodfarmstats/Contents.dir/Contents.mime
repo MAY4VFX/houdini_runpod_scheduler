@@ -1,0 +1,450 @@
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="HOUDINIMIMEBOUNDARY0xD3ADD339-0x00000F49-0x56B122C9-0x00000001HOUDINIMIMEBOUNDARY"
+
+--HOUDINIMIMEBOUNDARY0xD3ADD339-0x00000F49-0x56B122C9-0x00000001HOUDINIMIMEBOUNDARY
+Content-Disposition: attachment; filename=".OPfallbacks"
+Content-Type: application/external-reference
+
+.OPfallbacks
+
+--HOUDINIMIMEBOUNDARY0xD3ADD339-0x00000F49-0x56B122C9-0x00000001HOUDINIMIMEBOUNDARY
+Content-Disposition: attachment; filename=".OPdummydefs"
+Content-Type: application/external-reference
+
+.OPdummydefs
+
+--HOUDINIMIMEBOUNDARY0xD3ADD339-0x00000F49-0x56B122C9-0x00000001HOUDINIMIMEBOUNDARY
+Content-Disposition: attachment; filename="node_type"
+Content-Type: text/plain
+
+Top
+
+--HOUDINIMIMEBOUNDARY0xD3ADD339-0x00000F49-0x56B122C9-0x00000001HOUDINIMIMEBOUNDARY
+Content-Disposition: attachment; filename="hdaroot.init"
+Content-Type: text/plain
+
+type = runpodfarmstats
+matchesdef = 0
+
+--HOUDINIMIMEBOUNDARY0xD3ADD339-0x00000F49-0x56B122C9-0x00000001HOUDINIMIMEBOUNDARY
+Content-Disposition: attachment; filename="hdaroot.def"
+Content-Type: text/plain
+
+comment ""
+position 0 0
+connectornextid 0
+flags =  lock off model off template off footprint off xray off bypass off display on render off highlight off unload off savedata off compress off colordefault on exposed on
+outputsNamed3
+{
+}
+inputsNamed3
+{
+}
+inputs
+{
+}
+stat
+{
+  create -1
+  modify -1
+  author may@maymac01-2.local
+  access 0777
+}
+color UT_Color RGB 0.8 0.8 0.8 
+delscript ""
+exprlanguage hscript
+end
+
+--HOUDINIMIMEBOUNDARY0xD3ADD339-0x00000F49-0x56B122C9-0x00000001HOUDINIMIMEBOUNDARY
+Content-Disposition: attachment; filename="hdaroot.userdata"
+Content-Type: text/plain
+
+{
+	"___Version___":{
+		"type":"string",
+		"value":""
+	}
+}
+
+--HOUDINIMIMEBOUNDARY0xD3ADD339-0x00000F49-0x56B122C9-0x00000001HOUDINIMIMEBOUNDARY
+Content-Disposition: attachment; filename="hdaroot/output0.init"
+Content-Type: text/plain
+
+type = output
+matchesdef = 1
+
+--HOUDINIMIMEBOUNDARY0xD3ADD339-0x00000F49-0x56B122C9-0x00000001HOUDINIMIMEBOUNDARY
+Content-Disposition: attachment; filename="hdaroot/output0.def"
+Content-Type: text/plain
+
+comment ""
+position -1.6944 0.8942
+connectornextid 1
+flags =  lock off model off template off footprint off xray off bypass off display on render on highlight off unload off savedata off compress off colordefault on exposed on
+outputsNamed3
+{
+}
+inputsNamed3
+{
+0 	pythonprocessor1 0 1 "input1"
+}
+inputs
+{
+0 	pythonprocessor1 0 1
+}
+stat
+{
+  create -1
+  modify -1
+  author may@maymac01-2.local
+  access 0777
+}
+color UT_Color RGB 0.8 0.8 0.8 
+delscript ""
+exprlanguage hscript
+end
+
+--HOUDINIMIMEBOUNDARY0xD3ADD339-0x00000F49-0x56B122C9-0x00000001HOUDINIMIMEBOUNDARY
+Content-Disposition: attachment; filename="hdaroot/output0.parm"
+Content-Type: text/plain
+
+{
+version 0.8
+outputidx	[ 0	locks=0 ]	(	0	)
+pdg_workitemlabel	[ 0	locks=0 ]	(	"0"	)
+pdg_workitemlabelexpr	[ 0	locks=0 ]	(	""	)
+}
+
+--HOUDINIMIMEBOUNDARY0xD3ADD339-0x00000F49-0x56B122C9-0x00000001HOUDINIMIMEBOUNDARY
+Content-Disposition: attachment; filename="hdaroot/output0.userdata"
+Content-Type: text/plain
+
+{
+	"___Version___":{
+		"type":"string",
+		"value":"___EXTERNAL___"
+	}
+}
+
+--HOUDINIMIMEBOUNDARY0xD3ADD339-0x00000F49-0x56B122C9-0x00000001HOUDINIMIMEBOUNDARY
+Content-Disposition: attachment; filename="hdaroot/pythonprocessor1.init"
+Content-Type: text/plain
+
+type = pythonprocessor
+matchesdef = 0
+
+--HOUDINIMIMEBOUNDARY0xD3ADD339-0x00000F49-0x56B122C9-0x00000001HOUDINIMIMEBOUNDARY
+Content-Disposition: attachment; filename="hdaroot/pythonprocessor1.def"
+Content-Type: text/plain
+
+comment ""
+position -1.6944 1.7884
+connectornextid 1
+flags =  lock off model off template off footprint off xray off bypass off display off render off highlight off unload off savedata off compress off colordefault on exposed on
+outputsNamed3
+{
+0 "output1"
+}
+inputsNamed3
+{
+}
+inputs
+{
+}
+stat
+{
+  create -1
+  modify -1
+  author may@maymac01-2.local
+  access 0777
+}
+color UT_Color RGB 0.8 0.8 0.8 
+delscript ""
+exprlanguage hscript
+end
+
+--HOUDINIMIMEBOUNDARY0xD3ADD339-0x00000F49-0x56B122C9-0x00000001HOUDINIMIMEBOUNDARY
+Content-Disposition: attachment; filename="hdaroot/pythonprocessor1.chn"
+Content-Type: text/plain
+
+{
+    channel topscheduler {
+      lefttype = extend
+      righttype = extend
+      defaultString = \"\"
+      flags = 0
+      segment { options = {	 autoslope  ai ao }
+
+	 length = 0 accel = 0.33333333333333331 0.33333333333333331 expr = "hou.pwd().parent().path() + \"/localscheduler\"" language = python }
+    }
+  }
+
+--HOUDINIMIMEBOUNDARY0xD3ADD339-0x00000F49-0x56B122C9-0x00000001HOUDINIMIMEBOUNDARY
+Content-Disposition: attachment; filename="hdaroot/pythonprocessor1.parm"
+Content-Type: text/plain
+
+{
+version 0.8
+savenodescript	[ 0	locks=0 ]	(	0	)
+savenodehda	[ 0	locks=0 ]	(	0	)
+sepparm2	[ 0	locks=0 ]	(	)
+processor	[ 0	locks=0 ]	(	0	0	0	)
+pdg_workitemgeneration	[ 0	locks=0 ]	(	"2"	)
+pdg_command	[ 0	locks=0 ]	(	""	)
+sepparm	[ 0	locks=0 ]	(	)
+callbacks	[ 0	locks=0 ]	(	0	0	0	0	0	)
+generate	[ 0	locks=0 ]	(	"# Called when this node should generate new work items. No upstream input
+# (this node takes none -- see this node's Help) so generation is static:
+# fires once per cook, not re-invoked per upstream item like the download
+# node's \"outputs\" mode.
+#
+# self             -   A reference to the current pdg.Node instance
+# item_holder      -   A pdg.WorkItemHolder for constructing and adding work items
+# upstream_items   -   Always empty here (no input)
+# generation_type  -   The type of generation
+
+import os
+import pathlib
+import sys
+
+_RPFARM_ROOT = pathlib.Path(os.environ.get(\"RPFARM_ROOT\", pathlib.Path.home() / \".rpfarm\" / \"src\"))
+if str(_RPFARM_ROOT) not in sys.path:
+    sys.path.insert(0, str(_RPFARM_ROOT))
+
+node = self.topNode().parent()
+hm = node.hm()
+
+filtered, by_project, by_user, cleanup, vol_total, usebilling = hm.compute(node)
+
+# One work item per (filtered, billing-merged) ledger record -- a task, a
+# pod's synthetic idle remainder, or an unattributed billed pod (see
+# rpfarm.ledger.merge_billing). Every item cooks inProcess: this node's
+# whole point is fast local aggregation (Task 11 addendum -- \"данных мало,
+# сеть только на биллинг\"), and inProcess=True is what lets this node's own
+# (empty) cooktask actually run -- an item created without it silently
+# no-ops in cooktask instead (see this node's Help).
+for i, rec in enumerate(filtered):
+    wi = item_holder.addWorkItem(name=\"rec_{:04d}\".format(i), inProcess=True)
+    for k, v in rec.items():
+        hm._set_attrib(wi, k, v)
+
+hm._set_summary(
+    node, hm.build_summary_text(by_project, by_user, cleanup, vol_total, usebilling, len(filtered))
+)
+"	)
+useregeneratestatic	[ 0	locks=0 ]	(	"off"	)
+regeneratestatic	[ 0	locks=0 ]	(	"# Called when this node may need to regenerate existing work items
+#
+# self           -   A reference to the current pdg.Node instance
+# item_holder    -   A pdg.WorkItemHolder for constructing and adding new work items
+# existing_items -   The existing work items in the node
+# upstream_items -   The list of work items in the node above, or empty list
+# generation_type -   The type of generation, e.g. pdg.generationType.Static, Dynamic, or Regenerate"	)
+addinternaldependencies	[ 0	locks=0 ]	(	"# Called when the node has generated work items so that dependencies can
+# be added between work items in this node.
+#
+# self              -   A reference to the current pdg.Node instance
+# dependency_holder -   A pdg.WorkItemHolder for adding pairs of items that should have a dependency
+# internal_items    -   The list of items, either all static items or a group of dynamic items
+# is_static         -   Boolean indicating if the items list contains static items
+"	)
+cooktask	[ 0	locks=0 ]	(	"# Called for every inProcess work item (generate() above only creates
+# inProcess ones -- see this node's Help for why that matters). All of the
+# real work -- loading the ledger, merging billing, computing the
+# per-record cost -- already ran ONCE in generate(), not once per item;
+# this item's attributes were set there. Nothing left to cook.
+#
+# self              -   A reference to the current pdg.Node instance
+# work_item         -   The work item being cooked by this callback
+pass
+"	)
+servicename	[ 0	locks=0 ]	(	""	)
+sepparm3	[ 0	locks=0 ]	(	)
+alwaysregenerate	[ 0	locks=0 ]	(	"off"	)
+dirtyonregenerate	[ 0	locks=0 ]	(	"off"	)
+dirtyonincomplete	[ 0	locks=0 ]	(	"off"	)
+sepparm4	[ 0	locks=0 ]	(	)
+requiresgeneratedinputs	[ 0	locks=0 ]	(	"off"	)
+requirescookedinputs	[ 0	locks=0 ]	(	"off"	)
+requiresscenefile	[ 0	locks=0 ]	(	"off"	)
+requiresinputdata	[ 0	locks=0 ]	(	"off"	)
+sepparm6	[ 0	locks=0 ]	(	)
+usesdynamicbatching	[ 0	locks=0 ]	(	"off"	)
+sepparm7	[ 0	locks=0 ]	(	)
+usestatefilter	[ 0	locks=0 ]	(	"off"	)
+statefilter	[ 0	locks=0 ]	(	"0"	)
+clearfailures	[ 0	locks=0 ]	(	"off"	)
+pdgnodedeps	[ 0	locks=0 ]	(	1	)
+topscheduler	[ 0	locks=0 ]	(	[ topscheduler	"" ] 	)
+addjobparms	[ 0	locks=0 ]	(	0	)
+pdg_useschedulewhen	[ 0	locks=0 ]	(	"off"	)
+pdg_schedulewhen	[ 0	locks=0 ]	(	1	)
+sepparm5	[ 0	locks=0 ]	(	)
+pdg_workitemlabel	[ 0	locks=0 ]	(	"0"	)
+pdg_workitemlabelexpr	[ 0	locks=0 ]	(	""	)
+pdg_workitempriority	[ 0	locks=0 ]	(	"0"	)
+pdg_workitempriorityexpr	[ 0	locks=0 ]	(	0	)
+pdgnodedep1	[ 0	locks=0 ]	(	""	)
+}
+
+--HOUDINIMIMEBOUNDARY0xD3ADD339-0x00000F49-0x56B122C9-0x00000001HOUDINIMIMEBOUNDARY
+Content-Disposition: attachment; filename="hdaroot/pythonprocessor1.userdata"
+Content-Type: text/plain
+
+{
+	"___Version___":{
+		"type":"string",
+		"value":""
+	},
+	"___toolcount___":{
+		"type":"string",
+		"value":"1"
+	},
+	"___toolid___":{
+		"type":"string",
+		"value":"object_cop2plane"
+	}
+}
+
+--HOUDINIMIMEBOUNDARY0xD3ADD339-0x00000F49-0x56B122C9-0x00000001HOUDINIMIMEBOUNDARY
+Content-Disposition: attachment; filename="hdaroot/localscheduler.init"
+Content-Type: text/plain
+
+type = localscheduler
+matchesdef = 0
+
+--HOUDINIMIMEBOUNDARY0xD3ADD339-0x00000F49-0x56B122C9-0x00000001HOUDINIMIMEBOUNDARY
+Content-Disposition: attachment; filename="hdaroot/localscheduler.def"
+Content-Type: text/plain
+
+comment ""
+position 0 0.8942
+connectornextid 0
+flags =  lock off model off template off footprint off xray off bypass off display off render off highlight off unload off savedata off compress off colordefault on exposed on
+outputsNamed3
+{
+}
+inputsNamed3
+{
+}
+inputs
+{
+}
+stat
+{
+  create -1
+  modify -1
+  author may@maymac01-2.local
+  access 0777
+}
+color UT_Color RGB 0.478 0.478 0.478 
+delscript ""
+exprlanguage hscript
+end
+
+--HOUDINIMIMEBOUNDARY0xD3ADD339-0x00000F49-0x56B122C9-0x00000001HOUDINIMIMEBOUNDARY
+Content-Disposition: attachment; filename="hdaroot/localscheduler.parm"
+Content-Type: text/plain
+
+{
+version 0.8
+folder0	[ 0	locks=0 ]	(	0	0	0	)
+folder5	[ 0	locks=0 ]	(	0	)
+maxprocsmenu	[ 0	locks=0 ]	(	"0"	)
+maxprocs	[ 0	locks=0 ]	(	1	)
+pdg_usemaxtasks	[ 0	locks=0 ]	(	"off"	)
+pdg_maxtasks	[ 0	locks=0 ]	(	0	)
+verbose	[ 0	locks=0 ]	(	"off"	)
+pdg_waitforfailures	[ 0	locks=0 ]	(	"off"	)
+folder4	[ 0	locks=0 ]	(	0	)
+pdg_workingdir	[ 0	locks=0 ]	(	$HIP	)
+uselogfilename	[ 0	locks=0 ]	(	"off"	)
+logfilename	[ 0	locks=0 ]	(	`@pdg_name`.log	)
+hythonbin	[ 0	locks=0 ]	(	"0"	)
+hythonbincustomuniversal	[ 0	locks=0 ]	(	""	)
+pdg_workitemdatasource	[ 0	locks=0 ]	(	"0"	)
+pdg_compressworkitemdata	[ 0	locks=0 ]	(	"on"	)
+pdg_validateoutputs	[ 0	locks=0 ]	(	"on"	)
+pdg_checkexpectedoutputs	[ 0	locks=0 ]	(	"on"	)
+sepparm2	[ 0	locks=0 ]	(	)
+pdg_mapmode	[ 0	locks=0 ]	(	"0"	)
+pdg_usemapzone	[ 0	locks=0 ]	(	"off"	)
+pdg_mapzone	[ 0	locks=0 ]	(	$PDG_PATHMAP_ZONE	)
+sepparm6	[ 0	locks=0 ]	(	)
+pdg_transfertype	[ 0	locks=0 ]	(	"1"	)
+pdg_transferroot	[ 0	locks=0 ]	(	$HIP	)
+folder1	[ 0	locks=0 ]	(	0	)
+tempdirmenu	[ 0	locks=0 ]	(	"1"	)
+tempdirappendpid	[ 0	locks=0 ]	(	"on"	)
+tempdircustom	[ 0	locks=0 ]	(	$HOUDINI_TEMP_DIR/$HIPNAME/pdgtemp	)
+pdg_deletetempdir	[ 0	locks=0 ]	(	"0"	)
+socketcallbacks	[ 0	locks=0 ]	(	1	)
+pdg_rpcignoreerrors	[ 0	locks=0 ]	(	"0"	)
+pdg_rpcmaxerrors	[ 0	locks=0 ]	(	5	)
+pdg_rpctimeout	[ 0	locks=0 ]	(	4	)
+pdg_rpcretries	[ 0	locks=0 ]	(	2	)
+pdg_rpcbackoff	[ 0	locks=0 ]	(	2	)
+pdg_rpcbatch	[ 0	locks=0 ]	(	1	)
+pdg_rpcrelease	[ 0	locks=0 ]	(	"on"	)
+folder0_3	[ 0	locks=0 ]	(	0	)
+local_single	[ 0	locks=0 ]	(	"off"	)
+local_is_CPU_number_set	[ 0	locks=0 ]	(	"off"	)
+local_CPUs_to_use	[ 0	locks=0 ]	(	1	)
+folder6	[ 0	locks=0 ]	(	0	)
+local_useminfreemem	[ 0	locks=0 ]	(	"0"	)
+local_minfreemem	[ 0	locks=0 ]	(	0	)
+local_minfreemempct	[ 0	locks=0 ]	(	0	)
+folder2	[ 0	locks=0 ]	(	0	)
+local_enabletimeout	[ 0	locks=0 ]	(	"off"	)
+local_maxtime	[ 0	locks=0 ]	(	0	)
+local_handletimeout	[ 0	locks=0 ]	(	"0"	)
+sepparm4	[ 0	locks=0 ]	(	)
+local_enablemaxmemory	[ 0	locks=0 ]	(	"off"	)
+local_maxmemory	[ 0	locks=0 ]	(	0	)
+local_handlememory	[ 0	locks=0 ]	(	"0"	)
+sepparm5	[ 0	locks=0 ]	(	)
+local_echandleby	[ 0	locks=0 ]	(	"0"	)
+local_echandleall	[ 0	locks=0 ]	(	"on"	)
+local_eccustomcode	[ 0	locks=0 ]	(	1	)
+sepparm	[ 0	locks=0 ]	(	)
+local_maximumretries	[ 0	locks=0 ]	(	3	)
+local_addfailcountattr	[ 0	locks=0 ]	(	"off"	)
+local_failcountattr	[ 0	locks=0 ]	(	failurecount	)
+folder3	[ 0	locks=0 ]	(	0	)
+local_usehoudinimaxthreads	[ 0	locks=0 ]	(	"off"	)
+local_houdinimaxthreads	[ 0	locks=0 ]	(	0	)
+local_requireswindow	[ 0	locks=0 ]	(	"off"	)
+local_skippackages	[ 0	locks=0 ]	(	"on"	)
+local_setworkingdir	[ 0	locks=0 ]	(	"on"	)
+local_envunset	[ 0	locks=0 ]	(	""	)
+local_env_file	[ 0	locks=0 ]	(	""	)
+local_envmulti	[ 0	locks=0 ]	(	0	)
+}
+
+--HOUDINIMIMEBOUNDARY0xD3ADD339-0x00000F49-0x56B122C9-0x00000001HOUDINIMIMEBOUNDARY
+Content-Disposition: attachment; filename="hdaroot/localscheduler.userdata"
+Content-Type: text/plain
+
+{
+	"___Version___":{
+		"type":"string",
+		"value":"___EXTERNAL___"
+	}
+}
+
+--HOUDINIMIMEBOUNDARY0xD3ADD339-0x00000F49-0x56B122C9-0x00000001HOUDINIMIMEBOUNDARY
+Content-Disposition: attachment; filename="hdaroot.order"
+Content-Type: text/plain
+
+3
+output0
+pythonprocessor1
+localscheduler
+
+--HOUDINIMIMEBOUNDARY0xD3ADD339-0x00000F49-0x56B122C9-0x00000001HOUDINIMIMEBOUNDARY
+Content-Disposition: attachment; filename="hdaroot.net"
+Content-Type: text/plain
+
+1
+
+--HOUDINIMIMEBOUNDARY0xD3ADD339-0x00000F49-0x56B122C9-0x00000001HOUDINIMIMEBOUNDARY--
