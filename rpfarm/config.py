@@ -63,6 +63,13 @@ class Config:
     gpu_priority: list[str] = field(default_factory=list)
     rclone_path: str = field(default_factory=_default_rclone_path)
     ssh_key_path: str = field(default_factory=_default_ssh_key_path)
+    # Last uplink measurement from `rpfarm doctor` (Mbps, against the sync
+    # pod) -- threaded through here so the upload HDA's "auto" compression
+    # mode (rpfarm.packages.resolve_compress_flag) has a real number to
+    # compare against AUTO_COMPRESS_THRESHOLD_MBPS instead of always
+    # falling back to "compress" for want of one. None until doctor has
+    # run at least once with a sync pod up.
+    measured_mbps: float | None = None
 
 
 # -- config.toml ----------------------------------------------------------
@@ -71,7 +78,7 @@ class Config:
 def _toml_value(v):
     if isinstance(v, bool):
         return "true" if v else "false"
-    if isinstance(v, int):
+    if isinstance(v, (int, float)):
         return str(v)
     if isinstance(v, list):
         return "[" + ", ".join(_toml_value(x) for x in v) + "]"
@@ -82,12 +89,23 @@ def _toml_value(v):
 
 
 def save(cfg: Config) -> None:
-    """Write ``cfg`` to ``$RPFARM_HOME/config.toml``, chmod 600, atomically."""
+    """Write ``cfg`` to ``$RPFARM_HOME/config.toml``, chmod 600, atomically.
+
+    A field whose value is ``None`` (currently only ``measured_mbps``
+    before ``rpfarm doctor`` has ever run with a sync pod up) is omitted
+    entirely rather than written as some TOML stand-in for null — TOML has
+    no null literal, and ``load()`` already falls back to the dataclass
+    default for any key missing from the file.
+    """
     h = home()
     h.mkdir(parents=True, exist_ok=True)
     path = h / CONFIG_FILENAME
 
-    lines = [f"{f.name} = {_toml_value(getattr(cfg, f.name))}" for f in fields(cfg)]
+    lines = [
+        f"{f.name} = {_toml_value(getattr(cfg, f.name))}"
+        for f in fields(cfg)
+        if getattr(cfg, f.name) is not None
+    ]
     text = "\n".join(lines) + "\n"
 
     fd, tmp_path = tempfile.mkstemp(dir=str(h), prefix=".config-", suffix=".tmp")

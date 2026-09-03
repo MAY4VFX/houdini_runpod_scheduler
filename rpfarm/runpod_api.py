@@ -147,6 +147,9 @@ class RunPodAPI:
 
     # -- network volumes --------------------------------------------------
 
+    def list_volumes(self):
+        return self._call("GET", "/networkvolumes") or []
+
     def get_volume(self, vid):
         return self._call("GET", f"/networkvolumes/{vid}")
 
@@ -164,6 +167,9 @@ class RunPodAPI:
         self._call("DELETE", f"/networkvolumes/{vid}", ok404=True)
 
     # -- templates ---------------------------------------------------------
+
+    def list_templates(self):
+        return self._call("GET", "/templates") or []
 
     def save_template(
         self,
@@ -216,6 +222,32 @@ class RunPodAPI:
             raise RunPodError(status, raw.decode(errors="replace"))
         data = json.loads(raw)
         return float(data["data"]["myself"]["clientBalance"])
+
+    def gpu_types(self, dc="EU-RO-1"):
+        """Every GPU type RunPod knows about, with ``lowestPrice`` for *dc*.
+
+        REST has no per-datacenter stock signal (``GET /gputypes`` lists
+        types with no ``lowestPrice``/``stockStatus`` field at all), so
+        this is GraphQL, like :meth:`balance`. ``lowestPrice.stockStatus``
+        is ``None``/``"Low"``/``"Medium"``/``"High"`` -- ``None`` means out
+        of stock in *dc* right now, not a query failure (confirmed live
+        2026-09-03: querying without an ``id`` filter returns every type
+        RunPod offers, most with ``stockStatus: null`` for a niche
+        datacenter). Filtering down to a caller's ``gpu_priority`` list is
+        left to the caller -- this always returns the whole catalog so it
+        stays useful outside ``doctor`` too (e.g. picking a first
+        priority list at ``setup`` time).
+        """
+        query = (
+            "query { gpuTypes { id displayName "
+            'lowestPrice(input: {gpuCount: 1, dataCenterId: "%s"}) '
+            "{ stockStatus minimumBidPrice uninterruptablePrice } } }" % dc
+        )
+        status, raw = self._transport("POST", GRAPHQL_URL, {"query": query}, self._headers)
+        if status >= 300:
+            raise RunPodError(status, raw.decode(errors="replace"))
+        data = json.loads(raw)
+        return data["data"]["gpuTypes"]
 
 
 def pod_public_endpoint(pod, private_port):
