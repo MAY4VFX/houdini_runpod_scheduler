@@ -79,6 +79,11 @@ def main(argv):
         print("usage: python3 -m rpfarm.package_runner <item-json-path>", file=sys.stderr)
         return 2
 
+    # PID in every line is the cheapest possible evidence, in the log,
+    # that two packages ran as separate out-of-process work items rather
+    # than sequentially in one process.
+    print("[rpfarm-upload] pid={} starting {}".format(os.getpid(), argv[0]), flush=True)
+
     _bootstrap_rpfarm()
 
     from rpfarm import config as rpcfg
@@ -123,8 +128,8 @@ def main(argv):
         mbps = stats["bytes"] / 2**20 / max(1e-3, elapsed)
 
         print(
-            "[rpfarm-upload] done bytes={} files={} seconds={:.2f} mbps={:.3f}".format(
-                stats["bytes"], stats["files"], elapsed, mbps
+            "[rpfarm-upload] pid={} done bytes={} files={} seconds={:.2f} mbps={:.3f}".format(
+                os.getpid(), stats["bytes"], stats["files"], elapsed, mbps
             ),
             flush=True,
         )

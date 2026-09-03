@@ -56,8 +56,17 @@ def build_node(topnet, name):
     return topnet.createNode("runpodfarmupload", name)
 
 
-def cook(node, timeout):
-    """Cook one runpodfarmupload node to completion, guarded by a wall clock."""
+def cook(node, timeout, prove_nonblocking=False):
+    """Cook one runpodfarmupload node to completion, guarded by a wall clock.
+
+    When ``prove_nonblocking`` is set, cooks with ``block=False`` and polls
+    from this same thread instead -- if Houdini's main thread were actually
+    stuck inside a blocking call (the old in-process default), this poll
+    loop could not run at all. Each poll also timestamps every work item's
+    current state, so overlapping start/finish times across items are
+    direct evidence of out-of-process *parallel* dispatch, not just
+    non-blocking.
+    """
     ctx = node.parent().getPDGGraphContext()
     expired = threading.Event()
 
@@ -74,10 +83,30 @@ def cook(node, timeout):
     watchdog.start()
 
     started = time.time()
-    log("cooking {} (guard {}s)...".format(node.path(), timeout))
+    log("cooking {} (guard {}s, {})...".format(
+        node.path(), timeout, "non-blocking poll" if prove_nonblocking else "blocking"))
     failed = False
     try:
-        node.cookWorkItems(block=True, save_prompt=False)
+        if prove_nonblocking:
+            node.cookWorkItems(block=False, save_prompt=False)
+            last_states = {}
+            heartbeats = 0
+            while ctx.cooking:
+                heartbeats += 1
+                log("  main thread alive, still polling (t={:.1f}s, heartbeat #{})".format(
+                    time.time() - started, heartbeats))
+                pdg_node = node.getPDGNode()
+                if pdg_node:
+                    for item in pdg_node.workItems:
+                        state = str(item.state).rsplit(".", 1)[-1]
+                        if last_states.get(item.name) != state:
+                            log("    t={:.1f}s  {:<24} -> {}".format(time.time() - started, item.name, state))
+                            last_states[item.name] = state
+                if expired.is_set():
+                    break
+                time.sleep(0.5)
+        else:
+            node.cookWorkItems(block=True, save_prompt=False)
     except hou.OperationFailed as e:
         failed = True
         log("COOK FAILED: {}".format(e))
@@ -125,6 +154,22 @@ def report_items(node):
                 item.name, role, state, bytes_, files_, seconds_, mbps_
             )
         )
+        if not ok:
+            try:
+                for line in str(item.logMessages).splitlines():
+                    log("    log: {}".format(line))
+            except Exception as e:
+                log("    (logMessages read failed: {})".format(e))
+            try:
+                uri = item.logURI
+                log("    logURI: {!r}".format(uri))
+                path = uri[len("file://"):] if uri.startswith("file://") else uri
+                if path and os.path.exists(path):
+                    with open(path) as f:
+                        for line in f.read().splitlines():
+                            log("    logfile: {}".format(line))
+            except Exception as e:
+                log("    (logURI read failed: {})".format(e))
     return succeeded, len(items)
 
 
@@ -184,7 +229,7 @@ def run_custom(topnet, cfg, timeout, keep):
     node.parm("rpfarm_local3").set(fake_hip)
     node.parm("rpfarm_remote3").set(remote_project + "/fake_scene.hip")
 
-    elapsed, aborted = cook(node, timeout)
+    elapsed, aborted = cook(node, timeout, prove_nonblocking=True)
     succeeded, total = report_items(node)
 
     checks_ok = True

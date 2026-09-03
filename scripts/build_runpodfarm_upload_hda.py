@@ -4,8 +4,14 @@ Builds a Top/subnet node containing a pythonprocessor1 (work item
 generation/cook) and a localscheduler (forces this node's items to cook on
 PDG's local scheduler regardless of the parent topnet's own scheduler --
 see this node's Help), wires them up, sets the rpfarm_* parameter
-interface, converts the subnet to a digital asset, and saves it as a
-single packed .hda file at the path given on the command line.
+interface (including the rpfarm_inprocess debug toggle), adds an
+OnCreated event (Python, via ExtraFileOptions IsPython/IsScript -- see
+main() below for how that's set) that re-asserts the scheduler-override
+expression, converts the subnet to a digital asset, and saves it as a
+single packed .hda file at the path given on the command line. By
+default work items dispatch out of process through
+rpfarm.package_runner (Ruling R22) rather than cooking in this node's own
+cooktask callback.
 
 Regenerate the checked-in asset with, e.g.::
 
@@ -37,14 +43,18 @@ GENERATE_CODE = '''\
 # generation_type  -   The type of generation, e.g. pdg.generationType.Static, Dynamic, or Regenerate
 #
 # See this node's Help for the design: modes, the Install Houdini preset,
-# and why the post-command runs as one extra work item instead of once per
-# package (Ruling R3).
+# why the post-command runs as one extra work item instead of once per
+# package (Ruling R3), and why items dispatch out of process by default
+# through rpfarm.package_runner (Ruling R22).
 
 import json
 import math
 import os
 import pathlib
+import shlex
+import shutil
 import sys
+import tempfile
 
 import hou
 
@@ -122,35 +132,83 @@ except RunPodError as e:
 
 compress = rppkg.resolve_compress_flag(node.evalParm("rpfarm_compress"))
 
+# Ruling R22: uploads must not block Houdini's UI, and progress must be
+# visible per package -- so items dispatch OUT of process by default
+# (rpfarm_inprocess off). PDG's pythonprocessor only runs a callback-only
+# item out of process when it never happens at all (see cooktask below);
+# the actual out-of-process path needs a shell ".command" instead, so
+# each item's command points at rpfarm.package_runner (rpfarm/package_runner.py),
+# fed the item (+ this node's compress flag) as a small JSON file. That
+# module is stdlib-only like the rest of rpfarm, so a plain "python3" is
+# enough -- no need to pay hython's startup cost per package, and
+# sys.executable here would be wrong anyway (this process is hython).
+in_process = bool(node.evalParm("rpfarm_inprocess"))
+python3 = shutil.which("python3") or "python3"
+items_dir = tempfile.mkdtemp(prefix="rpfarm_upload_items_")
+# "python3 -m rpfarm.package_runner" has to resolve the rpfarm package
+# BEFORE any of package_runner's own code (its $RPFARM_ROOT/~/.rpfarm/src
+# bootstrap included) ever runs -- -m resolution happens at interpreter
+# startup, off sys.path, which for a plain "python3" subprocess is not
+# this checkout unless something puts it there. $RPFARM_ROOT alone does
+# NOT do that (verified live: it fixed nothing here -- see the Task 9
+# report); PYTHONPATH does, so it's set explicitly and unconditionally
+# from where `rppkg` -- already imported into THIS process -- actually
+# lives, rather than trusting cwd or an env var to happen to line up.
+rpfarm_pkg_root = str(pathlib.Path(rppkg.__file__).resolve().parent.parent)
+
+
+def _make_command(item_json_path):
+    # No shell involved -- the scheduler runs this via shlex.split() +
+    # subprocess.Popen(..., no shell=True), so a "VAR=value cmd" shell
+    # prefix does NOT set an env var here: it is parsed as the literal
+    # (nonexistent) executable "VAR=value" and fails instantly with no
+    # output at all (verified live -- see the Task 9 report). PYTHONPATH
+    # goes through the item's own environment (addEnvironmentVar) instead.
+    return "{} -m rpfarm.package_runner {}".format(shlex.quote(python3), shlex.quote(item_json_path))
+
+
+def _write_item_payload(name, it, compress_flag):
+    path = os.path.join(items_dir, "{}.json".format(name))
+    with open(path, "w") as f:
+        json.dump({"item": it, "compress": compress_flag}, f)
+    return path
+
+
+def _set_out_of_process(wi, item_json_path):
+    wi.setCommand(_make_command(item_json_path))
+    wi.addEnvironmentVar("PYTHONPATH", rpfarm_pkg_root)
+
+
 pkg_items = []
 for it in items:
-    wi = item_holder.addWorkItem(name="upload_{:03d}".format(it["index"]), inProcess=True)
+    name = "upload_{:03d}".format(it["index"])
+    wi = item_holder.addWorkItem(name=name, inProcess=in_process)
     wi.setStringAttrib("rpfarm_item", json.dumps(it))
     wi.setStringAttrib("rpfarm_role", "package")
     wi.setIntAttrib("bytes", it["bytes"])
     wi.setIntAttrib("files", len(it["files"]))
     wi.setIntAttrib("compress", 1 if compress else 0)
+    if not in_process:
+        _set_out_of_process(wi, _write_item_payload(name, it, compress))
     pkg_items.append(wi)
 
 if post_command and pkg_items:
-    post_item = item_holder.addWorkItem(name="upload_post", inProcess=True)
-    post_item.setStringAttrib(
-        "rpfarm_item",
-        json.dumps(
-            {
-                "index": len(items),
-                "local_root": "",
-                "remote_root": "",
-                "files": [],
-                "bytes": 0,
-                "post_command": post_command,
-            }
-        ),
-    )
+    post_dict = {
+        "index": len(items),
+        "local_root": "",
+        "remote_root": "",
+        "files": [],
+        "bytes": 0,
+        "post_command": post_command,
+    }
+    post_item = item_holder.addWorkItem(name="upload_post", inProcess=in_process)
+    post_item.setStringAttrib("rpfarm_item", json.dumps(post_dict))
     post_item.setStringAttrib("rpfarm_role", "post")
     post_item.setIntAttrib("bytes", 0)
     post_item.setIntAttrib("files", 0)
     post_item.setIntAttrib("compress", 0)
+    if not in_process:
+        _set_out_of_process(post_item, _write_item_payload("upload_post", post_dict, False))
 '''
 
 ADDDEPS_CODE = '''\
@@ -177,24 +235,17 @@ for post_item in posts:
 
 COOKTASK_CODE = '''\
 # Called when an in process work item needs to cook. In process work items
-# are created by passing the [in_process] flag when constructing the item in
-# the [onGenerate] callback -- onGenerate above does, for every item this
-# node creates.
-#
-# Why in-process rather than out-of-process (PDG's other mode, which would
-# spawn a fresh hython per item and keep Houdini's own UI thread free):
-# tried first, but pythonprocessor's out-of-process path is command-based
-# (it needs a work item ".command" shell string, like genericgenerator) --
-# a callback-only item with neither `inProcess` nor a command set silently
-# no-ops (PDG marks it CookedSuccess in ~0s without ever calling this
-# callback; verified live, see the Task 9 report). Making this genuinely
-# out-of-process would mean adding a small `rpfarm` CLI entry point this
-# callback shells out to instead of calling run_upload_item() directly --
-# left for a follow-up, noted in the Task 9 report for whoever picks it up.
-# For now: uploads block Houdini's UI while they run, same as any other
-# in-process TOP node (e.g. a plain Python Processor without its own
-# threading). Independent work items still cook one after another, not
-# concurrently, until that follow-up lands.
+# are created by passing the [in_process] flag when constructing the item
+# in the [onGenerate] callback -- onGenerate above only does that when the
+# Cook in process toggle (rpfarm_inprocess) is on; by default (Ruling R22)
+# every item instead carries a shell ".command" (rpfarm.package_runner)
+# and cooks out of process through this node's own localscheduler, in
+# parallel across its slots, without blocking Houdini's UI -- see this
+# node's Help. This callback is the FALLBACK path for the toggle: kept
+# working (and still fully unit-testable via run_upload_item) because it
+# costs nothing to keep, and because it is a straightforward way to debug
+# a package's upload logic directly in Houdini's own process without
+# going through package_runner's subprocess + pdgcmd round trip.
 #
 # self              -   A reference to the current pdg.Node instance
 # work_item         -   The work item being cooked by this callback
@@ -264,17 +315,30 @@ that needs its files can even start). The override is a Python expression
 on the internal Python Processor's `Scheduler` parm re-resolving the
 sibling `localscheduler` node's absolute path at cook time -- a bare
 relative name silently falls back to "network default" instead (verified
-empirically; see the Task 9 report if this ever needs re-deriving).
+empirically; see the Task 9 report if this ever needs re-deriving). This
+node's `OnCreated` event re-asserts the same expression once more when a
+new instance is made, belt-and-suspenders: a silently wrong scheduler here
+means real recursion in production, not a cosmetic bug.
 
-Packages cook *in process* (blocking Houdini's UI while a package
-uploads, one after another): PDG's Python Processor only dispatches a
-work item out of process when it carries a shell `.command` -- a
-callback-only item with neither `inProcess` nor a command silently no-ops
-(PDG marks it succeeded in ~0s without ever running the callback; this
-was live-verified, not theoretical). Making uploads genuinely
-non-blocking would mean adding an `rpfarm` CLI entry point this node
-shells out to instead of calling `run_upload_item()` directly from
-Python -- left as a follow-up (see the Task 9 report).
+Packages cook *out of process* by default (Ruling R22 -- must not block
+Houdini's UI, and progress must be visible per package): each work item's
+command is `python3 -m rpfarm.package_runner <item.json>`
+(`rpfarm/package_runner.py`), which PDG's local scheduler runs as a
+genuine separate process, in parallel across its slots. PDG's Python
+Processor only dispatches a work item out of process when it carries a
+shell `.command` this way -- a callback-only item with neither `inProcess`
+nor a command silently no-ops (PDG marks it succeeded in ~0s without ever
+running the callback; this was live-verified, not theoretical, which is
+why this node doesn't use the simpler callback-only path). `package_runner`
+reports `bytes`/`files`/`seconds`/`mbps`/`progress` back onto the live
+work item via `pdgcmd` (the standard mechanism for any out-of-process PDG
+command item), and runs under a plain `python3` -- every `rpfarm` module
+it touches is stdlib-only, so there's no reason to pay `hython`'s startup
+cost per package, and the generating process's own `sys.executable` would
+be wrong here anyway (that process is `hython`). The Cook In Process
+toggle below switches back to the old callback-only path (this node's
+`cooktask`) for debugging -- blocking, one item at a time, but easier to
+step through directly in Houdini's own process.
 
 @parameters
 
@@ -343,6 +407,14 @@ Houdini Tarball:
 
 Houdini Version:
     #id: rpfarm_houver
+
+Cook In Process (debug):
+    #id: rpfarm_inprocess
+
+    Off (default): packages upload out of process, in parallel, without
+    blocking Houdini (Ruling R22; see above). On: cook in this Houdini
+    session instead -- blocks the UI, one package at a time, useful for
+    stepping through `run_upload_item()` directly while debugging.
 
 @related
 
@@ -435,9 +507,19 @@ def main():
     houver_pt = hou.StringParmTemplate("rpfarm_houver", "Houdini Version", 1, default_value=("22.0.393",))
     houver_pt.setConditional(hou.parmCondType.HideWhen, "{ rpfarm_preset != install_houdini }")
 
+    # Ruling R22: out of process (this off) is the default -- uploads must
+    # not block Houdini's UI. Kept as a toggle rather than removed because
+    # it costs nothing and is a straightforward way to debug a package's
+    # upload logic directly in Houdini's own process (see cooktask/Help).
+    inprocess_pt = hou.ToggleParmTemplate("rpfarm_inprocess", "Cook In Process (debug)", default_value=False)
+    inprocess_pt.setHelp(
+        "Off (default): packages upload out of process, in parallel, without blocking Houdini. "
+        "On: cook in this Houdini session instead -- blocks the UI, one package at a time, useful for debugging."
+    )
+
     for pt in (
         mode_pt, project_pt, packagegb_pt, compress_pt, custom_pt, postcmd_pt,
-        preset_pt, houtar_pt, houver_pt,
+        preset_pt, houtar_pt, houver_pt, inprocess_pt,
     ):
         ptg.append(pt)
 
@@ -464,6 +546,31 @@ def main():
     # parms (verified empirically: skipping this line produces a
     # DialogScript with no parm{} blocks at all).
     definition.setParmTemplateGroup(ptg)
+
+    # Belt-and-suspenders for the scheduler override (see pp.parm
+    # "topscheduler" above): the baked-in Python expression already
+    # re-resolves the sibling localscheduler's absolute path on every
+    # cook, so this OnCreated re-asserts the *same* expression once more
+    # at instance-creation time rather than a static path (a static path
+    # would go stale if the node were ever renamed or moved). Belt AND
+    # suspenders because a silent wrong-scheduler fallback here means
+    # real recursion into runpodfarm_scheduler in production, not just a
+    # cosmetic bug -- see this node's Help.
+    definition.addSection(
+        "OnCreated",
+        'node = kwargs["node"]\n'
+        'pp = node.node("pythonprocessor1")\n'
+        'if pp is not None:\n'
+        '    try:\n'
+        '        node.allowEditingOfContents()\n'
+        '        pp.parm("topscheduler").setExpression(\n'
+        '            \'hou.pwd().parent().path() + "/localscheduler"\', language=hou.exprLanguage.Python)\n'
+        '    except hou.PermissionError:\n'
+        '        pass  # the baked-in default (set at build time) already has it right\n',
+    )
+    definition.setExtraFileOption("OnCreated/IsPython", True)
+    definition.setExtraFileOption("OnCreated/IsScript", True)
+
     definition.save(OUT_HDA, template_node=new_type)
 
     print("OK built", OUT_HDA, "type", new_type.type().name())

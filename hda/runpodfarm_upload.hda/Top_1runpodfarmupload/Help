@@ -16,17 +16,30 @@ that needs its files can even start). The override is a Python expression
 on the internal Python Processor's `Scheduler` parm re-resolving the
 sibling `localscheduler` node's absolute path at cook time -- a bare
 relative name silently falls back to "network default" instead (verified
-empirically; see the Task 9 report if this ever needs re-deriving).
+empirically; see the Task 9 report if this ever needs re-deriving). This
+node's `OnCreated` event re-asserts the same expression once more when a
+new instance is made, belt-and-suspenders: a silently wrong scheduler here
+means real recursion in production, not a cosmetic bug.
 
-Packages cook *in process* (blocking Houdini's UI while a package
-uploads, one after another): PDG's Python Processor only dispatches a
-work item out of process when it carries a shell `.command` -- a
-callback-only item with neither `inProcess` nor a command silently no-ops
-(PDG marks it succeeded in ~0s without ever running the callback; this
-was live-verified, not theoretical). Making uploads genuinely
-non-blocking would mean adding an `rpfarm` CLI entry point this node
-shells out to instead of calling `run_upload_item()` directly from
-Python -- left as a follow-up (see the Task 9 report).
+Packages cook *out of process* by default (Ruling R22 -- must not block
+Houdini's UI, and progress must be visible per package): each work item's
+command is `python3 -m rpfarm.package_runner <item.json>`
+(`rpfarm/package_runner.py`), which PDG's local scheduler runs as a
+genuine separate process, in parallel across its slots. PDG's Python
+Processor only dispatches a work item out of process when it carries a
+shell `.command` this way -- a callback-only item with neither `inProcess`
+nor a command silently no-ops (PDG marks it succeeded in ~0s without ever
+running the callback; this was live-verified, not theoretical, which is
+why this node doesn't use the simpler callback-only path). `package_runner`
+reports `bytes`/`files`/`seconds`/`mbps`/`progress` back onto the live
+work item via `pdgcmd` (the standard mechanism for any out-of-process PDG
+command item), and runs under a plain `python3` -- every `rpfarm` module
+it touches is stdlib-only, so there's no reason to pay `hython`'s startup
+cost per package, and the generating process's own `sys.executable` would
+be wrong here anyway (that process is `hython`). The Cook In Process
+toggle below switches back to the old callback-only path (this node's
+`cooktask`) for debugging -- blocking, one item at a time, but easier to
+step through directly in Houdini's own process.
 
 @parameters
 
@@ -95,6 +108,14 @@ Houdini Tarball:
 
 Houdini Version:
     #id: rpfarm_houver
+
+Cook In Process (debug):
+    #id: rpfarm_inprocess
+
+    Off (default): packages upload out of process, in parallel, without
+    blocking Houdini (Ruling R22; see above). On: cook in this Houdini
+    session instead -- blocks the UI, one package at a time, useful for
+    stepping through `run_upload_item()` directly while debugging.
 
 @related
 

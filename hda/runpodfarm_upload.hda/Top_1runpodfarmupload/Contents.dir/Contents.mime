@@ -56,93 +56,6 @@ exprlanguage hscript
 end
 
 --HOUDINIMIMEBOUNDARY0xD3ADD339-0x00000F49-0x56B122C9-0x00000001HOUDINIMIMEBOUNDARY
-Content-Disposition: attachment; filename="hdaroot.spareparmdef"
-Content-Type: text/plain
-
-    parm {
-        name    "rpfarm_mode"
-        baseparm
-        label   "Mode"
-        export  none
-    }
-    parm {
-        name    "rpfarm_project"
-        baseparm
-        label   "Project"
-        export  none
-    }
-    parm {
-        name    "rpfarm_packagegb"
-        baseparm
-        label   "Package Size (GB)"
-        export  none
-    }
-    parm {
-        name    "rpfarm_compress"
-        baseparm
-        label   "Compression"
-        export  none
-    }
-    multiparm {
-        name    "rpfarm_custom"
-        label    "Custom Paths"
-        baseparm
-        default 0
-
-        parm {
-            name    "rpfarm_local#_2"
-            baseparm
-            label   "Local"
-            invisible
-            export  none
-        }
-        parm {
-            name    "rpfarm_remote#_2"
-            baseparm
-            label   "Remote"
-            invisible
-            export  none
-        }
-        parm {
-            name    "rpfarm_local#"
-            baseparm
-            label   "Local"
-            export  none
-        }
-        parm {
-            name    "rpfarm_remote#"
-            baseparm
-            label   "Remote"
-            export  none
-        }
-    }
-
-    parm {
-        name    "rpfarm_postcmd"
-        baseparm
-        label   "Post-command"
-        export  none
-    }
-    parm {
-        name    "rpfarm_preset"
-        baseparm
-        label   "Preset"
-        export  none
-    }
-    parm {
-        name    "rpfarm_houtar"
-        baseparm
-        label   "Houdini Tarball"
-        export  none
-    }
-    parm {
-        name    "rpfarm_houver"
-        baseparm
-        label   "Houdini Version"
-        export  none
-    }
-
---HOUDINIMIMEBOUNDARY0xD3ADD339-0x00000F49-0x56B122C9-0x00000001HOUDINIMIMEBOUNDARY
 Content-Disposition: attachment; filename="hdaroot.userdata"
 Content-Type: text/plain
 
@@ -297,14 +210,18 @@ generate	[ 0	locks=0 ]	(	"# Called when this node should generate new work items
 # generation_type  -   The type of generation, e.g. pdg.generationType.Static, Dynamic, or Regenerate
 #
 # See this node's Help for the design: modes, the Install Houdini preset,
-# and why the post-command runs as one extra work item instead of once per
-# package (Ruling R3).
+# why the post-command runs as one extra work item instead of once per
+# package (Ruling R3), and why items dispatch out of process by default
+# through rpfarm.package_runner (Ruling R22).
 
 import json
 import math
 import os
 import pathlib
+import shlex
+import shutil
 import sys
+import tempfile
 
 import hou
 
@@ -382,35 +299,83 @@ except RunPodError as e:
 
 compress = rppkg.resolve_compress_flag(node.evalParm(\"rpfarm_compress\"))
 
+# Ruling R22: uploads must not block Houdini's UI, and progress must be
+# visible per package -- so items dispatch OUT of process by default
+# (rpfarm_inprocess off). PDG's pythonprocessor only runs a callback-only
+# item out of process when it never happens at all (see cooktask below);
+# the actual out-of-process path needs a shell \".command\" instead, so
+# each item's command points at rpfarm.package_runner (rpfarm/package_runner.py),
+# fed the item (+ this node's compress flag) as a small JSON file. That
+# module is stdlib-only like the rest of rpfarm, so a plain \"python3\" is
+# enough -- no need to pay hython's startup cost per package, and
+# sys.executable here would be wrong anyway (this process is hython).
+in_process = bool(node.evalParm(\"rpfarm_inprocess\"))
+python3 = shutil.which(\"python3\") or \"python3\"
+items_dir = tempfile.mkdtemp(prefix=\"rpfarm_upload_items_\")
+# \"python3 -m rpfarm.package_runner\" has to resolve the rpfarm package
+# BEFORE any of package_runner's own code (its $RPFARM_ROOT/~/.rpfarm/src
+# bootstrap included) ever runs -- -m resolution happens at interpreter
+# startup, off sys.path, which for a plain \"python3\" subprocess is not
+# this checkout unless something puts it there. $RPFARM_ROOT alone does
+# NOT do that (verified live: it fixed nothing here -- see the Task 9
+# report); PYTHONPATH does, so it's set explicitly and unconditionally
+# from where `rppkg` -- already imported into THIS process -- actually
+# lives, rather than trusting cwd or an env var to happen to line up.
+rpfarm_pkg_root = str(pathlib.Path(rppkg.__file__).resolve().parent.parent)
+
+
+def _make_command(item_json_path):
+    # No shell involved -- the scheduler runs this via shlex.split() +
+    # subprocess.Popen(..., no shell=True), so a \"VAR=value cmd\" shell
+    # prefix does NOT set an env var here: it is parsed as the literal
+    # (nonexistent) executable \"VAR=value\" and fails instantly with no
+    # output at all (verified live -- see the Task 9 report). PYTHONPATH
+    # goes through the item's own environment (addEnvironmentVar) instead.
+    return \"{} -m rpfarm.package_runner {}\".format(shlex.quote(python3), shlex.quote(item_json_path))
+
+
+def _write_item_payload(name, it, compress_flag):
+    path = os.path.join(items_dir, \"{}.json\".format(name))
+    with open(path, \"w\") as f:
+        json.dump({\"item\": it, \"compress\": compress_flag}, f)
+    return path
+
+
+def _set_out_of_process(wi, item_json_path):
+    wi.setCommand(_make_command(item_json_path))
+    wi.addEnvironmentVar(\"PYTHONPATH\", rpfarm_pkg_root)
+
+
 pkg_items = []
 for it in items:
-    wi = item_holder.addWorkItem(name=\"upload_{:03d}\".format(it[\"index\"]), inProcess=True)
+    name = \"upload_{:03d}\".format(it[\"index\"])
+    wi = item_holder.addWorkItem(name=name, inProcess=in_process)
     wi.setStringAttrib(\"rpfarm_item\", json.dumps(it))
     wi.setStringAttrib(\"rpfarm_role\", \"package\")
     wi.setIntAttrib(\"bytes\", it[\"bytes\"])
     wi.setIntAttrib(\"files\", len(it[\"files\"]))
     wi.setIntAttrib(\"compress\", 1 if compress else 0)
+    if not in_process:
+        _set_out_of_process(wi, _write_item_payload(name, it, compress))
     pkg_items.append(wi)
 
 if post_command and pkg_items:
-    post_item = item_holder.addWorkItem(name=\"upload_post\", inProcess=True)
-    post_item.setStringAttrib(
-        \"rpfarm_item\",
-        json.dumps(
-            {
-                \"index\": len(items),
-                \"local_root\": \"\",
-                \"remote_root\": \"\",
-                \"files\": [],
-                \"bytes\": 0,
-                \"post_command\": post_command,
-            }
-        ),
-    )
+    post_dict = {
+        \"index\": len(items),
+        \"local_root\": \"\",
+        \"remote_root\": \"\",
+        \"files\": [],
+        \"bytes\": 0,
+        \"post_command\": post_command,
+    }
+    post_item = item_holder.addWorkItem(name=\"upload_post\", inProcess=in_process)
+    post_item.setStringAttrib(\"rpfarm_item\", json.dumps(post_dict))
     post_item.setStringAttrib(\"rpfarm_role\", \"post\")
     post_item.setIntAttrib(\"bytes\", 0)
     post_item.setIntAttrib(\"files\", 0)
     post_item.setIntAttrib(\"compress\", 0)
+    if not in_process:
+        _set_out_of_process(post_item, _write_item_payload(\"upload_post\", post_dict, False))
 "	)
 useregeneratestatic	[ 0	locks=0 ]	(	"off"	)
 regeneratestatic	[ 0	locks=0 ]	(	"# Called when this node may need to regenerate existing work items
@@ -441,24 +406,17 @@ for post_item in posts:
         dependency_holder.addDependency(post_item, pkg_item)
 "	)
 cooktask	[ 0	locks=0 ]	(	"# Called when an in process work item needs to cook. In process work items
-# are created by passing the [in_process] flag when constructing the item in
-# the [onGenerate] callback -- onGenerate above does, for every item this
-# node creates.
-#
-# Why in-process rather than out-of-process (PDG's other mode, which would
-# spawn a fresh hython per item and keep Houdini's own UI thread free):
-# tried first, but pythonprocessor's out-of-process path is command-based
-# (it needs a work item \".command\" shell string, like genericgenerator) --
-# a callback-only item with neither `inProcess` nor a command set silently
-# no-ops (PDG marks it CookedSuccess in ~0s without ever calling this
-# callback; verified live, see the Task 9 report). Making this genuinely
-# out-of-process would mean adding a small `rpfarm` CLI entry point this
-# callback shells out to instead of calling run_upload_item() directly --
-# left for a follow-up, noted in the Task 9 report for whoever picks it up.
-# For now: uploads block Houdini's UI while they run, same as any other
-# in-process TOP node (e.g. a plain Python Processor without its own
-# threading). Independent work items still cook one after another, not
-# concurrently, until that follow-up lands.
+# are created by passing the [in_process] flag when constructing the item
+# in the [onGenerate] callback -- onGenerate above only does that when the
+# Cook in process toggle (rpfarm_inprocess) is on; by default (Ruling R22)
+# every item instead carries a shell \".command\" (rpfarm.package_runner)
+# and cooks out of process through this node's own localscheduler, in
+# parallel across its slots, without blocking Houdini's UI -- see this
+# node's Help. This callback is the FALLBACK path for the toggle: kept
+# working (and still fully unit-testable via run_upload_item) because it
+# costs nothing to keep, and because it is a straightforward way to debug
+# a package's upload logic directly in Houdini's own process without
+# going through package_runner's subprocess + pdgcmd round trip.
 #
 # self              -   A reference to the current pdg.Node instance
 # work_item         -   The work item being cooked by this callback
