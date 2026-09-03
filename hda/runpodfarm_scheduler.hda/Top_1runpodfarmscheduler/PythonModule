@@ -360,6 +360,10 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
                 {"name": "rpfarm_minbalance", "type": "Float"},
                 # -- Outputs --
                 {"name": "rpfarm_downloadoutputs", "type": "Integer"},
+                # -- Status --
+                # Read-only display, written by _update_status_text through the
+                # TOP node (see _setStatusText for why not setParameter).
+                {"name": "rpfarm_status_text", "type": "String"},
                 # -- Paths --
                 {"name": "rpfarm_overrideremoteworkingdir", "type": "Integer"},
                 {"name": "rpfarm_remoteworkingdir", "type": "String"},
@@ -599,6 +603,22 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         except AttributeError:
             pass
 
+    def _tagPathMap(self, work_item):
+        """Record this cook's {local prefix: farm prefix} on a work item.
+
+        Downstream nodes get the mapping from the item rather than from a
+        handle on the scheduler, which they have no reliable way to reach. A
+        failure here must never fail the item: the mapping is a convenience,
+        and localizePath still works through the global path map.
+        """
+        if work_item is None or not self._pathmap:
+            return
+        try:
+            work_item.setStringAttrib("rpfarm_pathmap", json.dumps(self._pathmap))
+        except Exception as e:
+            self._verboseLog("could not tag item {} with the path map: {}".format(
+                work_item.id, e))
+
     def _loadPathMap(self):
         """Build {local prefix: farm prefix} for this cook.
 
@@ -785,6 +805,10 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
             if result == "accepted":
                 self._dispatcher.assign(task.task_id, pod.pod_id)
                 task.started = time.time()
+                # PDG times an item from this call to workItemSucceeded; without
+                # it the UI shows every item as 0.0s and never as "cooking".
+                if task.work_item_id >= 0:
+                    self.workItemStartCook(task.work_item_id, -1)
                 self._verboseLog("task {} -> pod {} (item {})".format(
                     task.task_id, pod.pod_id, task.work_item_id))
             elif result == "busy":
@@ -973,7 +997,10 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         if self._sync_pod:
             lines.append("sync pod {}".format(self._sync_pod["id"]))
         for pod in sorted(self._dispatcher.pods.values(), key=lambda p: p.pod_id):
-            lines.append("  {} {:<8} {:<28} {}/{} busy  ${:.3f}/h".format(
+            # No "$" anywhere in this text: Houdini expands variables when it
+            # evaluates a string parm, so "$0.740/h" reaches the artist as
+            # ".740/h" ($0 being an empty variable). Verified on 22.0.368.
+            lines.append("  {} {:<8} {:<28} {}/{} busy  {:.3f} USD/h".format(
                 pod.pod_id, pod.status, pod.gpu or "-",
                 len(pod.running), pod.slots, pod.cost_per_hr))
         if not self._dispatcher.pods:
@@ -984,13 +1011,41 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         if self._sync_queue:
             lines.append("downloads queued: {}".format(len(self._sync_queue)))
         max_cost = self._cost_tracker.get("max_cost", 0.0)
-        lines.append("cost: ${:.3f}{}".format(
+        lines.append("cost: {:.3f} USD{}".format(
             self._cost_tracker.get("total_cost", 0.0),
-            "" if max_cost in (0.0, float("inf")) else " of ${:.2f}".format(max_cost)))
+            "" if max_cost in (0.0, float("inf")) else " of {:.2f} USD".format(max_cost)))
+        self._setStatusText("\n".join(lines))
+
+    def _setStatusText(self, text):
+        """Write the Status tab's text field.
+
+        PyScheduler.setParameter goes through PDG's own parameter store and
+        does not reach the HDA's parm -- it reports no error and the field
+        stays empty (that is what the first live cook showed). The TOP node
+        itself has to be written, and the scheduler only knows it by session
+        id. Cosmetic either way: a cook must never die over a text field.
+        """
+        node = self._houNode()
+        if node is None:
+            return
         try:
-            self.setParameter("rpfarm_status_text", "\n".join(lines))
-        except Exception:
-            pass
+            node.parm("rpfarm_status_text").set(text)
+        except Exception as e:
+            self._verboseLog("status text update failed: {}".format(e))
+
+    def _houNode(self):
+        """The hou node this scheduler runs on, or None."""
+        try:
+            import hou
+
+            node_id = self.topNodeId
+            if node_id is None or node_id < 0:
+                self._verboseLog("no TOP node id for the status text")
+                return None
+            return hou.nodeBySessionId(node_id)
+        except Exception as e:
+            self._verboseLog("cannot reach the TOP node: {}".format(e))
+            return None
 
     # -------------------------------------------------------------------------
     # Scheduler callbacks
@@ -1098,8 +1153,11 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
             return
         try:
             balance = self._api.balance()
-        except (RunPodError, KeyError, ValueError, TypeError) as e:
-            self._verboseLog("balance check failed: {}".format(e))
+        except (RunPodError, OSError, KeyError, ValueError, TypeError) as e:
+            # A warning must never be the thing that fails a cook: OSError
+            # covers the transport (DNS, TLS, timeouts), the rest cover a
+            # GraphQL reply that is not shaped the way we expect.
+            self._log("balance check failed, continuing: {}".format(e))
             return
         if balance >= threshold:
             self._verboseLog("RunPod balance ${:.2f}".format(balance))
@@ -1264,6 +1322,12 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
 
     def onSchedule(self, work_item):
         """[virtual] Queue a work item and try to place it on a pod."""
+        # 0. Stamp this cook's local <-> farm mapping onto the item, before it
+        #    is serialized. runpodfarm_download (Task 10) reads it off its
+        #    upstream items to turn the farm paths in resultData back into
+        #    local ones without needing a handle on this scheduler.
+        self._tagPathMap(work_item)
+
         # 1. Ensure directories exist and serialize the work item
         self.createJobDirsAndSerializeWorkItems(work_item)
 
