@@ -41,6 +41,16 @@ toggle below switches back to the old callback-only path (this node's
 `cooktask`) for debugging -- blocking, one item at a time, but easier to
 step through directly in Houdini's own process.
 
+If this node's optional input is wired to an already-cooked farm item
+(e.g. uploading something a `runpodfarm_scheduler` cook produced), cook
+THIS node in one `cookWorkItems()` call rather than cooking the upstream
+node separately first: a second, separate top-level cook does not treat
+the first call's already-succeeded items as up to date and recooks them
+too -- a second, separately billed GPU pod for work that already ran once
+(live-verified on `runpodfarm_download`; see [Node:top/runpodfarm_download]'s
+Help and `.superpowers/sdd/2026-09-02-rpfarm-v2/task-10-report.md` for the
+full explanation).
+
 @parameters
 
 Mode:

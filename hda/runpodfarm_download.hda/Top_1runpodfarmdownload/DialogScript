@@ -37,7 +37,7 @@
         label   "Overwrite"
         type    string
         default { "newer" }
-        help    "newer: rclone --update (skip a local file that is not older than the remote). always: no extra flag, always re-download. never: rclone --ignore-existing."
+        help    "newer: rclone --update (skip a local file that is not older than the remote). always: no extra flag -- rclone's own default comparison, which still skips a file whose size and mtime already match exactly. never: rclone --ignore-existing."
         menu {
             "newer"     "If Newer"
             "always"    "Always"
