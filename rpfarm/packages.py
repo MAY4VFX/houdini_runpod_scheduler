@@ -371,6 +371,21 @@ def _project_key_from_remote_root(remote_root):
     return "{}/{}".format(parts[0], parts[1])
 
 
+def _shquote(value):
+    """POSIX single-quote for interpolation into a shell command string
+    sent to ``sync_client.exec`` (the pod runs these through a shell).
+    Review finding (Ruling R26 fix round): ``key`` here is a project name,
+    artist-controlled (the node's Project parm, or a job dir basename) --
+    unquoted string interpolation into a shell command is injection, not
+    just a style nit. Mirrors the scheduler HDA's own ``_shquote``
+    (``hda/runpodfarm_scheduler.hda/.../PythonModule``) -- kept as an
+    independent copy rather than a cross-import: trivial, stable POSIX
+    quoting, and the HDA's python module isn't something this package can
+    import from anyway.
+    """
+    return "'" + str(value).replace("'", "'\"'\"'") + "'"
+
+
 def _touch_project_index(sync_client, remote_root, event):
     """Best-effort ``housekeeping.py touch`` for the project index.
 
@@ -382,7 +397,7 @@ def _touch_project_index(sync_client, remote_root, event):
     if key is None:
         return
     sync_client.exec(
-        "python3 /opt/rpfarm/housekeeping.py touch {} --event {}".format(key, event)
+        "python3 /opt/rpfarm/housekeeping.py touch {} --event {}".format(_shquote(key), event)
     )
 
 
@@ -395,51 +410,75 @@ _AUTO_GROW_THRESHOLD = 0.85
 _AUTO_GROW_TARGET_FRACTION = 0.8
 _AUTO_GROW_STEP_GB = 10
 _GB = 2**30
+# Ruling R26 review finding: this used to ask `ls` -- which walks every
+# zone and project (even bounded by ls's own --budget-s, per-project
+# outputs_pending scanning has no budget of its own, Task 12 report) --
+# for a full measurement, with a flat 60s exec timeout. On the real farm's
+# 11GB+ legacy Houdini install, that walk alone took 30-40s cold, so the
+# *outer* exec timeout was racing the walk instead of comfortably
+# outliving it, and a genuinely slow project could still blow both. The
+# auto-grow decision only ever needs the volume's real used/total bytes
+# (`disk-usage`: one instant `shutil.disk_usage` syscall, no walk at all)
+# -- using that instead removes the race, not just widens it.
+_AUTO_GROW_EXEC_TIMEOUT_S = 15.0
 
 
-def maybe_grow_volume(api, cfg, sync_client, needed_bytes, log=None):
+def maybe_grow_volume(api, cfg, sync_client, needed_bytes, log=None) -> str:
     """Grow the network volume when an upload would push it past 85% full.
 
     Called by ``rpfarm.package_runner`` right before ``run_upload_item``
     (only for uploads -- downloads free no space and need no headroom).
     Sizes the new volume so it lands at ~80% full afterwards, rounded up
     to the nearest 10 GB step (spec 4.1's formula:
-    ``ceil((used+bytes)/0.8/10GB)*10``).
+    ``ceil((used+bytes)/0.8/10GB)*10``). Reads real used/total bytes via
+    housekeeping's ``disk-usage`` -- one instant syscall, not ``ls``'s
+    zone/project walk (see :data:`_AUTO_GROW_EXEC_TIMEOUT_S`'s comment).
 
     Never raises: a failed size check or resize must not block an upload
-    that would otherwise succeed on its own. If this silently doesn't
-    help, the artist finds out from RunPod's own out-of-space error, or
-    from the next Volume tab Refresh.
+    that would otherwise succeed on its own. Returns a short status string
+    (``"ok"``, ``"grown to N GB"``, ``"skipped: ..."``, ``"error: ..."``)
+    -- callers are expected to surface anything other than ``"ok"``
+    somewhere the artist will actually see it (package_runner.py sets a
+    pdgcmd attribute), not just this function's own ``log()`` line, so a
+    silently-disabled guard doesn't stay silent.
     """
     log = log or (lambda msg: None)
     try:
-        result = sync_client.exec("python3 /opt/rpfarm/housekeeping.py ls", timeout_s=60)
+        result = sync_client.exec(
+            "python3 /opt/rpfarm/housekeeping.py disk-usage",
+            timeout_s=_AUTO_GROW_EXEC_TIMEOUT_S,
+        )
         if result.get("exit_code") != 0:
-            log("volume auto-grow check skipped: {}".format(result.get("stderr") or "ls failed"))
-            return
+            note = "skipped: {}".format(result.get("stderr") or "disk-usage failed")
+            log("volume auto-grow check " + note)
+            return note
         info = json.loads(result.get("stdout") or "{}")
         volume = info.get("volume") or {}
         used = int(volume.get("used") or 0)
         total = int(volume.get("total") or 0)
         if total <= 0:
-            return
+            return "skipped: volume total unknown"
         if used + needed_bytes <= _AUTO_GROW_THRESHOLD * total:
-            return
+            return "ok"
         new_size_gb = (
             math.ceil((used + needed_bytes) / _AUTO_GROW_TARGET_FRACTION / (_AUTO_GROW_STEP_GB * _GB))
             * _AUTO_GROW_STEP_GB
         )
         current_gb = int((api.get_volume(cfg.volume_id) or {}).get("size") or 0)
         if new_size_gb <= current_gb:
-            return
+            return "ok"
         api.resize_volume(cfg.volume_id, new_size_gb)
+        note = "grown to {} GB".format(new_size_gb)
         log(
             "volume {} auto-grown {} GB -> {} GB ({:.0f}% full before this upload)".format(
                 cfg.volume_id, current_gb, new_size_gb, 100.0 * (used + needed_bytes) / total
             )
         )
+        return note
     except Exception as e:  # noqa: BLE001 - background safety net, never fails the upload
+        note = "error: {}".format(e)
         log("volume auto-grow check failed (continuing): {}".format(e))
+        return note
 
 
 def _exec_checked(sync_client, command, timeout_s):

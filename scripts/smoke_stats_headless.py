@@ -245,6 +245,52 @@ def main():
             log("FAIL: old_proj monthly_cost = {}, expected ~{:.2f}".format(entry["monthly_cost"], expected_cost))
             ok = False
 
+    # -- 1c. Review fix: config present but Use Billing OFF must never touch
+    # the sync pod. Before this fix, _storage_snapshot ran unconditionally
+    # (only rpcfg.load()'s own ConfigError -- absent here, a fake config is
+    # wired up -- ever stopped it), so a configured user got a network call
+    # and a sync-pod touch on every cook/Refresh/Export CSV even with
+    # billing off. Reuses 1b's fakes; the only thing that changes is the
+    # Use Billing toggle.
+    ensure_sync_pod_calls = []
+
+    def _spy_ensure_sync_pod(api, cfg, token, pubkey):
+        ensure_sync_pod_calls.append(1)
+        return {"id": "pod1"}
+
+    g3 = hm.compute.__globals__
+    orig3 = {k: g3[k] for k in ("RunPodAPI", "WorkerClient", "_read_pubkey")}
+    orig_load3 = hm.rpcfg.load
+    orig_ensure_sync_pod3 = hm.rppods.ensure_sync_pod
+
+    g3["RunPodAPI"] = lambda api_key: _FakeApi()
+    g3["WorkerClient"] = _FakeWorkerClient
+    g3["_read_pubkey"] = lambda cfg: "ssh-ed25519 AAAA"
+    hm.rpcfg.load = lambda: _FakeCfg()
+    hm.rppods.ensure_sync_pod = _spy_ensure_sync_pod
+
+    try:
+        stats.parm("rpfarm_usebilling").set(0)  # the point of this case
+        _f3, _bp3, _bu3, cleanup3, vol_total3, usebilling3 = hm.compute(stats)
+    finally:
+        g3.update(orig3)
+        hm.rpcfg.load = orig_load3
+        hm.rppods.ensure_sync_pod = orig_ensure_sync_pod3
+
+    if ensure_sync_pod_calls:
+        log("FAIL: ensure_sync_pod was called {} time(s) with Use Billing off (config present)".format(
+            len(ensure_sync_pod_calls)))
+        ok = False
+    else:
+        log("OK: Use Billing off + config present never touches the sync pod")
+
+    entry3 = next((c for c in cleanup3 if c["project"] == "old_proj"), None)
+    if entry3 is not None and entry3["bytes"] is None and entry3["monthly_cost"] is None:
+        log("OK: cleanup candidate has no size/cost when the snapshot was correctly skipped")
+    else:
+        log("FAIL: expected old_proj bytes/monthly_cost both None (snapshot skipped), got {}".format(entry3))
+        ok = False
+
     # -- 2. project filter ------------------------------------------------------
     stats.parm("rpfarm_project").set("shot")
     # A plain parm change on this node doesn't by itself dirty its own

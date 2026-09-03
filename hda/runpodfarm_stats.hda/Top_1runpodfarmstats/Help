@@ -76,11 +76,13 @@ Summary:
 
     Read-only: totals by project and by user ($ / GPU-hours / tasks / $ per
     task), volume storage cost for the period (Use Billing only), and
-    cleanup candidates -- projects with no cook in over 30 days, each with
-    its real on-disk size (Task 12's housekeeping `ls`, via the sync pod)
-    and an estimated $/month: that project's byte share of the period's
-    actual `GET /billing/networkvolumes` charge, prorated to 30 days (Use
-    Billing only -- otherwise shown as "n/a", never a guessed $/GB rate).
+    cleanup candidates -- projects with no cook in over 30 days. With Use
+    Billing on, each candidate also gets its real on-disk size (Task 12's
+    housekeeping `ls`, via the sync pod) and an estimated $/month: that
+    project's byte share of the period's actual
+    `GET /billing/networkvolumes` charge, prorated to 30 days -- never a
+    guessed $/GB rate. With Use Billing off, size/$/month show as "n/a"
+    and nothing touches the sync pod or the network at all.
 
 @related
 

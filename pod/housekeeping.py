@@ -10,7 +10,7 @@ stdlib only -- deployed as-is to Ubuntu 22.04 / python3.10 pods alongside
 
 Commands (see ``main()``/each ``cmd_*`` docstring for exact shapes)::
 
-    housekeeping.py ls [--root /workspace] [--refresh]
+    housekeeping.py ls [--root /workspace] [--refresh] [--budget-s N] [--max-age-s N]
     housekeeping.py du <path>
     housekeeping.py touch <user>/<project> [--event cook|upload|download]
     housekeeping.py rm <user>/<project> [--force]
@@ -18,6 +18,7 @@ Commands (see ``main()``/each ``cmd_*`` docstring for exact shapes)::
     housekeeping.py houdini ls [--refresh]
     housekeeping.py houdini rm <version> [--dry-run]
     housekeeping.py sync-idle
+    housekeeping.py disk-usage
 
 ``ls``/``houdini ls`` serve cached sizes from ``/workspace/.rpfarm/index.json``
 when under 900s old and re-measure (bounded, see ``cmd_ls``/``cmd_houdini_ls``)
@@ -740,6 +741,28 @@ def cmd_houdini_rm(root: str, version: str, dry_run: bool = False) -> dict:
     return {"ok": True, "path": vdir, "bytes_freed": freed, "dry_run": dry_run}
 
 
+def cmd_disk_usage(root: str) -> dict:
+    """``{"volume": {"used": bytes, "total": bytes}}`` -- just
+    ``shutil.disk_usage(root)``, nothing else.
+
+    Ruling R26 review finding: ``maybe_grow_volume`` only ever needs the
+    volume's real used/total bytes (a single, instant OS statvfs call) to
+    decide whether to grow -- it does not need ``ls``'s zone/project
+    breakdown at all, and ``ls`` computing that breakdown (even bounded by
+    its own ``--budget-s``) still means the whole `housekeeping.py ls`
+    process can run past a short exec timeout, because per-project
+    ``outputs_pending`` scanning has no budget of its own (a separate,
+    still-open perf question -- see the Task 12 report). This command
+    exists so callers that only care about disk_usage never depend on any
+    of that.
+    """
+    try:
+        usage = shutil.disk_usage(root)
+        return {"volume": {"used": usage.used, "total": usage.total}}
+    except OSError:
+        return {"volume": {"used": 0, "total": 0}}
+
+
 def cmd_sync_idle(root: str) -> dict:
     """Seconds since ``.rpfarm/sync_last_used`` was last touched.
 
@@ -770,6 +793,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p_ls = sub.add_parser("ls")
     p_ls.add_argument("--root", default=DEFAULT_ROOT)
     p_ls.add_argument("--refresh", action="store_true")
+    p_ls.add_argument("--budget-s", type=float, default=_DEFAULT_BUDGET_S)
+    p_ls.add_argument("--max-age-s", type=float, default=_DEFAULT_MAX_AGE_S)
 
     p_du = sub.add_parser("du")
     p_du.add_argument("path")
@@ -795,6 +820,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_houdini_rm.add_argument("--dry-run", action="store_true")
 
     sub.add_parser("sync-idle")
+    sub.add_parser("disk-usage")
 
     return p
 
@@ -809,7 +835,9 @@ def main(argv: list[str]) -> int:
 
     try:
         if args.command == "ls":
-            result = cmd_ls(args.root, refresh=args.refresh)
+            result = cmd_ls(
+                args.root, refresh=args.refresh, max_age_s=args.max_age_s, budget_s=args.budget_s
+            )
         elif args.command == "du":
             result = du(args.path)
         elif args.command == "touch":
@@ -825,6 +853,8 @@ def main(argv: list[str]) -> int:
                 result = cmd_houdini_rm(DEFAULT_ROOT, args.version, dry_run=args.dry_run)
         elif args.command == "sync-idle":
             result = cmd_sync_idle(DEFAULT_ROOT)
+        elif args.command == "disk-usage":
+            result = cmd_disk_usage(DEFAULT_ROOT)
         else:  # pragma: no cover - argparse enforces `command` is one of the above
             print(f"unknown command: {args.command}", file=sys.stderr)
             return 2

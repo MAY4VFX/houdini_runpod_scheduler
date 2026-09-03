@@ -151,10 +151,19 @@ def main(argv):
             overwrite = payload.get("overwrite", "newer")
             stats = rppkg.run_download_item(item, cfg, sftp, sync_client, overwrite, progress_cb)
         else:
-            rppkg.maybe_grow_volume(
+            autogrow_note = rppkg.maybe_grow_volume(
                 api, cfg, sync_client, item.get("bytes") or 0,
                 log=lambda m: print("[{}] {}".format(tag, m), flush=True),
             )
+            # Review finding: a skipped/failed check must be visible
+            # somewhere the artist will actually see it, not just this
+            # line in the raw work-item log -- "ok" (the common case)
+            # isn't worth an attribute; anything else is.
+            if pdgcmd is not None and autogrow_note != "ok":
+                try:
+                    pdgcmd.setStringAttrib("volume_autogrow", autogrow_note, 0)
+                except Exception:
+                    pass
             compress = bool(payload.get("compress"))
             stats = rppkg.run_upload_item(item, cfg, sftp, sync_client, compress, progress_cb)
         elapsed = time.time() - t0

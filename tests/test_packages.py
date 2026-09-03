@@ -752,7 +752,7 @@ def test_run_upload_item_touches_project_index(tmp_path, monkeypatch):
         item, FakeCfg(), SftpTarget(host="1.2.3.4", port=22, key_path="/k"), sync_client, compress=False, progress_cb=None
     )
     assert any(
-        c == "python3 /opt/rpfarm/housekeeping.py touch may/shotA --event upload" for c in sync_client.commands
+        c == "python3 /opt/rpfarm/housekeeping.py touch 'may/shotA' --event upload" for c in sync_client.commands
     )
 
 
@@ -802,14 +802,18 @@ def test_run_download_item_touches_project_index(tmp_path, monkeypatch):
         item, FakeCfg(), SftpTarget(host="1.2.3.4", port=22, key_path="/k"), sync_client, "newer", progress_cb=None
     )
     assert any(
-        c == "python3 /opt/rpfarm/housekeeping.py touch may/shotA --event download" for c in sync_client.commands
+        c == "python3 /opt/rpfarm/housekeeping.py touch 'may/shotA' --event download" for c in sync_client.commands
     )
 
 
 # -- maybe_grow_volume ------------------------------------------------------
 
 
-class _LsSyncClient:
+class _DiskUsageSyncClient:
+    """Fake sync pod for maybe_grow_volume's `disk-usage` call (Ruling R26
+    review finding: not `ls` -- the auto-grow decision only ever needs
+    disk_usage's real used/total, never ls's slow zone/project walk)."""
+
     def __init__(self, used, total, exit_code=0):
         self.used = used
         self.total = total
@@ -840,37 +844,49 @@ class _FakeApi:
         self.resized.append((vid, size_gb))
 
 
+def test_maybe_grow_volume_uses_disk_usage_not_ls():
+    gb = 2**30
+    api = _FakeApi(size_gb=50)
+    sync_client = _DiskUsageSyncClient(used=10 * gb, total=50 * gb)
+    maybe_grow_volume(api, _GrowCfg(), sync_client, needed_bytes=1 * gb)
+    assert sync_client.commands == ["python3 /opt/rpfarm/housekeeping.py disk-usage"]
+
+
 def test_maybe_grow_volume_grows_past_threshold():
     gb = 2**30
     api = _FakeApi(size_gb=50)
-    sync_client = _LsSyncClient(used=44 * gb, total=50 * gb)
-    maybe_grow_volume(api, _GrowCfg(), sync_client, needed_bytes=2 * gb)
+    sync_client = _DiskUsageSyncClient(used=44 * gb, total=50 * gb)
+    result = maybe_grow_volume(api, _GrowCfg(), sync_client, needed_bytes=2 * gb)
     assert api.resized == [("vol1", 60)]  # ceil(46/0.8/10)*10 = 60
+    assert result == "grown to 60 GB"
 
 
 def test_maybe_grow_volume_no_op_under_threshold():
     gb = 2**30
     api = _FakeApi(size_gb=50)
-    sync_client = _LsSyncClient(used=10 * gb, total=50 * gb)
-    maybe_grow_volume(api, _GrowCfg(), sync_client, needed_bytes=1 * gb)
+    sync_client = _DiskUsageSyncClient(used=10 * gb, total=50 * gb)
+    result = maybe_grow_volume(api, _GrowCfg(), sync_client, needed_bytes=1 * gb)
     assert api.resized == []
+    assert result == "ok"
 
 
 def test_maybe_grow_volume_never_shrinks_or_repeats():
     gb = 2**30
     api = _FakeApi(size_gb=100)  # already bigger than the computed target
-    sync_client = _LsSyncClient(used=44 * gb, total=50 * gb)
-    maybe_grow_volume(api, _GrowCfg(), sync_client, needed_bytes=2 * gb)
+    sync_client = _DiskUsageSyncClient(used=44 * gb, total=50 * gb)
+    result = maybe_grow_volume(api, _GrowCfg(), sync_client, needed_bytes=2 * gb)
     assert api.resized == []
+    assert result == "ok"
 
 
-def test_maybe_grow_volume_swallows_ls_failure():
+def test_maybe_grow_volume_swallows_disk_usage_failure():
     api = _FakeApi(size_gb=50)
-    sync_client = _LsSyncClient(used=0, total=0, exit_code=1)
+    sync_client = _DiskUsageSyncClient(used=0, total=0, exit_code=1)
     logs = []
-    maybe_grow_volume(api, _GrowCfg(), sync_client, needed_bytes=1, log=logs.append)
+    result = maybe_grow_volume(api, _GrowCfg(), sync_client, needed_bytes=1, log=logs.append)
     assert api.resized == []
     assert logs  # the failure was logged, not raised
+    assert result.startswith("skipped:")
 
 
 def test_maybe_grow_volume_swallows_api_exception():
@@ -879,7 +895,28 @@ def test_maybe_grow_volume_swallows_api_exception():
             raise RuntimeError("network down")
 
     gb = 2**30
-    sync_client = _LsSyncClient(used=44 * gb, total=50 * gb)
+    sync_client = _DiskUsageSyncClient(used=44 * gb, total=50 * gb)
     logs = []
-    maybe_grow_volume(ExplodingApi(), _GrowCfg(), sync_client, needed_bytes=2 * gb, log=logs.append)
+    result = maybe_grow_volume(ExplodingApi(), _GrowCfg(), sync_client, needed_bytes=2 * gb, log=logs.append)
     assert logs
+    assert result.startswith("error:")
+
+
+def test_maybe_grow_volume_short_exec_timeout():
+    """R26 review finding: the old flat 60s timeout raced ls's own
+    zone-walk on the real farm. disk-usage never walks anything, so the
+    exec timeout can be short -- confirm it's meaningfully tighter than
+    the old value, not just renamed."""
+    gb = 2**30
+    api = _FakeApi(size_gb=50)
+    sync_client = _DiskUsageSyncClient(used=10 * gb, total=50 * gb)
+    calls = []
+    real_exec = sync_client.exec
+
+    def spying_exec(command, timeout_s=600):
+        calls.append(timeout_s)
+        return real_exec(command, timeout_s=timeout_s)
+
+    sync_client.exec = spying_exec
+    maybe_grow_volume(api, _GrowCfg(), sync_client, needed_bytes=1 * gb)
+    assert calls and calls[0] <= 30
