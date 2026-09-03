@@ -38,6 +38,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import sys
 import time
@@ -444,25 +445,76 @@ def _rotate_boot_logs(root: str, now: float, dry_run: bool) -> list[dict]:
     return rotated
 
 
+# A proper version directory looks like "22.0.393" (rpfarm's own installs,
+# via the Houdini-install upload preset). v1 installed straight into
+# /workspace/houdini/ with no version subdirectory at all (spec 4.1: "сейчас
+# legacy 20.5 лежит прямо в /workspace/houdini/") -- every top-level entry
+# that doesn't match this shape is grouped into one synthetic "legacy"
+# version instead of being listed (and sized) as N separate fake versions.
+_VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
+
+LEGACY_VERSION = "legacy"
+
+
 def cmd_houdini_ls(root: str) -> dict:
-    """Installed Houdini versions under ``/workspace/houdini``."""
+    """Installed Houdini versions under ``/workspace/houdini``.
+
+    Real ``NN.N.NNN`` version directories are listed individually; any
+    other top-level entry (v1's flat legacy install: `bin/`, `houdini/`,
+    loose files, ...) is summed into one ``"legacy"`` entry so it shows up
+    as one cleanup unit, not dozens.
+    """
     houdini_root = os.path.join(root, "houdini")
     versions = []
+    legacy_bytes = 0
+    have_legacy = False
     if os.path.isdir(houdini_root):
         for name in sorted(os.listdir(houdini_root)):
-            vdir = os.path.join(houdini_root, name)
-            if name.startswith(".") or not os.path.isdir(vdir):
+            if name.startswith("."):
                 continue
-            versions.append({"version": name, "bytes": _size(vdir)})
+            entry = os.path.join(houdini_root, name)
+            if _VERSION_RE.match(name) and os.path.isdir(entry):
+                versions.append({"version": name, "bytes": _size(entry)})
+            else:
+                have_legacy = True
+                legacy_bytes += _size(entry)
+    if have_legacy:
+        versions.append({"version": LEGACY_VERSION, "bytes": legacy_bytes})
     return {"versions": versions}
 
 
 def cmd_houdini_rm(root: str, version: str) -> dict:
-    """Delete one installed Houdini version directory."""
+    """Delete one installed Houdini version.
+
+    ``version="legacy"`` removes every top-level entry under
+    ``/workspace/houdini`` that is *not* a proper ``NN.N.NNN`` directory
+    (v1's flat install) in one call, leaving real versions untouched --
+    otherwise deletes that one version's directory.
+    """
     if not version or version in (".", "..") or "/" in version or "\\" in version:
         raise HousekeepingError(f"invalid version {version!r}")
-    vdir = os.path.normpath(os.path.join(root, "houdini", version))
     houdini_root = os.path.normpath(os.path.join(root, "houdini"))
+
+    if version == LEGACY_VERSION:
+        if not os.path.isdir(houdini_root):
+            return {"ok": False, "error": "not found", "path": houdini_root}
+        removed = []
+        freed = 0
+        for name in sorted(os.listdir(houdini_root)):
+            if name.startswith(".") or _VERSION_RE.match(name):
+                continue
+            entry = os.path.join(houdini_root, name)
+            freed += _size(entry)
+            if os.path.isdir(entry) and not os.path.islink(entry):
+                shutil.rmtree(entry)
+            else:
+                os.remove(entry)
+            removed.append(entry)
+        if not removed:
+            return {"ok": False, "error": "no legacy entries found", "path": houdini_root}
+        return {"ok": True, "path": houdini_root, "removed": removed, "bytes_freed": freed}
+
+    vdir = os.path.normpath(os.path.join(root, "houdini", version))
     if vdir == houdini_root or not vdir.startswith(houdini_root + os.sep):
         raise HousekeepingError(f"resolved path escapes houdini/: {vdir}")
     if not os.path.isdir(vdir):

@@ -261,6 +261,45 @@ def test_houdini_rm_rejects_traversal(tmp_path):
         hk.cmd_houdini_rm(root, "../ledger")
 
 
+# -- houdini ls/rm: v1's flat "legacy" install (spec 4.1) --------------------
+
+
+def test_houdini_ls_groups_legacy_entries(tmp_path):
+    root = mk(tmp_path)
+    (tmp_path / "houdini/bin").mkdir()
+    (tmp_path / "houdini/bin/hexpand").write_bytes(b"x" * 10)
+    (tmp_path / "houdini/houdini.env").write_bytes(b"y" * 5)
+    out = hk.cmd_houdini_ls(root)
+    by_version = {v["version"]: v["bytes"] for v in out["versions"]}
+    assert by_version["22.0.393"] == 0  # the real version dir, still separate
+    assert by_version["legacy"] == 15  # bin/hexpand + houdini.env, summed
+
+
+def test_houdini_ls_no_legacy_entry_when_only_proper_versions(tmp_path):
+    root = mk(tmp_path)
+    out = hk.cmd_houdini_ls(root)
+    assert "legacy" not in {v["version"] for v in out["versions"]}
+
+
+def test_houdini_rm_legacy_removes_only_non_version_entries(tmp_path):
+    root = mk(tmp_path)
+    (tmp_path / "houdini/bin").mkdir()
+    (tmp_path / "houdini/bin/hexpand").write_bytes(b"x" * 10)
+    (tmp_path / "houdini/houdini.env").write_bytes(b"y" * 5)
+    result = hk.cmd_houdini_rm(root, "legacy")
+    assert result["ok"] is True
+    assert result["bytes_freed"] == 15
+    assert not (tmp_path / "houdini/bin").exists()
+    assert not (tmp_path / "houdini/houdini.env").exists()
+    assert (tmp_path / "houdini/22.0.393").exists()  # real version untouched
+
+
+def test_houdini_rm_legacy_not_found_when_nothing_to_remove(tmp_path):
+    root = mk(tmp_path)
+    result = hk.cmd_houdini_rm(root, "legacy")
+    assert result["ok"] is False
+
+
 # -- sync-idle ----------------------------------------------------------------
 
 
