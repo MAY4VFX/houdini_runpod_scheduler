@@ -188,13 +188,19 @@ def main():
         def billing_volumes(self, since_iso, until_iso):
             return [{"amount": 30.0}]  # $30 over the (Since/Until empty -> 90-day fallback) period
 
+        def get_volume(self, vid):
+            return {"size": 100}  # Ruling R27: real size, from RunPod's own API
+
     gb = 2**30
+
+    ls_commands = []
 
     class _FakeWorkerClient:
         def __init__(self, pod_id, token):
             pass
 
         def exec(self, command, timeout_s=600):
+            ls_commands.append(command)
             payload = {"projects": [{"user": "bob", "project": "old_proj", "bytes": 10 * gb}],
                        "volume": {"total": 100 * gb, "used": 40 * gb}}
             return {"exit_code": 0, "stdout": json.dumps(payload), "stderr": ""}
@@ -244,6 +250,13 @@ def main():
         else:
             log("FAIL: old_proj monthly_cost = {}, expected ~{:.2f}".format(entry["monthly_cost"], expected_cost))
             ok = False
+
+    if any("--volume-size-gb 100" in c for c in ls_commands):
+        log("OK: _storage_snapshot passed the real volume size (100 GB, from RunPod's own "
+            "get_volume) to housekeeping ls -- never shutil.disk_usage (Ruling R27)")
+    else:
+        log("FAIL: expected an ls call with --volume-size-gb 100, got: {}".format(ls_commands))
+        ok = False
 
     # -- 1c. Review fix: config present but Use Billing OFF must never touch
     # the sync pod. Before this fix, _storage_snapshot ran unconditionally

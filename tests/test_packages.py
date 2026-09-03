@@ -6,6 +6,7 @@ import pytest
 from rpfarm.packages import (
     build_download_items,
     build_upload_items,
+    get_volume_size_gb,
     group_download_pairs,
     houdini_install_preset,
     localize_via_pathmap,
@@ -806,26 +807,7 @@ def test_run_download_item_touches_project_index(tmp_path, monkeypatch):
     )
 
 
-# -- maybe_grow_volume ------------------------------------------------------
-
-
-class _DiskUsageSyncClient:
-    """Fake sync pod for maybe_grow_volume's `disk-usage` call (Ruling R26
-    review finding: not `ls` -- the auto-grow decision only ever needs
-    disk_usage's real used/total, never ls's slow zone/project walk)."""
-
-    def __init__(self, used, total, exit_code=0):
-        self.used = used
-        self.total = total
-        self.exit_code = exit_code
-        self.commands = []
-
-    def exec(self, command, timeout_s=600):
-        self.commands.append(command)
-        if self.exit_code != 0:
-            return {"exit_code": self.exit_code, "stdout": "", "stderr": "boom"}
-        payload = json.dumps({"volume": {"used": self.used, "total": self.total}})
-        return {"exit_code": 0, "stdout": payload, "stderr": ""}
+# -- get_volume_size_gb (Ruling R27: RunPod's own size, cached per session) --
 
 
 class _GrowCfg:
@@ -835,53 +817,146 @@ class _GrowCfg:
 class _FakeApi:
     def __init__(self, size_gb):
         self.size_gb = size_gb
+        self.get_volume_calls = 0
         self.resized = []
 
     def get_volume(self, vid):
+        self.get_volume_calls += 1
         return {"size": self.size_gb}
 
     def resize_volume(self, vid, size_gb):
         self.resized.append((vid, size_gb))
 
 
-def test_maybe_grow_volume_uses_disk_usage_not_ls():
+def test_get_volume_size_gb_fetches_and_caches(tmp_path, monkeypatch):
+    monkeypatch.setenv("RPFARM_HOME", str(tmp_path))
+    api = _FakeApi(size_gb=50)
+    assert get_volume_size_gb(api, _GrowCfg()) == 50
+    assert api.get_volume_calls == 1
+    assert get_volume_size_gb(api, _GrowCfg()) == 50
+    assert api.get_volume_calls == 1  # second call served from the cache file
+
+
+def test_get_volume_size_gb_persists_across_fresh_calls(tmp_path, monkeypatch):
+    """The real point of the cache: package_runner.py is a fresh process
+    per upload item, so a plain in-process cache would never be reused --
+    only a call with no shared Python state in common proves the file
+    cache actually crosses that boundary."""
+    monkeypatch.setenv("RPFARM_HOME", str(tmp_path))
+    api1 = _FakeApi(size_gb=50)
+    get_volume_size_gb(api1, _GrowCfg())
+    api2 = _FakeApi(size_gb=999)  # a second "process" -- must not be consulted
+    assert get_volume_size_gb(api2, _GrowCfg()) == 50
+    assert api2.get_volume_calls == 0
+
+
+def test_get_volume_size_gb_refetches_when_stale(tmp_path, monkeypatch):
+    monkeypatch.setenv("RPFARM_HOME", str(tmp_path))
+    api = _FakeApi(size_gb=50)
+    assert get_volume_size_gb(api, _GrowCfg(), max_age_s=0) == 50
+    api.size_gb = 60  # simulates a resize
+    assert get_volume_size_gb(api, _GrowCfg(), max_age_s=0) == 60
+    assert api.get_volume_calls == 2
+
+
+def test_get_volume_size_gb_falls_back_to_stale_on_api_failure(tmp_path, monkeypatch):
+    monkeypatch.setenv("RPFARM_HOME", str(tmp_path))
+    api = _FakeApi(size_gb=50)
+    get_volume_size_gb(api, _GrowCfg())
+
+    class ExplodingApi:
+        def get_volume(self, vid):
+            raise RuntimeError("network down")
+
+    assert get_volume_size_gb(ExplodingApi(), _GrowCfg(), max_age_s=0) == 50
+
+
+def test_get_volume_size_gb_none_with_no_cache_and_failing_api(tmp_path, monkeypatch):
+    monkeypatch.setenv("RPFARM_HOME", str(tmp_path))
+
+    class ExplodingApi:
+        def get_volume(self, vid):
+            raise RuntimeError("network down")
+
+    assert get_volume_size_gb(ExplodingApi(), _GrowCfg()) is None
+
+
+# -- maybe_grow_volume ------------------------------------------------------
+
+
+class _DiskUsageSyncClient:
+    """Fake sync pod for maybe_grow_volume's `disk-usage` call (Ruling R26:
+    not `ls` -- the decision only needs the zone-summed used bytes, never
+    ls's per-project walk; Ruling R27: total comes from the caller's
+    --volume-size-gb, never shutil.disk_usage)."""
+
+    def __init__(self, used, exit_code=0, partial=False):
+        self.used = used
+        self.exit_code = exit_code
+        self.partial = partial
+        self.commands = []
+
+    def exec(self, command, timeout_s=600):
+        self.commands.append(command)
+        if self.exit_code != 0:
+            return {"exit_code": self.exit_code, "stdout": "", "stderr": "boom"}
+        payload = json.dumps({"volume": {"used": self.used}, "partial": self.partial})
+        # A real disk-usage --volume-size-gb N response computes total/used_pct
+        # itself; parse N back out of the command so this fake matches that
+        # contract instead of duplicating the arithmetic independently.
+        if "--volume-size-gb" in command:
+            gb = float(command.split("--volume-size-gb")[1].split()[0])
+            total = int(gb * 2**30)
+            payload = json.dumps(
+                {"volume": {"used": self.used, "total": total}, "partial": self.partial}
+            )
+        return {"exit_code": 0, "stdout": payload, "stderr": ""}
+
+
+@pytest.fixture
+def rpfarm_home(tmp_path, monkeypatch):
+    monkeypatch.setenv("RPFARM_HOME", str(tmp_path))
+    return tmp_path
+
+
+def test_maybe_grow_volume_passes_real_size_to_disk_usage(rpfarm_home):
     gb = 2**30
     api = _FakeApi(size_gb=50)
-    sync_client = _DiskUsageSyncClient(used=10 * gb, total=50 * gb)
+    sync_client = _DiskUsageSyncClient(used=10 * gb)
     maybe_grow_volume(api, _GrowCfg(), sync_client, needed_bytes=1 * gb)
-    assert sync_client.commands == ["python3 /opt/rpfarm/housekeeping.py disk-usage"]
+    assert sync_client.commands == ["python3 /opt/rpfarm/housekeeping.py disk-usage --volume-size-gb 50"]
 
 
-def test_maybe_grow_volume_grows_past_threshold():
+def test_maybe_grow_volume_grows_past_threshold(rpfarm_home):
     gb = 2**30
     api = _FakeApi(size_gb=50)
-    sync_client = _DiskUsageSyncClient(used=44 * gb, total=50 * gb)
+    sync_client = _DiskUsageSyncClient(used=44 * gb)
     result = maybe_grow_volume(api, _GrowCfg(), sync_client, needed_bytes=2 * gb)
     assert api.resized == [("vol1", 60)]  # ceil(46/0.8/10)*10 = 60
     assert result == "grown to 60 GB"
 
 
-def test_maybe_grow_volume_no_op_under_threshold():
+def test_maybe_grow_volume_no_op_under_threshold(rpfarm_home):
     gb = 2**30
     api = _FakeApi(size_gb=50)
-    sync_client = _DiskUsageSyncClient(used=10 * gb, total=50 * gb)
+    sync_client = _DiskUsageSyncClient(used=10 * gb)
     result = maybe_grow_volume(api, _GrowCfg(), sync_client, needed_bytes=1 * gb)
     assert api.resized == []
     assert result == "ok"
 
 
-def test_maybe_grow_volume_never_shrinks_or_repeats():
+def test_maybe_grow_volume_never_shrinks_or_repeats(rpfarm_home):
     gb = 2**30
     api = _FakeApi(size_gb=100)  # already bigger than the computed target
-    sync_client = _DiskUsageSyncClient(used=44 * gb, total=50 * gb)
+    sync_client = _DiskUsageSyncClient(used=44 * gb)
     result = maybe_grow_volume(api, _GrowCfg(), sync_client, needed_bytes=2 * gb)
     assert api.resized == []
     assert result == "ok"
 
 
-def test_maybe_grow_volume_swallows_disk_usage_failure():
+def test_maybe_grow_volume_swallows_disk_usage_failure(rpfarm_home):
     api = _FakeApi(size_gb=50)
-    sync_client = _DiskUsageSyncClient(used=0, total=0, exit_code=1)
+    sync_client = _DiskUsageSyncClient(used=0, exit_code=1)
     logs = []
     result = maybe_grow_volume(api, _GrowCfg(), sync_client, needed_bytes=1, log=logs.append)
     assert api.resized == []
@@ -889,27 +964,51 @@ def test_maybe_grow_volume_swallows_disk_usage_failure():
     assert result.startswith("skipped:")
 
 
-def test_maybe_grow_volume_swallows_api_exception():
+def test_maybe_grow_volume_skips_with_visible_note_when_size_unknown(rpfarm_home):
     class ExplodingApi:
         def get_volume(self, vid):
             raise RuntimeError("network down")
 
-    gb = 2**30
-    sync_client = _DiskUsageSyncClient(used=44 * gb, total=50 * gb)
     logs = []
-    result = maybe_grow_volume(ExplodingApi(), _GrowCfg(), sync_client, needed_bytes=2 * gb, log=logs.append)
+    sync_client = _DiskUsageSyncClient(used=0)
+    result = maybe_grow_volume(ExplodingApi(), _GrowCfg(), sync_client, needed_bytes=1, log=logs.append)
+    assert result.startswith("skipped:")
+    assert logs
+    assert sync_client.commands == []  # never even asked the pod without a real size
+
+
+def test_maybe_grow_volume_swallows_unexpected_exec_exception(rpfarm_home):
+    """The outer try/except is a safety net for anything unexpected, not
+    just a failed RunPod lookup or a non-zero exit_code -- exercise it
+    with sync_client.exec itself raising (WorkerClient.exec never does in
+    practice, but this is the last line of defense regardless)."""
+    api = _FakeApi(size_gb=50)
+    gb = 2**30
+    sync_client = _DiskUsageSyncClient(used=44 * gb)
+    sync_client.exec = lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("transport down"))
+    logs = []
+    result = maybe_grow_volume(api, _GrowCfg(), sync_client, needed_bytes=2 * gb, log=logs.append)
     assert logs
     assert result.startswith("error:")
 
 
-def test_maybe_grow_volume_short_exec_timeout():
-    """R26 review finding: the old flat 60s timeout raced ls's own
-    zone-walk on the real farm. disk-usage never walks anything, so the
-    exec timeout can be short -- confirm it's meaningfully tighter than
-    the old value, not just renamed."""
+def test_maybe_grow_volume_notes_partial_data(rpfarm_home):
     gb = 2**30
     api = _FakeApi(size_gb=50)
-    sync_client = _DiskUsageSyncClient(used=10 * gb, total=50 * gb)
+    sync_client = _DiskUsageSyncClient(used=10 * gb, partial=True)
+    logs = []
+    result = maybe_grow_volume(api, _GrowCfg(), sync_client, needed_bytes=1 * gb, log=logs.append)
+    assert result == "ok (partial data)"
+    assert any("partial" in m for m in logs)
+
+
+def test_maybe_grow_volume_short_exec_timeout(rpfarm_home):
+    """R26/R27: disk-usage's "used" comes from the cached zone sizes (fast
+    when warm) and never walks anything to get "total" -- the exec
+    timeout can stay short."""
+    gb = 2**30
+    api = _FakeApi(size_gb=50)
+    sync_client = _DiskUsageSyncClient(used=10 * gb)
     calls = []
     real_exec = sync_client.exec
 

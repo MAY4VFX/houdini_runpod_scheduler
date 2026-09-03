@@ -86,11 +86,30 @@ def test_ls_projects_sorted_and_index_fields(tmp_path):
     assert shotB["last_used"] is not None and shotB["last_cook"] is not None
 
 
-def test_ls_volume_totals_present(tmp_path):
+def _volume_used_from_zones(root):
+    return sum(hk._size(os.path.join(root, z)) or 0 for z in hk._ZONES)
+
+
+def test_ls_volume_without_size_gb_is_null_not_disk_usage(tmp_path):
+    # Ruling R27: shutil.disk_usage(root) inside a pod reports the backing
+    # storage pool's capacity, not the volume's real size (confirmed live:
+    # a real 50GB volume read back as ~2.14 PiB) -- never used for this.
     root = mk(tmp_path)
     volume = hk.cmd_ls(root)["volume"]
-    assert volume["total"] > 0
-    assert volume["used"] >= 0
+    assert volume["used"] == _volume_used_from_zones(root) == 1010
+    assert volume["total"] is None
+    assert volume["used_pct"] is None
+    assert "note" in volume
+
+
+def test_ls_volume_with_size_gb_computes_totals(tmp_path):
+    root = mk(tmp_path)
+    gb = 2**30
+    volume = hk.cmd_ls(root, volume_size_gb=50)["volume"]
+    assert volume["total"] == 50 * gb
+    assert volume["used"] == _volume_used_from_zones(root)
+    assert volume["used_pct"] == round(100.0 * volume["used"] / (50 * gb), 2)
+    assert "note" not in volume
 
 
 def test_ls_empty_root(tmp_path):
@@ -531,20 +550,56 @@ def test_houdini_rm_dry_run_legacy_does_not_delete(tmp_path):
 # -- disk-usage (Ruling R26 review fix: maybe_grow_volume's fast path) ------
 
 
-def test_disk_usage_shape(tmp_path):
+def test_disk_usage_shape_without_size_gb(tmp_path):
     root = mk(tmp_path)
     out = hk.cmd_disk_usage(root)
-    assert set(out.keys()) == {"volume"}
-    assert set(out["volume"].keys()) == {"used", "total"}
-    assert out["volume"]["total"] > 0
+    assert set(out.keys()) == {"volume", "partial"}
+    assert out["volume"]["used"] == _volume_used_from_zones(root)
+    assert out["volume"]["total"] is None
+    assert out["volume"]["used_pct"] is None
+    assert "note" in out["volume"]
+
+
+def test_disk_usage_with_size_gb(tmp_path):
+    root = mk(tmp_path)
+    gb = 2**30
+    out = hk.cmd_disk_usage(root, volume_size_gb=50)
+    assert out["volume"]["total"] == 50 * gb
+    assert out["volume"]["used"] == _volume_used_from_zones(root)
+    assert "note" not in out["volume"]
+
+
+def test_disk_usage_reuses_ls_cache(tmp_path, monkeypatch):
+    """R27: disk-usage's "used" is the same _sizes cache ls populates --
+    a disk-usage call right after ls must not re-measure anything."""
+    root = mk(tmp_path)
+    calls = {"n": 0}
+    real_size = hk._size
+
+    def counting_size(path, timeout_s=hk._SIZE_TIMEOUT_S):
+        calls["n"] += 1
+        return real_size(path, timeout_s=timeout_s)
+
+    hk.cmd_ls(root)  # populates the _sizes cache with the real _size
+    monkeypatch.setattr(hk, "_size", counting_size)
+    hk.cmd_disk_usage(root, volume_size_gb=50)
+    assert calls["n"] == 0
 
 
 def test_main_disk_usage(tmp_path, capsys, monkeypatch):
     monkeypatch.setattr(hk, "DEFAULT_ROOT", str(tmp_path))
+    rc = hk.main(["housekeeping.py", "disk-usage", "--volume-size-gb", "50"])
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["volume"]["total"] == 50 * 2**30
+
+
+def test_main_disk_usage_without_size_gb_is_null(tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr(hk, "DEFAULT_ROOT", str(tmp_path))
     rc = hk.main(["housekeeping.py", "disk-usage"])
     assert rc == 0
     out = json.loads(capsys.readouterr().out)
-    assert out["volume"]["total"] > 0
+    assert out["volume"]["total"] is None
 
 
 def test_main_ls_accepts_budget_and_max_age_flags(tmp_path, capsys):
@@ -555,3 +610,35 @@ def test_main_ls_accepts_budget_and_max_age_flags(tmp_path, capsys):
     assert rc == 0
     out = json.loads(capsys.readouterr().out)
     assert out["zones"]["projects"] == 1010
+
+
+# -- houdini rm reuses houdini ls's cache (review follow-up) ----------------
+
+
+def test_houdini_rm_legacy_dry_run_reuses_houdini_ls_cache(tmp_path, monkeypatch):
+    root = mk(tmp_path)
+    (tmp_path / "houdini/bin").mkdir()
+    (tmp_path / "houdini/bin/hexpand").write_bytes(b"x" * 10)
+    hk.cmd_houdini_ls(root)  # populates the _houdini cache
+
+    calls = {"n": 0}
+    real_size = hk._size
+
+    def counting_size(path, timeout_s=hk._SIZE_TIMEOUT_S):
+        calls["n"] += 1
+        return real_size(path, timeout_s=timeout_s)
+
+    monkeypatch.setattr(hk, "_size", counting_size)
+    result = hk.cmd_houdini_rm(root, "legacy", dry_run=True)
+    assert calls["n"] == 0  # served entirely from the houdini-ls-populated cache
+    assert result["bytes_freed"] == 10
+
+
+def test_houdini_rm_real_deletion_prunes_cache_entry(tmp_path):
+    root = mk(tmp_path)
+    hk.cmd_houdini_ls(root)  # populates the _houdini cache for 22.0.393
+    hk.cmd_houdini_rm(root, "22.0.393")
+    index_path = os.path.join(root, ".rpfarm", "index.json")
+    with open(index_path) as f:
+        data = json.load(f)
+    assert "22.0.393" not in data.get("_houdini", {})

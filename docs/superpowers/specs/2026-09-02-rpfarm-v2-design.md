@@ -247,6 +247,15 @@ volume, поставить туда Houdini (пресет), переключит
 Текущий volume `2ze7qdwkt3` (50 ГБ, Houdini 20.5.684) переиспользуется: 20.5 удаляется,
 22.0.393 ставится, размер растёт по потребности.
 
+**Ловушка, проверенная вживую (Task 12, Ruling R27):** изнутри пода `shutil.disk_usage`
+(и любой `statvfs` на `/workspace`) показывает ёмкость backing storage pool хостовой
+машины, а не реальный/оплаченный размер network volume — на настоящем 50 ГБ volume это
+дало ~2.14 PiB. У пода нет ключа RunPod API, чтобы узнать реальный размер самому; его
+обязан передавать вызывающий (`RunPodAPI.get_volume(volume_id)["size"]`, кешируется —
+`rpfarm.packages.get_volume_size_gb`). `pod/housekeeping.py`'s `ls`/`disk-usage` берут
+размер только через `--volume-size-gb`; без него `total`/`used_pct` — `null`, а не
+подставленное число из `shutil.disk_usage`.
+
 ### 4.2 Зависимости и маппинг путей
 
 `rpfarm/deps.py`: `hou.fileReferences()` (раскрытые `$HIP/$JOB`, `$F`, UDIM, папки

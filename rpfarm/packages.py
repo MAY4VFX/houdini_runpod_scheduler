@@ -38,6 +38,7 @@ import math
 import os
 import posixpath
 import tempfile
+import time
 
 from .deps import resolve_entries
 from .sync import FileEntry, SyncStats, compress_stage, rclone_copy
@@ -410,17 +411,64 @@ _AUTO_GROW_THRESHOLD = 0.85
 _AUTO_GROW_TARGET_FRACTION = 0.8
 _AUTO_GROW_STEP_GB = 10
 _GB = 2**30
-# Ruling R26 review finding: this used to ask `ls` -- which walks every
-# zone and project (even bounded by ls's own --budget-s, per-project
-# outputs_pending scanning has no budget of its own, Task 12 report) --
-# for a full measurement, with a flat 60s exec timeout. On the real farm's
-# 11GB+ legacy Houdini install, that walk alone took 30-40s cold, so the
-# *outer* exec timeout was racing the walk instead of comfortably
-# outliving it, and a genuinely slow project could still blow both. The
-# auto-grow decision only ever needs the volume's real used/total bytes
-# (`disk-usage`: one instant `shutil.disk_usage` syscall, no walk at all)
-# -- using that instead removes the race, not just widens it.
+# Ruling R27 review finding: this used to trust `disk-usage`'s (or,
+# before that, `ls`'s) `shutil.disk_usage(root)`-derived "total" -- which
+# is the *backing storage pool's* capacity from inside a pod, not the
+# RunPod network volume's own provisioned size (confirmed live: a real
+# 50GB volume read back as ~2.14 PiB). The pod has no RunPod API key and
+# cannot look up the real size itself, so the caller must supply it.
+# `--volume-size-gb` makes `disk-usage` compute against that instead of
+# ever touching `shutil.disk_usage`; `used` still comes from the same
+# zone/`du -sb` numbers `ls` uses (cached, Ruling R26), never a syscall
+# that reports the wrong thing for the same reason `total` did.
 _AUTO_GROW_EXEC_TIMEOUT_S = 15.0
+
+
+def get_volume_size_gb(api, cfg, max_age_s=300.0):
+    """The volume's real provisioned size in GB, from RunPod's own API.
+
+    Cached in ``~/.rpfarm/volume_size_cache.json`` (per ``cfg.volume_id``,
+    ``max_age_s`` default 5 min -- a resize is a rare, explicit action,
+    not something worth polling every item) because ``maybe_grow_volume``
+    is called once per upload item, and each item is its own
+    ``package_runner.py`` process (Ruling R27 review: "cache the API
+    answer per session" has to mean a file, not an in-process dict, or it
+    would never actually be reused). Never raises: a failed lookup falls
+    back to a stale cached value if there is one, else returns ``None`` --
+    :func:`maybe_grow_volume` already treats an unknown size as "skip",
+    not an error.
+    """
+    from . import config as rpcfg  # local: packages.py has no other rpcfg dependency
+
+    path = rpcfg.home() / "volume_size_cache.json"
+    now = time.time()
+    try:
+        with open(path) as f:
+            cache = json.load(f)
+    except (OSError, ValueError):
+        cache = {}
+    if not isinstance(cache, dict):
+        cache = {}
+    entry = cache.get(cfg.volume_id)
+    if entry and (now - entry.get("cached_at", 0)) < max_age_s:
+        return entry.get("size_gb")
+
+    try:
+        size_gb = (api.get_volume(cfg.volume_id) or {}).get("size")
+    except Exception:  # noqa: BLE001 - RunPod control-plane hiccup, not fatal here
+        size_gb = None
+
+    if not size_gb:
+        return entry.get("size_gb") if entry else None
+
+    cache[cfg.volume_id] = {"size_gb": size_gb, "cached_at": now}
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w") as f:
+            json.dump(cache, f)
+    except OSError:
+        pass
+    return size_gb
 
 
 def maybe_grow_volume(api, cfg, sync_client, needed_bytes, log=None) -> str:
@@ -430,22 +478,33 @@ def maybe_grow_volume(api, cfg, sync_client, needed_bytes, log=None) -> str:
     (only for uploads -- downloads free no space and need no headroom).
     Sizes the new volume so it lands at ~80% full afterwards, rounded up
     to the nearest 10 GB step (spec 4.1's formula:
-    ``ceil((used+bytes)/0.8/10GB)*10``). Reads real used/total bytes via
-    housekeeping's ``disk-usage`` -- one instant syscall, not ``ls``'s
-    zone/project walk (see :data:`_AUTO_GROW_EXEC_TIMEOUT_S`'s comment).
+    ``ceil((used+bytes)/0.8/10GB)*10``). Looks up the volume's real size
+    via :func:`get_volume_size_gb` (RunPod's own API, cached -- the pod
+    cannot do this itself) and passes it to housekeeping's ``disk-usage``
+    as ``--volume-size-gb`` so ``used``/``total`` are never derived from
+    ``shutil.disk_usage`` (Ruling R27).
 
     Never raises: a failed size check or resize must not block an upload
     that would otherwise succeed on its own. Returns a short status string
-    (``"ok"``, ``"grown to N GB"``, ``"skipped: ..."``, ``"error: ..."``)
-    -- callers are expected to surface anything other than ``"ok"``
-    somewhere the artist will actually see it (package_runner.py sets a
-    pdgcmd attribute), not just this function's own ``log()`` line, so a
-    silently-disabled guard doesn't stay silent.
+    (``"ok"``, ``"ok (partial data)"``, ``"grown to N GB"``,
+    ``"skipped: ..."``, ``"error: ..."``) -- callers are expected to
+    surface anything other than plain ``"ok"`` somewhere the artist will
+    actually see it (package_runner.py sets a pdgcmd attribute), not just
+    this function's own ``log()`` line, so a silently-disabled or
+    partial-data guard doesn't stay silent.
     """
     log = log or (lambda msg: None)
     try:
+        volume_size_gb = get_volume_size_gb(api, cfg)
+        if not volume_size_gb:
+            note = "skipped: volume size unknown (RunPod get_volume unavailable)"
+            log("volume auto-grow check " + note)
+            return note
+
         result = sync_client.exec(
-            "python3 /opt/rpfarm/housekeeping.py disk-usage",
+            "python3 /opt/rpfarm/housekeeping.py disk-usage --volume-size-gb {}".format(
+                volume_size_gb
+            ),
             timeout_s=_AUTO_GROW_EXEC_TIMEOUT_S,
         )
         if result.get("exit_code") != 0:
@@ -456,19 +515,25 @@ def maybe_grow_volume(api, cfg, sync_client, needed_bytes, log=None) -> str:
         volume = info.get("volume") or {}
         used = int(volume.get("used") or 0)
         total = int(volume.get("total") or 0)
+        partial_note = " (partial data)" if info.get("partial") else ""
+        if info.get("partial"):
+            log("volume auto-grow check: disk-usage returned partial (still-warming cache) "
+                "sizes -- deciding from those anyway")
         if total <= 0:
-            return "skipped: volume total unknown"
+            note = "skipped: disk-usage returned no total"
+            log("volume auto-grow check " + note)
+            return note
         if used + needed_bytes <= _AUTO_GROW_THRESHOLD * total:
-            return "ok"
+            return "ok" + partial_note
         new_size_gb = (
             math.ceil((used + needed_bytes) / _AUTO_GROW_TARGET_FRACTION / (_AUTO_GROW_STEP_GB * _GB))
             * _AUTO_GROW_STEP_GB
         )
-        current_gb = int((api.get_volume(cfg.volume_id) or {}).get("size") or 0)
+        current_gb = int(volume_size_gb)
         if new_size_gb <= current_gb:
-            return "ok"
+            return "ok" + partial_note
         api.resize_volume(cfg.volume_id, new_size_gb)
-        note = "grown to {} GB".format(new_size_gb)
+        note = "grown to {} GB".format(new_size_gb) + partial_note
         log(
             "volume {} auto-grown {} GB -> {} GB ({:.0f}% full before this upload)".format(
                 cfg.volume_id, current_gb, new_size_gb, 100.0 * (used + needed_bytes) / total
