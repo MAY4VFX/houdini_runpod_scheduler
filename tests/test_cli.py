@@ -256,6 +256,40 @@ def test_storage_grow_resizes_volume(tmp_path, monkeypatch, capsys):
 # -- farm -----------------------------------------------------------------
 
 
+def test_parse_pod_timestamp_handles_runpods_actual_format():
+    """Confirmed live 2026-09-03 against a real GET /pods response --
+    RunPod's createdAt is not ISO8601 despite the openapi spec saying
+    "string" with no format."""
+    ts = cli._parse_pod_timestamp("2026-09-03 21:19:39.775 +0000 UTC")
+    assert ts == pytest.approx(1788470379.775, abs=0.01)
+
+
+def test_parse_pod_timestamp_falls_back_to_iso8601():
+    ts = cli._parse_pod_timestamp("2026-09-03T21:19:39Z")
+    assert ts is not None
+
+
+def test_parse_pod_timestamp_none_on_garbage():
+    assert cli._parse_pod_timestamp("not a date") is None
+    assert cli._parse_pod_timestamp(None) is None
+
+
+def test_farm_status_computes_uptime_and_cost_from_real_pod_shape(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("RPFARM_HOME", str(tmp_path))
+    _write_cfg(tmp_path, user="tester")
+    pod = {
+        "id": "gpu1", "name": "rpfarm-tester-shotA-abc123-0", "desiredStatus": "RUNNING",
+        "costPerHr": 0.34, "createdAt": "2026-09-03 21:19:39.775 +0000 UTC",
+    }
+    monkeypatch.setattr(cli, "_transport", FakeTransport({("GET", "/pods"): (200, json.dumps([pod]).encode())}))
+    monkeypatch.setattr(cli.time, "time", lambda: 1788470379.775 + 3600)  # exactly 1h later
+    rc = cli.main(["farm", "status"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "1h00m" in out
+    assert "$0.34" in out  # 1h * $0.34/h
+
+
 def test_farm_status_prints_no_pods_running(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("RPFARM_HOME", str(tmp_path))
     _write_cfg(tmp_path)
