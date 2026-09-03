@@ -4,9 +4,13 @@ import os
 import pytest
 
 from rpfarm.packages import (
+    build_download_items,
     build_upload_items,
+    group_download_pairs,
     houdini_install_preset,
+    localize_via_pathmap,
     resolve_compress_flag,
+    run_download_item,
     run_upload_item,
     write_pathmap,
 )
@@ -477,3 +481,245 @@ def test_group_by_pathmap_raises_for_entry_outside_every_root(tmp_path):
 
     with pytest.raises(ValueError, match="not under any"):
         _group_by_pathmap([entry], path_map)
+
+
+# -- localize_via_pathmap --------------------------------------------------------
+
+
+def test_localize_via_pathmap_basic():
+    path_map = {"/job": "/workspace/projects/may/shot"}
+    assert (
+        localize_via_pathmap("/workspace/projects/may/shot/render/a.exr", path_map)
+        == "/job/render/a.exr"
+    )
+
+
+def test_localize_via_pathmap_exact_root_match():
+    path_map = {"/job": "/workspace/projects/may/shot"}
+    assert localize_via_pathmap("/workspace/projects/may/shot", path_map) == "/job"
+
+
+def test_localize_via_pathmap_longest_prefix_wins():
+    path_map = {
+        "/job": "/workspace/projects/may/shot",
+        "/job/render": "/workspace/projects/may/shot/render",
+    }
+    # Both entries' farm prefixes match; the longer (more specific) one wins.
+    assert (
+        localize_via_pathmap("/workspace/projects/may/shot/render/a.exr", path_map)
+        == "/job/render/a.exr"
+    )
+
+
+def test_localize_via_pathmap_no_match_returns_none():
+    path_map = {"/job": "/workspace/projects/may/shot"}
+    assert localize_via_pathmap("/workspace/projects/someone_else/other", path_map) is None
+
+
+def test_localize_via_pathmap_does_not_match_unrelated_sibling_prefix():
+    # "/workspace/projects/may/shot2" must not match the "/shot" entry just
+    # because it shares a string prefix -- only a real path-segment boundary
+    # counts (the trailing "/" check in the implementation).
+    path_map = {"/job": "/workspace/projects/may/shot"}
+    assert localize_via_pathmap("/workspace/projects/may/shot2/x", path_map) is None
+
+
+# -- group_download_pairs ------------------------------------------------------
+
+
+def test_group_download_pairs_single_pair():
+    pairs = [("/workspace/projects/may/shot/render/a.exr", "/job/render/a.exr")]
+    groups = group_download_pairs(pairs, {"/workspace/projects/may/shot/render/a.exr": 5})
+    assert groups == [
+        (
+            "/job/render",
+            "/workspace/projects/may/shot/render",
+            [FileEntry(local="/job/render/a.exr", remote="/workspace/projects/may/shot/render/a.exr", size=5)],
+        )
+    ]
+
+
+def test_group_download_pairs_groups_by_directory_pair():
+    pairs = [
+        ("/workspace/projects/may/shot/render/a.exr", "/job/render/a.exr"),
+        ("/workspace/projects/may/shot/render/b.exr", "/job/render/b.exr"),
+        ("/workspace/projects/may/shot/logs/c.log", "/job/logs/c.log"),
+    ]
+    groups = group_download_pairs(pairs)
+    keys = {(local_root, remote_root) for local_root, remote_root, _ in groups}
+    assert keys == {
+        ("/job/render", "/workspace/projects/may/shot/render"),
+        ("/job/logs", "/workspace/projects/may/shot/logs"),
+    }
+    render_group = next(g for g in groups if g[0] == "/job/render")
+    assert {e.remote for e in render_group[2]} == {
+        "/workspace/projects/may/shot/render/a.exr",
+        "/workspace/projects/may/shot/render/b.exr",
+    }
+
+
+def test_group_download_pairs_defaults_missing_size_to_zero():
+    pairs = [("/workspace/projects/may/shot/render/a.exr", "/job/render/a.exr")]
+    groups = group_download_pairs(pairs)
+    assert groups[0][2][0].size == 0
+    groups_partial = group_download_pairs(pairs, {"/some/other/remote": 99})
+    assert groups_partial[0][2][0].size == 0
+
+
+# -- build_download_items -------------------------------------------------------
+
+
+def test_download_items_custom_single_file():
+    items = build_download_items(
+        "custom",
+        [("/workspace/projects/may/shot/render/a.exr", "/job/render/a.exr")],
+        1,
+        {"/workspace/projects/may/shot/render/a.exr": 5},
+    )
+    assert len(items) == 1
+    assert items[0]["files"] == [["/job/render/a.exr", "/workspace/projects/may/shot/render/a.exr", 5]]
+    assert items[0]["local_root"] == "/job/render"
+    assert items[0]["remote_root"] == "/workspace/projects/may/shot/render"
+    assert items[0]["bytes"] == 5
+    assert items[0]["index"] == 0
+    assert items[0]["post_command"] == ""
+
+
+def test_download_items_groups_different_folders_separately():
+    pairs = [
+        ("/workspace/projects/may/shot/render/a.exr", "/job/render/a.exr"),
+        ("/workspace/projects/may/shot/logs/run.log", "/job/logs/run.log"),
+    ]
+    sizes = {
+        "/workspace/projects/may/shot/render/a.exr": 10,
+        "/workspace/projects/may/shot/logs/run.log": 20,
+    }
+    items = build_download_items("outputs", pairs, 1, sizes)
+    roots = {it["remote_root"] for it in items}
+    assert roots == {"/workspace/projects/may/shot/render", "/workspace/projects/may/shot/logs"}
+
+
+def test_download_items_splits_by_package_size():
+    pairs = [
+        ("/workspace/projects/may/shot/render/a.exr", "/job/render/a.exr"),
+        ("/workspace/projects/may/shot/render/b.exr", "/job/render/b.exr"),
+    ]
+    sizes = {
+        "/workspace/projects/may/shot/render/a.exr": 700,
+        "/workspace/projects/may/shot/render/b.exr": 700,
+    }
+    items = build_download_items("outputs", pairs, 1000 / 2**30, sizes)
+    assert len(items) == 2
+    assert all(it["bytes"] <= 1000 for it in items)
+    assert [it["index"] for it in items] == [0, 1]
+
+
+def test_download_items_no_sizes_defaults_to_zero_bytes():
+    pairs = [("/workspace/projects/may/shot/render/a.exr", "/job/render/a.exr")]
+    items = build_download_items("outputs", pairs, 1)
+    assert items[0]["bytes"] == 0
+    assert items[0]["files"] == [["/job/render/a.exr", "/workspace/projects/may/shot/render/a.exr", 0]]
+
+
+def test_build_download_items_rejects_unknown_mode():
+    with pytest.raises(ValueError, match="unknown download mode"):
+        build_download_items("bogus", [], 1)
+
+
+# -- run_download_item ----------------------------------------------------------
+
+
+def test_run_download_item_no_files(tmp_path, monkeypatch):
+    item = {"index": 0, "local_root": str(tmp_path), "remote_root": "/workspace/x", "files": [], "bytes": 0}
+
+    def fake_rclone_copy(*a, **kw):
+        raise AssertionError("rclone_copy should not be called for an empty item")
+
+    monkeypatch.setattr("rpfarm.packages.rclone_copy", fake_rclone_copy)
+    sync_client = FakeSyncClient()
+    stats = run_download_item(
+        item, FakeCfg(), SftpTarget(host="1.2.3.4", port=22, key_path="/k"), sync_client, "newer", progress_cb=None
+    )
+    assert stats == {"files": 0, "bytes": 0, "seconds": 0.0}
+    assert any("sync_last_used" in c for c in sync_client.commands)
+
+
+def test_run_download_item_newer_uses_update_flag(tmp_path, monkeypatch):
+    dst_root = tmp_path / "render"
+    item = {
+        "index": 0,
+        "local_root": str(dst_root),
+        "remote_root": "/workspace/projects/may/shot/render",
+        "files": [[str(dst_root / "a.exr"), "/workspace/projects/may/shot/render/a.exr", 10]],
+        "bytes": 10,
+    }
+    calls = []
+
+    def fake_rclone_copy(package, target, direction, rclone_bin, local_root, remote_root, progress_cb=None, extra_args=()):
+        calls.append((direction, local_root, remote_root, tuple(extra_args)))
+        from rpfarm.sync import SyncStats
+
+        return SyncStats(files=len(package), bytes=sum(e.size for e in package), seconds=0.1)
+
+    monkeypatch.setattr("rpfarm.packages.rclone_copy", fake_rclone_copy)
+    sync_client = FakeSyncClient()
+    stats = run_download_item(
+        item, FakeCfg(), SftpTarget(host="1.2.3.4", port=22, key_path="/k"), sync_client, "newer", progress_cb=None
+    )
+    assert stats == {"files": 1, "bytes": 10, "seconds": pytest.approx(0.1)}
+    assert calls == [("down", str(dst_root), "/workspace/projects/may/shot/render", ("--update",))]
+    assert os.path.isdir(dst_root)
+
+
+def test_run_download_item_always_has_no_extra_flag(tmp_path, monkeypatch):
+    item = {
+        "index": 0,
+        "local_root": str(tmp_path),
+        "remote_root": "/workspace/x",
+        "files": [[str(tmp_path / "a"), "/workspace/x/a", 1]],
+        "bytes": 1,
+    }
+    calls = []
+
+    def fake_rclone_copy(package, target, direction, rclone_bin, local_root, remote_root, progress_cb=None, extra_args=()):
+        calls.append(tuple(extra_args))
+        from rpfarm.sync import SyncStats
+
+        return SyncStats(files=len(package), bytes=1, seconds=0.1)
+
+    monkeypatch.setattr("rpfarm.packages.rclone_copy", fake_rclone_copy)
+    run_download_item(
+        item, FakeCfg(), SftpTarget(host="1.2.3.4", port=22, key_path="/k"), FakeSyncClient(), "always", progress_cb=None
+    )
+    assert calls == [()]
+
+
+def test_run_download_item_never_uses_ignore_existing(tmp_path, monkeypatch):
+    item = {
+        "index": 0,
+        "local_root": str(tmp_path),
+        "remote_root": "/workspace/x",
+        "files": [[str(tmp_path / "a"), "/workspace/x/a", 1]],
+        "bytes": 1,
+    }
+    calls = []
+
+    def fake_rclone_copy(package, target, direction, rclone_bin, local_root, remote_root, progress_cb=None, extra_args=()):
+        calls.append(tuple(extra_args))
+        from rpfarm.sync import SyncStats
+
+        return SyncStats(files=len(package), bytes=1, seconds=0.1)
+
+    monkeypatch.setattr("rpfarm.packages.rclone_copy", fake_rclone_copy)
+    run_download_item(
+        item, FakeCfg(), SftpTarget(host="1.2.3.4", port=22, key_path="/k"), FakeSyncClient(), "never", progress_cb=None
+    )
+    assert calls == [("--ignore-existing",)]
+
+
+def test_run_download_item_rejects_unknown_overwrite(tmp_path):
+    item = {"index": 0, "local_root": str(tmp_path), "remote_root": "/workspace/x", "files": [], "bytes": 0}
+    with pytest.raises(ValueError, match="unknown overwrite mode"):
+        run_download_item(
+            item, FakeCfg(), SftpTarget(host="1.2.3.4", port=22, key_path="/k"), FakeSyncClient(), "bogus"
+        )
