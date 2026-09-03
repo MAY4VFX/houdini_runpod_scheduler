@@ -59,6 +59,7 @@ if str(_RPFARM_ROOT) not in sys.path:
 from rpfarm import config as rpcfg
 from rpfarm import deps as rpdeps
 from rpfarm import dispatch as rpdispatch
+from rpfarm import packages as rppkg
 from rpfarm import pods as rppods
 from rpfarm import sync as rpsync
 from rpfarm.runpod_api import RunPodAPI, RunPodError, pod_public_endpoint
@@ -936,27 +937,28 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         see it succeed they are in work_item.resultData as farm paths.
         localizePath turns each one into the local path the ROP was aimed at.
 
-        Entries are grouped by (local dir, farm dir): rclone's --files-from
-        lines have to be relative to both roots at once (ruling R8), and one
-        directory pair per package makes that hold by construction.
+        Grouping (local dir, farm dir) -- rclone's --files-from lines have to
+        be relative to both roots at once (ruling R8) -- is
+        rpfarm.packages.group_download_pairs, shared with the
+        runpodfarm_download node (Task 10) so the two download paths can't
+        drift apart.
         """
         if not self["rpfarm_downloadoutputs"].evaluateInt():
             return
-        groups = {}
+        pairs = []
         for rd in work_item.resultData:
             remote = rd[0] if isinstance(rd, (tuple, list)) else str(rd)
             local = self.localizePath(remote)
             if not local or local == remote:
                 # Not under any mapping we know: nothing to pull it to.
                 continue
-            key = (os.path.dirname(local), posixpath.dirname(remote))
-            groups.setdefault(key, []).append(
-                rpsync.FileEntry(local=local, remote=remote, size=0))
-        for (local_root, remote_root), entries in groups.items():
+            pairs.append((remote, local))
+        groups = rppkg.group_download_pairs(pairs)
+        for local_root, remote_root, entries in groups:
             self._sync_queue.append((local_root, remote_root, entries))
         if groups:
             self._verboseLog("queued {} output(s) of item {} for download".format(
-                sum(len(v) for v in groups.values()), work_item.id))
+                sum(len(entries) for _, _, entries in groups), work_item.id))
 
     def _drain_sync_queue(self, block=False, deadline=None):
         """Run queued downloads. Failures go back on the queue and are retried

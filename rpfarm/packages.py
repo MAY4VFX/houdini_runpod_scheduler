@@ -1,4 +1,5 @@
-"""Upload package planning and execution for the ``runpodfarm_upload`` TOP node.
+"""Upload/download package planning and execution for the ``runpodfarm_upload``
+and ``runpodfarm_download`` TOP nodes.
 
 Two modes feed :func:`build_upload_items`:
 
@@ -38,7 +39,7 @@ import posixpath
 import tempfile
 
 from .deps import resolve_entries
-from .sync import FileEntry, compress_stage, rclone_copy
+from .sync import FileEntry, SyncStats, compress_stage, rclone_copy
 
 DEFAULT_MAX_BYTES = int(1.5 * 2**30)
 
@@ -200,6 +201,82 @@ def build_upload_items(mode, job_dir, user, project, custom, refs, package_gb):
     raise ValueError(f"unknown upload mode: {mode!r}")
 
 
+# -- download package planning ------------------------------------------------
+
+# Task 10 (runpodfarm_download): the mirror image of build_upload_items, but
+# every entry a download plans already names its own local AND remote file --
+# there is no job_dir/refs walk to do here, because:
+#
+# - "outputs" mode: the HDA's onGenerate reads each upstream work item's
+#   resultData (farm paths) and localizes them via the rpfarm_pathmap
+#   attribute the scheduler tags onto work items (_tagPathMap, hda/
+#   runpodfarm_scheduler.hda/.../PythonModule), producing (remote, local)
+#   pairs directly.
+# - "custom" mode: the HDA's onGenerate turns each rpfarm_remote#/rpfarm_local#
+#   multiparm row (a *directory* pair) into file-level (remote, local) pairs
+#   by listing the remote directory on the sync pod (``find <dir> -type f
+#   -printf '%s %p\n'``), which is also where per-file sizes for this mode
+#   come from.
+#
+# So by the time build_download_items runs, "mode" no longer changes how
+# pairs are grouped into work items -- it is accepted (and validated) purely
+# so a typo'd mode fails the same way build_upload_items' does, rather than
+# being silently accepted and producing a possibly-nonsensical plan.
+
+
+def group_download_pairs(pairs, sizes=None):
+    """Group ``(remote, local)`` download pairs into ``(local_root,
+    remote_root, [FileEntry])`` groups by ``(dirname(local),
+    dirname(remote))`` -- R8 for downloads, the same directory-pair
+    invariant :func:`rpfarm.sync.build_rclone_args` enforces at transfer
+    time.
+
+    This is the exact grouping ``runpodfarm_scheduler``'s own
+    ``_download_outputs`` (hda/runpodfarm_scheduler.hda/.../PythonModule)
+    used inline before Task 10 extracted it here; the scheduler now calls
+    this too (its per-item auto-download path) so it and the
+    ``runpodfarm_download`` node's planning can't drift apart.
+
+    ``sizes`` is an optional ``{remote: size}`` map; a remote missing from
+    it (or ``sizes=None`` entirely) gets size ``0`` -- the scheduler's
+    auto-download path never looks sizes up (its packages are one item's
+    outputs, already small in practice), only the download node's own
+    ``outputs``/``custom`` planning bothers to stat first.
+
+    Order is dict-insertion order (first pair seen for a given directory
+    pair fixes its position), so the result is deterministic for a given
+    ``pairs`` list.
+    """
+    sizes = sizes or {}
+    groups = {}
+    for remote, local in pairs:
+        key = (os.path.dirname(local), posixpath.dirname(remote))
+        groups.setdefault(key, []).append(FileEntry(local=local, remote=remote, size=sizes.get(remote, 0)))
+    return [(local_root, remote_root, entries) for (local_root, remote_root), entries in groups.items()]
+
+
+def build_download_items(mode, pairs, package_gb, sizes=None):
+    """Plan the work items for one ``runpodfarm_download`` cook.
+
+    ``pairs`` is a list of ``(remote, local)`` file pairs -- already fully
+    resolved by the caller for both ``"outputs"`` and ``"custom"`` modes
+    (see the module-level note above); this function only groups them (via
+    :func:`group_download_pairs`) and chunks each group by
+    ``package_gb`` (:func:`_chunk_by_size`, shared with
+    :func:`build_upload_items`). Returns the same work-item dict shape as
+    :func:`build_upload_items`: ``{"index", "local_root", "remote_root",
+    "files": [[local, remote, size], ...], "bytes", "post_command": ""}`` --
+    ``post_command`` is always empty (downloads never run a remote
+    decompress/post step; that is an upload-only concern, Ruling R10).
+    """
+    if mode not in ("outputs", "custom"):
+        raise ValueError(f"unknown download mode: {mode!r}")
+
+    max_bytes = max(1, int(package_gb * 2**30))
+    groups = group_download_pairs(pairs, sizes)
+    return _items_from_groups(groups, max_bytes)
+
+
 # -- compression toggle --------------------------------------------------------
 
 # Uplink threshold (Mbps) below which "auto" enables compression, per the
@@ -296,6 +373,35 @@ def _exec_checked(sync_client, command, timeout_s):
 # -- path map --------------------------------------------------------------
 
 
+def localize_via_pathmap(remote, path_map):
+    """Turn a farm path back into a local one using a ``{local prefix: farm
+    prefix}`` map -- the same shape :func:`write_pathmap`/the scheduler's
+    ``_tagPathMap`` produce (``hda/runpodfarm_scheduler.hda/.../
+    PythonModule``). This is the inverse direction of what
+    :func:`build_upload_items`'s ``_group_by_pathmap`` does, and is a
+    self-contained equivalent of PDG's own ``localizePath`` -- used by the
+    ``runpodfarm_download`` node (Task 10) so it never needs a handle on
+    the scheduler node itself, only the ``rpfarm_pathmap`` attribute the
+    scheduler already stamps onto every work item it schedules.
+
+    The longest matching farm prefix wins (mirrors ``_group_by_pathmap``'s
+    longest-local-prefix-wins rule for the opposite direction). Returns
+    ``None`` if no entry's farm prefix is a prefix of ``remote`` -- callers
+    treat that the same way the scheduler's own ``_download_outputs``
+    treats an unmapped ``localizePath`` result: nothing to pull it to.
+    """
+    best = None
+    for local, farm in path_map.items():
+        if remote == farm or remote.startswith(farm.rstrip("/") + "/"):
+            if best is None or len(farm) > len(best[1]):
+                best = (local, farm)
+    if best is None:
+        return None
+    local_prefix, farm_prefix = best
+    rel = remote[len(farm_prefix):].lstrip("/")
+    return posixpath.join(local_prefix, rel) if rel else local_prefix
+
+
 def write_pathmap(job_dir, path_map):
     """Write ``$JOB/.rpfarm_pathmap.json`` in the format the scheduler's
     ``_loadPathMap`` expects: a plain ``{local prefix: farm prefix}`` JSON
@@ -378,3 +484,58 @@ def run_upload_item(item, cfg, sftp, sync_client, compress, progress_cb=None):
     sync_client.exec("mkdir -p /workspace/.rpfarm && touch /workspace/.rpfarm/sync_last_used")
 
     return {"files": total_files, "bytes": total_bytes, "seconds": total_seconds}
+
+
+# Ruling R8/download: which rclone flag each ``rpfarm_overwrite`` setting
+# maps to. "newer" skips a local file that is not older than the remote
+# (rclone's own mtime-based --update); "always" adds nothing (the default:
+# always re-transfer); "never" skips anything that already exists locally,
+# regardless of mtime.
+_OVERWRITE_EXTRA_ARGS = {
+    "newer": ("--update",),
+    "always": (),
+    "never": ("--ignore-existing",),
+}
+
+
+def run_download_item(item, cfg, sftp, sync_client, overwrite, progress_cb=None):
+    """Transfer one work item's package down from the farm.
+
+    Mirrors :func:`run_upload_item` for ``direction="down"``, with two
+    differences: there is no compression stage (staging/decompression is an
+    upload-only concern -- Ruling R10's ``compress_stage`` splits a package
+    for the *upload* side specifically, and a download's package is already
+    exactly the files to fetch), and ``overwrite`` selects one of
+    :data:`_OVERWRITE_EXTRA_ARGS` instead of a post-command.
+
+    ``sync_client`` is used only to touch the sync pod's idle-timestamp file
+    (same as ``run_upload_item`` -- a long download is real activity that
+    must not let the pod look idle mid-transfer).
+
+    Returns ``{"files", "bytes", "seconds"}``.
+    """
+    if overwrite not in _OVERWRITE_EXTRA_ARGS:
+        raise ValueError(f"unknown overwrite mode: {overwrite!r}")
+
+    entries = [FileEntry(local=local, remote=remote, size=size) for local, remote, size in item["files"]]
+    local_root = item["local_root"]
+    remote_root = item["remote_root"]
+
+    if entries:
+        os.makedirs(local_root, exist_ok=True)
+        stats = rclone_copy(
+            entries,
+            sftp,
+            "down",
+            cfg.rclone_path,
+            local_root,
+            remote_root,
+            progress_cb=progress_cb,
+            extra_args=_OVERWRITE_EXTRA_ARGS[overwrite],
+        )
+    else:
+        stats = SyncStats(files=0, bytes=0, seconds=0.0)
+
+    sync_client.exec("mkdir -p /workspace/.rpfarm && touch /workspace/.rpfarm/sync_last_used")
+
+    return {"files": stats.files, "bytes": stats.bytes, "seconds": stats.seconds}
