@@ -1,0 +1,73 @@
+# Dialog script for runpodfarmdownload automatically generated
+
+{
+    name	runpodfarmdownload
+    script	runpodfarmdownload
+    label	"RunPodFarm Download"
+
+    help {
+    }
+
+    inputlabel	1	"Input 1"
+    inputlabel	2	"Input 2"
+    inputlabel	3	"Input 3"
+    inputlabel	4	"Input 4"
+
+    parm {
+        name    "rpfarm_mode"
+        label   "Mode"
+        type    string
+        default { "outputs" }
+        help    "Upstream outputs: resultData of every upstream work item, localized via rpfarm_pathmap. Custom paths: exactly the remote -> local pairs below."
+        menu {
+            "outputs"   "Upstream Outputs"
+            "custom"    "Custom Paths"
+        }
+    }
+    parm {
+        name    "rpfarm_packagegb"
+        label   "Package Size (GB)"
+        type    float
+        default { "1.5" }
+        help    "Files are grouped into work items no larger than this (a single bigger file still gets its own item)."
+        range   { 0.1 16 }
+    }
+    parm {
+        name    "rpfarm_overwrite"
+        label   "Overwrite"
+        type    string
+        default { "newer" }
+        help    "newer: rclone --update (skip a local file that is not older than the remote). always: no extra flag, always re-download. never: rclone --ignore-existing."
+        menu {
+            "newer"     "If Newer"
+            "always"    "Always"
+            "never"     "Never"
+        }
+    }
+    multiparm {
+        name    "rpfarm_custom"
+        label    "Custom Paths"
+        default 0
+
+        parm {
+            name    "rpfarm_remote#"
+            label   "Remote"
+            type    string
+            default { "" }
+        }
+        parm {
+            name    "rpfarm_local#"
+            label   "Local"
+            type    directory
+            default { "" }
+        }
+    }
+
+    parm {
+        name    "rpfarm_inprocess"
+        label   "Cook In Process (debug)"
+        type    toggle
+        default { "0" }
+        help    "Off (default): packages download out of process, in parallel, without blocking Houdini. On: cook in this Houdini session instead -- blocks the UI, one package at a time, useful for debugging."
+    }
+}
