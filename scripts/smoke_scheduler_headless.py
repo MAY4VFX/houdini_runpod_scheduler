@@ -43,6 +43,13 @@ def parse_args(argv):
     ap.add_argument("--scheduler", default="runpodfarmscheduler",
                     help="scheduler node type (use localscheduler for a free dry run)")
     ap.add_argument("--items", type=int, default=3, help="work items to generate")
+    ap.add_argument("--fail-item", type=int, default=None, metavar="INDEX",
+                    help="make the item at this index exit non-zero (proves the "
+                         "failure path reports the item exactly once)")
+    ap.add_argument("--output-item", type=int, default=None, metavar="INDEX",
+                    help="make the item at this index write a file under $PDG_DIR "
+                         "and declare it with pdgcmd.addOutputFile (proves the "
+                         "output-download path)")
     ap.add_argument("--sleep", type=int, default=5, help="seconds each work item sleeps")
     ap.add_argument("--timeout", type=int, default=1500,
                     help="wall-clock guard in seconds; the cook is cancelled past it")
@@ -80,11 +87,7 @@ def build_graph(args):
 
     gen = topnet.createNode("genericgenerator", "gen")
     gen.parm("itemcount").set(args.items)
-    # The backslash keeps Houdini's own parm expansion off $PDG_ITEM_NAME, so
-    # the literal string reaches bash on the pod, which expands it from the
-    # task environment the scheduler sends.
-    gen.parm("pdg_command").set(
-        "echo hello from \\$PDG_ITEM_NAME; sleep {}".format(args.sleep))
+    gen.parm("pdg_command").set(item_command(args))
     # Without this the command is exec'd argv-style, so ';' and 'sleep' are
     # passed to echo as literal words. RunPodFarm always runs commands through
     # `bash -c` on the pod, but the local dry run has to be told.
@@ -94,6 +97,65 @@ def build_graph(args):
     gen.setDisplayFlag(True)
     log("graph: {} -> {}".format(gen.path(), sched.path()))
     return topnet, gen, sched, job
+
+
+OUTPUT_DIR = "smoke_out"
+
+
+def item_command(args):
+    """The shell command every work item runs.
+
+    One string for all items, branching on $PDG_INDEX, because
+    genericgenerator gives every item the same command. Backslashes keep
+    Houdini's own parm expansion off the variables so the literal text reaches
+    bash, which expands it from the task environment the scheduler sends.
+    """
+    parts = ["echo hello from \\$PDG_ITEM_NAME"]
+
+    if args.output_item is not None:
+        # $PDG_DIR is the working dir on whichever machine runs this -- the
+        # farm's project dir on a pod, the local one under localscheduler --
+        # so the path maps cleanly back through localizePath either way.
+        out = '\\$PDG_DIR/{}/\\$PDG_ITEM_NAME.txt'.format(OUTPUT_DIR)
+        report = (
+            '__PDG_PYTHON__ -c \'import os, sys; '
+            'sys.path.insert(0, os.environ["PDG_SCRIPTDIR"]); '
+            'import pdgcmd; pdgcmd.addOutputFile(sys.argv[1])\' "{}"'.format(out))
+        parts.append(
+            'if [ "\\$PDG_INDEX" = "{}" ]; then mkdir -p "\\$PDG_DIR/{}" && '
+            'echo "written by \\$PDG_ITEM_NAME" > "{}" && {}; fi'.format(
+                args.output_item, OUTPUT_DIR, out, report))
+
+    if args.fail_item is not None:
+        parts.append(
+            'if [ "\\$PDG_INDEX" = "{}" ]; then echo "deliberate smoke failure" '
+            '>&2; exit 3; fi'.format(args.fail_item))
+
+    parts.append("sleep {}".format(args.sleep))
+    return "; ".join(parts)
+
+
+def report_downloads(job, sched):
+    """List the files the output-download path pulled back to this machine.
+
+    The items write under $PDG_DIR, which localises to the scheduler's own
+    local working directory -- $JOB for runpodfarmscheduler, but whatever
+    pdg_workingdir says for the local scheduler -- so look in both.
+    """
+    roots = [job]
+    parm = sched.parm("pdg_workingdir")
+    if parm is not None:
+        roots.append(hou.expandString(parm.evalAsString()))
+    files = []
+    for root in dict.fromkeys(r for r in roots if r):
+        out_dir = os.path.join(root, OUTPUT_DIR)
+        found = sorted(glob.glob(os.path.join(out_dir, "*")))
+        log("outputs in {} ({}):".format(out_dir, len(found)))
+        for path in found:
+            with open(path) as f:
+                log("  {}  {!r}".format(path, f.read().strip()))
+        files.extend(found)
+    return files
 
 
 def cook(topnet, gen, sched, timeout):
@@ -219,9 +281,18 @@ def main(argv):
             log("status text:\n" + sched.parm("rpfarm_status_text").evalAsString())
         report_pods()
 
-    ok = not aborted and total > 0 and succeeded == total
-    log("RESULT: {} -- {}/{} items succeeded, {} ledger record(s), {:.0f}s".format(
-        "PASS" if ok else "FAIL", succeeded, total, records, elapsed))
+    expected_failures = 1 if args.fail_item is not None else 0
+    downloads = report_downloads(job, sched) if args.output_item is not None else []
+    want_downloads = 1 if args.output_item is not None else 0
+
+    ok = (not aborted
+          and total > 0
+          and succeeded == total - expected_failures
+          and len(downloads) >= want_downloads)
+    log("RESULT: {} -- {}/{} items succeeded ({} expected to fail), "
+        "{} ledger record(s), {} output(s) downloaded, {:.0f}s".format(
+            "PASS" if ok else "FAIL", succeeded, total, expected_failures,
+            records, len(downloads), elapsed))
     return 0 if ok else 1
 
 
