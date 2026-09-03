@@ -66,6 +66,11 @@ except ImportError:  # pragma: no cover - Windows dev boxes only, pods are Linux
 DEFAULT_ROOT = "/workspace"
 
 _ZONES = ("houdini", "apps", "projects", "ledger")
+# disk-usage (fix round 2, "A"): the only zone an upload can change is
+# projects/ -- houdini/apps/ledger are treated as static there and served
+# from cache however stale, never walked on that hot path.
+_DISK_USAGE_DYNAMIC_ZONE = "projects"
+_DISK_USAGE_STATIC_ZONES = tuple(z for z in _ZONES if z != _DISK_USAGE_DYNAMIC_ZONE)
 # Zone directory names that rm/prune/houdini-rm must never delete or descend
 # past. Relative to the volume root -- ported from v1's _PROTECTED_PREFIXES.
 _PROTECTED_ZONES = ("houdini", "ledger", ".rpfarm")
@@ -387,17 +392,31 @@ def _outputs_pending(project_dir: str, last_download) -> bool:
 class _SizeCache:
     """One re-measure sweep's worth of state, shared across every zone or
     version cmd_ls/cmd_houdini_ls looks at, so a single deadline (not a
-    fresh per-call budget) governs the whole command."""
+    fresh per-call budget) governs the whole command.
+
+    Review finding (fix round 2, "C"): ``flush()`` used to replace the
+    whole namespace with ``self.cache`` -- a snapshot read at
+    construction time, *outside* any lock. Two concurrent
+    ``package_runner.py`` processes each doing their own `ls`/
+    `disk-usage`/`touch` would each load that stale snapshot, and
+    whichever flushed second would silently discard whatever the first
+    had written for keys it never touched -- `flock` only prevents a
+    torn write, not this logical race. Fixed by tracking only the keys
+    *this* sweep actually (re)measured (``updated``, separate from
+    ``cache``, which still holds the full read-time view so ``get()``'s
+    own within-sweep staleness logic is unaffected) and merging just
+    those into a freshly re-read index at flush time, inside the lock.
+    """
 
     def __init__(self, root, index, namespace, refresh, max_age_s, budget_s):
         self.root = root
-        self.index = index
+        self.namespace = namespace
         self.cache = dict(index.get(namespace) or {})
+        self.updated = {}
         self.refresh = refresh
         self.max_age_s = max_age_s
         self.deadline = time.time() + budget_s
         self.partial = False
-        self.dirty = False
 
     def get(self, key, path):
         """(bytes, measured_at) for one zone/project/version, from cache or
@@ -416,17 +435,23 @@ class _SizeCache:
                 return cached["bytes"], cached["measured_at"]
             return 0, None
 
-        self.cache[key] = {"bytes": measured, "measured_at": now}
-        self.dirty = True
+        entry = {"bytes": measured, "measured_at": now}
+        self.cache[key] = entry
+        self.updated[key] = entry
         return measured, now
 
-    def flush(self, namespace):
-        """Persist this sweep's cache updates, if any."""
-        if not self.dirty:
+    def flush(self, namespace=None):
+        """Merge this sweep's freshly-measured keys into the *current*
+        on-disk namespace (re-read inside the lock), not the read-time
+        snapshot -- see the class docstring."""
+        if not self.updated:
             return
+        ns = namespace or self.namespace
 
         def _mutate(index):
-            index[namespace] = self.cache
+            current = dict(index.get(ns) or {})
+            current.update(self.updated)
+            index[ns] = current
             return index
 
         _save_index(self.root, _mutate)
@@ -532,7 +557,7 @@ def cmd_ls(
                     }
                 )
 
-    size_cache.flush("_sizes")
+    size_cache.flush()
 
     volume = _volume_totals(sum(zones.values()), volume_size_gb)
 
@@ -544,17 +569,48 @@ def cmd_ls(
     }
 
 
+def _invalidate_size_cache(root: str, keys) -> None:
+    """Drop ``keys`` from the ``_sizes`` cache so the next `ls`/`disk-usage`
+    remeasures them instead of serving a now-wrong cached figure."""
+    keys = list(keys)
+    if not keys:
+        return
+
+    def _mutate(index):
+        cache = dict(index.get("_sizes") or {})
+        for key in keys:
+            cache.pop(key, None)
+        index["_sizes"] = cache
+        return index
+
+    _save_index(root, _mutate)
+
+
 def cmd_touch(root: str, user_project: str, event: str = "cook") -> dict:
     """Stamp ``last_used`` (and the per-event field) for a project.
 
     ``touch <user>/<project> [--event cook|upload|download]``.
+
+    Review finding (fix round 2, "B"): an ``event="upload"`` touch means
+    bytes just landed on disk, so it invalidates that project's and the
+    ``projects`` zone's cached size (Ruling R26/R27) -- without this,
+    every upload item after the first in a burst decided `maybe_grow_volume`
+    against a figure that under-reports exactly the bytes the burst itself
+    is writing, for up to ``max_age_s`` (900s default), with no ``partial``
+    flag to say so (that only fires when a *fresh* measurement times out,
+    not when a stale one is served without even trying). ``cook``/
+    ``download`` touches don't change volume-side bytes and don't
+    invalidate anything.
     """
     if event not in _TOUCH_EVENTS:
         raise HousekeepingError(f"unknown event {event!r}, expected one of {_TOUCH_EVENTS}")
     user, project = _parse_user_project(user_project)
     now = time.time()
     fields = {"last_used": now, _EVENT_FIELD[event]: now}
-    entry = _update_index(root, f"{user}/{project}", fields)
+    key = f"{user}/{project}"
+    entry = _update_index(root, key, fields)
+    if event == "upload":
+        _invalidate_size_cache(root, [key, "projects"])
     return {"ok": True, "user": user, "project": project, "event": event, **entry}
 
 
@@ -724,7 +780,7 @@ def cmd_houdini_ls(
     if have_legacy:
         versions.append({"version": LEGACY_VERSION, "bytes": legacy_bytes})
 
-    size_cache.flush("_houdini")
+    size_cache.flush()
     return {"versions": versions, "partial": size_cache.partial}
 
 
@@ -794,7 +850,7 @@ def cmd_houdini_rm(
                     os.remove(entry)
                 removed_names.append(name)
             removed.append(entry)
-        size_cache.flush("_houdini")
+        size_cache.flush()
         if removed_names:
             _prune_houdini_cache(root, removed_names)
         if not removed:
@@ -814,7 +870,7 @@ def cmd_houdini_rm(
     if not os.path.isdir(vdir):
         return {"ok": False, "error": "not found", "path": vdir}
     freed, _ = size_cache.get(version, vdir)
-    size_cache.flush("_houdini")
+    size_cache.flush()
     if not dry_run:
         shutil.rmtree(vdir)
         _prune_houdini_cache(root, [version])
@@ -840,21 +896,48 @@ def cmd_disk_usage(
     full project listing/``outputs_pending`` scanning (that scanning has
     no budget of its own -- see the Task 12 report) just to decide whether
     to grow the volume. Ruling R27: it also must never use
-    ``shutil.disk_usage`` (see :func:`_volume_totals`) -- so ``used`` here
-    is the sum of the four zone sizes, from the *same* ``_sizes`` cache
-    ``ls`` uses (Ruling R26: warm is instant, cold is bounded by
-    ``budget_s`` the same way, and ``partial`` means the same thing). This
-    is `ls` minus the per-project walk, not a different measurement.
+    ``shutil.disk_usage`` (see :func:`_volume_totals`) -- so ``used`` is
+    zone-summed, from the same ``_sizes`` cache ``ls`` uses (Ruling R26).
+
+    Fix round 2 finding "A": summing all four zones still meant walking
+    ``houdini`` (~30s cold on the real farm's legacy install) on every
+    call whose cache had gone stale -- exactly the timeout race this
+    command was created to avoid, just moved one level down. Uploads only
+    ever change ``projects``, so that's the only zone measured fresh here
+    (bounded by ``budget_s``, ``--refresh`` still forces a full sweep);
+    ``houdini``/``apps``/``ledger`` are served straight from whatever the
+    ``_sizes`` cache already has, however stale -- warmed off this hot
+    path by the scheduler's ``onSetupCook`` (``_HOUSEKEEPING`` `disk-usage
+    --refresh`, once per cook). A static zone with *no* cache entry at all
+    (never measured by anything yet) contributes 0 and sets ``partial``,
+    same meaning as a timed-out measurement: this number is incomplete,
+    not wrong.
     """
     index = _load_index(root)
     size_cache = _SizeCache(root, index, "_sizes", refresh, max_age_s, budget_s)
-    used = 0
-    for zone in _ZONES:
-        nbytes, _ = size_cache.get(zone, os.path.join(root, zone))
-        used += nbytes
-    size_cache.flush("_sizes")
+    static_cache = index.get("_sizes") or {}
 
-    return {"volume": _volume_totals(used, volume_size_gb), "partial": size_cache.partial}
+    used = 0
+    unknown_static = False
+    for zone in _DISK_USAGE_STATIC_ZONES:
+        if refresh:
+            nbytes, _ = size_cache.get(zone, os.path.join(root, zone))
+            used += nbytes
+            continue
+        cached = static_cache.get(zone)
+        if cached is not None:
+            used += cached["bytes"]
+        else:
+            unknown_static = True
+
+    nbytes, _ = size_cache.get(_DISK_USAGE_DYNAMIC_ZONE, os.path.join(root, _DISK_USAGE_DYNAMIC_ZONE))
+    used += nbytes
+    size_cache.flush()
+
+    return {
+        "volume": _volume_totals(used, volume_size_gb),
+        "partial": size_cache.partial or unknown_static,
+    }
 
 
 def cmd_sync_idle(root: str) -> dict:
