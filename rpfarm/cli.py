@@ -236,6 +236,19 @@ def _ensure_src_symlink(home, log=print):
     log(f"[OK] {link} -> {target}")
 
 
+def _resolve_volume_id(api, args, existing, user, log=print, prompt=input):
+    """``--volume`` wins; else an already-configured volume is kept as-is
+    (idempotency -- a rerun of ``setup`` must not go back to RunPod and
+    possibly land on a *different* volume just because the account now has
+    more than one); only a first run with neither discovers/creates one."""
+    if args.volume:
+        return args.volume
+    if existing is not None and existing.volume_id:
+        log(f"[OK] keeping configured volume {existing.volume_id} (pass --volume to change)")
+        return existing.volume_id
+    return _pick_volume(api, args, user, log=log, prompt=prompt)
+
+
 def _pick_volume(api, args, user, log=print, prompt=input):
     if args.volume:
         return args.volume
@@ -260,6 +273,17 @@ def _pick_volume(api, args, user, log=print, prompt=input):
     return volumes[int(choice) - 1]["id"]
 
 
+def _resolve_template_id(api, args, existing, cfg_stub, log=print):
+    """Same idempotency rule as :func:`_resolve_volume_id`: a rerun keeps
+    the configured template rather than re-discovering/recreating one."""
+    if args.template:
+        return args.template
+    if existing is not None and existing.template_id:
+        log(f"[OK] keeping configured template {existing.template_id} (pass --template to change)")
+        return existing.template_id
+    return _pick_template(api, args, cfg_stub, log=log)
+
+
 def _pick_template(api, args, cfg_stub, log=print):
     if args.template:
         return args.template
@@ -279,21 +303,36 @@ def _pick_template(api, args, cfg_stub, log=print):
 
 
 def cmd_setup(args, prompt=input):
+    """Idempotent by design: a rerun (the checklist's own "install Houdini
+    locally, then rerun `rpfarm setup`") must never reset hand-tuned or
+    doctor-written fields -- `gpu_priority`, `houdini_version`,
+    `sync_idle_min`, `measured_mbps`, `sesinetd_host/port`, `rclone_path`,
+    `ssh_key_path` -- back to their dataclass defaults. When a
+    `config.toml` already exists, this loads and mutates it in place
+    (only `api_key`/`user`/`volume_id`/`template_id`/`datacenter` are ever
+    touched by `setup` itself); a first run with no existing config still
+    builds a fresh `Config` from scratch.
+    """
     home = rpcfg.home()
     home.mkdir(parents=True, exist_ok=True)
 
-    api_key = args.api_key
+    try:
+        existing = rpcfg.load()
+    except rpcfg.ConfigError:
+        existing = None
+
+    api_key = args.api_key or (existing.api_key if existing else None)
     if not api_key:
         if args.non_interactive:
-            print("error: --non-interactive requires --api-key", file=sys.stderr)
+            print("error: --non-interactive requires --api-key (no existing config.toml to reuse one from)", file=sys.stderr)
             return 1
         api_key = prompt("RunPod API key: ").strip()
     if not api_key:
         print("error: no API key given", file=sys.stderr)
         return 1
 
-    default_user = getpass.getuser()
-    user = args.user
+    default_user = (existing.user if existing else None) or getpass.getuser()
+    user = args.user or (existing.user if existing else None)
     if not user:
         user = default_user if args.non_interactive else (prompt(f"User name [{default_user}]: ").strip() or default_user)
 
@@ -307,11 +346,11 @@ def cmd_setup(args, prompt=input):
     print(f"[OK] RunPod API key valid (balance ${balance:.2f})")
 
     try:
-        volume_id = _pick_volume(api, args, user)
+        volume_id = _resolve_volume_id(api, args, existing, user)
     except SystemExit as e:
         return e.code or 1
 
-    datacenter = "EU-RO-1"
+    datacenter = (existing.datacenter if existing else None) or "EU-RO-1"
     try:
         vinfo = api.get_volume(volume_id)
         if vinfo:
@@ -319,8 +358,16 @@ def cmd_setup(args, prompt=input):
     except RunPodError:
         pass
 
-    cfg = rpcfg.Config(api_key=api_key, user=user, volume_id=volume_id, template_id="", datacenter=datacenter)
-    cfg.template_id = _pick_template(api, args, cfg)
+    if existing is not None:
+        cfg = existing
+        cfg.api_key = api_key
+        cfg.user = user
+        cfg.volume_id = volume_id
+        cfg.datacenter = datacenter
+    else:
+        cfg = rpcfg.Config(api_key=api_key, user=user, volume_id=volume_id, template_id="", datacenter=datacenter)
+
+    cfg.template_id = _resolve_template_id(api, args, existing, cfg)
 
     rpcfg.save(cfg)
     print(f"[OK] wrote {home / rpcfg.CONFIG_FILENAME}")
@@ -366,17 +413,27 @@ def cmd_setup(args, prompt=input):
 # -- doctor ----------------------------------------------------------------
 
 
-def _measure_uplink(cfg, pod, rclone_bin, size_mb=20, copy_fn=rpsync.rclone_copy):
+def _measure_uplink(cfg, pod, client, rclone_bin, size_mb=20, copy_fn=rpsync.rclone_copy):
+    """Upload ``size_mb`` of random bytes to the sync pod and return the
+    measured Mbps. Removes the probe file from the volume afterward
+    (best-effort, via ``client``) so repeated `doctor` runs don't leave
+    junk behind on shared paid storage -- failure to clean up is not
+    itself a measurement failure and is not surfaced to the caller.
+    """
     ip, port = pod_public_endpoint(pod, 22)
     target = rpsync.SftpTarget(host=ip, port=port, key_path=cfg.ssh_key_path)
     remote_dir = "/workspace/.rpfarm"
     remote_name = "rpfarm_doctor_uplink.bin"
-    with tempfile.TemporaryDirectory() as tmp:
-        local = os.path.join(tmp, remote_name)
-        with open(local, "wb") as f:
-            f.write(os.urandom(size_mb * 2**20))
-        entry = rpsync.FileEntry(local=local, remote=posixpath.join(remote_dir, remote_name), size=os.path.getsize(local))
-        stats = copy_fn([entry], target, "up", rclone_bin, tmp, remote_dir)
+    remote_path = posixpath.join(remote_dir, remote_name)
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            local = os.path.join(tmp, remote_name)
+            with open(local, "wb") as f:
+                f.write(os.urandom(size_mb * 2**20))
+            entry = rpsync.FileEntry(local=local, remote=remote_path, size=os.path.getsize(local))
+            stats = copy_fn([entry], target, "up", rclone_bin, tmp, remote_dir)
+    finally:
+        client.exec(f"rm -f {shlex.quote(remote_path)}", timeout_s=15)
     return (stats.bytes * 8) / 1e6 / max(stats.seconds, 1e-3)
 
 
@@ -481,7 +538,7 @@ def cmd_doctor(args):
             warn(f"could not check Houdini on volume: {(result.get('stderr') or result.get('stdout') or '').strip()}")
 
         try:
-            mbps = _measure_uplink(cfg, sync_pod, cfg.rclone_path)
+            mbps = _measure_uplink(cfg, sync_pod, client, cfg.rclone_path)
             ok(f"uplink: {mbps:.1f} Mbps (measured against the sync pod)")
             cfg.measured_mbps = mbps
             rpcfg.save(cfg)
@@ -671,13 +728,29 @@ def cmd_storage_du(args):
 
 
 def cmd_storage_rm(args):
+    """Delete one project directory. ``--force`` is required for ANY
+    deletion, not just to override housekeeping's own "outputs pending"
+    guard: ``pod/housekeeping.py``'s ``cmd_rm`` deletes immediately with
+    no confirmation at all when nothing is pending, so without a
+    CLI-level gate a project with no pending downloads was one typo away
+    from silent, permanent, irreversible loss on shared paid storage.
+    Without ``--force`` this refuses client-side and never even connects
+    to a sync pod -- review with ``storage ls``/``storage du`` first.
+    """
+    if not args.force:
+        print(
+            f"refusing to delete {args.user_project} without --force "
+            "-- this permanently deletes files from the shared farm volume. "
+            "Review with `rpfarm storage ls`/`storage du` first, then rerun with --force.",
+            file=sys.stderr,
+        )
+        return 2
+
     cfg = rpcfg.load()
     api = _make_api(cfg.api_key)
     token = rpcfg.session_token()
     _pod, client = _connect_sync_pod(api, cfg, token)
-    cmd_str = f"rm {shlex.quote(args.user_project)}"
-    if args.force:
-        cmd_str += " --force"
+    cmd_str = f"rm {shlex.quote(args.user_project)} --force"
     exit_code, data, result = _housekeeping_exec(client, cmd_str, timeout_s=120)
     if exit_code != 0 or data is None:
         _report_housekeeping_failure(result)
@@ -690,12 +763,20 @@ def cmd_storage_rm(args):
 
 
 def cmd_storage_prune(args):
+    """List (and, only with ``--yes``, delete) projects unused for
+    ``--older-days``. Defaults to a dry run: this is bulk, unattended-
+    looking deletion across every project on shared paid storage, so
+    "show what would happen" is the safe default and ``--dry-run`` is
+    kept only as an explicit alias for it (scripts that already pass it
+    keep working unchanged). Actually deleting requires ``--yes``.
+    """
+    dry_run = not args.yes
     cfg = rpcfg.load()
     api = _make_api(cfg.api_key)
     token = rpcfg.session_token()
     _pod, client = _connect_sync_pod(api, cfg, token)
     cmd_str = f"prune --older-days {args.older_days}"
-    if args.dry_run:
+    if dry_run:
         cmd_str += " --dry-run"
     exit_code, data, result = _housekeeping_exec(client, cmd_str, timeout_s=180)
     if exit_code != 0 or data is None:
@@ -704,8 +785,10 @@ def cmd_storage_prune(args):
     candidates = data.get("candidates", [])
     rows = [(c["user"], c["project"], _fmt_bytes(c["bytes"]), f"{c['age_days']:.0f}d") for c in candidates]
     print(_fmt_table(rows, ["user", "project", "size", "age"]))
-    verb = "deleted" if data.get("deleted") else "would delete"
-    print(f"{verb} {len(candidates)} project(s)")
+    if dry_run:
+        print(f"would delete {len(candidates)} project(s) -- pass --yes to actually delete")
+    else:
+        print(f"deleted {len(candidates)} project(s)")
     if data.get("boot_logs_rotated"):
         print(f"rotated {len(data['boot_logs_rotated'])} old boot log(s)")
     return 0
@@ -800,6 +883,15 @@ def cmd_farm_status(args):
 
 
 def cmd_farm_kill(args):
+    """Terminate rpfarm pod(s). Scope is opt-in and explicit, because the
+    account-wide ``rpfarm-`` prefix used by ``farm status`` covers every
+    user's pods, not just the caller's: ``--pod ID`` one specific pod;
+    ``--sync`` this user's own sync pod only (``rpfarm-sync-<user>``);
+    ``--all`` this user's own cook pods only (``rpfarm-<user>-*`` --
+    never the sync pod, never another user's pods); ``--everyone`` is the
+    one flag that reaches outside ``cfg.user`` at all, killing every
+    ``rpfarm-*`` pod on the whole shared account.
+    """
     cfg = rpcfg.load()
     api = _make_api(cfg.api_key)
 
@@ -811,10 +903,12 @@ def cmd_farm_kill(args):
     if args.sync:
         name = rppods.sync_pod_name(cfg.user)
         pods = [p for p in api.list_pods(name) if p.get("name") == name]
-    elif args.all:
+    elif args.everyone:
         pods = api.list_pods("rpfarm-")
+    elif args.all:
+        pods = api.list_pods(f"rpfarm-{cfg.user}-")
     else:
-        print("error: pass --all, --pod <id>, or --sync", file=sys.stderr)
+        print("error: pass --all (your own pods), --everyone (DANGER: every user's pods), --pod <id>, or --sync", file=sys.stderr)
         return 1
 
     if not pods:
@@ -863,56 +957,60 @@ def build_parser():
     p = argparse.ArgumentParser(prog="rpfarm")
     sub = p.add_subparsers(dest="command", required=True)
 
-    p_setup = sub.add_parser("setup", help="set up ~/.rpfarm, find/create volume+template, install HDAs")
-    p_setup.add_argument("--api-key")
-    p_setup.add_argument("--user")
-    p_setup.add_argument("--volume")
-    p_setup.add_argument("--template")
-    p_setup.add_argument("--non-interactive", action="store_true")
+    p_setup = sub.add_parser("setup", help="set up ~/.rpfarm, find/create volume+template, install HDAs (safe to rerun)")
+    p_setup.add_argument("--api-key", help="RunPod API key (default: prompt, or the key already in config.toml)")
+    p_setup.add_argument("--user", help="your farm username (default: config.toml's, else the OS login name)")
+    p_setup.add_argument("--volume", help="use this network volume id instead of discovering/keeping one")
+    p_setup.add_argument("--template", help="use this pod template id instead of discovering/keeping one")
+    p_setup.add_argument("--non-interactive", action="store_true", help="never prompt; fail instead of asking")
 
-    sub.add_parser("doctor", help="check the whole setup end to end")
+    sub.add_parser("doctor", help="check the whole setup end to end (key, volume, template, HDAs, GPU stock, ...)")
 
-    p_houdini = sub.add_parser("houdini", help="manage Houdini installs on the farm volume")
+    p_houdini = sub.add_parser("houdini", help="manage Houdini installs on the shared farm volume")
     houdini_sub = p_houdini.add_subparsers(dest="houdini_command", required=True)
-    p_hi = houdini_sub.add_parser("install")
+    p_hi = houdini_sub.add_parser("install", help="upload a Houdini tarball to the volume and run its installer")
     p_hi.add_argument("--tar", required=True, help="local path, or sftp://[user@]host/path")
     p_hi.add_argument("--version", default=None, help="defaults to config.toml's houdini_version")
-    houdini_sub.add_parser("ls")
-    p_hrm = houdini_sub.add_parser("rm")
-    p_hrm.add_argument("version")
-    p_hrm.add_argument("--dry-run", action="store_true")
+    houdini_sub.add_parser("ls", help="list Houdini versions installed on the volume, with size")
+    p_hrm = houdini_sub.add_parser("rm", help="delete one installed Houdini version from the volume")
+    p_hrm.add_argument("version", help="e.g. 22.0.393, or \"legacy\" for a v1 flat install")
+    p_hrm.add_argument("--dry-run", action="store_true", help="show what would be freed; delete nothing")
 
-    p_storage = sub.add_parser("storage", help="inspect/manage the farm volume")
+    p_storage = sub.add_parser("storage", help="inspect/manage the shared farm volume")
     storage_sub = p_storage.add_subparsers(dest="storage_command", required=True)
-    storage_sub.add_parser("ls")
-    p_du = storage_sub.add_parser("du")
-    p_du.add_argument("path")
-    p_rm = storage_sub.add_parser("rm")
+    storage_sub.add_parser("ls", help="zones, per-project sizes, and volume totals")
+    p_du = storage_sub.add_parser("du", help="sizes of the immediate children of a path on the volume")
+    p_du.add_argument("path", help="an absolute path on the volume, e.g. /workspace/projects/may")
+    p_rm = storage_sub.add_parser("rm", help="permanently delete one project directory (requires --force)")
     p_rm.add_argument("user_project", metavar="USER/PROJECT")
-    p_rm.add_argument("--force", action="store_true")
-    p_prune = storage_sub.add_parser("prune")
-    p_prune.add_argument("--older-days", type=float, default=30)
-    p_prune.add_argument("--dry-run", action="store_true")
-    p_grow = storage_sub.add_parser("grow")
+    p_rm.add_argument("--force", action="store_true", help="required for any deletion -- this is irreversible, shared, paid storage")
+    p_prune = storage_sub.add_parser("prune", help="find (and, with --yes, delete) projects unused for --older-days")
+    p_prune.add_argument("--older-days", type=float, default=30, help="candidate threshold in days (default 30)")
+    p_prune.add_argument("--dry-run", action="store_true", help="(default behaviour) show candidates only, delete nothing")
+    p_prune.add_argument("--yes", "--force", dest="yes", action="store_true", help="actually delete the listed candidates")
+    p_grow = storage_sub.add_parser("grow", help="grow the volume (RunPod volumes only ever grow, never shrink)")
     p_grow.add_argument("amount", metavar="+N", help="grow by N GB, e.g. +20")
-    p_recreate = storage_sub.add_parser("recreate")
-    p_recreate.add_argument("--size", type=int, required=True)
-    p_recreate.add_argument("--tar", default=None)
-    p_recreate.add_argument("--version", default=None)
+    p_recreate = storage_sub.add_parser(
+        "recreate", help="create a brand-new volume, point config.toml at it, print the old volume's delete command"
+    )
+    p_recreate.add_argument("--size", type=int, required=True, help="size of the new volume, in GB")
+    p_recreate.add_argument("--tar", default=None, help="also install Houdini on the new volume (with --version)")
+    p_recreate.add_argument("--version", default=None, help="Houdini version to install on the new volume (with --tar)")
 
     p_farm = sub.add_parser("farm", help="see/kill running rpfarm pods")
     farm_sub = p_farm.add_subparsers(dest="farm_command", required=True)
-    farm_sub.add_parser("status")
-    p_kill = farm_sub.add_parser("kill")
-    p_kill.add_argument("--all", action="store_true")
-    p_kill.add_argument("--pod")
-    p_kill.add_argument("--sync", action="store_true")
+    farm_sub.add_parser("status", help="list running rpfarm-* pods (all users) with rate/uptime/est cost")
+    p_kill = farm_sub.add_parser("kill", help="terminate pod(s) -- pick exactly one of the flags below")
+    p_kill.add_argument("--all", action="store_true", help="kill all of YOUR OWN cook pods (rpfarm-<user>-*) -- not the sync pod, not other users' pods")
+    p_kill.add_argument("--everyone", action="store_true", help="DANGER: kill every rpfarm-* pod on the whole account, including other users' pods and every sync pod")
+    p_kill.add_argument("--pod", metavar="ID", help="kill one specific pod by id")
+    p_kill.add_argument("--sync", action="store_true", help="kill YOUR OWN sync pod (rpfarm-sync-<user>) only")
 
     p_costs = sub.add_parser("costs", help="ledger + billing cost summary")
-    p_costs.add_argument("--by", choices=["project", "user", "cook"], default="project")
-    p_costs.add_argument("--since", metavar="YYYY-MM-DD")
-    p_costs.add_argument("--until", metavar="YYYY-MM-DD")
-    p_costs.add_argument("--billing", action="store_true", help="merge in RunPod's actual billed cost")
+    p_costs.add_argument("--by", choices=["project", "user", "cook"], default="project", help="group totals by (default: project)")
+    p_costs.add_argument("--since", metavar="YYYY-MM-DD", help="only records started on/after this date")
+    p_costs.add_argument("--until", metavar="YYYY-MM-DD", help="only records started on/before this date")
+    p_costs.add_argument("--billing", action="store_true", help="merge in RunPod's actual billed cost (GET /billing/pods)")
 
     return p
 
