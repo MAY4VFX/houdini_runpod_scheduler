@@ -120,7 +120,7 @@ try:
     upload_bytes = sum(it["bytes"] for it in items)
     if upload_bytes and cfg.volume_id:
         api = RunPodAPI(cfg.api_key)
-        vol = api.get_volume(cfg.volume_id)
+        vol = api.get_volume(cfg.volume_id) or {}
         total_gb = float(vol.get("size") or 0)
         upload_gb = upload_bytes / 2**30
         if total_gb and upload_gb > 0.85 * total_gb:
@@ -364,10 +364,14 @@ Package Size (GB):
 Compression:
     #id: rpfarm_compress
 
-    `auto` compresses when no uplink measurement is available (the safe
-    default for an unknown connection) or when a measured uplink is below
-    200 Mbps; `on`/`off` force it. Compressible files are staged to a temp
-    dir with zstd and decompressed on the sync pod after upload -- see
+    `auto` is meant to compress when a measured uplink is below 200 Mbps
+    and skip it above that -- but no node or CLI measures uplink yet
+    (Ruling R23), so today `auto` unconditionally compresses, the safe
+    choice for an unknown connection. `rpfarm doctor` (Task 13) is where
+    that measurement will come from; once it exists, `auto` starts
+    comparing against it with no change needed here. `on`/`off` force it
+    either way. Compressible files are staged to a temp dir with zstd and
+    decompressed on the sync pod after upload -- see
     `rpfarm.sync.compress_stage`.
 
 Custom Paths:
@@ -387,7 +391,11 @@ Post-command:
     makes depend on every package item (the first working option that
     doesn't need a second scheduler pass: package items are added first in
     `onGenerate`, then the post item's dependency on all of them is wired
-    once every item exists). Ignored when empty.
+    once every item exists). Ignored when empty. A non-zero exit fails the
+    work item (`rpfarm.packages.run_upload_item` checks this command's
+    exit code, same as the decompress step -- neither is allowed to fail
+    silently), with a timeout scaled from the item's own byte size (a
+    600s floor, since this item never carries files of its own).
 
 Preset:
     #id: rpfarm_preset
@@ -477,7 +485,11 @@ def main():
         "rpfarm_compress", "Compression", 1, default_value=("auto",),
         menu_items=("auto", "on", "off"), menu_labels=("Auto", "On", "Off"),
     )
-    compress_pt.setHelp("auto compresses when no uplink measurement is available, or when uplink < 200 Mbps.")
+    compress_pt.setHelp(
+        "auto compresses by default (Ruling R23: no live uplink measurement exists yet -- "
+        "`rpfarm doctor` will supply one in Task 13, at which point auto starts actually "
+        "comparing it against 200 Mbps instead of always compressing)."
+    )
 
     local_pt = hou.StringParmTemplate(
         "rpfarm_local#", "Local", 1, default_value=("",),
