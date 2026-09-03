@@ -32,13 +32,7 @@ from __future__ import annotations
 import csv
 import json
 import os
-import re
 from pathlib import Path
-
-# rpfarm-<user>-<project>-<cook8>-<n>  (project may itself contain dashes,
-# so the cook_id -- always 8 hex chars -- and the trailing numeric index
-# anchor the parse from the right; see rppods pod naming).
-_POD_NAME_RE = re.compile(r"^rpfarm-([^-]+)-(.+)-([0-9a-f]{8})-(\d+)$")
 
 
 def append(path, **record) -> None:
@@ -107,36 +101,34 @@ def load_all(local_dir) -> list[dict]:
     return records
 
 
-def _parse_pod_name(name):
-    """``rpfarm-<user>-<project>-<cook8>-<n>`` -> ``(user, project, cook_id)``,
-    or ``(None, None, None)`` if *name* doesn't match the farm convention
-    (a sync pod, or another tenant's pod visible in the same billing call)."""
-    m = _POD_NAME_RE.match(name or "")
-    if not m:
-        return None, None, None
-    user, project, cook_id, _n = m.groups()
-    return user, project, cook_id
-
-
 def merge_billing(records, billing_pods) -> list[dict]:
     """Merge per-task ledger *records* with RunPod's actual ``/billing/pods``
     cost.
 
+    ``GET /billing/pods`` (verified live 2026-09-03, see task-11-report.md)
+    returns one row **per pod per day** -- ``{podId, amount, timeBilledMs,
+    diskSpaceBilledGB, time}`` -- with no pod name at all, unlike the design
+    doc's assumption of a ``podName``/``timeBilledSeconds`` shape. This
+    function first sums every row sharing a ``podId`` into one
+    ``(amount, timeBilledMs)`` total for the queried period, then matches
+    that total to local records purely by ``podId`` (the same id the
+    scheduler already stamps onto every task record's ``pod`` field).
+
     Groups task records (``record != "cook_summary"``, has a ``pod``) by
-    pod, matches each group to its ``billing_pods`` entry by ``podId``, and
-    prorates that entry's ``amount`` across the group's records by
+    pod and prorates its billed amount across the group's records by
     ``duration_s / timeBilledSeconds`` -- the pod's billed time almost
     always exceeds the sum of its task durations (boot, idle between
     tasks), and that remainder becomes one synthetic ``kind="idle"``
     record per pod so the group's total ``cost`` always reconciles to the
     bill.
 
-    Billing entries whose ``podName`` doesn't start with ``rpfarm-`` are
-    someone else's pod on the same RunPod account (billing sees the whole
-    account) and are ignored. A billed ``rpfarm-`` pod with no local task
-    records at all (an orphan, the sync pod, or another machine's cook not
-    yet synced) still becomes a standalone idle record, attributed via
-    ``_parse_pod_name``.
+    A billed ``podId`` with no matching local record at all -- the sync
+    pod, an orphan, another machine's cook not yet synced, or truly
+    another tenant's pod on the same account (billing sees the whole
+    account, and there is no name to filter on) -- becomes one
+    ``kind="unattributed"`` record instead of a guess: with no ``podName``
+    there is nothing to attribute it to, so it is surfaced honestly rather
+    than mis-labeled as ours.
 
     Records with no matching billing entry (pod still running, or outside
     the billing call's date range) pass through unmodified, still carrying
@@ -152,9 +144,14 @@ def merge_billing(records, billing_pods) -> list[dict]:
             continue
         by_pod.setdefault(pod, []).append(rec)
 
-    billed_by_pod = {
-        b.get("podId"): b for b in billing_pods if (b.get("podName") or "").startswith("rpfarm-")
-    }
+    billed_by_pod: dict[str, dict] = {}
+    for b in billing_pods:
+        pod_id = b.get("podId")
+        if pod_id is None:
+            continue
+        agg = billed_by_pod.setdefault(pod_id, {"amount": 0.0, "ms": 0.0})
+        agg["amount"] += float(b.get("amount") or 0.0)
+        agg["ms"] += float(b.get("timeBilledMs") or 0.0)
 
     out: list[dict] = []
     for pod, recs in by_pod.items():
@@ -163,8 +160,8 @@ def merge_billing(records, billing_pods) -> list[dict]:
             out.extend(recs)
             continue
 
-        billed_seconds = float(billing.get("timeBilledSeconds") or 0.0)
-        amount = float(billing.get("amount") or 0.0)
+        billed_seconds = billing["ms"] / 1000.0
+        amount = billing["amount"]
         task_seconds = 0.0
         for rec in recs:
             duration = float(rec.get("duration_s") or 0.0)
@@ -190,15 +187,14 @@ def merge_billing(records, billing_pods) -> list[dict]:
     for pod_id, billing in billed_by_pod.items():
         if pod_id in by_pod:
             continue
-        user, project, cook_id = _parse_pod_name(billing.get("podName"))
         out.append({
-            "cook_id": cook_id,
-            "user": user or "unknown",
-            "project": project or "unknown",
+            "cook_id": None,
+            "user": "(unattributed)",
+            "project": "(unattributed)",
             "pod": pod_id,
-            "kind": "idle",
-            "duration_s": float(billing.get("timeBilledSeconds") or 0.0),
-            "cost": float(billing.get("amount") or 0.0),
+            "kind": "unattributed",
+            "duration_s": billing["ms"] / 1000.0,
+            "cost": billing["amount"],
         })
 
     out.extend(rec for rec in records if rec.get("record") == "cook_summary")
@@ -214,10 +210,10 @@ def summarize(records, by="project", since=None, until=None) -> list[dict]:
     by ``cost`` descending. ``cost`` sums every record's ``cost`` (falling
     back to ``cost_est`` when billing wasn't merged in) including idle
     records, since idle time is real spend attributable to the group.
-    ``gpu_hours`` likewise sums ``duration_s`` over every record (task +
-    idle) -- it is pod-occupancy time, not just work-item time. ``tasks``
-    counts records with ``kind in (None, "task")`` -- i.e. everything
-    except a synthetic idle record.
+    ``gpu_hours`` likewise sums ``duration_s`` over every record (task,
+    idle, or unattributed) -- it is pod-occupancy time, not just work-item
+    time. ``tasks`` counts records with ``kind in (None, "task")`` -- i.e.
+    everything except a synthetic ``idle``/``unattributed`` record.
 
     ``cook_summary`` rows are always excluded: their ``cost_est`` already
     covers the whole cook and would double-count against the per-task
@@ -242,7 +238,7 @@ def summarize(records, by="project", since=None, until=None) -> list[dict]:
         g = groups.setdefault(key, {"key": key, "cost": 0.0, "gpu_hours": 0.0, "tasks": 0})
         g["cost"] += rec.get("cost", rec.get("cost_est", 0.0)) or 0.0
         g["gpu_hours"] += (rec.get("duration_s") or 0.0) / 3600.0
-        if rec.get("kind", "task") != "idle":
+        if rec.get("kind", "task") not in ("idle", "unattributed"):
             g["tasks"] += 1
 
     out = list(groups.values())

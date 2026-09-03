@@ -1,0 +1,89 @@
+= RunPodFarm Stats =
+
+#type: node
+#context: top
+#internal: runpodfarmstats
+#icon: TOP/pythonprocessor
+
+"""Journal and cost analytics for RunPodFarm: turns the local ~/.rpfarm/ledger
+into work items (one per task/idle/unattributed record) plus a summary of
+totals by project and by user."""
+
+Work item = one ledger record (a task, a pod's synthetic idle remainder, or
+a billed pod with no matching local record -- see
+[Node:python/rpfarm.ledger.merge_billing]) after the Project/User/Since/
+Until filters. Every item cooks *in process* -- unlike
+[Node:top/runpodfarm_upload] and [Node:top/runpodfarm_download], this node
+never dispatches through `rpfarm.package_runner`: the data volume here is
+small (the local journal, plus one `GET /billing/pods` call), so there is
+nothing worth parallelizing out of process (Task 11 addendum). This node
+still overrides `Scheduler` to its own internal `localscheduler` (same
+absolute-path Python expression trick as the other two nodes, reasserted in
+`OnCreated`) purely so cooking it never accidentally dispatches onto
+`runpodfarm_scheduler` and spins up a real GPU pod for what is a read-only
+report.
+
+All the real logic (loading the ledger, filtering, merging billing,
+building the summary text) lives in this asset's own `PythonModule` --
+shared between the `generate` callback and the `Refresh`/`Export CSV`
+buttons, the same pattern [Node:top/runpodfarm_scheduler] uses for its own
+buttons.
+
+@parameters
+
+Since / Until:
+    #id: rpfarm_since
+
+    `YYYY-MM-DD`, either empty. Filters ledger records by their `started`
+    timestamp. Billing calls (when Use Billing is on) default to 90 days
+    back when Since is empty -- RunPod's billing endpoints need a bounded
+    range, unlike the ledger filter itself.
+
+Project / User:
+    #id: rpfarm_project
+
+    Exact-match filters on the ledger record's own `project`/`user`
+    fields. Empty means no filter.
+
+Use Billing:
+    #id: rpfarm_usebilling
+
+    Off: costs come from the scheduler's own live `cost_est` (no network
+    call). On: `generate` calls `GET /billing/pods` and
+    `GET /billing/networkvolumes` and merges RunPod's actual charge in via
+    `rpfarm.ledger.merge_billing`, prorated per pod by task duration, with
+    the remainder folded into a synthetic idle record.
+
+Refresh:
+    #id: rpfarm_refresh
+
+    Pulls any ledger files off the volume this session doesn't have locally
+    yet (`rpfarm.ledger.sync_from_volume`, via the sync pod's worker HTTP
+    API -- not rclone/sftp, there is nothing to gain from a second
+    transport just to fetch a handful of small text files), then re-cooks
+    this node so `generate` picks up the new data (and re-pulls billing, if
+    Use Billing is on).
+
+Export CSV:
+    #id: rpfarm_export_csv
+
+    Writes the current filtered+merged record set to
+    `~/.rpfarm/exports/rpfarm_stats_<timestamp>.csv`
+    (`rpfarm.ledger.to_csv`) and prepends the path to the summary text.
+
+Summary:
+    #id: rpfarm_summary
+
+    Read-only: totals by project and by user ($ / GPU-hours / tasks / $ per
+    task), volume storage cost for the period (Use Billing only), and
+    cleanup candidates -- projects with no cook in over 30 days. Per-project
+    on-disk size and $/month are a TODO for Task 12's housekeeping `ls`
+    (not landed yet -- only `du` exists today).
+
+@related
+
+- [Node:top/runpodfarm_scheduler]
+- [Node:top/runpodfarm_upload]
+- [Node:top/runpodfarm_download]
+- [Node:top/pythonprocessor]
+- [Node:top/localscheduler]

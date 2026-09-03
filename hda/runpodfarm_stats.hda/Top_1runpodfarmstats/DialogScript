@@ -1,0 +1,72 @@
+# Dialog script for runpodfarmstats automatically generated
+
+{
+    name	runpodfarmstats
+    script	runpodfarmstats
+    label	"RunPodFarm Stats"
+
+    help {
+    }
+
+    inputlabel	1	"Input 1"
+    inputlabel	2	"Input 2"
+    inputlabel	3	"Input 3"
+    inputlabel	4	"Input 4"
+
+    parm {
+        name    "rpfarm_since"
+        label   "Since (YYYY-MM-DD)"
+        type    string
+        default { "" }
+    }
+    parm {
+        name    "rpfarm_until"
+        label   "Until (YYYY-MM-DD)"
+        type    string
+        default { "" }
+    }
+    parm {
+        name    "rpfarm_project"
+        label   "Project"
+        type    string
+        default { "" }
+    }
+    parm {
+        name    "rpfarm_user"
+        label   "User"
+        type    string
+        default { "" }
+    }
+    parm {
+        name    "rpfarm_usebilling"
+        label   "Use Billing"
+        type    toggle
+        default { "0" }
+        help    "Off: the scheduler's own live cost_est, no network call. On: merge in RunPod's actual GET /billing/pods charge (Task 11)."
+    }
+    parm {
+        name    "rpfarm_refresh"
+        label   "Refresh"
+        type    button
+        default { "0" }
+        parmtag { "script_callback" "hou.phm().onRefresh(kwargs)" }
+        parmtag { "script_callback_language" "python" }
+    }
+    parm {
+        name    "rpfarm_export_csv"
+        label   "Export CSV"
+        type    button
+        default { "0" }
+        parmtag { "script_callback" "hou.phm().onExportCsv(kwargs)" }
+        parmtag { "script_callback_language" "python" }
+    }
+    parm {
+        name    "rpfarm_summary"
+        label   "Summary"
+        type    string
+        default { "" }
+        disablewhen "{ rpfarm_usebilling >= 0 }"
+        parmtag { "editor" "1" }
+        parmtag { "editorlines" "8-30" }
+    }
+}
