@@ -526,3 +526,32 @@ def test_houdini_rm_dry_run_legacy_does_not_delete(tmp_path):
     assert result["bytes_freed"] == 10
     assert (tmp_path / "houdini/bin").exists()
     assert (tmp_path / "houdini/22.0.393").exists()
+
+
+# -- disk-usage (Ruling R26 review fix: maybe_grow_volume's fast path) ------
+
+
+def test_disk_usage_shape(tmp_path):
+    root = mk(tmp_path)
+    out = hk.cmd_disk_usage(root)
+    assert set(out.keys()) == {"volume"}
+    assert set(out["volume"].keys()) == {"used", "total"}
+    assert out["volume"]["total"] > 0
+
+
+def test_main_disk_usage(tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr(hk, "DEFAULT_ROOT", str(tmp_path))
+    rc = hk.main(["housekeeping.py", "disk-usage"])
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["volume"]["total"] > 0
+
+
+def test_main_ls_accepts_budget_and_max_age_flags(tmp_path, capsys):
+    root = mk(tmp_path)
+    rc = hk.main(
+        ["housekeeping.py", "ls", "--root", root, "--budget-s", "5", "--max-age-s", "0"]
+    )
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["zones"]["projects"] == 1010

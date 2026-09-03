@@ -125,17 +125,23 @@ def compute(node):
     the point is to surface stale projects the current filter might be
     hiding), each entry a dict with ``user, project, last_cook, age_days,
     bytes, monthly_cost``. ``bytes`` comes from Task 12's housekeeping
-    ``ls`` on the sync pod (``None`` if unreachable); ``monthly_cost`` is
-    that project's share of ``vol_total``, prorated by size and by the
+    ``ls`` on the sync pod, and is only ever fetched when Use Billing is
+    on (review finding: a plain per-cook/Refresh/Export network call and
+    sync-pod touch regardless of the toggle is not what "Use Billing"
+    promises, and before ``ls``'s Ruling R26 speedup this made routine,
+    billing-off stats viewing slow on top of it) -- ``None`` with Use
+    Billing off or the snapshot unreachable. ``monthly_cost`` is that
+    project's share of ``vol_total``, prorated by size and by the
     period's length to a 30-day estimate -- ``None`` unless both Use
     Billing and the storage snapshot are available (there is no invented
     $/GB/month constant here: RunPod's own billing is the only price this
     codebase trusts, per spec 4.4).
     """
     # rpcfg.home() needs no config.toml (it is just $RPFARM_HOME or
-    # ~/.rpfarm) -- config is only actually loaded below, and only when
-    # Use Billing is on, so the common local-only view works with no
-    # `rpfarm setup` at all.
+    # ~/.rpfarm) -- config (and the sync-pod-touching storage snapshot
+    # below) is only ever loaded when Use Billing is on, so the common
+    # local-only view works with no `rpfarm setup` at all, and costs
+    # nothing extra even when it is set up.
     local_dir = rpcfg.home() / "ledger"
     records = rpledger.load_all(local_dir)
 
@@ -200,7 +206,13 @@ def compute(node):
         if key not in last_by_project or ts > last_by_project[key][0]:
             last_by_project[key] = (ts, user, project)
 
-    sizes_by_key, vol_bytes_total = _storage_snapshot(cfg, node)
+    # Gated on usebilling (review finding): _storage_snapshot touches the
+    # sync pod over the network, which "Use Billing" off must never do,
+    # config present or not -- this used to run unconditionally.
+    if usebilling:
+        sizes_by_key, vol_bytes_total = _storage_snapshot(cfg, node)
+    else:
+        sizes_by_key, vol_bytes_total = {}, None
 
     period_start = since_epoch if since_epoch is not None else (now - 90 * 86400.0)
     period_end = until_epoch if until_epoch is not None else now

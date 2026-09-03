@@ -284,7 +284,8 @@ def onVolumeDelete(kwargs):
         # The UI confirmation below stands in for --force: an artist who
         # explicitly names a project and confirms the dialog has already
         # made the call that any pending download is expendable.
-        command = "{} rm {}/{} --force".format(_HOUSEKEEPING, parts[0], parts[1])
+        user_project = "{}/{}".format(parts[0], parts[1])
+        command = "{} rm {} --force".format(_HOUSEKEEPING, _shquote(user_project))
     elif target.startswith(_VOLUME_DELETE_HOUDINI_PREFIX):
         version = target[len(_VOLUME_DELETE_HOUDINI_PREFIX):].strip("/")
         if not version or "/" in version:
@@ -292,7 +293,7 @@ def onVolumeDelete(kwargs):
                 node, "rpfarm_volume_text",
                 "Refusing {!r}: expected /workspace/houdini/<version>.".format(target))
             return
-        command = "{} houdini rm {}".format(_HOUSEKEEPING, version)
+        command = "{} houdini rm {}".format(_HOUSEKEEPING, _shquote(version))
     else:
         _set_text(
             node, "rpfarm_volume_text",
@@ -345,6 +346,20 @@ def onVolumeGrow(kwargs):
         )
     except Exception as e:
         _set_text(node, "rpfarm_volume_text", "Grow failed: {}".format(e))
+
+
+def _shquote(value):
+    """POSIX single-quote a value for interpolation into a shell command
+    string sent to `_volume_exec`/`WorkerClient.exec` (the pod runs these
+    through a shell, e.g. `mkdir -p ... && touch ...`). Restored after
+    review: onVolumeDelete interpolates artist-typed path components
+    (`parts[0]`/`parts[1]`/`version`) unquoted, which is shell injection,
+    not just a style nit -- a Target like
+    `/workspace/projects/may/x; rm -rf /workspace/ledger` fails the
+    "well-formed <user>/<project>" check (an extra '/'), but
+    `/workspace/projects/may/x; touch pwned` does not.
+    """
+    return "'" + str(value).replace("'", "'\"'\"'") + "'"
 
 
 def _read_pubkey(cfg):
@@ -1447,7 +1462,7 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
             return
         key = "{}/{}".format(self._cfg.user, self._project)
         self._sync_client.exec(
-            "{} touch {} --event {}".format(_HOUSEKEEPING, key, event), timeout_s=30)
+            "{} touch {} --event {}".format(_HOUSEKEEPING, _shquote(key), event), timeout_s=30)
 
     def _mirror_ledger_to_volume(self):
         """Push this cook's local ledger .jsonl up to the volume (Ruling
