@@ -27,7 +27,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from . import VERSION
+from . import VERSION, tls
 
 
 def _urllib_transport(method, url, body, headers, timeout=30):
@@ -42,7 +42,7 @@ def _urllib_transport(method, url, body, headers, timeout=30):
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, method=method, data=data, headers=headers)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        with urllib.request.urlopen(req, timeout=timeout, context=tls.ssl_context()) as r:
             return r.status, r.read()
     except urllib.error.HTTPError as e:
         return e.code, e.read()

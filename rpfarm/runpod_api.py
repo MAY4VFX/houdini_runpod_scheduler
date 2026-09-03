@@ -14,7 +14,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from . import VERSION
+from . import VERSION, tls
 
 BASE = "https://rest.runpod.io/v1"
 GRAPHQL_URL = "https://api.runpod.io/graphql"
@@ -42,10 +42,17 @@ def _urllib_transport(method, url, body, headers):
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, method=method, data=data, headers=headers)
     try:
-        with urllib.request.urlopen(req, timeout=60) as r:
+        with urllib.request.urlopen(req, timeout=60, context=tls.ssl_context()) as r:
             return r.status, r.read()
     except urllib.error.HTTPError as e:
         return e.code, e.read()
+    except OSError as e:
+        # A transport-level failure -- DNS, TLS, connection reset, timeout.
+        # Every caller in the scheduler knows how to handle RunPodError and
+        # nothing handles a bare URLError, so a passing network blip would
+        # otherwise take a whole cook down. status 0 means "never reached
+        # RunPod", as it does in pod_public_endpoint.
+        raise RunPodError(0, "request to {} failed: {}".format(url, e)) from e
 
 
 class RunPodAPI:
