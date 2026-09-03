@@ -1,4 +1,6 @@
 import json
+import ssl
+import urllib.error
 
 import pytest
 
@@ -147,3 +149,40 @@ def test_every_request_carries_an_explicit_user_agent():
     for _m, _url, _body, headers in t.calls:
         assert headers["User-Agent"] == ra.USER_AGENT
         assert "urllib" not in headers["User-Agent"]
+
+
+def test_default_transport_uses_a_verifying_ssl_context(monkeypatch):
+    """Houdini's bundled OpenSSL has no CA store; without an explicit context
+    every RunPod call fails with CERTIFICATE_VERIFY_FAILED."""
+    seen = {}
+
+    class FakeResponse:
+        status = 200
+
+        def read(self):
+            return b"{}"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def fake_urlopen(req, timeout=None, context=None):
+        seen["context"] = context
+        return FakeResponse()
+
+    monkeypatch.setattr(ra.urllib.request, "urlopen", fake_urlopen)
+    ra._urllib_transport("GET", "https://rest.runpod.io/v1/pods", None, {})
+    assert seen["context"] is not None
+    assert seen["context"].verify_mode == ssl.CERT_REQUIRED
+
+
+def test_default_transport_turns_network_errors_into_runpoderror(monkeypatch):
+    def boom(req, timeout=None, context=None):
+        raise urllib.error.URLError("no route to host")
+
+    monkeypatch.setattr(ra.urllib.request, "urlopen", boom)
+    with pytest.raises(ra.RunPodError) as excinfo:
+        ra._urllib_transport("GET", "https://rest.runpod.io/v1/pods", None, {})
+    assert excinfo.value.status == 0

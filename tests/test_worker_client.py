@@ -1,8 +1,10 @@
 import json
+import ssl
 
 import pytest
 
 from rpfarm import VERSION
+from rpfarm import worker_client as wc
 from rpfarm.worker_client import WorkerClient, WorkerError
 
 
@@ -218,7 +220,7 @@ def test_default_transport_forwards_explicit_timeout(monkeypatch):
         def __exit__(self, *a):
             return False
 
-    def fake_urlopen(req, timeout=None):
+    def fake_urlopen(req, timeout=None, context=None):
         captured["timeout"] = timeout
         return FakeResp()
 
@@ -244,7 +246,7 @@ def test_default_transport_defaults_timeout_to_30(monkeypatch):
         def __exit__(self, *a):
             return False
 
-    def fake_urlopen(req, timeout=None):
+    def fake_urlopen(req, timeout=None, context=None):
         captured["timeout"] = timeout
         return FakeResp()
 
@@ -253,3 +255,30 @@ def test_default_transport_defaults_timeout_to_30(monkeypatch):
 
     _urllib_transport("GET", "https://x/health", None, {})
     assert captured["timeout"] == 30
+
+
+def test_default_transport_uses_a_verifying_ssl_context(monkeypatch):
+    """Same Houdini CA-store problem as the RunPod API transport: without an
+    explicit context, every call to the pod proxy fails the TLS handshake."""
+    seen = {}
+
+    class FakeResponse:
+        status = 200
+
+        def read(self):
+            return b"{}"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def fake_urlopen(req, timeout=None, context=None):
+        seen["context"] = context
+        return FakeResponse()
+
+    monkeypatch.setattr(wc.urllib.request, "urlopen", fake_urlopen)
+    wc._urllib_transport("GET", "https://p-8000.proxy.runpod.net/health", None, {})
+    assert seen["context"] is not None
+    assert seen["context"].verify_mode == ssl.CERT_REQUIRED
