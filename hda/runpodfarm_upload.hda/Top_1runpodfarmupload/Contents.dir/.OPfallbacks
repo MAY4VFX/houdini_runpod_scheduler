@@ -1,0 +1,4 @@
+Top/localscheduler /Applications/Houdini/Houdini22.0.368/Frameworks/Houdini.framework/Versions/22.0/Resources/houdini/otls/OPlibTop.hda
+Top/localscheduler otls/OPlibTop.hda
+Top/pythonprocessor /Applications/Houdini/Houdini22.0.368/Frameworks/Houdini.framework/Versions/22.0/Resources/houdini/otls/OPlibTop.hda
+Top/pythonprocessor otls/OPlibTop.hda

@@ -1,0 +1,103 @@
+= RunPodFarm Upload =
+
+#type: node
+#context: top
+#internal: runpodfarmupload
+#icon: TOP/pythonprocessor
+
+"""Package and upload files to the RunPodFarm sync pod, as a normal TOP
+work item generator -- progress is visible per package as it cooks."""
+
+Work item = one package of files. Each package cooks on PDG's *local*
+scheduler (this node overrides `Scheduler` to its own internal
+`localscheduler`, never `runpodfarm_scheduler` -- pointing it at that
+scheduler would recurse: the upload has to finish before the farm cook
+that needs its files can even start). The override is a Python expression
+on the internal Python Processor's `Scheduler` parm re-resolving the
+sibling `localscheduler` node's absolute path at cook time -- a bare
+relative name silently falls back to "network default" instead (verified
+empirically; see the Task 9 report if this ever needs re-deriving).
+
+Packages cook *in process* (blocking Houdini's UI while a package
+uploads, one after another): PDG's Python Processor only dispatches a
+work item out of process when it carries a shell `.command` -- a
+callback-only item with neither `inProcess` nor a command silently no-ops
+(PDG marks it succeeded in ~0s without ever running the callback; this
+was live-verified, not theoretical). Making uploads genuinely
+non-blocking would mean adding an `rpfarm` CLI entry point this node
+shells out to instead of calling `run_upload_item()` directly from
+Python -- left as a follow-up (see the Task 9 report).
+
+@parameters
+
+Mode:
+    #id: rpfarm_mode
+    `Project dependencies` walks `hou.fileReferences()` (via
+    `rpfarm.deps.collect_refs`/`resolve_entries`) -- the hip file itself
+    plus everything it references, expanded and de-duplicated. `Custom
+    paths` uploads exactly the local -> remote pairs below.
+
+Project:
+    #id: rpfarm_project
+
+    Remote project folder: `/workspace/projects/<user>/<project>`. Empty
+    means the name of the `$JOB` directory.
+
+Package Size (GB):
+    #id: rpfarm_packagegb
+
+    Files are grouped into work items no larger than this (a single file
+    bigger than the limit still gets its own item).
+
+Compression:
+    #id: rpfarm_compress
+
+    `auto` compresses when no uplink measurement is available (the safe
+    default for an unknown connection) or when a measured uplink is below
+    200 Mbps; `on`/`off` force it. Compressible files are staged to a temp
+    dir with zstd and decompressed on the sync pod after upload -- see
+    `rpfarm.sync.compress_stage`.
+
+Custom Paths:
+    #id: rpfarm_custom
+
+    Multiparm of local -> remote pairs, used in Custom mode (and filled in
+    automatically by the Install Houdini preset). `local` may be a file or
+    a directory (walked recursively, subdirectories preserved under
+    `remote`).
+
+Post-command:
+    #id: rpfarm_postcmd
+
+    Shell command run on the sync pod once, after every package in this
+    cook has uploaded -- not once per package. Implemented as one extra
+    "upload_post" work item that PDG's `onAddInternalDependencies` callback
+    makes depend on every package item (the first working option that
+    doesn't need a second scheduler pass: package items are added first in
+    `onGenerate`, then the post item's dependency on all of them is wired
+    once every item exists). Ignored when empty.
+
+Preset:
+    #id: rpfarm_preset
+
+    `Install Houdini from tarball` computes Custom Paths and Post-command
+    from the two fields below via `rpfarm.packages.houdini_install_preset`
+    at generate time (the visible Custom Paths / Post-command parms are
+    left alone, not overwritten, in case a mistaken preset pick needs to
+    be undone without losing hand-entered values).
+
+Houdini Tarball:
+    #id: rpfarm_houtar
+
+    Local path to `houdini-<version>-linux_x86_64_gcc14.2.tar.gz`. Uploads
+    to `/workspace/apps/dist/`; the post-command extracts it and runs the
+    silent Linux installer into `/workspace/houdini/<version>`.
+
+Houdini Version:
+    #id: rpfarm_houver
+
+@related
+
+- [Node:top/runpodfarm_scheduler]
+- [Node:top/pythonprocessor]
+- [Node:top/localscheduler]

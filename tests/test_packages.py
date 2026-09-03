@@ -51,6 +51,57 @@ def test_custom_items_single_file_pair(tmp_path):
     )
     assert len(items) == 1
     assert items[0]["files"] == [[str(tar), "/workspace/apps/dist/houdini-22.0.393-linux_x86_64_gcc14.2.tar.gz", 50]]
+    # R8 (rpfarm.sync): local_root must be the file's own containing
+    # directory, not the file itself -- relpath(file, file) is ".", which
+    # does not reproduce basename(file) when joined with remote_root.
+    # Caught live against the real sync pod (CookedFail on a single-file
+    # custom pair) before this assertion existed -- see the Task 9 report.
+    assert items[0]["local_root"] == str(tmp_path)
+
+
+def _assert_r8(items):
+    """rpfarm.sync's R8 invariant, the way rclone_copy's build_rclone_args
+    checks it: relpath(local, local_root) joined onto remote_root must
+    reproduce remote, for every file in every item this function returns.
+    """
+    import posixpath
+
+    for it in items:
+        for local, remote, _size in it["files"]:
+            rel = os.path.relpath(local, it["local_root"]).replace(os.sep, "/")
+            assert posixpath.join(it["remote_root"], rel) == remote, (it, local, remote)
+
+
+def test_custom_items_satisfy_r8_dir_and_file_pairs(tmp_path):
+    src = tmp_path / "plug"
+    src.mkdir()
+    (src / "a.so").write_bytes(b"1" * 10)
+    tar = tmp_path / "houdini-22.0.393-linux_x86_64_gcc14.2.tar.gz"
+    tar.write_bytes(b"x" * 10)
+    items = build_upload_items(
+        "custom",
+        str(tmp_path),
+        "may",
+        "shot",
+        [(str(src), "/workspace/apps/plug"), (str(tar), "/workspace/apps/dist/")],
+        [],
+        package_gb=1,
+    )
+    _assert_r8(items)
+
+
+def test_deps_items_satisfy_r8(tmp_path):
+    job = tmp_path / "job"
+    job.mkdir()
+    (job / "x.hip").write_bytes(b"h")
+    ext_dir = tmp_path / "lib"
+    ext_dir.mkdir()
+    ext_file = ext_dir / "tex.exr"
+    ext_file.write_bytes(b"e" * 20)
+    items = build_upload_items(
+        "deps", str(job), "may", "shot", [], [str(job / "x.hip"), str(ext_file)], package_gb=1
+    )
+    _assert_r8(items)
 
 
 def test_custom_items_splits_by_package_size(tmp_path):

@@ -1,0 +1,14 @@
+Operator:     runpodfarmupload
+Label:        RunPodFarm Upload
+Path:         oplib:/Top/runpodfarmupload?Top/runpodfarmupload
+Icon:         TOP_subnet
+Table:        Top
+License:      
+Extra:        
+User:         
+Inputs:       0 to 1
+Subnet:       true
+Python:       false
+Empty:        false
+Modified:     Thu Sep  3 16:16:19 2026
+
