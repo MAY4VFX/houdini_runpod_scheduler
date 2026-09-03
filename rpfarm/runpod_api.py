@@ -94,24 +94,42 @@ class RunPodAPI:
         }
 
     def create_gpu_pod(self, name, template_id, gpu_type_ids, volume_id, env, ports):
+        """Create a GPU pod, trying ``gpu_type_ids`` in the order given.
+
+        ``gpuTypePriority`` defaults to ``"availability"``, which picks
+        whatever RunPod has most of and ignores the caller's order -- a live
+        cook asked for an A4500 (~$0.25/h) first and got an RTX 4090 at
+        $0.740/h. The openapi spec: "set to availability to respond to
+        current GPU type availability. Set to custom to always try to rent
+        GPU types in the order specified in gpuTypeIds." The artist's
+        priority list is a cost decision, so it is ``"custom"`` here.
+        """
         body = self._pod_body(name, template_id, volume_id, env, ports)
         body.update(
             {
                 "computeType": "GPU",
                 "gpuTypeIds": list(gpu_type_ids),
-                "gpuTypePriority": "availability",
+                "gpuTypePriority": "custom",
                 "gpuCount": 1,
             }
         )
         return self._call("POST", "/pods", body)
 
     def create_cpu_pod(self, name, template_id, volume_id, env, ports, vcpu=2, flavors=("cpu3c", "cpu5c")):
+        """Create a CPU pod, trying ``flavors`` in the order given.
+
+        Same reasoning as :meth:`create_gpu_pod`. The openapi spec: "set to
+        availability to respond to current CPU flavor availability. Set to
+        custom to always try to rent CPU flavors in the order specified in
+        cpuFlavorIds." The default flavours are cheapest-first ($0.06/h for
+        cpu3c against $0.07/h for cpu5c), so the order is the point.
+        """
         body = self._pod_body(name, template_id, volume_id, env, ports)
         body.update(
             {
                 "computeType": "CPU",
                 "cpuFlavorIds": list(flavors),
-                "cpuFlavorPriority": "availability",
+                "cpuFlavorPriority": "custom",
                 "vcpuCount": vcpu,
             }
         )
