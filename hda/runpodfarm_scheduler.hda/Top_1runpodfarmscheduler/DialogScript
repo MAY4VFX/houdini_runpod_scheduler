@@ -197,14 +197,14 @@
             default { "0" }
             parmtag { "script_callback" "hou.phm().onVolumeRefresh(kwargs)" }
             parmtag { "script_callback_language" "python" }
-            help    "List /workspace/projects on the volume with sizes. Starts the sync pod if it is not up."
+            help    "List zones, every project's size, and total usage. Starts the sync pod if it is not up."
         }
         parm {
             name    "rpfarm_volume_target"
             label   "Target"
             type    string
             default { "" }
-            help    "Path under /workspace to delete, e.g. /workspace/projects/may/oldshow."
+            help    "Project or Houdini version to delete: /workspace/projects/<user>/<project> or /workspace/houdini/<version>."
         }
         parm {
             name    "rpfarm_volume_delete"
@@ -213,7 +213,7 @@
             default { "0" }
             parmtag { "script_callback" "hou.phm().onVolumeDelete(kwargs)" }
             parmtag { "script_callback_language" "python" }
-            help    "Permanently remove Target from the volume. Asks first."
+            help    "Permanently remove Target from the volume. Asks first. Refuses anything outside projects/ or houdini/, including ledger/ and .rpfarm/."
         }
         parm {
             name    "rpfarm_volume_growgb"

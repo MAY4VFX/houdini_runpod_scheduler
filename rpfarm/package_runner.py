@@ -151,6 +151,10 @@ def main(argv):
             overwrite = payload.get("overwrite", "newer")
             stats = rppkg.run_download_item(item, cfg, sftp, sync_client, overwrite, progress_cb)
         else:
+            rppkg.maybe_grow_volume(
+                api, cfg, sync_client, item.get("bytes") or 0,
+                log=lambda m: print("[{}] {}".format(tag, m), flush=True),
+            )
             compress = bool(payload.get("compress"))
             stats = rppkg.run_upload_item(item, cfg, sftp, sync_client, compress, progress_cb)
         elapsed = time.time() - t0

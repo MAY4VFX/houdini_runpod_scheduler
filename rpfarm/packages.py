@@ -34,6 +34,7 @@ fully testable without Houdini installed.
 from __future__ import annotations
 
 import json
+import math
 import os
 import posixpath
 import tempfile
@@ -351,6 +352,96 @@ def _scaled_timeout(num_bytes):
     return int(min(_EXEC_TIMEOUT_CEILING_S, max(_EXEC_TIMEOUT_FLOOR_S, (num_bytes or 0) / _EXEC_BYTES_PER_SECOND)))
 
 
+_PROJECTS_PREFIX = "/workspace/projects/"
+
+
+def _project_key_from_remote_root(remote_root):
+    """Best-effort ``<user>/<project>`` from a package's ``remote_root``.
+
+    ``None`` if ``remote_root`` isn't under ``/workspace/projects/`` (a
+    Houdini install, an ``apps/`` custom upload, ...) -- those have no
+    project index entry to touch.
+    """
+    if not remote_root.startswith(_PROJECTS_PREFIX):
+        return None
+    rel = remote_root[len(_PROJECTS_PREFIX):].strip("/")
+    parts = rel.split("/", 2)
+    if len(parts) < 2 or not parts[0] or not parts[1]:
+        return None
+    return "{}/{}".format(parts[0], parts[1])
+
+
+def _touch_project_index(sync_client, remote_root, event):
+    """Best-effort ``housekeeping.py touch`` for the project index.
+
+    Fire-and-forget like the ``sync_last_used`` touch beside every call
+    site: an index update is bookkeeping for the Volume tab and ``prune``,
+    never something that should fail a transfer that otherwise succeeded.
+    """
+    key = _project_key_from_remote_root(remote_root)
+    if key is None:
+        return
+    sync_client.exec(
+        "python3 /opt/rpfarm/housekeeping.py touch {} --event {}".format(key, event)
+    )
+
+
+# Spec 4.1: "Ресайз вверх автоматический: при заполнении > 85% перед
+# заливкой шедулер/upload увеличивает volume на нужный объём (с
+# округлением до 10 ГБ) и пишет об этом в лог ноды." RunPod volumes only
+# grow, never shrink, so this must run *before* the transfer that would
+# push usage over the line, not after.
+_AUTO_GROW_THRESHOLD = 0.85
+_AUTO_GROW_TARGET_FRACTION = 0.8
+_AUTO_GROW_STEP_GB = 10
+_GB = 2**30
+
+
+def maybe_grow_volume(api, cfg, sync_client, needed_bytes, log=None):
+    """Grow the network volume when an upload would push it past 85% full.
+
+    Called by ``rpfarm.package_runner`` right before ``run_upload_item``
+    (only for uploads -- downloads free no space and need no headroom).
+    Sizes the new volume so it lands at ~80% full afterwards, rounded up
+    to the nearest 10 GB step (spec 4.1's formula:
+    ``ceil((used+bytes)/0.8/10GB)*10``).
+
+    Never raises: a failed size check or resize must not block an upload
+    that would otherwise succeed on its own. If this silently doesn't
+    help, the artist finds out from RunPod's own out-of-space error, or
+    from the next Volume tab Refresh.
+    """
+    log = log or (lambda msg: None)
+    try:
+        result = sync_client.exec("python3 /opt/rpfarm/housekeeping.py ls", timeout_s=60)
+        if result.get("exit_code") != 0:
+            log("volume auto-grow check skipped: {}".format(result.get("stderr") or "ls failed"))
+            return
+        info = json.loads(result.get("stdout") or "{}")
+        volume = info.get("volume") or {}
+        used = int(volume.get("used") or 0)
+        total = int(volume.get("total") or 0)
+        if total <= 0:
+            return
+        if used + needed_bytes <= _AUTO_GROW_THRESHOLD * total:
+            return
+        new_size_gb = (
+            math.ceil((used + needed_bytes) / _AUTO_GROW_TARGET_FRACTION / (_AUTO_GROW_STEP_GB * _GB))
+            * _AUTO_GROW_STEP_GB
+        )
+        current_gb = int((api.get_volume(cfg.volume_id) or {}).get("size") or 0)
+        if new_size_gb <= current_gb:
+            return
+        api.resize_volume(cfg.volume_id, new_size_gb)
+        log(
+            "volume {} auto-grown {} GB -> {} GB ({:.0f}% full before this upload)".format(
+                cfg.volume_id, current_gb, new_size_gb, 100.0 * (used + needed_bytes) / total
+            )
+        )
+    except Exception as e:  # noqa: BLE001 - background safety net, never fails the upload
+        log("volume auto-grow check failed (continuing): {}".format(e))
+
+
 def _exec_checked(sync_client, command, timeout_s):
     """Run one command on the sync pod; raise RuntimeError on non-zero exit.
 
@@ -482,6 +573,7 @@ def run_upload_item(item, cfg, sftp, sync_client, compress, progress_cb=None):
         _exec_checked(sync_client, post_command, timeout_s)
 
     sync_client.exec("mkdir -p /workspace/.rpfarm && touch /workspace/.rpfarm/sync_last_used")
+    _touch_project_index(sync_client, remote_root, "upload")
 
     return {"files": total_files, "bytes": total_bytes, "seconds": total_seconds}
 
@@ -537,5 +629,6 @@ def run_download_item(item, cfg, sftp, sync_client, overwrite, progress_cb=None)
         stats = SyncStats(files=0, bytes=0, seconds=0.0)
 
     sync_client.exec("mkdir -p /workspace/.rpfarm && touch /workspace/.rpfarm/sync_last_used")
+    _touch_project_index(sync_client, remote_root, "download")
 
     return {"files": stats.files, "bytes": stats.bytes, "seconds": stats.seconds}

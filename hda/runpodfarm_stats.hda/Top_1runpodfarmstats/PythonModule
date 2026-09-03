@@ -13,6 +13,7 @@ the last cook) and writes the result with ``rpfarm.ledger.to_csv``.
 """
 
 import datetime
+import json
 import os
 import pathlib
 import sys
@@ -74,6 +75,45 @@ def _set_attrib(wi, key, value):
         wi.setStringAttrib(key, str(value))
 
 
+def _storage_snapshot(cfg, node):
+    """Real per-(user, project) bytes and the volume's total bytes, via the
+    sync pod's housekeeping ``ls`` (Task 12). Returns ``(sizes, vol_bytes)``
+    -- ``sizes`` keyed ``"<user>/<project>"`` -- or ``({}, None)`` on any
+    failure. Never raises: a stats readout must never block on the farm
+    being reachable. A missing config (no ``rpfarm setup`` yet) is quiet
+    (the common local-only view works with none at all, same as billing);
+    any other failure (RunPod unreachable, sync pod wouldn't come up, a
+    stale pod image with no housekeeping ``ls``) leaves a node warning.
+    """
+    quiet = cfg is None
+    try:
+        if cfg is None:
+            cfg = rpcfg.load()
+        token = rpcfg.session_token()
+        pubkey = _read_pubkey(cfg)
+        api = RunPodAPI(cfg.api_key)
+        pod = rppods.ensure_sync_pod(api, cfg, token, pubkey)
+        client = WorkerClient(pod["id"], token)
+        result = client.exec("python3 /opt/rpfarm/housekeeping.py ls", timeout_s=60)
+        if result.get("exit_code") != 0:
+            node.addWarning("storage sizes unavailable: {}".format(
+                result.get("stderr") or "housekeeping ls failed"))
+            return {}, None
+        info = json.loads(result.get("stdout") or "{}")
+        sizes = {
+            "{}/{}".format(p.get("user"), p.get("project")): p.get("bytes", 0)
+            for p in info.get("projects", [])
+        }
+        vol_bytes = (info.get("volume") or {}).get("total")
+        return sizes, vol_bytes
+    except rpcfg.ConfigError:
+        return {}, None
+    except (RunPodError, OSError, TimeoutError, ValueError) as e:
+        if not quiet:
+            node.addWarning("storage sizes unavailable: {}".format(e))
+        return {}, None
+
+
 def compute(node):
     """Load, filter (project/user/since/until) and -- if Use Billing is on
     -- billing-merge the local ledger for *node*'s current parameters.
@@ -83,11 +123,14 @@ def compute(node):
     period (``None`` when billing is off or unreachable). ``cleanup`` is
     computed from the FULL local ledger (not the project/user filter --
     the point is to surface stale projects the current filter might be
-    hiding), each entry a dict with ``project, last_cook, age_days``; the
-    per-project on-disk size and $/month are left as a TODO for Task 12's
-    housekeeping ``ls`` (not landed -- only ``du`` exists today, see
-    ``pod/housekeeping.py`` -- inventing that API here would just be a
-    second, divergent guess at its shape).
+    hiding), each entry a dict with ``user, project, last_cook, age_days,
+    bytes, monthly_cost``. ``bytes`` comes from Task 12's housekeeping
+    ``ls`` on the sync pod (``None`` if unreachable); ``monthly_cost`` is
+    that project's share of ``vol_total``, prorated by size and by the
+    period's length to a 30-day estimate -- ``None`` unless both Use
+    Billing and the storage snapshot are available (there is no invented
+    $/GB/month constant here: RunPod's own billing is the only price this
+    codebase trusts, per spec 4.4).
     """
     # rpcfg.home() needs no config.toml (it is just $RPFARM_HOME or
     # ~/.rpfarm) -- config is only actually loaded below, and only when
@@ -104,6 +147,7 @@ def compute(node):
 
     vol_total = None
     merged = records
+    cfg = None
     if usebilling:
         try:
             cfg = rpcfg.load()
@@ -139,25 +183,46 @@ def compute(node):
     by_user = rpledger.summarize(filtered, by="user")
 
     now = time.time()
+    # Keyed by "<user>/<project>", not project alone: two users can share a
+    # project name (the volume itself namespaces by user --
+    # /workspace/projects/<user>/<project>), and the storage snapshot below
+    # is keyed the same way.
     last_by_project = {}
     for rec in records:
         if rec.get("record") == "cook_summary":
             continue
         project = rec.get("project")
+        user = rec.get("user")
         ts = rec.get("ended") or rec.get("started")
-        if not project or ts is None:
+        if not project or not user or ts is None:
             continue
-        if project not in last_by_project or ts > last_by_project[project]:
-            last_by_project[project] = ts
+        key = "{}/{}".format(user, project)
+        if key not in last_by_project or ts > last_by_project[key][0]:
+            last_by_project[key] = (ts, user, project)
+
+    sizes_by_key, vol_bytes_total = _storage_snapshot(cfg, node)
+
+    period_start = since_epoch if since_epoch is not None else (now - 90 * 86400.0)
+    period_end = until_epoch if until_epoch is not None else now
+    period_days = max(1.0, (period_end - period_start) / 86400.0)
+
     cleanup = []
-    for project, ts in sorted(last_by_project.items()):
+    for key, (ts, user, project) in sorted(last_by_project.items()):
         age_days = (now - ts) / 86400.0
-        if age_days > _STALE_DAYS:
-            cleanup.append({
-                "project": project,
-                "last_cook": time.strftime("%Y-%m-%d", time.gmtime(ts)),
-                "age_days": age_days,
-            })
+        if age_days <= _STALE_DAYS:
+            continue
+        entry_bytes = sizes_by_key.get(key)
+        monthly_cost = None
+        if usebilling and vol_total is not None and vol_bytes_total and entry_bytes is not None:
+            monthly_cost = (vol_total / period_days * 30.0) * (entry_bytes / vol_bytes_total)
+        cleanup.append({
+            "user": user,
+            "project": project,
+            "last_cook": time.strftime("%Y-%m-%d", time.gmtime(ts)),
+            "age_days": age_days,
+            "bytes": entry_bytes,
+            "monthly_cost": monthly_cost,
+        })
 
     return filtered, by_project, by_user, cleanup, vol_total, usebilling
 
@@ -210,8 +275,10 @@ def build_summary_text(by_project, by_user, cleanup, vol_total, usebilling, n_re
     lines.append("Cleanup candidates (no cook in > {} days):".format(_STALE_DAYS))
     if cleanup:
         for c in cleanup:
-            lines.append("  {:<24s} last cook {}  ({:.0f}d ago)  size: TODO (Task 12 housekeeping ls)".format(
-                c["project"], c["last_cook"], c["age_days"]))
+            size_str = "{:.2f} GB".format(c["bytes"] / 2**30) if c["bytes"] is not None else "size n/a"
+            cost_str = "{} /mo".format(_fmt_money(c["monthly_cost"])) if c["monthly_cost"] is not None else "$/mo n/a"
+            lines.append("  {:<24s} last cook {}  ({:.0f}d ago)  {:>10s}  {}".format(
+                "{}/{}".format(c["user"], c["project"]), c["last_cook"], c["age_days"], size_str, cost_str))
     else:
         lines.append("  (none)")
     return "\n".join(lines)
