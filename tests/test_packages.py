@@ -9,6 +9,7 @@ from rpfarm.packages import (
     group_download_pairs,
     houdini_install_preset,
     localize_via_pathmap,
+    maybe_grow_volume,
     resolve_compress_flag,
     run_download_item,
     run_upload_item,
@@ -723,3 +724,162 @@ def test_run_download_item_rejects_unknown_overwrite(tmp_path):
         run_download_item(
             item, FakeCfg(), SftpTarget(host="1.2.3.4", port=22, key_path="/k"), FakeSyncClient(), "bogus"
         )
+
+
+# -- touch of the project index -------------------------------------------
+
+
+def test_run_upload_item_touches_project_index(tmp_path, monkeypatch):
+    src = tmp_path / "f.txt"
+    src.write_bytes(b"x" * 10)
+    item = {
+        "index": 0,
+        "local_root": str(tmp_path),
+        "remote_root": "/workspace/projects/may/shotA",
+        "files": [[str(src), "/workspace/projects/may/shotA/f.txt", 10]],
+        "bytes": 10,
+        "post_command": "",
+    }
+
+    def fake_rclone_copy(package, target, direction, rclone_bin, local_root, remote_root, progress_cb=None):
+        from rpfarm.sync import SyncStats
+
+        return SyncStats(files=len(package), bytes=10, seconds=0.1)
+
+    monkeypatch.setattr("rpfarm.packages.rclone_copy", fake_rclone_copy)
+    sync_client = FakeSyncClient()
+    run_upload_item(
+        item, FakeCfg(), SftpTarget(host="1.2.3.4", port=22, key_path="/k"), sync_client, compress=False, progress_cb=None
+    )
+    assert any(
+        c == "python3 /opt/rpfarm/housekeeping.py touch may/shotA --event upload" for c in sync_client.commands
+    )
+
+
+def test_run_upload_item_skips_touch_outside_projects(tmp_path, monkeypatch):
+    src = tmp_path / "f.txt"
+    src.write_bytes(b"x" * 10)
+    item = {
+        "index": 0,
+        "local_root": str(tmp_path),
+        "remote_root": "/workspace/apps/plug",
+        "files": [[str(src), "/workspace/apps/plug/f.txt", 10]],
+        "bytes": 10,
+        "post_command": "",
+    }
+
+    def fake_rclone_copy(package, target, direction, rclone_bin, local_root, remote_root, progress_cb=None):
+        from rpfarm.sync import SyncStats
+
+        return SyncStats(files=len(package), bytes=10, seconds=0.1)
+
+    monkeypatch.setattr("rpfarm.packages.rclone_copy", fake_rclone_copy)
+    sync_client = FakeSyncClient()
+    run_upload_item(
+        item, FakeCfg(), SftpTarget(host="1.2.3.4", port=22, key_path="/k"), sync_client, compress=False, progress_cb=None
+    )
+    assert not any("housekeeping.py touch" in c for c in sync_client.commands)
+
+
+def test_run_download_item_touches_project_index(tmp_path, monkeypatch):
+    dst_root = tmp_path / "out"
+    item = {
+        "index": 0,
+        "local_root": str(dst_root),
+        "remote_root": "/workspace/projects/may/shotA/render",
+        "files": [["/workspace/projects/may/shotA/render/f.exr", str(dst_root / "f.exr"), 10]],
+        "bytes": 10,
+    }
+
+    def fake_rclone_copy(package, target, direction, rclone_bin, local_root, remote_root, progress_cb=None, extra_args=()):
+        from rpfarm.sync import SyncStats
+
+        return SyncStats(files=len(package), bytes=10, seconds=0.1)
+
+    monkeypatch.setattr("rpfarm.packages.rclone_copy", fake_rclone_copy)
+    sync_client = FakeSyncClient()
+    run_download_item(
+        item, FakeCfg(), SftpTarget(host="1.2.3.4", port=22, key_path="/k"), sync_client, "newer", progress_cb=None
+    )
+    assert any(
+        c == "python3 /opt/rpfarm/housekeeping.py touch may/shotA --event download" for c in sync_client.commands
+    )
+
+
+# -- maybe_grow_volume ------------------------------------------------------
+
+
+class _LsSyncClient:
+    def __init__(self, used, total, exit_code=0):
+        self.used = used
+        self.total = total
+        self.exit_code = exit_code
+        self.commands = []
+
+    def exec(self, command, timeout_s=600):
+        self.commands.append(command)
+        if self.exit_code != 0:
+            return {"exit_code": self.exit_code, "stdout": "", "stderr": "boom"}
+        payload = json.dumps({"volume": {"used": self.used, "total": self.total}})
+        return {"exit_code": 0, "stdout": payload, "stderr": ""}
+
+
+class _GrowCfg:
+    volume_id = "vol1"
+
+
+class _FakeApi:
+    def __init__(self, size_gb):
+        self.size_gb = size_gb
+        self.resized = []
+
+    def get_volume(self, vid):
+        return {"size": self.size_gb}
+
+    def resize_volume(self, vid, size_gb):
+        self.resized.append((vid, size_gb))
+
+
+def test_maybe_grow_volume_grows_past_threshold():
+    gb = 2**30
+    api = _FakeApi(size_gb=50)
+    sync_client = _LsSyncClient(used=44 * gb, total=50 * gb)
+    maybe_grow_volume(api, _GrowCfg(), sync_client, needed_bytes=2 * gb)
+    assert api.resized == [("vol1", 60)]  # ceil(46/0.8/10)*10 = 60
+
+
+def test_maybe_grow_volume_no_op_under_threshold():
+    gb = 2**30
+    api = _FakeApi(size_gb=50)
+    sync_client = _LsSyncClient(used=10 * gb, total=50 * gb)
+    maybe_grow_volume(api, _GrowCfg(), sync_client, needed_bytes=1 * gb)
+    assert api.resized == []
+
+
+def test_maybe_grow_volume_never_shrinks_or_repeats():
+    gb = 2**30
+    api = _FakeApi(size_gb=100)  # already bigger than the computed target
+    sync_client = _LsSyncClient(used=44 * gb, total=50 * gb)
+    maybe_grow_volume(api, _GrowCfg(), sync_client, needed_bytes=2 * gb)
+    assert api.resized == []
+
+
+def test_maybe_grow_volume_swallows_ls_failure():
+    api = _FakeApi(size_gb=50)
+    sync_client = _LsSyncClient(used=0, total=0, exit_code=1)
+    logs = []
+    maybe_grow_volume(api, _GrowCfg(), sync_client, needed_bytes=1, log=logs.append)
+    assert api.resized == []
+    assert logs  # the failure was logged, not raised
+
+
+def test_maybe_grow_volume_swallows_api_exception():
+    class ExplodingApi:
+        def get_volume(self, vid):
+            raise RuntimeError("network down")
+
+    gb = 2**30
+    sync_client = _LsSyncClient(used=44 * gb, total=50 * gb)
+    logs = []
+    maybe_grow_volume(ExplodingApi(), _GrowCfg(), sync_client, needed_bytes=2 * gb, log=logs.append)
+    assert logs

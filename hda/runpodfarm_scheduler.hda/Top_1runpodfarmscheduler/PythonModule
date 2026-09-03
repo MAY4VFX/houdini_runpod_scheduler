@@ -206,21 +206,57 @@ def _volume_exec(node, command, timeout_s=300):
 
 
 def onVolumeRefresh(kwargs):
-    """List the volume's project zone with sizes."""
+    """List the volume's zones, per-project usage, and totals (Task 12 `ls`)."""
     node = kwargs["node"]
     try:
-        out = _volume_exec(node, "{} du /workspace/projects".format(_HOUSEKEEPING))
-        rows = json.loads(out or "[]")
-        lines = ["{:>10.2f} GB  {}".format(r["bytes"] / 2**30, r["path"]) for r in rows]
-        total = sum(r["bytes"] for r in rows)
-        lines.append("{:>10.2f} GB  TOTAL".format(total / 2**30))
-        _set_text(node, "rpfarm_volume_text", "\n".join(lines) or "(empty)")
+        out = _volume_exec(node, "{} ls".format(_HOUSEKEEPING))
+        info = json.loads(out or "{}")
+
+        lines = ["Zones:"]
+        for zone, nbytes in info.get("zones", {}).items():
+            lines.append("{:>10.2f} GB  {}".format(nbytes / 2**30, zone))
+
+        lines.append("")
+        lines.append("Projects:")
+        projects = info.get("projects", [])
+        if not projects:
+            lines.append("  (none)")
+        for p in projects:
+            pending = "  [pending download]" if p.get("outputs_pending") else ""
+            lines.append(
+                "{:>10.2f} GB  {}/{}{}".format(
+                    p.get("bytes", 0) / 2**30, p.get("user"), p.get("project"), pending
+                )
+            )
+
+        volume = info.get("volume", {})
+        used, total = volume.get("used", 0), volume.get("total", 0)
+        pct = (100.0 * used / total) if total else 0.0
+        lines.append("")
+        lines.append(
+            "Volume: {:.2f} / {:.2f} GB ({:.0f}% full)".format(used / 2**30, total / 2**30, pct)
+        )
+        _set_text(node, "rpfarm_volume_text", "\n".join(lines))
     except Exception as e:  # a button must never raise into the UI
         _set_text(node, "rpfarm_volume_text", "Refresh failed: {}".format(e))
 
 
+# Accepted 'Target' shapes for onVolumeDelete, each routed through a guarded
+# housekeeping command instead of a raw `rm -rf` -- see that function.
+_VOLUME_DELETE_PROJECT_PREFIX = "/workspace/projects/"
+_VOLUME_DELETE_HOUDINI_PREFIX = "/workspace/houdini/"
+
+
 def onVolumeDelete(kwargs):
-    """Delete one path under /workspace (asks for confirmation in the UI)."""
+    """Delete one project or Houdini version from the volume (guarded, confirms in the UI).
+
+    'Target' must be ``/workspace/projects/<user>/<project>`` or
+    ``/workspace/houdini/<version>`` -- routed through housekeeping's `rm`
+    (Task 12) / `houdini rm`, which refuse `/workspace/houdini`,
+    `/workspace/ledger` and `/workspace/.rpfarm` outright. This replaces
+    the old raw `rm -rf`, which only blocked the top-level zone itself and
+    could still delete e.g. a path one level into `/workspace/ledger/`.
+    """
     node = kwargs["node"]
     target = node.parm("rpfarm_volume_target").evalAsString().strip()
     if not target:
@@ -228,14 +264,35 @@ def onVolumeDelete(kwargs):
         return
     # posixpath, not os.path: the target is a path on the Linux pod, and this
     # callback also runs on Windows.
-    target = posixpath.normpath(target)
-    if not target.startswith("/workspace/") or target.count("/") < 3:
+    target = posixpath.normpath(target).replace("\\", "/")
+
+    if target.startswith(_VOLUME_DELETE_PROJECT_PREFIX):
+        rel = target[len(_VOLUME_DELETE_PROJECT_PREFIX):].strip("/")
+        parts = rel.split("/")
+        if len(parts) != 2 or not all(parts):
+            _set_text(
+                node, "rpfarm_volume_text",
+                "Refusing {!r}: expected /workspace/projects/<user>/<project>.".format(target))
+            return
+        # The UI confirmation below stands in for --force: an artist who
+        # explicitly names a project and confirms the dialog has already
+        # made the call that any pending download is expendable.
+        command = "{} rm {}/{} --force".format(_HOUSEKEEPING, parts[0], parts[1])
+    elif target.startswith(_VOLUME_DELETE_HOUDINI_PREFIX):
+        version = target[len(_VOLUME_DELETE_HOUDINI_PREFIX):].strip("/")
+        if not version or "/" in version:
+            _set_text(
+                node, "rpfarm_volume_text",
+                "Refusing {!r}: expected /workspace/houdini/<version>.".format(target))
+            return
+        command = "{} houdini rm {}".format(_HOUSEKEEPING, version)
+    else:
         _set_text(
-            node,
-            "rpfarm_volume_text",
-            "Refusing to delete {!r}: must be a path under /workspace/<zone>/.".format(target),
-        )
+            node, "rpfarm_volume_text",
+            "Refusing {!r}: must be /workspace/projects/<user>/<project> or "
+            "/workspace/houdini/<version>.".format(target))
         return
+
     import hou
 
     if hou.isUIAvailable():
@@ -248,8 +305,14 @@ def onVolumeDelete(kwargs):
         ):
             return
     try:
-        _volume_exec(node, "rm -rf -- {}".format(_shquote(target)))
-        _set_text(node, "rpfarm_volume_text", "Deleted {}".format(target))
+        out = _volume_exec(node, command)
+        result = json.loads(out or "{}")
+        if result.get("ok"):
+            _set_text(node, "rpfarm_volume_text", "Deleted {}".format(target))
+        else:
+            _set_text(
+                node, "rpfarm_volume_text",
+                "Delete refused: {}".format(result.get("error", "unknown reason")))
     except Exception as e:
         _set_text(node, "rpfarm_volume_text", "Delete failed: {}".format(e))
 
@@ -275,10 +338,6 @@ def onVolumeGrow(kwargs):
         )
     except Exception as e:
         _set_text(node, "rpfarm_volume_text", "Grow failed: {}".format(e))
-
-
-def _shquote(value):
-    return "'" + str(value).replace("'", "'\"'\"'") + "'"
 
 
 def _read_pubkey(cfg):
@@ -1323,6 +1382,7 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
             host=ip, port=port, key_path=self._cfg.ssh_key_path)
         self._log("sync pod {} ready ({}:{})".format(self._sync_pod["id"], ip, port))
         self._touchSyncPod()
+        self._touchProjectIndex("cook")
 
         # PDG's own job scripts and any serialized work item data.
         self._uploadPdgTemp()
@@ -1365,6 +1425,22 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
                 posixpath.dirname(_SYNC_LAST_USED), int(time.time()), _SYNC_LAST_USED),
             timeout_s=30,
         )
+
+    def _touchProjectIndex(self, event):
+        """Stamp this project's entry in housekeeping's /workspace/.rpfarm/index.json.
+
+        Best-effort like ``_touchSyncPod`` beside it: an index update is
+        bookkeeping for the Volume tab and ``prune``, never something that
+        should fail a cook. Called once per cook (event "cook") right
+        after the sync pod connection is established -- ``onStartCook``
+        runs before any pod exists, so this can't happen there without
+        forcing an early, otherwise-unneeded sync pod creation.
+        """
+        if self._sync_client is None or not self._cfg or not self._project:
+            return
+        key = "{}/{}".format(self._cfg.user, self._project)
+        self._sync_client.exec(
+            "{} touch {} --event {}".format(_HOUSEKEEPING, key, event), timeout_s=30)
 
     def _mirror_ledger_to_volume(self):
         """Push this cook's local ledger .jsonl up to the volume (Ruling

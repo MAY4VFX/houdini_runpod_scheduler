@@ -159,6 +159,92 @@ def main():
         log("FAIL: shot (fresh, 1h old) wrongly listed as a cleanup candidate")
         ok = False
 
+    # Task 12: no rpfarm config in this throwaway $RPFARM_HOME, so the
+    # storage snapshot must degrade quietly to "n/a" -- never raise, never
+    # fabricate a size or a $/month guess.
+    cleanup_section = summary.split("Cleanup candidates")[-1]
+    if "size n/a" in cleanup_section and "$/mo n/a" in cleanup_section:
+        log("OK: cleanup candidate shows size/cost as n/a with no rpfarm config")
+    else:
+        log("FAIL: expected 'size n/a' and '$/mo n/a' in cleanup section:\n" + cleanup_section)
+        ok = False
+
+    # -- 1b. Task 12: real sizes plumb through compute(), $/month formula ------
+    # Exercises _storage_snapshot's caller-facing contract and the
+    # size-share-of-vol_total proration without needing a real farm: fakes
+    # everything compute() would otherwise reach over the network for.
+    hm = stats.hm()
+
+    class _FakeCfg:
+        api_key = "k"
+        user = "bob"
+        volume_id = "vol1"
+        ssh_key_path = "/tmp/does-not-matter"
+
+    class _FakeApi:
+        def billing_pods(self, since_iso, until_iso):
+            return []
+
+        def billing_volumes(self, since_iso, until_iso):
+            return [{"amount": 30.0}]  # $30 over the (Since/Until empty -> 90-day fallback) period
+
+    gb = 2**30
+
+    class _FakeWorkerClient:
+        def __init__(self, pod_id, token):
+            pass
+
+        def exec(self, command, timeout_s=600):
+            payload = {"projects": [{"user": "bob", "project": "old_proj", "bytes": 10 * gb}],
+                       "volume": {"total": 100 * gb, "used": 40 * gb}}
+            return {"exit_code": 0, "stdout": json.dumps(payload), "stderr": ""}
+
+    # `hm.compute`'s bare-name imports (`RunPodAPI`, `WorkerClient`,
+    # `_read_pubkey`) are globals of *that function's own module*, which
+    # `stats.hm()` does not reliably hand back as the same mutable object
+    # on every access -- patch `compute.__globals__` directly so this is
+    # unaffected by however `hm()` is implemented. `rpcfg`/`rppods` are
+    # real shared module objects (`sys.modules['rpfarm...']`), so patching
+    # their attributes is safe however they were reached.
+    g = hm.compute.__globals__
+    orig = {k: g[k] for k in ("RunPodAPI", "WorkerClient", "_read_pubkey")}
+    orig_load = hm.rpcfg.load
+    orig_ensure_sync_pod = hm.rppods.ensure_sync_pod
+
+    g["RunPodAPI"] = lambda api_key: _FakeApi()
+    g["WorkerClient"] = _FakeWorkerClient
+    g["_read_pubkey"] = lambda cfg: "ssh-ed25519 AAAA"
+    hm.rpcfg.load = lambda: _FakeCfg()
+    hm.rppods.ensure_sync_pod = lambda api, cfg, token, pubkey: {"id": "pod1"}
+
+    try:
+        stats.parm("rpfarm_usebilling").set(1)
+        _f, _bp, _bu, cleanup2, vol_total2, usebilling2 = hm.compute(stats)
+    finally:
+        g.update(orig)
+        hm.rpcfg.load = orig_load
+        hm.rppods.ensure_sync_pod = orig_ensure_sync_pod
+        stats.parm("rpfarm_usebilling").set(0)
+
+    entry = next((c for c in cleanup2 if c["project"] == "old_proj"), None)
+    if entry is None:
+        log("FAIL: old_proj missing from compute() cleanup with fakes wired up")
+        ok = False
+    elif entry["bytes"] != 10 * gb:
+        log("FAIL: old_proj bytes = {}, expected {} (10 GB)".format(entry["bytes"], 10 * gb))
+        ok = False
+    else:
+        log("OK: old_proj bytes from housekeeping ls = {:.1f} GB".format(entry["bytes"] / gb))
+        # $30 billed over the ~90-day fallback period, prorated to 30 days,
+        # times this project's 10/100 GB share of the volume: $1.00.
+        expected_cost = 30.0 / 90.0 * 30.0 * (10.0 / 100.0)
+        if entry["monthly_cost"] is not None and abs(entry["monthly_cost"] - expected_cost) < 0.05:
+            log("OK: old_proj $/month = {:.2f} (share of real volume billing, not a guessed rate)".format(
+                entry["monthly_cost"]))
+        else:
+            log("FAIL: old_proj monthly_cost = {}, expected ~{:.2f}".format(entry["monthly_cost"], expected_cost))
+            ok = False
+
     # -- 2. project filter ------------------------------------------------------
     stats.parm("rpfarm_project").set("shot")
     # A plain parm change on this node doesn't by itself dirty its own
