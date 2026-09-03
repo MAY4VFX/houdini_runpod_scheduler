@@ -236,6 +236,13 @@ def onVolumeRefresh(kwargs):
         lines.append(
             "Volume: {:.2f} / {:.2f} GB ({:.0f}% full)".format(used / 2**30, total / 2**30, pct)
         )
+        if info.get("partial"):
+            # Ruling R26: ls serves cached sizes and re-measures stale ones
+            # within a shared time budget -- if that budget ran out, some
+            # numbers above are stale rather than missing. Rerunning
+            # (Refresh again) re-measures whatever is still stale.
+            lines.append("")
+            lines.append("(partial: some sizes are cached/stale -- click Refresh again to retry)")
         _set_text(node, "rpfarm_volume_text", "\n".join(lines))
     except Exception as e:  # a button must never raise into the UI
         _set_text(node, "rpfarm_volume_text", "Refresh failed: {}".format(e))
