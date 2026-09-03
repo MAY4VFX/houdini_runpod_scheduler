@@ -158,7 +158,12 @@ GPU на CPU-поде; connection-файл (`-c /tmp/mq.txt`) содержит
 ### 3.3 GPU-поды
 
 Создаются шедулером через `POST /pods`: шаблон `rpfarm-pod`, volume, `supportPublicIp`,
-GPU из приоритетного списка ноды (первый доступный в стоке EU-RO-1), env:
+GPU из приоритетного списка ноды (первый доступный в стоке EU-RO-1 — для этого в теле
+запроса `gpuTypePriority: "custom"`, а не дефолтный `"availability"`: по openapi
+`"custom"` значит «всегда пытаться арендовать типы в порядке `gpuTypeIds`», тогда как
+`"availability"` порядок игнорирует и берёт то, чего у RunPod больше. Разница в цене
+трёхкратная: в живом smoke с `"availability"` вместо A4500 (~$0.25/ч) достался
+RTX 4090 за $0.740/ч. То же для `cpuFlavorPriority` на sync-поде), env:
 `RPFARM_TOKEN`, `RPFARM_ROLE=gpu`, `PDG_RESULT_SERVER=<sync-ip>:<mq-port>`,
 `SESINETD_HOST/PORT`, `HFS=/workspace/houdini/<version>`. Имя:
 `rpfarm-<user>-<project>-<cook8>-<n>`. Живут только пока шедулер держит для них
@@ -199,6 +204,23 @@ Farm): `mqserver` запускается на sync-поде через `/exec`, 
 штатно. Параллельно шедулер опрашивает `/tasks/{id}` — источник истины по
 завершению и exit code; MQ — источник выходных файлов и атрибутов. Ignore RPC
 errors = «When cooking batches» (как у HQueue).
+
+### 3.7 TLS изнутри Houdini
+
+Houdini поставляется со своим OpenSSL, у которого вкомпилированные пути к CA указывают
+на сборочную машину SideFX (`/Users/prisms/builder-new/.../ssl/cert.pem`). На машине
+любого пользователя этого пути нет, поэтому под `hython` `ssl.create_default_context()`
+возвращает контекст с **нулём** сертификатов, и любой https-запрос падает с
+`CERTIFICATE_VERIFY_FAILED: unable to get local issuer certificate`. Это ломает весь
+транспорт v2 разом: REST RunPod, GraphQL-запрос баланса и каждый вызов `WorkerClient`
+через `*.proxy.runpod.net` — первый живой smoke умер на этом в `onStartCook`, не создав
+ни одного пода. Поэтому **любой https-вызов, который делается изнутри Houdini, обязан
+идти через `rpfarm.tls.ssl_context()`** (`urlopen(..., context=rpfarm.tls.ssl_context())`):
+модуль ищет настоящий CA-бандл в `RPFARM_CA_BUNDLE`, `SSL_CERT_FILE`, `certifi` (если
+импортируется) и в системных путях платформы, и строит из него проверяющий контекст.
+Проверка сертификата никогда не отключается: по этим соединениям идут API-ключ аккаунта
+и токен воркеров. Касается Task 9 (upload-нода), Task 10 (download-нода) и Task 13 (CLI,
+когда его запускают под `hython`).
 
 ## 4. Данные
 
