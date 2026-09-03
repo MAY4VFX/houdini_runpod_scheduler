@@ -148,6 +148,41 @@ def test_balance_uses_graphql_endpoint():
     assert headers["Authorization"] == "Bearer k"
 
 
+def test_list_volumes_and_list_templates():
+    t = FakeTransport([(200, [{"id": "v1"}]), (200, [{"id": "t1", "name": "rpfarm-pod"}])])
+    api = ra.RunPodAPI("k", transport=t)
+
+    vols = api.list_volumes()
+    assert vols == [{"id": "v1"}]
+    assert t.calls[0][:2] == ("GET", "https://rest.runpod.io/v1/networkvolumes")
+
+    templates = api.list_templates()
+    assert templates == [{"id": "t1", "name": "rpfarm-pod"}]
+    assert t.calls[1][:2] == ("GET", "https://rest.runpod.io/v1/templates")
+
+
+def test_gpu_types_uses_graphql_endpoint_with_dc():
+    payload = {
+        "data": {
+            "gpuTypes": [
+                {"id": "NVIDIA GeForce RTX 4090", "displayName": "RTX 4090",
+                 "lowestPrice": {"stockStatus": "High", "minimumBidPrice": 0.34, "uninterruptablePrice": 0.34}},
+                {"id": "NVIDIA RTX A4500", "displayName": "RTX A4500",
+                 "lowestPrice": {"stockStatus": None, "minimumBidPrice": None, "uninterruptablePrice": None}},
+            ]
+        }
+    }
+    t = FakeTransport([(200, payload)])
+    api = ra.RunPodAPI("k", transport=t)
+    types = api.gpu_types(dc="EU-RO-1")
+    assert types[0]["id"] == "NVIDIA GeForce RTX 4090"
+    assert types[0]["lowestPrice"]["stockStatus"] == "High"
+    assert types[1]["lowestPrice"]["stockStatus"] is None
+    m, url, body, headers = t.calls[0]
+    assert (m, url) == ("POST", "https://api.runpod.io/graphql")
+    assert "EU-RO-1" in body["query"]
+
+
 def test_every_request_carries_an_explicit_user_agent():
     """Cloudflare 403s Python's default User-Agent on api.runpod.io."""
     t = FakeTransport([(200, []), (200, {"data": {"myself": {"clientBalance": 1.0}}})])
