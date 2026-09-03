@@ -11,53 +11,42 @@
 
     group {
         name    "folder0"
-        label   "RunPod"
+        label   "Farm"
 
         parm {
             name    "rpfarm_apikey"
             label   "API Key"
             type    string
             default { "" }
-            help    "RunPod API key for authentication. Get it from https://www.runpod.io/console/user/settings"
+            help    "RunPod API key. Leave empty to use the key in ~/.rpfarm/config.toml (written by `rpfarm setup`)."
         }
         parm {
-            name    "rpfarm_gputype"
-            label   "GPU Type"
-            type    ordinal
-            default { "0" }
-            menu {
-                "0" "NVIDIA RTX 4090"
-                "1" "NVIDIA RTX A5000"
-                "2" "NVIDIA A100 80GB"
-                "3" "NVIDIA RTX 4080"
-                "4" "NVIDIA RTX 3090"
-                "5" "NVIDIA L40S"
-                "6" "NVIDIA RTX 5090"
-            }
-            parmtag { "script_callback" "hou.phm().onGpuTypeChanged(kwargs)" }
-            parmtag { "script_callback_language" "python" }
-            help    "GPU model for worker pods"
-        }
-        parm {
-            name    "rpfarm_gputypeid"
-            label   "GPU Type ID"
+            name    "rpfarm_project"
+            label   "Project"
             type    string
-            default { "NVIDIA GeForce RTX 4090" }
-            help    "RunPod GPU type identifier. Auto-filled from GPU Type dropdown, or override manually"
+            default { "" }
+            help    "Project folder on the network volume: /workspace/projects/<user>/<project>. Empty means the name of the $JOB directory."
+        }
+        parm {
+            name    "rpfarm_gpulist"
+            label   "GPU Priority"
+            type    string
+            default { "" }
+            help    "Comma-separated RunPod GPU type names, most wanted first; the first one in stock is used. Empty means gpu_priority from ~/.rpfarm/config.toml."
         }
         parm {
             name    "rpfarm_templateid"
             label   "Template ID"
             type    string
             default { "" }
-            help    "RunPod template ID for the worker Docker image"
+            help    "RunPod template for the pod image. Empty means template_id from ~/.rpfarm/config.toml."
         }
         parm {
             name    "rpfarm_networkvolumeid"
             label   "Network Volume ID"
             type    string
             default { "" }
-            help    "RunPod Network Volume ID containing Houdini installation"
+            help    "Shared network volume mounted at /workspace on every pod. Empty means volume_id from ~/.rpfarm/config.toml."
         }
         parm {
             name    "rpfarm_datacenter"
@@ -71,18 +60,88 @@
                 "US-TX-3"   "US Texas"
                 "CA-MTL-1"  "CA Montreal"
             }
-            help    "Preferred datacenter region for pods"
+            help    "Must be the datacenter the network volume lives in."
         }
         parm {
-            name    "rpfarm_cloudtype"
-            label   "Cloud Type"
-            type    ordinal
-            default { "0" }
-            menu {
-                "0" "Secure Cloud"
-                "1" "Community Cloud"
-            }
-            help    "Secure Cloud is more reliable. Community Cloud is cheaper"
+            name    "sepparm_scaling"
+            label   "Separator"
+            type    separator
+            default { "" }
+        }
+        parm {
+            name    "rpfarm_minpods"
+            label   "Min Pods"
+            type    integer
+            default { "1" }
+            range   { 1 20 }
+            help    "GPU pods created when the cook starts, and the floor the idle timeout respects while work is still queued."
+        }
+        parm {
+            name    "rpfarm_maxpods"
+            label   "Max Pods"
+            type    integer
+            default { "4" }
+            range   { 1 50 }
+            help    "Hard ceiling on GPU pods for this cook."
+        }
+        parm {
+            name    "rpfarm_slots"
+            label   "Tasks Per Pod"
+            type    integer
+            default { "1" }
+            range   { 1 16 }
+            help    "Work items one pod runs at once."
+        }
+        parm {
+            name    "rpfarm_idletimeout"
+            label   "Idle Timeout (sec)"
+            type    integer
+            default { "120" }
+            range   { 30 600 }
+            help    "Terminate a GPU pod after this many seconds with nothing to run. 0 disables it."
+        }
+        parm {
+            name    "rpfarm_syncidle"
+            label   "Sync Pod Idle (min)"
+            type    integer
+            default { "15" }
+            range   { 0 240 }
+            help    "The shared CPU sync pod is retired at the start of the next cook once it has gone unused for this long. 0 keeps it forever."
+        }
+        parm {
+            name    "sepparm_budget"
+            label   "Separator"
+            type    separator
+            default { "" }
+        }
+        parm {
+            name    "rpfarm_maxcost"
+            label   "Budget ($ per cook)"
+            type    float
+            default { "5.0" }
+            range   { 0 500 }
+            help    "Warn at 80%, stop adding pods at 100%, terminate everything and fail the cook at 120%. 0 means no limit."
+        }
+        parm {
+            name    "rpfarm_minbalance"
+            label   "Warn Below Balance ($)"
+            type    float
+            default { "5.0" }
+            range   { 0 100 }
+            help    "Warn before the cook when the RunPod account balance is below this. 0 skips the check."
+        }
+        parm {
+            name    "sepparm_outputs"
+            label   "Separator"
+            type    separator
+            default { "" }
+        }
+        parm {
+            name    "rpfarm_downloadoutputs"
+            label   "Download Outputs"
+            type    toggle
+            default { "1" }
+            help    "Pull each work item's output files back from the volume as soon as it finishes, to the paths the ROP was aimed at."
         }
         parm {
             name    "rpfarm_verbose"
@@ -93,240 +152,210 @@
     }
 
     group {
-        name    "folder1"
-        label   "Scaling"
+        name    "folder_status"
+        label   "Status"
 
         parm {
-            name    "rpfarm_minpods"
-            label   "Min Pods"
-            type    integer
-            default { "2" }
-            range   { 1 20 }
-            help    "Minimum number of pods to keep running during cook"
+            name    "rpfarm_killall"
+            label   "Kill All Pods"
+            type    button
+            default { "0" }
+            parmtag { "script_callback" "hou.phm().onKillAll(kwargs)" }
+            parmtag { "script_callback_language" "python" }
+            help    "Terminate every rpfarm GPU pod belonging to this user, including leftovers from a crashed session. The sync pod is left alone."
         }
         parm {
-            name    "rpfarm_maxpods"
-            label   "Max Pods"
-            type    integer
-            default { "8" }
-            range   { 1 50 }
-            help    "Maximum number of pods (budget limit)"
+            name    "rpfarm_syncledger"
+            label   "Sync Ledger"
+            type    button
+            default { "0" }
+            joinnext
+            parmtag { "script_callback" "hou.phm().onSyncLedger(kwargs)" }
+            parmtag { "script_callback_language" "python" }
+            help    "Copy /workspace/ledger from the volume into ~/.rpfarm/ledger."
         }
         parm {
-            name    "rpfarm_targetqueuedepth"
-            label   "Target Queue Depth"
-            type    integer
-            default { "4" }
-            range   { 1 20 }
-            help    "Target number of tasks per pod in queue. Scale up when exceeded"
-        }
-        parm {
-            name    "rpfarm_scaleupthreshold"
-            label   "Scale Up After (min)"
-            type    integer
-            default { "5" }
-            range   { 1 30 }
-            help    "Minutes of estimated remaining time before scaling up"
-        }
-        parm {
-            name    "rpfarm_scalebatchsize"
-            label   "Scale Batch Size"
-            type    integer
-            default { "2" }
-            range   { 1 8 }
-            help    "Number of pods to add per scale-up event"
-        }
-        parm {
-            name    "rpfarm_idletimeout"
-            label   "Idle Timeout (sec)"
-            type    integer
-            default { "120" }
-            range   { 30 600 }
-            help    "Seconds of idle time before terminating a pod"
+            name    "rpfarm_status_text"
+            label   "Farm Status"
+            type    string
+            default { "" }
+            disablewhen "{ rpfarm_verbose >= 0 }"
+            parmtag { "editor" "1" }
+            parmtag { "editorlines" "8-24" }
+            help    "Read-only: the scheduler rewrites this while it cooks."
         }
     }
 
     group {
-        name    "folder2"
-        label   "Budget"
+        name    "folder_volume"
+        label   "Volume"
 
         parm {
-            name    "rpfarm_maxcost"
-            label   "Max Cost ($)"
-            type    float
-            default { "50.0" }
-            range   { 1 500 }
-            help    "Maximum allowed cost for this cook session"
-        }
-        parm {
-            name    "rpfarm_currentcost"
-            label   "Current Cost ($)"
-            type    float
-            default { "0.0" }
-            range   { 0 500 }
-            help    "Current accumulated cost (read-only, updated during cook)"
+            name    "rpfarm_volume_refresh"
+            label   "Refresh"
+            type    button
+            default { "0" }
+            parmtag { "script_callback" "hou.phm().onVolumeRefresh(kwargs)" }
             parmtag { "script_callback_language" "python" }
+            help    "List /workspace/projects on the volume with sizes. Starts the sync pod if it is not up."
         }
         parm {
-            name    "rpfarm_costperhour"
-            label   "Cost Per Hour ($)"
-            type    float
-            default { "0.0" }
-            range   { 0 100 }
-            help    "Current hourly burn rate (read-only)"
+            name    "rpfarm_volume_target"
+            label   "Target"
+            type    string
+            default { "" }
+            help    "Path under /workspace to delete, e.g. /workspace/projects/may/oldshow."
         }
         parm {
-            name    "rpfarm_estimatedtotal"
-            label   "Estimated Total ($)"
-            type    float
-            default { "0.0" }
-            range   { 0 500 }
-            help    "Estimated total cost at completion (read-only)"
+            name    "rpfarm_volume_delete"
+            label   "Delete Target"
+            type    button
+            default { "0" }
+            parmtag { "script_callback" "hou.phm().onVolumeDelete(kwargs)" }
+            parmtag { "script_callback_language" "python" }
+            help    "Permanently remove Target from the volume. Asks first."
+        }
+        parm {
+            name    "rpfarm_volume_growgb"
+            label   "Grow By (GB)"
+            type    integer
+            default { "100" }
+            range   { 10 2000 }
+            joinnext
+        }
+        parm {
+            name    "rpfarm_volume_grow"
+            label   "Grow Volume"
+            type    button
+            default { "0" }
+            parmtag { "script_callback" "hou.phm().onVolumeGrow(kwargs)" }
+            parmtag { "script_callback_language" "python" }
+            help    "Network volumes can only grow, never shrink."
+        }
+        parm {
+            name    "rpfarm_volume_text"
+            label   "Volume"
+            type    string
+            default { "" }
+            disablewhen "{ rpfarm_verbose >= 0 }"
+            parmtag { "editor" "1" }
+            parmtag { "editorlines" "8-24" }
         }
     }
 
     group {
         name    "folder3"
-        label   "Project"
+        label   "Paths"
 
         parm {
-            name    "rpfarm_redisurl"
-            label   "Redis URL"
+            name    "pdg_workingdir"
+            label   "Local Shared Path"
             type    string
-            default { "" }
-            help    "Redis connection URL (rediss://default:xxx@xxx.upstash.io:6379)"
+            default { "$JOB" }
+            help    "Local root of the project. PDG's temp, script and data directories live under it, and it is the local half of the path map."
         }
         parm {
-            name    "rpfarm_projectid"
-            label   "Project ID"
-            type    string
-            default { "default" }
-            help    "Unique project identifier for Redis namespace isolation"
+            name    "rpfarm_overrideremoteworkingdir"
+            label   "Override Remote Shared Path"
+            type    toggle
+            nolabel
+            joinnext
+            default { "0" }
         }
         parm {
-            name    "rpfarm_userid"
-            label   "User ID"
+            name    "rpfarm_remoteworkingdir"
+            label   "Remote Shared Path"
             type    string
             default { "" }
-            help    "Artist identifier for Redis namespace isolation"
+            disablewhen "{ rpfarm_overrideremoteworkingdir == 0 }"
+            help    "Defaults to /workspace/projects/<user>/<project> on the volume."
         }
-        groupsimple {
-            name    "folder3_paths"
-            label   "Paths"
-
-            parm {
-                name    "pdg_workingdir"
-                label   "Local Shared Path"
-                type    string
-                default { "/project" }
+        parm {
+            name    "pdg_workitemdatasource"
+            label   "Load Item Data From"
+            type    ordinal
+            default { "1" }
+            menu {
+                "0" "Temporary JSON File"
+                "1" "RPC Message"
             }
-            parm {
-                name    "rpfarm_mountinfo"
-                label   "Label"
-                type    label
-                nolabel
-                default { "Ensure the Network Volume is mounted at the Local Shared Path\nbefore starting the cook." }
+            help    "RPC Message fetches each item's data over the MQ, so no per-item file has to be copied to the farm. Temporary JSON File uploads one file per item instead."
+            parmtag { "script_callback_language" "python" }
+        }
+        parm {
+            name    "pdg_deletetempdir"
+            label   "Delete Temp Dir"
+            type    ordinal
+            default { "0" }
+            menu {
+                "0" "Never"
+                "1" "When Scheduler is Deleted"
+                "2" "When Cook Completes"
             }
-            parm {
-                name    "rpfarm_overrideremoteworkingdir"
-                label   "Override Remote Shared Path"
-                type    toggle
-                nolabel
-                joinnext
-                default { "0" }
+            parmtag { "script_callback_language" "python" }
+        }
+        parm {
+            name    "pdg_compressworkitemdata"
+            label   "Compress Work Item Data"
+            type    toggle
+            default { "1" }
+            disablewhen "{ pdg_workitemdatasource == 1 }"
+            parmtag { "script_callback_language" "python" }
+        }
+        parm {
+            name    "pdg_validateoutputs"
+            label   "Validate Outputs When Recooking"
+            type    toggle
+            default { "1" }
+            parmtag { "script_callback_language" "python" }
+        }
+        parm {
+            name    "pdg_checkexpectedoutputs"
+            label   "Check Expected Outputs on Disk"
+            type    toggle
+            default { "1" }
+            parmtag { "script_callback_language" "python" }
+        }
+        parm {
+            name    "sepparm"
+            label   "Separator"
+            type    separator
+            default { "" }
+        }
+        parm {
+            name    "pdg_mapmode"
+            label   "Path Mapping"
+            type    ordinal
+            default { "0" }
+            menu {
+                "0" "Global"
+                "1" "None"
             }
-            parm {
-                name    "rpfarm_remoteworkingdir"
-                label   "Remote Shared Path"
-                type    string
-                default { "/project" }
-                disablewhen "{ rpfarm_overrideremoteworkingdir == 0 }"
+            help    "Global lets the scheduler register $JOB <-> /workspace/projects/<user>/<project> for the cook. None turns path mapping off entirely."
+            parmtag { "script_callback_language" "python" }
+        }
+        parm {
+            name    "pdg_usemapzone"
+            label   "Zone"
+            type    toggle
+            nolabel
+            joinnext
+            default { "0" }
+            disablewhen "{ pdg_mapmode == 1 }"
+            parmtag { "script_callback_language" "python" }
+        }
+        parm {
+            name    "pdg_mapzone"
+            label   "Path Map Zone"
+            type    string
+            default { "$PDG_PATHMAP_ZONE" }
+            disablewhen "{ pdg_usemapzone == 0 }"
+            menureplace {
+                "LINUX" "LINUX"
+                "WIN"   "WIN"
+                "MAC"   "MAC"
             }
-            parm {
-                name    "pdg_workitemdatasource"
-                label   "Load Item Data From"
-                type    ordinal
-                default { "0" }
-                menu {
-                    "0" "Temporary JSON File"
-                    "1" "RPC Message"
-                }
-                parmtag { "script_callback_language" "python" }
-            }
-            parm {
-                name    "pdg_deletetempdir"
-                label   "Delete Temp Dir"
-                type    ordinal
-                default { "0" }
-                menu {
-                    "0" "Never"
-                    "1" "When Scheduler is Deleted"
-                    "2" "When Cook Completes"
-                }
-                parmtag { "script_callback_language" "python" }
-            }
-            parm {
-                name    "pdg_compressworkitemdata"
-                label   "Compress Work Item Data"
-                type    toggle
-                default { "1" }
-                disablewhen "{ pdg_workitemdatasource == 1 }"
-                parmtag { "script_callback_language" "python" }
-            }
-            parm {
-                name    "pdg_validateoutputs"
-                label   "Validate Outputs When Recooking"
-                type    toggle
-                default { "1" }
-                parmtag { "script_callback_language" "python" }
-            }
-            parm {
-                name    "pdg_checkexpectedoutputs"
-                label   "Check Expected Outputs on Disk"
-                type    toggle
-                default { "1" }
-                parmtag { "script_callback_language" "python" }
-            }
-            parm {
-                name    "sepparm"
-                label   "Separator"
-                type    separator
-                default { "" }
-            }
-            parm {
-                name    "pdg_mapmode"
-                label   "Path Mapping"
-                type    ordinal
-                default { "0" }
-                menu {
-                    "0" "Global"
-                    "1" "None"
-                }
-                parmtag { "script_callback_language" "python" }
-            }
-            parm {
-                name    "pdg_usemapzone"
-                label   "Zone"
-                type    toggle
-                nolabel
-                joinnext
-                default { "0" }
-                disablewhen "{ pdg_mapmode == 1 }"
-                parmtag { "script_callback_language" "python" }
-            }
-            parm {
-                name    "pdg_mapzone"
-                label   "Path Map Zone"
-                type    string
-                default { "$PDG_PATHMAP_ZONE" }
-                disablewhen "{ pdg_usemapzone == 0 }"
-                menureplace {
-                    "LINUX" "LINUX"
-                    "WIN"   "WIN"
-                    "MAC"   "MAC"
-                }
-                parmtag { "script_callback_language" "python" }
-            }
+            parmtag { "script_callback_language" "python" }
         }
     }
 
@@ -378,13 +407,14 @@
             name    "mqusage"
             label   "Type"
             type    integer
-            default { "1" }
+            default { "0" }
             menu {
                 "0" "Farm"
                 "1" "Local"
                 "2" "Connect"
             }
             range   { 0 10 }
+            help    "Farm runs mqserver on the sync pod and is the only mode the render pods can reach. Local only works if this machine is reachable from RunPod."
             parmtag { "script_callback_language" "python" }
         }
         parm {
@@ -578,102 +608,6 @@
                 disablewhen "{ rpfarm_usehoudinimaxthreads == 0 }"
                 range   { 0 10 }
                 parmtag { "pdg::scheduler" "" }
-            }
-        }
-
-        groupsimple {
-            name    "folder7_b2"
-            label   "B2 Storage & Compression"
-
-            parm {
-                name    "rpfarm_b2_enabled"
-                label   "Enable B2 Sync"
-                type    toggle
-                default { "1" }
-                help    "Enable file sync via Backblaze B2 + rclone"
-            }
-            parm {
-                name    "rpfarm_b2_key_id"
-                label   "B2 Key ID"
-                type    string
-                default { "" }
-                disablewhen "{ rpfarm_b2_enabled == 0 }"
-                help    "Backblaze B2 application key ID"
-            }
-            parm {
-                name    "rpfarm_b2_app_key"
-                label   "B2 App Key"
-                type    string
-                default { "" }
-                disablewhen "{ rpfarm_b2_enabled == 0 }"
-                help    "Backblaze B2 application key"
-            }
-            parm {
-                name    "rpfarm_b2_bucket"
-                label   "B2 Bucket"
-                type    string
-                default { "runpodfarm-juicefs" }
-                disablewhen "{ rpfarm_b2_enabled == 0 }"
-                help    "B2 bucket name for project storage"
-            }
-            parm {
-                name    "rpfarm_compression_enabled"
-                label   "Enable Compression"
-                type    toggle
-                default { "1" }
-                disablewhen "{ rpfarm_b2_enabled == 0 }"
-                help    "Enable smart compression by file type. Disable for benchmarking"
-            }
-            parm {
-                name    "rpfarm_compression_level"
-                label   "Compression Level"
-                type    integer
-                default { "3" }
-                range   { 1 19 }
-                disablewhen "{ rpfarm_b2_enabled == 0 }"
-                disablewhen "{ rpfarm_compression_enabled == 0 }"
-                help    "Zstd compression level (1=fastest, 19=best ratio, 3=default)"
-            }
-        }
-
-        groupsimple {
-            name    "folder7_metrics"
-            label   "Transfer Metrics"
-
-            parm {
-                name    "rpfarm_metrics_upload_size"
-                label   "Upload Size (MB)"
-                type    float
-                default { "0.0" }
-                help    "Total original upload size (read-only)"
-            }
-            parm {
-                name    "rpfarm_metrics_upload_compressed"
-                label   "Compressed Size (MB)"
-                type    float
-                default { "0.0" }
-                help    "Total compressed upload size (read-only)"
-            }
-            parm {
-                name    "rpfarm_metrics_upload_ratio"
-                label   "Compression Ratio"
-                type    float
-                default { "0.0" }
-                help    "Average compression ratio (read-only)"
-            }
-            parm {
-                name    "rpfarm_metrics_upload_time"
-                label   "Upload Time (s)"
-                type    float
-                default { "0.0" }
-                help    "Total upload time in seconds (read-only)"
-            }
-            parm {
-                name    "rpfarm_metrics_download_time"
-                label   "Download Time (s)"
-                type    float
-                default { "0.0" }
-                help    "Total download time in seconds (read-only)"
             }
         }
     }
