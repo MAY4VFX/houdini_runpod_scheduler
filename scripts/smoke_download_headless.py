@@ -317,25 +317,62 @@ def run_custom(topnet, cfg, timeout, keep):
 # -- outputs mode -----------------------------------------------------------------
 
 
-def run_outputs(cfg, timeout, keep):
-    sched_args = sched_smoke.parse_args([
-        "--items", "1",
-        "--output-item", "0",
-        "--sleep", "3",
-        "--maxcost", "1.0",
-        "--minpods", "1",
-        "--maxpods", "1",
-        "--slots", "1",
-        "--idletimeout", "90",
-        "--timeout", str(timeout),
-    ])
-    topnet, gen, sched, job = sched_smoke.build_graph(sched_args)
-    log("[outputs] $JOB = {}".format(job))
+OUTPUTS_MULTI_DIR = "smoke_out_multi"
+OUTPUTS_MULTI_ITEMS = 3
 
+
+def build_multi_output_graph(job, n_items, sleep, gpus, maxcost, minpods, maxpods, slots, idletimeout):
+    """A genericgenerator where EVERY item declares its own farm-side output
+    file via pdgcmd.addOutputFile -- unlike scripts/smoke_scheduler_headless.py's
+    own --output-item (exactly one index), this is what proves the download
+    node handles a real multi-item farm cook: >=3 upstream items, each with
+    its own resultData, downloaded by ONE runpodfarmdownload cook with no
+    item dropped, no duplicate, and no work-item name collision.
+    """
+    hou.putenv("JOB", job)
+    log("$JOB = {}".format(job))
+
+    topnet = hou.node("/obj").createNode("topnet", "topnet_multi")
+    sched = topnet.createNode("runpodfarmscheduler", "rpfarm")
+    sched.parm("rpfarm_gpulist").set(gpus)
+    sched.parm("rpfarm_maxcost").set(maxcost)
+    sched.parm("rpfarm_minpods").set(minpods)
+    sched.parm("rpfarm_maxpods").set(maxpods)
+    sched.parm("rpfarm_slots").set(slots)
+    sched.parm("rpfarm_idletimeout").set(idletimeout)
+    sched.parm("rpfarm_verbose").set(1)
+    sched.parm("rpfarm_project").set("smoke")
     # Only the download node should prove this path -- not the scheduler's
     # own auto-download (which would otherwise write the exact same local
-    # file via localizePath before the download node ever ran).
+    # files via localizePath before the download node ever ran).
     sched.parm("rpfarm_downloadoutputs").set(0)
+
+    gen = topnet.createNode("genericgenerator", "gen")
+    gen.parm("itemcount").set(n_items)
+    out = '\\$PDG_DIR/{}/\\$PDG_ITEM_NAME.txt'.format(OUTPUTS_MULTI_DIR)
+    report = (
+        '__PDG_PYTHON__ -c \'import os, sys; '
+        'sys.path.insert(0, os.environ["PDG_SCRIPTDIR"]); '
+        'import pdgcmd; pdgcmd.addOutputFile(sys.argv[1])\' "{}"'.format(out))
+    cmd = (
+        'mkdir -p "\\$PDG_DIR/{}" && echo "written by \\$PDG_ITEM_NAME" > "{}" && {}; sleep {}'
+        .format(OUTPUTS_MULTI_DIR, out, report, sleep)
+    )
+    gen.parm("pdg_command").set(cmd)
+    gen.parm("shellcommand").set(1)
+    topnet.parm("topscheduler").set(sched.path())
+    gen.setDisplayFlag(True)
+    log("graph: {} -> {} ({} item(s), each declaring its own output)".format(gen.path(), sched.path(), n_items))
+    return topnet, gen, sched
+
+
+def run_outputs(cfg, timeout, keep):
+    job = tempfile.mkdtemp(prefix="rpfarm-smoke-download-outputs-")
+    topnet, gen, sched = build_multi_output_graph(
+        job, OUTPUTS_MULTI_ITEMS, sleep=3, gpus=sched_smoke.DEFAULT_GPUS,
+        maxcost=1.0, minpods=1, maxpods=1, slots=OUTPUTS_MULTI_ITEMS, idletimeout=90,
+    )
+    log("[outputs] $JOB = {}".format(job))
 
     # IMPORTANT: wire dl_outputs downstream of gen and cook dl_outputs
     # ONCE, in a single cookWorkItems() call -- gen has not cooked yet at
@@ -363,34 +400,64 @@ def run_outputs(cfg, timeout, keep):
 
     dl_succeeded, dl_total, dl_items = report_items(dl)
 
-    checks_ok = (
-        not dl_aborted and dl_total > 0 and dl_succeeded == dl_total
-        and gen_total > 0 and gen_succeeded == gen_total
-    )
-    found_content = None
-    found_path = None
+    # Work-item name collision check (the Task 10 fix under review): with
+    # >=3 upstream items, a stale/restarting per-call counter would have
+    # produced duplicate "download_000"-style names across separate
+    # onGenerate invocations. Names are now derived from the parent
+    # upstream item, so they must all be distinct.
+    dl_names = [item.name for item in dl_items]
+    unique_names_ok = len(dl_names) == len(set(dl_names))
+    log("[outputs] download work item names: {} (unique={})".format(dl_names, unique_names_ok))
+
+    gen_pdg_node = gen.getPDGNode()
+    gen_items = list(gen_pdg_node.workItems) if gen_pdg_node else []
+    expected_upstream_names = {item.name for item in gen_items}
+
+    all_remotes = []
+    content_ok = True
     for item in dl_items:
         try:
             it = json.loads(item.stringAttribValue("rpfarm_item"))
         except Exception as e:
             log("[outputs] could not parse rpfarm_item for {}: {}".format(item.name, e))
+            content_ok = False
             continue
         for local, remote, _size in it.get("files", []):
+            all_remotes.append(remote)
             log("[outputs] item {} file: local={} remote={}".format(item.name, local, remote))
             if os.path.exists(local):
                 with open(local) as f:
                     content = f.read().strip()
-                if found_content is None:
-                    found_content = content
-                    found_path = local
                 log("[outputs]   local file exists, content={!r}".format(content))
+                if not content.startswith("written by"):
+                    content_ok = False
             else:
                 log("[outputs]   MISSING local file {}".format(local))
-                checks_ok = False
+                content_ok = False
 
-    checks_ok = checks_ok and found_content is not None and found_content.startswith("written by")
-    log("[outputs] download node: {} -- {}/{} items, path={}, content={!r}, {:.0f}s".format(
-        "PASS" if checks_ok else "FAIL", dl_succeeded, dl_total, found_path, found_content, dl_elapsed))
+    # Every upstream item's output downloaded exactly once: as many
+    # distinct remote files as upstream items, and no remote seen twice
+    # (which would mean two download work items both claimed the same
+    # output -- a dropped/duplicated planning bug, not just a naming one).
+    no_duplicates_ok = len(all_remotes) == len(set(all_remotes))
+    complete_ok = (
+        len(set(all_remotes)) == len(expected_upstream_names) == OUTPUTS_MULTI_ITEMS
+    )
+    log(
+        "[outputs] {} remote file(s) downloaded for {} upstream item(s) (expected {}); "
+        "no_duplicates={}, complete={}".format(
+            len(all_remotes), len(expected_upstream_names), OUTPUTS_MULTI_ITEMS,
+            no_duplicates_ok, complete_ok
+        )
+    )
+
+    checks_ok = (
+        not dl_aborted and dl_total > 0 and dl_succeeded == dl_total
+        and gen_total > 0 and gen_succeeded == gen_total
+        and unique_names_ok and no_duplicates_ok and complete_ok and content_ok
+    )
+    log("[outputs] download node: {} -- {}/{} work items, {:.0f}s".format(
+        "PASS" if checks_ok else "FAIL", dl_succeeded, dl_total, dl_elapsed))
 
     if not keep:
         shutil.rmtree(job, ignore_errors=True)

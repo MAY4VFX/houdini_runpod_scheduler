@@ -394,12 +394,22 @@ def _write_item_payload(name, it):
     return path
 
 
-for n, (it, parent) in enumerate(planned):
-    # Global counter for the name/payload filename -- it[\"index\"] is only
-    # unique WITHIN one upstream item's own build_download_items() call
-    # (outputs mode plans each upstream item separately, see above), not
-    # across the whole node.
-    name = \"download_{:03d}\".format(n)
+for it, parent in planned:
+    # Name from the parent, not a per-call counter: AllUpstreamCooked makes
+    # this dynamic generation (see above), and PDG may invoke onGenerate
+    # more than once as different upstream items finish cooking -- a plain
+    # \"download_{:03d}\".format(n) restarting at 0 (or continuing from a
+    # stale count) on every separate invocation could then collide with a
+    # name an earlier invocation already used. it[\"index\"] is only unique
+    # WITHIN one upstream item's own build_download_items() call (outputs
+    # mode plans each upstream item separately, see above); a given
+    # upstream item is only ever a parent once (each work item cooks and
+    # reports resultData exactly once), so parent.name + that per-parent
+    # index is globally unique across however many onGenerate calls this
+    # node ends up getting. \"custom\" mode has no parent and exactly one
+    # build_download_items() call total, so its own it[\"index\"] is already
+    # globally unique on its own.
+    name = \"download_{}_{:03d}\".format(parent.name, it[\"index\"]) if parent is not None else \"download_{:03d}\".format(it[\"index\"])
     kwargs = {\"name\": name, \"inProcess\": in_process}
     if parent is not None:
         kwargs[\"parent\"] = parent

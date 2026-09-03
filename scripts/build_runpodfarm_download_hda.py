@@ -230,12 +230,22 @@ def _write_item_payload(name, it):
     return path
 
 
-for n, (it, parent) in enumerate(planned):
-    # Global counter for the name/payload filename -- it["index"] is only
-    # unique WITHIN one upstream item's own build_download_items() call
-    # (outputs mode plans each upstream item separately, see above), not
-    # across the whole node.
-    name = "download_{:03d}".format(n)
+for it, parent in planned:
+    # Name from the parent, not a per-call counter: AllUpstreamCooked makes
+    # this dynamic generation (see above), and PDG may invoke onGenerate
+    # more than once as different upstream items finish cooking -- a plain
+    # "download_{:03d}".format(n) restarting at 0 (or continuing from a
+    # stale count) on every separate invocation could then collide with a
+    # name an earlier invocation already used. it["index"] is only unique
+    # WITHIN one upstream item's own build_download_items() call (outputs
+    # mode plans each upstream item separately, see above); a given
+    # upstream item is only ever a parent once (each work item cooks and
+    # reports resultData exactly once), so parent.name + that per-parent
+    # index is globally unique across however many onGenerate calls this
+    # node ends up getting. "custom" mode has no parent and exactly one
+    # build_download_items() call total, so its own it["index"] is already
+    # globally unique on its own.
+    name = "download_{}_{:03d}".format(parent.name, it["index"]) if parent is not None else "download_{:03d}".format(it["index"])
     kwargs = {"name": name, "inProcess": in_process}
     if parent is not None:
         kwargs["parent"] = parent
@@ -344,6 +354,20 @@ dispatch, and why a plain `python3` (not `hython`) runs it. The Cook In
 Process toggle below switches back to the old callback-only path (this
 node's `cooktask`) for debugging.
 
+Cooking this node when it has an upstream input (`Upstream outputs` mode):
+cook THIS node -- the downstream-most node in the graph -- in one single
+`cookWorkItems()` call. Do not cook the upstream farm-scheduler generator
+node separately first and then cook this one: each top-level
+`cookWorkItems()` call starts its own independent PDG cook, so a second
+call does not treat the first call's already-`CookedSuccess` items as up
+to date -- it recooks the upstream node from scratch too, on
+`runpodfarm_scheduler`, which means a SECOND real (and separately billed)
+GPU pod for work that already ran once. One cook of this node is also the
+intended pattern: it lets `gen`'s item cook on the farm and this node's own
+download item cook locally, in one graph cook, one GPU pod total (live-
+verified; see the Task 10 report, `.superpowers/sdd/2026-09-02-rpfarm-v2/
+task-10-report.md`).
+
 @parameters
 
 Mode:
@@ -368,9 +392,12 @@ Overwrite:
     #id: rpfarm_overwrite
 
     `newer` (default) skips a local file that is not older than its remote
-    counterpart (`rclone --update`). `always` re-downloads unconditionally.
-    `never` skips anything that already exists locally, regardless of mtime
-    (`rclone --ignore-existing`).
+    counterpart (`rclone --update`). `always` adds no extra flag, which is
+    rclone's own default comparison: it still skips a file whose size AND
+    modification time already match the remote exactly, and re-transfers
+    anything else -- "always" here means "no `--update`/`--ignore-existing`
+    override", not "every file every time". `never` skips anything that
+    already exists locally, regardless of mtime (`rclone --ignore-existing`).
 
 Custom Paths:
     #id: rpfarm_custom
@@ -448,7 +475,8 @@ def main():
     )
     overwrite_pt.setHelp(
         "newer: rclone --update (skip a local file that is not older than the remote). "
-        "always: no extra flag, always re-download. never: rclone --ignore-existing."
+        "always: no extra flag -- rclone's own default comparison, which still skips a file "
+        "whose size and mtime already match exactly. never: rclone --ignore-existing."
     )
 
     remote_pt = hou.StringParmTemplate("rpfarm_remote#", "Remote", 1, default_value=("",))
