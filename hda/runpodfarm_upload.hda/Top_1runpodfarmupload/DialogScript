@@ -44,7 +44,7 @@
         label   "Compression"
         type    string
         default { "auto" }
-        help    "auto compresses when no uplink measurement is available, or when uplink < 200 Mbps."
+        help    "auto compresses by default (Ruling R23: no live uplink measurement exists yet -- `rpfarm doctor` will supply one in Task 13, at which point auto starts actually comparing it against 200 Mbps instead of always compressing)."
         menu {
             "auto"  "Auto"
             "on"    "On"

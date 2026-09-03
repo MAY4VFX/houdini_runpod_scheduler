@@ -65,10 +65,14 @@ Package Size (GB):
 Compression:
     #id: rpfarm_compress
 
-    `auto` compresses when no uplink measurement is available (the safe
-    default for an unknown connection) or when a measured uplink is below
-    200 Mbps; `on`/`off` force it. Compressible files are staged to a temp
-    dir with zstd and decompressed on the sync pod after upload -- see
+    `auto` is meant to compress when a measured uplink is below 200 Mbps
+    and skip it above that -- but no node or CLI measures uplink yet
+    (Ruling R23), so today `auto` unconditionally compresses, the safe
+    choice for an unknown connection. `rpfarm doctor` (Task 13) is where
+    that measurement will come from; once it exists, `auto` starts
+    comparing against it with no change needed here. `on`/`off` force it
+    either way. Compressible files are staged to a temp dir with zstd and
+    decompressed on the sync pod after upload -- see
     `rpfarm.sync.compress_stage`.
 
 Custom Paths:
@@ -88,7 +92,11 @@ Post-command:
     makes depend on every package item (the first working option that
     doesn't need a second scheduler pass: package items are added first in
     `onGenerate`, then the post item's dependency on all of them is wired
-    once every item exists). Ignored when empty.
+    once every item exists). Ignored when empty. A non-zero exit fails the
+    work item (`rpfarm.packages.run_upload_item` checks this command's
+    exit code, same as the decompress step -- neither is allowed to fail
+    silently), with a timeout scaled from the item's own byte size (a
+    600s floor, since this item never carries files of its own).
 
 Preset:
     #id: rpfarm_preset
