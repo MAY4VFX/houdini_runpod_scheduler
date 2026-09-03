@@ -1,6 +1,7 @@
 import json
 import os
 import sys
+import threading
 import time
 
 import pytest
@@ -642,3 +643,165 @@ def test_houdini_rm_real_deletion_prunes_cache_entry(tmp_path):
     with open(index_path) as f:
         data = json.load(f)
     assert "22.0.393" not in data.get("_houdini", {})
+
+
+# -- fix round 2, "A": disk-usage only walks projects/, not houdini/apps/ledger --
+
+
+def _count_size_calls(monkeypatch):
+    calls = {"n": 0, "paths": []}
+    real_size = hk._size
+
+    def counting_size(path, timeout_s=hk._SIZE_TIMEOUT_S):
+        calls["n"] += 1
+        calls["paths"].append(path)
+        return real_size(path, timeout_s=timeout_s)
+
+    monkeypatch.setattr(hk, "_size", counting_size)
+    return calls
+
+
+def test_disk_usage_never_walks_static_zones_when_cached(tmp_path, monkeypatch):
+    root = mk(tmp_path)
+    hk.cmd_ls(root)  # populate every zone's cache once, for real
+    calls = _count_size_calls(monkeypatch)
+    hk.cmd_disk_usage(root, volume_size_gb=50)
+    # Only projects/ may be remeasured; houdini/apps/ledger must come
+    # straight from the cache dict, never through _size() at all.
+    assert all("houdini" not in p and "apps" not in p and "ledger" not in p for p in calls["paths"])
+
+
+def test_disk_usage_measures_projects_fresh_even_when_stale(tmp_path, monkeypatch):
+    root = mk(tmp_path)
+    hk.cmd_ls(root)
+    calls = _count_size_calls(monkeypatch)
+    hk.cmd_disk_usage(root, volume_size_gb=50, max_age_s=0)  # force staleness
+    assert any(p.endswith("projects") for p in calls["paths"])
+
+
+def test_disk_usage_partial_when_static_zone_never_measured(tmp_path):
+    root = mk(tmp_path)
+    # No prior ls/disk-usage call -- the _sizes cache is completely empty,
+    # so houdini/apps/ledger are "unknown", not just stale.
+    out = hk.cmd_disk_usage(root, volume_size_gb=50)
+    assert out["partial"] is True
+
+
+def test_disk_usage_refresh_still_walks_everything(tmp_path, monkeypatch):
+    root = mk(tmp_path)
+    hk.cmd_ls(root)
+    calls = _count_size_calls(monkeypatch)
+    hk.cmd_disk_usage(root, volume_size_gb=50, refresh=True)
+    assert any("houdini" in p for p in calls["paths"])
+
+
+# -- fix round 2, "B": touch invalidates the size cache on upload --------------
+
+
+def test_touch_upload_invalidates_project_and_projects_zone_cache(tmp_path):
+    root = mk(tmp_path)
+    hk.cmd_ls(root)  # populate _sizes for "projects" and "may/shotA"
+    index_path = os.path.join(root, ".rpfarm", "index.json")
+    with open(index_path) as f:
+        before = json.load(f)
+    assert "projects" in before["_sizes"] and "may/shotA" in before["_sizes"]
+
+    hk.cmd_touch(root, "may/shotA", "upload")
+
+    with open(index_path) as f:
+        after = json.load(f)
+    assert "projects" not in after.get("_sizes", {})
+    assert "may/shotA" not in after.get("_sizes", {})
+
+
+def test_touch_cook_does_not_invalidate_size_cache(tmp_path):
+    root = mk(tmp_path)
+    hk.cmd_ls(root)
+    hk.cmd_touch(root, "may/shotA", "cook")
+    index_path = os.path.join(root, ".rpfarm", "index.json")
+    with open(index_path) as f:
+        after = json.load(f)
+    assert "projects" in after["_sizes"] and "may/shotA" in after["_sizes"]
+
+
+def test_touch_download_does_not_invalidate_size_cache(tmp_path):
+    root = mk(tmp_path)
+    hk.cmd_ls(root)
+    hk.cmd_touch(root, "may/shotA", "download")
+    index_path = os.path.join(root, ".rpfarm", "index.json")
+    with open(index_path) as f:
+        after = json.load(f)
+    assert "projects" in after["_sizes"] and "may/shotA" in after["_sizes"]
+
+
+def test_touch_upload_invalidation_forces_ls_to_remeasure(tmp_path, monkeypatch):
+    root = mk(tmp_path)
+    hk.cmd_ls(root)
+    hk.cmd_touch(root, "may/shotA", "upload")
+    calls = _count_size_calls(monkeypatch)
+    hk.cmd_ls(root)  # within max_age_s, but the cache entries were invalidated
+    assert any(p.endswith(os.path.join("projects")) for p in calls["paths"])
+    assert any(p.endswith(os.path.join("projects", "may", "shotA")) for p in calls["paths"])
+
+
+# -- fix round 2, "C": _SizeCache.flush() merges, doesn't clobber -------------
+
+
+def test_size_cache_concurrent_flush_merges_not_clobbers(tmp_path):
+    root = str(tmp_path)
+    (tmp_path / ".rpfarm").mkdir()
+
+    start1 = threading.Event()
+    start2 = threading.Event()
+    proceed = threading.Event()
+    errors = []
+
+    def worker(key, value, ready_event):
+        try:
+            index = hk._load_index(root)
+            cache = hk._SizeCache(root, index, "_sizes", False, hk._DEFAULT_MAX_AGE_S, hk._DEFAULT_BUDGET_S)
+            # Simulate "this sweep measured one key" without a real du call.
+            cache.updated[key] = {"bytes": value, "measured_at": 1.0}
+            ready_event.set()
+            proceed.wait(timeout=5)
+            cache.flush()
+        except Exception as e:  # noqa: BLE001 - surfaced via `errors`, not swallowed
+            errors.append(e)
+
+    t1 = threading.Thread(target=worker, args=("zoneA", 111, start1))
+    t2 = threading.Thread(target=worker, args=("zoneB", 222, start2))
+    t1.start()
+    t2.start()
+    assert start1.wait(timeout=5) and start2.wait(timeout=5)
+    proceed.set()
+    t1.join(timeout=5)
+    t2.join(timeout=5)
+
+    assert not errors
+    index = hk._load_index(root)
+    assert index["_sizes"]["zoneA"]["bytes"] == 111
+    assert index["_sizes"]["zoneB"]["bytes"] == 222
+
+
+def test_size_cache_flush_does_not_resurrect_deleted_key(tmp_path):
+    """A flush must merge into the *current* on-disk state, not the
+    read-time snapshot -- if another writer removed a key in between
+    (e.g. touch's invalidation), a stale-snapshot flush must not bring it
+    back for an unrelated key it never even measured."""
+    root = str(tmp_path)
+    (tmp_path / ".rpfarm").mkdir()
+    index = hk._load_index(root)
+    cache = hk._SizeCache(root, index, "_sizes", False, hk._DEFAULT_MAX_AGE_S, hk._DEFAULT_BUDGET_S)
+    cache.cache["stale_key"] = {"bytes": 999, "measured_at": 1.0}  # in the read-time view only
+    cache.updated["fresh_key"] = {"bytes": 1, "measured_at": 2.0}  # actually measured this sweep
+    cache.flush()
+    on_disk = hk._load_index(root)["_sizes"]
+    assert "fresh_key" in on_disk
+    assert "stale_key" not in on_disk
+
+
+# Reviewer-noted, intentionally NOT fixed (documented in the report):
+# `houdini rm <version> --dry-run` still writes the `_houdini` cache via
+# its own `_SizeCache.flush()` -- the cache write is exactly the same
+# size-measurement bookkeeping a real `houdini ls` would do; --dry-run
+# only skips the deletion itself, not the (harmless, correct) caching.

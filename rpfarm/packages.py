@@ -421,7 +421,58 @@ _GB = 2**30
 # ever touching `shutil.disk_usage`; `used` still comes from the same
 # zone/`du -sb` numbers `ls` uses (cached, Ruling R26), never a syscall
 # that reports the wrong thing for the same reason `total` did.
-_AUTO_GROW_EXEC_TIMEOUT_S = 15.0
+#
+# Fix round 2 finding "A": `disk-usage` used to sum all four zones, so a
+# stale cache meant walking `houdini` too -- ~30s cold on the real farm's
+# legacy install, close enough to the old flat 60s exec timeout that the
+# transport could still kill the whole process before `disk-usage`'s own
+# bounded remeasure gave up gracefully, reproducing the exact silent-skip
+# this call was built to avoid. `disk-usage` now only ever walks
+# `projects/` fresh (the one zone an upload can change; `houdini`/`apps`/
+# `ledger` are served from cache however stale, warmed off this path by
+# the scheduler's `onSetupCook`) -- `du -sb /workspace/projects` measured
+# 1.24s cold on the real farm's ~150MB of projects. `_AUTO_GROW_LS_BUDGET_S`
+# leaves an order of magnitude of headroom over that as `projects/` grows
+# over a cook's lifetime; the exec timeout leaves further margin over the
+# internal budget for process startup and network round-trip.
+_AUTO_GROW_LS_BUDGET_S = 20.0
+_AUTO_GROW_EXEC_TIMEOUT_S = 30.0
+
+
+def _volume_size_cache_path():
+    from . import config as rpcfg  # local: packages.py has no other rpcfg dependency
+
+    return rpcfg.home() / "volume_size_cache.json"
+
+
+def _load_volume_size_cache():
+    try:
+        with open(_volume_size_cache_path()) as f:
+            cache = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return cache if isinstance(cache, dict) else {}
+
+
+def set_volume_size_gb(volume_id, size_gb, when=None):
+    """Write ``volume_id``'s size straight into the cache (no API call).
+
+    Used right after a successful ``resize_volume`` (fix round 2, "D"):
+    the new size is already known -- caching it immediately means the
+    *next* upload item's ``get_volume_size_gb`` doesn't need another
+    RunPod round-trip, and, more importantly, doesn't keep deciding
+    against the pre-resize figure for up to 5 minutes and re-issuing an
+    already-satisfied resize.
+    """
+    cache = _load_volume_size_cache()
+    cache[volume_id] = {"size_gb": size_gb, "cached_at": time.time() if when is None else when}
+    try:
+        path = _volume_size_cache_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w") as f:
+            json.dump(cache, f)
+    except OSError:
+        pass
 
 
 def get_volume_size_gb(api, cfg, max_age_s=300.0):
@@ -438,17 +489,8 @@ def get_volume_size_gb(api, cfg, max_age_s=300.0):
     :func:`maybe_grow_volume` already treats an unknown size as "skip",
     not an error.
     """
-    from . import config as rpcfg  # local: packages.py has no other rpcfg dependency
-
-    path = rpcfg.home() / "volume_size_cache.json"
+    cache = _load_volume_size_cache()
     now = time.time()
-    try:
-        with open(path) as f:
-            cache = json.load(f)
-    except (OSError, ValueError):
-        cache = {}
-    if not isinstance(cache, dict):
-        cache = {}
     entry = cache.get(cfg.volume_id)
     if entry and (now - entry.get("cached_at", 0)) < max_age_s:
         return entry.get("size_gb")
@@ -461,13 +503,7 @@ def get_volume_size_gb(api, cfg, max_age_s=300.0):
     if not size_gb:
         return entry.get("size_gb") if entry else None
 
-    cache[cfg.volume_id] = {"size_gb": size_gb, "cached_at": now}
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "w") as f:
-            json.dump(cache, f)
-    except OSError:
-        pass
+    set_volume_size_gb(cfg.volume_id, size_gb, when=now)
     return size_gb
 
 
@@ -502,8 +538,8 @@ def maybe_grow_volume(api, cfg, sync_client, needed_bytes, log=None) -> str:
             return note
 
         result = sync_client.exec(
-            "python3 /opt/rpfarm/housekeeping.py disk-usage --volume-size-gb {}".format(
-                volume_size_gb
+            "python3 /opt/rpfarm/housekeeping.py disk-usage --volume-size-gb {} --budget-s {}".format(
+                volume_size_gb, int(_AUTO_GROW_LS_BUDGET_S)
             ),
             timeout_s=_AUTO_GROW_EXEC_TIMEOUT_S,
         )
@@ -533,6 +569,10 @@ def maybe_grow_volume(api, cfg, sync_client, needed_bytes, log=None) -> str:
         if new_size_gb <= current_gb:
             return "ok" + partial_note
         api.resize_volume(cfg.volume_id, new_size_gb)
+        # Fix round 2, "D": cache the new size immediately -- otherwise
+        # the next item, within the 5-minute window, still sees the
+        # pre-resize figure and can re-issue an already-satisfied resize.
+        set_volume_size_gb(cfg.volume_id, new_size_gb)
         note = "grown to {} GB".format(new_size_gb) + partial_note
         log(
             "volume {} auto-grown {} GB -> {} GB ({:.0f}% full before this upload)".format(

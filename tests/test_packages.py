@@ -924,7 +924,9 @@ def test_maybe_grow_volume_passes_real_size_to_disk_usage(rpfarm_home):
     api = _FakeApi(size_gb=50)
     sync_client = _DiskUsageSyncClient(used=10 * gb)
     maybe_grow_volume(api, _GrowCfg(), sync_client, needed_bytes=1 * gb)
-    assert sync_client.commands == ["python3 /opt/rpfarm/housekeeping.py disk-usage --volume-size-gb 50"]
+    assert sync_client.commands == [
+        "python3 /opt/rpfarm/housekeeping.py disk-usage --volume-size-gb 50 --budget-s 20"
+    ]
 
 
 def test_maybe_grow_volume_grows_past_threshold(rpfarm_home):
@@ -934,6 +936,27 @@ def test_maybe_grow_volume_grows_past_threshold(rpfarm_home):
     result = maybe_grow_volume(api, _GrowCfg(), sync_client, needed_bytes=2 * gb)
     assert api.resized == [("vol1", 60)]  # ceil(46/0.8/10)*10 = 60
     assert result == "grown to 60 GB"
+
+
+def test_maybe_grow_volume_caches_new_size_after_resize(rpfarm_home):
+    """Fix round 2, "D": the next item, within the 5-minute window, must
+    see the *new* size -- not re-issue an already-satisfied resize
+    against the stale pre-resize figure."""
+    gb = 2**30
+    api = _FakeApi(size_gb=50)
+    sync_client = _DiskUsageSyncClient(used=44 * gb)
+    maybe_grow_volume(api, _GrowCfg(), sync_client, needed_bytes=2 * gb)
+    assert api.resized == [("vol1", 60)]
+    assert api.get_volume_calls == 1  # only the very first lookup hit the API
+
+    # A second item, same "session": used is now safely under 60GB's 85%,
+    # so no second resize should fire, and it must not need another
+    # get_volume() call either -- the cache already has the new number.
+    sync_client2 = _DiskUsageSyncClient(used=44 * gb)
+    result2 = maybe_grow_volume(api, _GrowCfg(), sync_client2, needed_bytes=2 * gb)
+    assert result2 == "ok"
+    assert api.resized == [("vol1", 60)]  # unchanged -- no re-issued resize
+    assert api.get_volume_calls == 1  # still just the one API call, ever
 
 
 def test_maybe_grow_volume_no_op_under_threshold(rpfarm_home):
