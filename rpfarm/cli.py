@@ -133,16 +133,26 @@ def _days_ago_iso(days):
 def _parse_pod_timestamp(value):
     """RunPod's pod ``createdAt`` as epoch seconds, or ``None``.
 
-    Accepts an ISO8601 string (``...Z`` or ``+00:00``) or a raw epoch
-    number -- the REST API has been observed to return either depending on
-    endpoint/version, and neither is worth failing ``farm status`` over.
+    A raw epoch number is accepted as-is. Otherwise this tries RunPod
+    REST's own actual format first -- confirmed live 2026-09-03 against a
+    real ``GET /pods`` response: ``"2026-09-03 21:19:39.775 +0000 UTC"``,
+    not ISO8601 despite ``openapi.json`` documenting the field as a plain
+    string with no format -- then falls back to ISO8601 (``...Z`` or
+    ``+00:00``) in case a future API revision changes it. Neither format
+    matching is worth failing ``farm status`` over: an unparseable
+    timestamp just means uptime/est-cost show as ``"?"`` for that pod.
     """
     if value is None:
         return None
     if isinstance(value, (int, float)):
         return float(value)
+    s = str(value)
     try:
-        return datetime.datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+        return datetime.datetime.strptime(s, "%Y-%m-%d %H:%M:%S.%f %z UTC").timestamp()
+    except ValueError:
+        pass
+    try:
+        return datetime.datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
     except ValueError:
         return None
 
