@@ -10,131 +10,157 @@
 
 == Overview ==
 
-This scheduler creates and manages a pool of RunPod GPU pods to execute PDG work items. Work items are distributed via a Redis queue, and results are collected through Redis and MQ.
+This scheduler creates and manages a pool of RunPod GPU pods to execute PDG work
+items. Work items are dispatched over plain HTTP to a small worker daemon on each
+pod; PDG's own `mqserver` runs on a shared CPU "sync" pod and is reached over its
+public ports, so work item results and attributes come back through the standard
+PDG path. Files move by `rclone` over sftp to the same sync pod, which mounts the
+shared network volume.
 
 The scheduler supports:
-* Automatic pod pool management with configurable min/max pods
-* Autoscaling based on queue depth and estimated remaining work
-* Budget tracking with configurable cost limits
-* Pod health monitoring via heartbeats
-* Network volume support for shared storage
+* Automatic pod pool management with configurable min/max pods and slots per pod
+* Autoscaling from the measured cook rate, and idle pods retired automatically
+* Budget tracking with a per-cook cost limit and a hard kill at 120% of it
+* Pod health monitoring, with a dead pod's work items requeued onto another pod
+* A shared network volume for Houdini, project files and the run ledger
+* Per-work-item output download back to the local paths the ROPs were aimed at
 
 Before using the scheduler, you need:
-* A RunPod account with API key
-* A RunPod template (Docker image) with Houdini installed
-* A Redis instance accessible from both your machine and RunPod pods
-* Optionally, a RunPod Network Volume for shared storage
+* A RunPod account with an API key and a network volume
+* A RunPod template built from `pod/Dockerfile` in this repository
+* `~/.rpfarm/config.toml` and an SSH key pair, both written by `rpfarm setup`
 
 == Setup ==
 
-# Install the `redis` Python package to `hython`:
-    * `hython -m pip install redis`
+# Run `rpfarm setup`. It writes `~/.rpfarm/config.toml` (API key, user name,
+  volume and template ids, GPU priority), generates `~/.rpfarm/id_ed25519`,
+  downloads a private `rclone`, and symlinks `~/.rpfarm/src` at this checkout.
+# Create the RunPod template and network volume, and install Houdini onto the
+  volume under `/workspace/houdini/<version>`.
+# Add a __RunPod Farm Scheduler__ to your TOP network and set it as the scheduler.
+# Leave __API Key__, __Template ID__, __Network Volume ID__ and __GPU Priority__
+  empty to use the values from `~/.rpfarm/config.toml`.
 
-# Restart Houdini to register the scheduler with PDG.
+== Cooking ==
 
-# Create a RunPod template with your Houdini Docker image.
+On cook the scheduler will:
+* Bring up (or reuse) the shared CPU sync pod and start `mqserver` on it
+* Upload PDG's job scripts to the network volume
+* Create GPU pods and dispatch work items to their worker daemons over HTTP
+* Download each work item's outputs as it succeeds
+* Terminate every GPU pod of the cook when the cook ends
 
-# Set up a Redis instance (e.g., Redis Cloud, or self-hosted with TLS).
+== Tips ==
 
-# Configure the scheduler parameters on the node.
+* Use the __Status__ tab to watch pods, tasks and spend during a cook, and
+  __Kill All Pods__ to terminate anything left behind by an interrupted session.
 
-== Using the Scheduler ==
-
-# Enter the __API Key__, __GPU Type__, __Template ID__, and __Redis URL__ parameters.
-
-# Set the __Min Pods__ and __Max Pods__ for your pod pool.
-
-# Optionally configure __Max Cost__ to set a budget limit.
-
-# Cook your TOP network. The scheduler will:
-    * Create an initial pool of pods (Min Pods)
-    * Distribute work items via Redis
-    * Autoscale pods based on queue depth and estimated remaining time
-    * Track costs and stop scaling if over budget
-    * Terminate pods when the cook completes
-
-=== Troubleshooting ===
-
-* Ensure your Redis instance is accessible from both your local machine and RunPod pods. Use `rediss://` (TLS) URLs for production.
-
-* If pods are not starting, check your RunPod API key, template ID, and GPU availability in the selected datacenter.
+* If pods are not starting, check the API key, template id, and whether the GPU
+  types in __GPU Priority__ are in stock in the datacenter.
 
 * Enable __Verbose Logging__ for detailed output to the Houdini console.
 
-* If tasks are timing out, check that the pod worker script is correctly reading from the Redis task queue.
+* Per-task logs live on the volume under `/workspace/ledger/logs/<cook>/`, and
+  the MQ log under `/workspace/ledger/logs/mq_<cook>.log`. __Sync Ledger__ pulls
+  the ledger down to `~/.rpfarm/ledger`.
 
 @parameters
 
-== RunPod == (runpodparam)
+== Farm == (runpodparam)
 
-Global parameters describing the RunPod configuration.
+Global parameters describing the RunPod configuration. Every one of these may be
+left empty to fall back to `~/.rpfarm/config.toml`.
 
 API Key:
     #id: rpfarm_apikey
 
-    (Required) Your RunPod API key for authentication. Can be generated from the RunPod web console under Settings > API Keys.
+    Your RunPod API key. Generated from the RunPod web console under
+    Settings > API Keys. Empty means `api_key` from `~/.rpfarm/config.toml`.
 
-GPU Type:
-    #id: rpfarm_gputype
+Project:
+    #id: rpfarm_project
 
-    The GPU model to request for pods. Examples: `NVIDIA RTX A6000`, `NVIDIA GeForce RTX 4090`, `NVIDIA A100 80GB PCIe`.
+    Project folder on the network volume: `/workspace/projects/<user>/<project>`.
+    Empty means the name of the `$JOB` directory.
+
+GPU Priority:
+    #id: rpfarm_gpulist
+
+    Comma-separated RunPod GPU type names, most wanted first; the first one in
+    stock is used. Example:
+    `NVIDIA RTX A4500, NVIDIA GeForce RTX 4090`. Empty means `gpu_priority` from
+    `~/.rpfarm/config.toml`.
 
 Template ID:
     #id: rpfarm_templateid
 
-    (Required) The RunPod template ID defining the Docker image and configuration for pods. The template should include a Houdini installation and the pod worker script.
+    The RunPod template defining the pod image. It must be built from
+    `pod/Dockerfile` in this repository, which carries the worker daemon.
 
 Network Volume ID:
     #id: rpfarm_networkvolumeid
 
-    The RunPod Network Volume ID for shared storage between pods. The volume is mounted at `/workspace` inside the pod.
+    The RunPod network volume shared by every pod, mounted at `/workspace`. It
+    holds Houdini, the project files and the ledger.
 
 Datacenter:
     #id: rpfarm_datacenter
 
-    Preferred RunPod datacenter region. Leave empty for automatic selection.
+    RunPod datacenter region. The network volume only exists in one region, so
+    this has to match it.
 
-== Scaling == (scalingparam)
-
-Parameters controlling pod pool autoscaling behavior.
+=== Scaling ===
 
 Min Pods:
     #id: rpfarm_minpods
 
-    Minimum number of pods to keep running during a cook. These pods are created at the start of the cook and maintained until completion.
+    Pods created at the start of the cook. They are kept while work is queued;
+    once the queue is empty even these are retired when they go idle.
 
 Max Pods:
     #id: rpfarm_maxpods
 
-    Maximum number of pods allowed. The autoscaler will not create more pods than this limit.
+    Ceiling on the pod pool. The autoscaler never goes above it.
 
-== Budget == (budgetparam)
+Slots Per Pod:
+    #id: rpfarm_slots
 
-Parameters controlling cost limits.
+    Work items one pod runs at the same time. Raise it for cheap items that do
+    not saturate the GPU; leave it at 1 for renders.
+
+Idle Timeout (s):
+    #id: rpfarm_idletimeout
+
+    A pod with nothing to do for this long is terminated. 0 disables it.
+
+Sync Pod Idle (min):
+    #id: rpfarm_syncidle
+
+    The shared sync pod survives between cooks. When the next cook finds it
+    unused for longer than this, it is terminated first. 0 keeps it forever.
+
+=== Budget ===
 
 Max Cost ($):
     #id: rpfarm_maxcost
 
-    Maximum allowed cost in USD for this cook. When the estimated cost reaches this limit, the scheduler stops creating new pods. Set to 0 for unlimited.
+    Cost limit in USD for this cook. At 80% the scheduler warns, at 100% it
+    stops adding pods, and at 120% it terminates every pod and cancels the
+    cook. 0 means no limit.
 
-== Project == (projectparam)
+Min Balance ($):
+    #id: rpfarm_minbalance
 
-Parameters identifying the project and Redis connection.
+    A RunPod account balance below this only produces a warning at the start of
+    the cook; the cook goes ahead either way. 0 disables the check.
 
-Redis URL:
-    #id: rpfarm_redisurl
+=== Outputs ===
 
-    (Required) The Redis connection URL. Supports `redis://` and `rediss://` (TLS) schemes. Example: `rediss://default:password@host:port`.
+Download Outputs:
+    #id: rpfarm_downloadoutputs
 
-Project ID:
-    #id: rpfarm_projectid
-
-    Unique project identifier used to namespace Redis keys. This ensures multiple projects can share the same Redis instance without conflicts.
-
-User ID:
-    #id: rpfarm_userid
-
-    User identifier for task queue namespacing.
+    When on, each work item's output files are pulled from the network volume
+    back to the local paths they map to as soon as the item succeeds.
 
 === Paths ===
 
@@ -146,7 +172,9 @@ Local Shared Path:
 Remote Shared Path:
     #id: rpfarm_remoteworkingdir
 
-    When enabled, overrides the path to the mounted directory on the RunPod pod. Typically `/workspace` when using Network Volumes.
+    When enabled, overrides the working directory on the pods. The default is
+    this cook's project directory on the network volume,
+    `/workspace/projects/<user>/<project>`.
 
 :include _scheduler_common#pdg_workitemdatasource:
 
@@ -185,7 +213,10 @@ Save Task Graph File:
 == Message Queue ==
 #id: messagequeue
 
-    The Message Queue (MQ) server is required to get work item results from the jobs running on RunPod pods. The MQ runs locally and communicates with pods via the network.
+    The Message Queue (MQ) server is how work item results get back from jobs
+    running on RunPod pods. __Farm__ runs `mqserver` on the shared sync pod and
+    is the only mode the render pods can reach from RunPod's network; __Local__
+    only works if this machine is reachable from the internet.
 
 :include _scheduler_common#mqusage:
 
@@ -258,11 +289,6 @@ Verbose Logging:
     #id: rpfarm_verbose
 
     When on, prints detailed output to console. Can be useful for debugging problems.
-
-Warmup Paths:
-    #id: rpfarm_warmuppaths
-
-    Comma-separated list of file paths to pre-cache on pods before executing tasks. This can speed up initial task execution.
 
 @related
 
