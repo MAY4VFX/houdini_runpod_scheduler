@@ -127,19 +127,39 @@ def _items_from_groups(groups, max_bytes):
 def _group_by_pathmap(entries, path_map):
     """Assign each entry to the ``(local_root, remote_root)`` from
     ``path_map`` whose local prefix it falls under (longest match wins).
+
+    Two passes, matching :func:`rpfarm.deps.resolve_entries`'s own
+    inside/outside logic: a literal prefix check first, then -- because a
+    symlinked ``$JOB`` (or any symlinked root) means a real file's
+    ``FileEntry.local`` need not literally start with any ``path_map`` key
+    even though it resolves under one -- a ``os.path.realpath`` comparison
+    for anything the literal check misses. An entry that matches neither
+    is a real bug upstream (``resolve_entries`` is supposed to produce a
+    ``path_map`` entry covering everything it returns), so this raises
+    rather than silently filing it under an arbitrary root.
     """
     roots = sorted(path_map.items(), key=lambda kv: -len(kv[0]))
+    real_roots = [(local, os.path.realpath(local)) for local, _ in roots]
     buckets = {local: [] for local, _ in roots}
+
     for e in entries:
+        matched = None
         for local, _remote in roots:
             if e.local == local or e.local.startswith(local + os.sep) or e.local.startswith(local + "/"):
-                buckets[local].append(e)
+                matched = local
                 break
-        else:
-            # Should not happen: resolve_entries always produces a path_map
-            # entry covering every entry it returns. Fall back to the job
-            # root (first/longest-shared entry) rather than dropping data.
-            buckets[roots[0][0]].append(e)
+        if matched is None:
+            e_real = os.path.realpath(e.local)
+            for local, local_real in real_roots:
+                if e_real == local_real or e_real.startswith(local_real + os.sep):
+                    matched = local
+                    break
+        if matched is None:
+            raise ValueError(
+                "entry {!r} is not under any path_map root {}".format(e.local, [r for r, _ in roots])
+            )
+        buckets[matched].append(e)
+
     return [(local, path_map[local], es) for local, es in buckets.items() if es]
 
 
@@ -232,6 +252,47 @@ def houdini_install_preset(tar_local_path, version):
     return pairs, post_command
 
 
+# -- remote command execution -----------------------------------------------
+
+# Timeout for the decompress/post-command exec() calls, scaled from the
+# item's own byte size rather than left at exec()'s 600s default -- the
+# addendum notes unpacking tens of GB takes minutes, and the default alone
+# doesn't say so. A floor keeps a small package from being cut off by a
+# slow pod; a ceiling keeps a genuinely stuck remote command from hanging
+# a work item forever. The synthetic R3 "post" item always has bytes=0 (it
+# carries no files of its own -- see build_upload_items' caller in the
+# HDA's onGenerate), so a post-command that runs on it -- the Houdini
+# install preset today -- always gets the floor; that has been enough in
+# practice (design spec 3.2: a cold hython start alone was ~104s, and the
+# installer itself is mostly a filesystem copy, not a multi-GB unpack).
+_EXEC_TIMEOUT_FLOOR_S = 600
+_EXEC_TIMEOUT_CEILING_S = 3 * 3600
+_EXEC_BYTES_PER_SECOND = 5 * 2**20  # ~5 MB/s: a conservative pod-side IO/decompress rate
+
+
+def _scaled_timeout(num_bytes):
+    return int(min(_EXEC_TIMEOUT_CEILING_S, max(_EXEC_TIMEOUT_FLOOR_S, (num_bytes or 0) / _EXEC_BYTES_PER_SECOND)))
+
+
+def _exec_checked(sync_client, command, timeout_s):
+    """Run one command on the sync pod; raise RuntimeError on non-zero exit.
+
+    Same contract as the scheduler's own ``_volume_exec`` (``hda/
+    runpodfarm_scheduler.hda/.../PythonModule``, ``_volume_exec``): a
+    failed remote command must never be swallowed as a successful work
+    item. Only the tail of stderr is kept in the message -- a failed
+    Houdini install can log megabytes.
+    """
+    result = sync_client.exec(command, timeout_s=timeout_s)
+    if result.get("exit_code") != 0:
+        stderr = (result.get("stderr") or "").strip()
+        tail = stderr[-2000:] if stderr else "(no stderr)"
+        raise RuntimeError(
+            "remote command failed (exit {}): {}\ncommand: {}".format(result.get("exit_code"), tail, command)
+        )
+    return result
+
+
 # -- path map --------------------------------------------------------------
 
 
@@ -305,12 +366,14 @@ def run_upload_item(item, cfg, sftp, sync_client, compress, progress_cb=None):
         if entries:
             _accumulate(rclone_copy(entries, sftp, "up", cfg.rclone_path, local_root, remote_root, progress_cb=progress_cb))
 
+    timeout_s = _scaled_timeout(item.get("bytes"))
+
     if decompress_command:
-        sync_client.exec(decompress_command)
+        _exec_checked(sync_client, decompress_command, timeout_s)
 
     post_command = item.get("post_command") or ""
     if post_command:
-        sync_client.exec(post_command)
+        _exec_checked(sync_client, post_command, timeout_s)
 
     sync_client.exec("mkdir -p /workspace/.rpfarm && touch /workspace/.rpfarm/sync_last_used")
 
