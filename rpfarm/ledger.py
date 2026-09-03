@@ -32,7 +32,10 @@ from __future__ import annotations
 import csv
 import json
 import os
+import posixpath
 from pathlib import Path
+
+from rpfarm.sync import FileEntry, rclone_copy
 
 
 def append(path, **record) -> None:
@@ -320,3 +323,42 @@ def sync_from_volume(client, local_dir, user) -> int:
         local_path.write_text(content)
         new_count += 1
     return new_count
+
+
+def mirror_to_volume(local_path, user, target, rclone_bin, progress_cb=None):
+    """Push one local ledger ``.jsonl`` file up to the volume's
+    ``/workspace/ledger/<user>/`` mirror (Ruling R25).
+
+    Before this, nothing ever wrote to the volume's ledger tree -- verified
+    live (2026-09-03): ``find /workspace/ledger -type f`` showed only
+    ``logs/``, no ``*.jsonl`` at all, which made ``sync_from_volume``
+    structurally useless (nothing to pull) and defeated the point of this
+    whole task: several people on one account are supposed to end up with
+    one shared record. This is the write side; ``sync_from_volume`` is the
+    read side (through the worker HTTP API instead of rclone -- see its own
+    docstring for why the two use different transports).
+
+    Uses ``rpfarm.sync.rclone_copy`` with a single-entry package, over
+    *target* (an already-connected :class:`rpfarm.sync.SftpTarget` --
+    callers reuse the sync pod connection a cook already holds rather than
+    standing up a new one just for this). ``local_root``/``remote_root``
+    satisfy ruling R8's invariant by construction: ``local_root`` is
+    *local_path*'s own parent directory (``~/.rpfarm/ledger``),
+    ``remote_root`` is ``/workspace/ledger/<user>``, and the one
+    :class:`~rpfarm.sync.FileEntry`'s ``remote`` is
+    ``posixpath.join(remote_root, basename(local_path))`` -- exactly
+    ``relpath(local_path, local_root)`` mapped onto ``remote_root``.
+
+    Raises :class:`rpfarm.sync.SyncError` (from ``rclone_copy``) or
+    ``OSError`` (from ``os.path.getsize`` if *local_path* vanished) on
+    failure. Callers (the scheduler's ``onStopCook``) are expected to catch
+    both and treat a failed mirror as "the ledger stayed local-only", never
+    as a reason to fail the cook itself.
+    """
+    local_path = str(local_path)
+    local_root = os.path.dirname(local_path)
+    remote_root = posixpath.join("/workspace/ledger", user)
+    remote = posixpath.join(remote_root, os.path.basename(local_path))
+    size = os.path.getsize(local_path)
+    package = [FileEntry(local=local_path, remote=remote, size=size)]
+    return rclone_copy(package, target, "up", rclone_bin, local_root, remote_root, progress_cb=progress_cb)
