@@ -186,6 +186,18 @@ def test_houdini_preset():
     assert "--accept-EULA" in post
 
 
+def test_houdini_preset_invalidates_houdini_zone_cache(tmp_path):
+    """Fix round 3, "2": an install adds bytes to the houdini zone but
+    doesn't touch a project, so cmd_touch's upload-invalidation (fix
+    round 2, "B") never fires for it -- the preset must invalidate that
+    zone itself, and it must run *before* the final `ls` proof step
+    (an install that fails partway shouldn't leave the cache invalidated
+    based on a step that never actually ran)."""
+    _pairs, post = houdini_install_preset("/dl/houdini-22.0.393-linux_x86_64_gcc14.2.tar.gz", "22.0.393")
+    assert "housekeeping.py invalidate houdini" in post
+    assert post.index("invalidate houdini") < post.index("ls /workspace/houdini/22.0.393/bin/hython")
+
+
 def test_houdini_preset_pair_feeds_build_upload_items(tmp_path):
     tar = tmp_path / "houdini-22.0.393-linux_x86_64_gcc14.2.tar.gz"
     tar.write_bytes(b"x" * 10)
