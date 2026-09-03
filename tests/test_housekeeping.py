@@ -356,3 +356,173 @@ def test_main_unknown_touch_event_exits_nonzero(tmp_path, capsys, monkeypatch):
 def test_main_bad_command_exits_nonzero(capsys):
     rc = hk.main(["housekeeping.py", "not-a-command"])
     assert rc == 2
+
+
+# -- Ruling R26: du -sb fast path -----------------------------------------
+
+
+@pytest.fixture
+def reset_du_flag():
+    """`_DU_B_UNSUPPORTED` is a sticky module-level flag by design (Ruling
+    R26) -- save/restore it so one test's mocked `du` behavior can't leak
+    into another."""
+    original = hk._DU_B_UNSUPPORTED
+    yield
+    hk._DU_B_UNSUPPORTED = original
+
+
+def test_size_uses_du_sb_when_available(tmp_path, monkeypatch, reset_du_flag):
+    hk._DU_B_UNSUPPORTED = False
+    calls = []
+
+    def fake_run(cmd, capture_output, text, timeout):
+        calls.append(cmd)
+        return subprocess_completed(returncode=0, stdout="424242\t/some/path\n", stderr="")
+
+    monkeypatch.setattr(hk.subprocess, "run", fake_run)
+    assert hk._size(str(tmp_path)) == 424242
+    assert calls and calls[0][:2] == ["du", "-sb"]
+
+
+def test_size_falls_back_to_walk_when_du_b_unsupported(tmp_path, monkeypatch, reset_du_flag):
+    hk._DU_B_UNSUPPORTED = False
+    (tmp_path / "f.txt").write_bytes(b"x" * 77)
+
+    def fake_run(cmd, capture_output, text, timeout):
+        return subprocess_completed(returncode=1, stdout="", stderr="du: illegal option -- b\n")
+
+    monkeypatch.setattr(hk.subprocess, "run", fake_run)
+    assert hk._size(str(tmp_path)) == 77
+    assert hk._DU_B_UNSUPPORTED is True  # sticky: won't retry `du -sb` again this process
+
+
+def test_size_returns_none_on_timeout_without_falling_back(tmp_path, monkeypatch, reset_du_flag):
+    hk._DU_B_UNSUPPORTED = False
+
+    def fake_run(cmd, capture_output, text, timeout):
+        raise hk.subprocess.TimeoutExpired(cmd, timeout)
+
+    monkeypatch.setattr(hk.subprocess, "run", fake_run)
+    assert hk._size(str(tmp_path), timeout_s=1) is None
+    assert hk._DU_B_UNSUPPORTED is False  # a timeout says nothing about -b support
+
+
+class _FakeCompletedProcess:
+    def __init__(self, returncode, stdout, stderr):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+def subprocess_completed(returncode, stdout, stderr):
+    return _FakeCompletedProcess(returncode, stdout, stderr)
+
+
+# -- Ruling R26: ls/houdini ls size caching --------------------------------
+
+
+def test_ls_serves_cached_size_without_remeasuring(tmp_path, monkeypatch):
+    root = mk(tmp_path)
+    calls = {"n": 0}
+    real_size = hk._size
+
+    def counting_size(path, timeout_s=hk._SIZE_TIMEOUT_S):
+        calls["n"] += 1
+        return real_size(path, timeout_s=timeout_s)
+
+    monkeypatch.setattr(hk, "_size", counting_size)
+    hk.cmd_ls(root)
+    first = calls["n"]
+    assert first > 0
+    hk.cmd_ls(root)  # within max_age_s -- must be served from cache
+    assert calls["n"] == first
+
+
+def test_ls_refresh_forces_remeasure(tmp_path, monkeypatch):
+    root = mk(tmp_path)
+    calls = {"n": 0}
+    real_size = hk._size
+
+    def counting_size(path, timeout_s=hk._SIZE_TIMEOUT_S):
+        calls["n"] += 1
+        return real_size(path, timeout_s=timeout_s)
+
+    monkeypatch.setattr(hk, "_size", counting_size)
+    hk.cmd_ls(root)
+    first = calls["n"]
+    hk.cmd_ls(root, refresh=True)
+    assert calls["n"] > first
+
+
+def test_ls_stale_cache_remeasures(tmp_path, monkeypatch):
+    root = mk(tmp_path)
+    calls = {"n": 0}
+    real_size = hk._size
+
+    def counting_size(path, timeout_s=hk._SIZE_TIMEOUT_S):
+        calls["n"] += 1
+        return real_size(path, timeout_s=timeout_s)
+
+    monkeypatch.setattr(hk, "_size", counting_size)
+    hk.cmd_ls(root)
+    first = calls["n"]
+    hk.cmd_ls(root, max_age_s=0)  # everything counts as stale
+    assert calls["n"] > first
+
+
+def test_ls_partial_when_measurement_times_out(tmp_path, monkeypatch):
+    root = mk(tmp_path)
+    monkeypatch.setattr(hk, "_size", lambda path, timeout_s=hk._SIZE_TIMEOUT_S: None)
+    out = hk.cmd_ls(root)
+    assert out["partial"] is True
+    assert out["zones"]["projects"] == 0  # no cache yet, timed out -> reports 0
+
+
+def test_ls_partial_serves_stale_cache_instead_of_zero(tmp_path, monkeypatch):
+    root = mk(tmp_path)
+    hk.cmd_ls(root)  # populate the cache for real first
+    monkeypatch.setattr(hk, "_size", lambda path, timeout_s=hk._SIZE_TIMEOUT_S: None)
+    out = hk.cmd_ls(root, refresh=True)  # force a re-measure attempt, which "times out"
+    assert out["partial"] is True
+    assert out["zones"]["projects"] == 1010  # served the last known-good value, not 0
+
+
+def test_ls_out_of_budget_reports_partial(tmp_path):
+    root = mk(tmp_path)
+    hk.cmd_ls(root)  # populate cache
+    out = hk.cmd_ls(root, refresh=True, budget_s=0)  # no time left for any remeasure
+    assert out["partial"] is True
+    assert out["zones"]["projects"] == 1010  # stale cache served, not blocked
+
+
+def test_houdini_ls_partial_and_cache_same_as_ls(tmp_path, monkeypatch):
+    root = mk(tmp_path)
+    hk.cmd_houdini_ls(root)
+    monkeypatch.setattr(hk, "_size", lambda path, timeout_s=hk._SIZE_TIMEOUT_S: None)
+    out = hk.cmd_houdini_ls(root, refresh=True)
+    assert out["partial"] is True
+    by_version = {v["version"]: v["bytes"] for v in out["versions"]}
+    assert by_version["22.0.393"] == 0  # stale cache (was 0 the first time too)
+
+
+# -- houdini rm --dry-run ---------------------------------------------------
+
+
+def test_houdini_rm_dry_run_does_not_delete_version(tmp_path):
+    root = mk(tmp_path)
+    result = hk.cmd_houdini_rm(root, "22.0.393", dry_run=True)
+    assert result["ok"] is True
+    assert result["dry_run"] is True
+    assert (tmp_path / "houdini/22.0.393").exists()
+
+
+def test_houdini_rm_dry_run_legacy_does_not_delete(tmp_path):
+    root = mk(tmp_path)
+    (tmp_path / "houdini/bin").mkdir()
+    (tmp_path / "houdini/bin/hexpand").write_bytes(b"x" * 10)
+    result = hk.cmd_houdini_rm(root, "legacy", dry_run=True)
+    assert result["ok"] is True
+    assert result["dry_run"] is True
+    assert result["bytes_freed"] == 10
+    assert (tmp_path / "houdini/bin").exists()
+    assert (tmp_path / "houdini/22.0.393").exists()

@@ -10,14 +10,18 @@ stdlib only -- deployed as-is to Ubuntu 22.04 / python3.10 pods alongside
 
 Commands (see ``main()``/each ``cmd_*`` docstring for exact shapes)::
 
-    housekeeping.py ls [--root /workspace]
+    housekeeping.py ls [--root /workspace] [--refresh]
     housekeeping.py du <path>
     housekeeping.py touch <user>/<project> [--event cook|upload|download]
     housekeeping.py rm <user>/<project> [--force]
     housekeeping.py prune [--older-days N] [--dry-run]
-    housekeeping.py houdini ls
-    housekeeping.py houdini rm <version>
+    housekeeping.py houdini ls [--refresh]
+    housekeeping.py houdini rm <version> [--dry-run]
     housekeeping.py sync-idle
+
+``ls``/``houdini ls`` serve cached sizes from ``/workspace/.rpfarm/index.json``
+when under 900s old and re-measure (bounded, see ``cmd_ls``/``cmd_houdini_ls``)
+otherwise; ``--refresh`` forces a re-measure regardless of age (Ruling R26).
 
 Every command prints one JSON value to stdout. On failure it prints a
 one-line message to stderr and exits non-zero -- callers (``_volume_exec``
@@ -40,6 +44,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import time
 
@@ -73,32 +78,103 @@ _EVENT_FIELD = {"cook": "last_cook", "upload": "last_upload", "download": "last_
 # their name (case varies by node).
 _OUTPUT_DIR_NAMES = ("render", "geo")
 
+# Ruling R26: a pure-Python os.walk + os.lstat-per-file size (the original
+# Task 4/12 implementation) timed out at 60s on the real farm's Houdini
+# install over the network-mounted volume. `du -sb` (GNU coreutils, on the
+# pod image) is one native tree walk instead of one Python-level syscall
+# per file -- dramatically faster for the same tree. Per-call timeout for
+# that subprocess; see _size()'s docstring for the fallback/caching story.
+_SIZE_TIMEOUT_S = 30.0
+# ls/houdini ls default budget for a *full* re-measure sweep across every
+# zone/project that needs one (Ruling R26 point 3) -- comfortably under
+# _volume_exec's own 300s exec timeout, with margin for network latency.
+_DEFAULT_BUDGET_S = 120.0
+# How long a cached size is served before ls/houdini ls re-measures it
+# (Ruling R26 point 2); --refresh forces a re-measure regardless of age.
+_DEFAULT_MAX_AGE_S = 900.0
+
 
 # ---------------------------------------------------------------------------
 # Low-level helpers
 # ---------------------------------------------------------------------------
 
+# Sticky once we learn `du -sb` doesn't work in this environment (BSD `du`
+# on macOS dev/test boxes has no -b; a real Ubuntu pod always supports it,
+# so this stays False there and every call takes the fast path). Set only
+# from an immediate "invalid/illegal option" or "command not found" --
+# never from a timeout, which says nothing about whether the flag itself
+# is supported.
+_DU_B_UNSUPPORTED = False
 
-def _size(path: str) -> int:
-    """Total size in bytes of a file, or recursively of a directory."""
-    if os.path.isdir(path) and not os.path.islink(path):
-        total = 0
-        for dirpath, _dirnames, filenames in os.walk(path, onerror=lambda e: None):
-            for name in filenames:
-                fp = os.path.join(dirpath, name)
+
+def _size(path: str, timeout_s: float = _SIZE_TIMEOUT_S):
+    """Total size in bytes of a file, or recursively of a directory.
+
+    Directories go through ``du -sb`` first (falls back once, permanently
+    for this process, to a pure-Python walk if ``-b`` isn't supported at
+    all -- macOS/BSD ``du`` has no such flag). Returns ``None`` if the
+    ``du`` subprocess itself exceeds ``timeout_s`` -- callers decide how to
+    handle that (serve a cached value, report 0, ...); this never silently
+    falls back to the slow walk on a timeout, which would just make a slow
+    path slower still.
+    """
+    global _DU_B_UNSUPPORTED
+    if os.path.islink(path):
+        try:
+            return os.lstat(path).st_size
+        except OSError:
+            return 0
+    if not os.path.isdir(path):
+        try:
+            return os.lstat(path).st_size
+        except OSError:
+            return 0
+
+    if not _DU_B_UNSUPPORTED:
+        try:
+            proc = subprocess.run(
+                ["du", "-sb", path], capture_output=True, text=True, timeout=timeout_s
+            )
+        except subprocess.TimeoutExpired:
+            return None
+        except FileNotFoundError:
+            _DU_B_UNSUPPORTED = True  # no `du` binary at all -- never coming back
+            proc = None
+        except OSError:
+            proc = None
+        if proc is not None:
+            if proc.returncode == 0 and proc.stdout:
                 try:
-                    total += os.lstat(fp).st_size
-                except OSError:
-                    continue
-        return total
-    try:
-        return os.lstat(path).st_size
-    except OSError:
-        return 0
+                    return int(proc.stdout.split()[0])
+                except (ValueError, IndexError):
+                    pass
+            elif "invalid option" in proc.stderr.lower() or "illegal option" in proc.stderr.lower():
+                _DU_B_UNSUPPORTED = True
+
+    return _size_walk(path)
+
+
+def _size_walk(path: str) -> int:
+    """Pure-Python recursive size -- the pre-R26 implementation, kept as
+    the fallback for platforms without a `-b`-capable `du` (tests)."""
+    total = 0
+    for dirpath, _dirnames, filenames in os.walk(path, onerror=lambda e: None):
+        for name in filenames:
+            fp = os.path.join(dirpath, name)
+            try:
+                total += os.lstat(fp).st_size
+            except OSError:
+                continue
+    return total
 
 
 def du(path: str) -> list[dict]:
-    """Sizes of the first-level children of ``path``. Unchanged Task 4 contract."""
+    """Sizes of the first-level children of ``path``. Unchanged Task 4 contract.
+
+    A child whose ``du -sb`` exceeds :data:`_SIZE_TIMEOUT_S` reports
+    ``bytes: null`` rather than blocking the rest of the listing or falling
+    back to an even-slower full Python walk.
+    """
     entries = []
     try:
         names = sorted(os.listdir(path))
@@ -209,6 +285,34 @@ def _update_index(root: str, key: str, fields: dict) -> dict:
         f.close()
 
 
+def _save_index(root: str, mutate) -> dict:
+    """Read-modify-write the whole index under one lock.
+
+    ``mutate(index) -> index`` gets the current (possibly empty) dict and
+    returns the dict to persist -- used by ls/houdini ls to batch many
+    size-cache updates (one per zone/project) into a single lock
+    acquisition instead of one ``_update_index`` call each.
+    """
+    f = _with_index_lock(root)
+    try:
+        raw = f.read()
+        try:
+            index = json.loads(raw) if raw.strip() else {}
+        except ValueError:
+            index = {}
+        if not isinstance(index, dict):
+            index = {}
+        index = mutate(index)
+        f.seek(0)
+        f.truncate()
+        json.dump(index, f)
+        return index
+    finally:
+        if fcntl is not None:
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        f.close()
+
+
 def _remove_index_entry(root: str, key: str) -> None:
     f = _with_index_lock(root)
     try:
@@ -261,21 +365,98 @@ def _outputs_pending(project_dir: str, last_download) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Size caching (Ruling R26): serve /workspace/.rpfarm/index.json's cached
+# sizes when they're fresh enough, re-measure (bounded by a shared,
+# shrinking deadline) when they're not, and never let one slow zone/project
+# block every other one from at least reporting its last known size.
+# ---------------------------------------------------------------------------
+
+
+class _SizeCache:
+    """One re-measure sweep's worth of state, shared across every zone or
+    version cmd_ls/cmd_houdini_ls looks at, so a single deadline (not a
+    fresh per-call budget) governs the whole command."""
+
+    def __init__(self, root, index, namespace, refresh, max_age_s, budget_s):
+        self.root = root
+        self.index = index
+        self.cache = dict(index.get(namespace) or {})
+        self.refresh = refresh
+        self.max_age_s = max_age_s
+        self.deadline = time.time() + budget_s
+        self.partial = False
+        self.dirty = False
+
+    def get(self, key, path):
+        """(bytes, measured_at) for one zone/project/version, from cache or
+        a fresh ``_size()`` call within the shared deadline."""
+        now = time.time()
+        cached = self.cache.get(key)
+        stale = cached is None or (now - cached["measured_at"]) > self.max_age_s
+        if not self.refresh and not stale:
+            return cached["bytes"], cached["measured_at"]
+
+        remaining = self.deadline - now
+        measured = _size(path, timeout_s=remaining) if remaining > 0 else None
+        if measured is None:
+            self.partial = True
+            if cached is not None:
+                return cached["bytes"], cached["measured_at"]
+            return 0, None
+
+        self.cache[key] = {"bytes": measured, "measured_at": now}
+        self.dirty = True
+        return measured, now
+
+    def flush(self, namespace):
+        """Persist this sweep's cache updates, if any."""
+        if not self.dirty:
+            return
+
+        def _mutate(index):
+            index[namespace] = self.cache
+            return index
+
+        _save_index(self.root, _mutate)
+
+
+# ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
 
 
-def cmd_ls(root: str) -> dict:
+def cmd_ls(
+    root: str,
+    refresh: bool = False,
+    max_age_s: float = _DEFAULT_MAX_AGE_S,
+    budget_s: float = _DEFAULT_BUDGET_S,
+) -> dict:
     """Zones, per-project usage, and volume totals.
 
     ``{"zones": {"houdini": bytes, "apps": bytes, "projects": bytes,
     "ledger": bytes}, "projects": [{"user", "project", "bytes", "last_used",
     "last_cook", "outputs_pending"}], "volume": {"used": bytes, "total":
-    bytes}}``. Projects are sorted by (user, project) for a stable order.
-    """
-    zones = {zone: _size(os.path.join(root, zone)) for zone in _ZONES}
+    bytes}, "partial": bool}``. Projects are sorted by (user, project) for
+    a stable order.
 
+    Sizes come from the ``_sizes`` cache (zone and per-project entries) in
+    ``/workspace/.rpfarm/index.json`` when they're under ``max_age_s`` old
+    (default 900s); otherwise re-measured, bounded by ``budget_s`` shared
+    across the whole call (default 120s -- comfortably under
+    ``_volume_exec``'s 300s exec timeout). ``partial`` is true if the
+    budget ran out before every stale entry could be re-measured -- those
+    entries report their last known (stale) size instead of blocking.
+    ``refresh=True`` (CLI ``--refresh``) forces every entry to be
+    re-measured regardless of age.
+    """
     index = _load_index(root)
+    size_cache = _SizeCache(root, index, "_sizes", refresh, max_age_s, budget_s)
+
+    zones = {}
+    for zone in _ZONES:
+        nbytes, _ = size_cache.get(zone, os.path.join(root, zone))
+        zones[zone] = nbytes
+
     projects_root = os.path.join(root, "projects")
     projects = []
     if os.path.isdir(projects_root):
@@ -291,12 +472,14 @@ def cmd_ls(root: str) -> dict:
                 project_dir = os.path.join(user_dir, project)
                 if not os.path.isdir(project_dir):
                     continue
-                entry = index.get(f"{user}/{project}", {})
+                key = f"{user}/{project}"
+                entry = index.get(key, {})
+                nbytes, _ = size_cache.get(key, project_dir)
                 projects.append(
                     {
                         "user": user,
                         "project": project,
-                        "bytes": _size(project_dir),
+                        "bytes": nbytes,
                         "last_used": entry.get("last_used"),
                         "last_cook": entry.get("last_cook"),
                         "outputs_pending": _outputs_pending(
@@ -305,13 +488,20 @@ def cmd_ls(root: str) -> dict:
                     }
                 )
 
+    size_cache.flush("_sizes")
+
     try:
         usage = shutil.disk_usage(root)
         volume = {"used": usage.used, "total": usage.total}
     except OSError:
         volume = {"used": 0, "total": 0}
 
-    return {"zones": zones, "projects": projects, "volume": volume}
+    return {
+        "zones": zones,
+        "projects": projects,
+        "volume": volume,
+        "partial": size_cache.partial,
+    }
 
 
 def cmd_touch(root: str, user_project: str, event: str = "cook") -> dict:
@@ -456,15 +646,27 @@ _VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
 LEGACY_VERSION = "legacy"
 
 
-def cmd_houdini_ls(root: str) -> dict:
+def cmd_houdini_ls(
+    root: str,
+    refresh: bool = False,
+    max_age_s: float = _DEFAULT_MAX_AGE_S,
+    budget_s: float = _DEFAULT_BUDGET_S,
+) -> dict:
     """Installed Houdini versions under ``/workspace/houdini``.
 
     Real ``NN.N.NNN`` version directories are listed individually; any
     other top-level entry (v1's flat legacy install: `bin/`, `houdini/`,
     loose files, ...) is summed into one ``"legacy"`` entry so it shows up
-    as one cleanup unit, not dozens.
+    as one cleanup unit, not dozens. ``{"versions": [...], "partial":
+    bool}`` -- caching/budget/``refresh`` semantics match :func:`cmd_ls`
+    (Ruling R26); each top-level entry (real version or legacy piece) is
+    cached individually under its own name so an unrelated legacy file
+    changing doesn't invalidate a real version's cached size.
     """
     houdini_root = os.path.join(root, "houdini")
+    index = _load_index(root)
+    size_cache = _SizeCache(root, index, "_houdini", refresh, max_age_s, budget_s)
+
     versions = []
     legacy_bytes = 0
     have_legacy = False
@@ -473,23 +675,29 @@ def cmd_houdini_ls(root: str) -> dict:
             if name.startswith("."):
                 continue
             entry = os.path.join(houdini_root, name)
+            nbytes, _ = size_cache.get(name, entry)
             if _VERSION_RE.match(name) and os.path.isdir(entry):
-                versions.append({"version": name, "bytes": _size(entry)})
+                versions.append({"version": name, "bytes": nbytes})
             else:
                 have_legacy = True
-                legacy_bytes += _size(entry)
+                legacy_bytes += nbytes
     if have_legacy:
         versions.append({"version": LEGACY_VERSION, "bytes": legacy_bytes})
-    return {"versions": versions}
+
+    size_cache.flush("_houdini")
+    return {"versions": versions, "partial": size_cache.partial}
 
 
-def cmd_houdini_rm(root: str, version: str) -> dict:
-    """Delete one installed Houdini version.
+def cmd_houdini_rm(root: str, version: str, dry_run: bool = False) -> dict:
+    """Delete one installed Houdini version (or report what would be deleted).
 
     ``version="legacy"`` removes every top-level entry under
     ``/workspace/houdini`` that is *not* a proper ``NN.N.NNN`` directory
     (v1's flat install) in one call, leaving real versions untouched --
-    otherwise deletes that one version's directory.
+    otherwise deletes that one version's directory. ``dry_run=True``
+    (CLI ``--dry-run``) computes and reports the same ``removed``/
+    ``bytes_freed`` shape without deleting anything -- Task 14's
+    destructive step is expected to run this first.
     """
     if not version or version in (".", "..") or "/" in version or "\\" in version:
         raise HousekeepingError(f"invalid version {version!r}")
@@ -505,14 +713,21 @@ def cmd_houdini_rm(root: str, version: str) -> dict:
                 continue
             entry = os.path.join(houdini_root, name)
             freed += _size(entry)
-            if os.path.isdir(entry) and not os.path.islink(entry):
-                shutil.rmtree(entry)
-            else:
-                os.remove(entry)
+            if not dry_run:
+                if os.path.isdir(entry) and not os.path.islink(entry):
+                    shutil.rmtree(entry)
+                else:
+                    os.remove(entry)
             removed.append(entry)
         if not removed:
             return {"ok": False, "error": "no legacy entries found", "path": houdini_root}
-        return {"ok": True, "path": houdini_root, "removed": removed, "bytes_freed": freed}
+        return {
+            "ok": True,
+            "path": houdini_root,
+            "removed": removed,
+            "bytes_freed": freed,
+            "dry_run": dry_run,
+        }
 
     vdir = os.path.normpath(os.path.join(root, "houdini", version))
     if vdir == houdini_root or not vdir.startswith(houdini_root + os.sep):
@@ -520,8 +735,9 @@ def cmd_houdini_rm(root: str, version: str) -> dict:
     if not os.path.isdir(vdir):
         return {"ok": False, "error": "not found", "path": vdir}
     freed = _size(vdir)
-    shutil.rmtree(vdir)
-    return {"ok": True, "path": vdir, "bytes_freed": freed}
+    if not dry_run:
+        shutil.rmtree(vdir)
+    return {"ok": True, "path": vdir, "bytes_freed": freed, "dry_run": dry_run}
 
 
 def cmd_sync_idle(root: str) -> dict:
@@ -553,6 +769,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_ls = sub.add_parser("ls")
     p_ls.add_argument("--root", default=DEFAULT_ROOT)
+    p_ls.add_argument("--refresh", action="store_true")
 
     p_du = sub.add_parser("du")
     p_du.add_argument("path")
@@ -571,9 +788,11 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_houdini = sub.add_parser("houdini")
     houdini_sub = p_houdini.add_subparsers(dest="houdini_command", required=True)
-    houdini_sub.add_parser("ls")
+    p_houdini_ls = houdini_sub.add_parser("ls")
+    p_houdini_ls.add_argument("--refresh", action="store_true")
     p_houdini_rm = houdini_sub.add_parser("rm")
     p_houdini_rm.add_argument("version")
+    p_houdini_rm.add_argument("--dry-run", action="store_true")
 
     sub.add_parser("sync-idle")
 
@@ -590,7 +809,7 @@ def main(argv: list[str]) -> int:
 
     try:
         if args.command == "ls":
-            result = cmd_ls(args.root)
+            result = cmd_ls(args.root, refresh=args.refresh)
         elif args.command == "du":
             result = du(args.path)
         elif args.command == "touch":
@@ -601,9 +820,9 @@ def main(argv: list[str]) -> int:
             result = cmd_prune(DEFAULT_ROOT, args.older_days, args.dry_run)
         elif args.command == "houdini":
             if args.houdini_command == "ls":
-                result = cmd_houdini_ls(DEFAULT_ROOT)
+                result = cmd_houdini_ls(DEFAULT_ROOT, refresh=args.refresh)
             else:
-                result = cmd_houdini_rm(DEFAULT_ROOT, args.version)
+                result = cmd_houdini_rm(DEFAULT_ROOT, args.version, dry_run=args.dry_run)
         elif args.command == "sync-idle":
             result = cmd_sync_idle(DEFAULT_ROOT)
         else:  # pragma: no cover - argparse enforces `command` is one of the above
