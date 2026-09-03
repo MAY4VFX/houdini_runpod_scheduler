@@ -481,7 +481,32 @@ def test_houdini_ls_prints_versions(tmp_path, monkeypatch, capsys):
     assert fake_client.calls == ["python3 /opt/rpfarm/housekeeping.py houdini ls"]
 
 
-def test_houdini_rm_dry_run_shows_what_would_be_freed(tmp_path, monkeypatch, capsys):
+def test_houdini_rm_defaults_to_dry_run_without_yes(tmp_path, monkeypatch, capsys):
+    """Ruling R30: houdini rm can delete tens of GB, so it gets the same
+    default-safe treatment as storage prune -- --dry-run is sent even when
+    the flag isn't spelled out, and the CLI never claims anything was
+    actually freed without --yes."""
+    monkeypatch.setenv("RPFARM_HOME", str(tmp_path))
+    _write_cfg(tmp_path)
+
+    fake_pod = {"id": "sync1", "name": "rpfarm-sync-tester"}
+    fake_client = FakeWorkerClient([
+        ("houdini rm 20.5.684 --dry-run", {
+            "exit_code": 0,
+            "stdout": json.dumps({"ok": True, "path": "/workspace/houdini/20.5.684", "bytes_freed": 5 * 2**30, "dry_run": True}),
+            "stderr": "",
+        }),
+    ])
+    monkeypatch.setattr(cli, "_connect_sync_pod", lambda api, cfg, token, log=print: (fake_pod, fake_client))
+
+    rc = cli.main(["houdini", "rm", "20.5.684"])  # no --dry-run, no --yes
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "would free" in out and "5.0GB" in out and "--yes" in out
+    assert fake_client.calls == ["python3 /opt/rpfarm/housekeeping.py houdini rm 20.5.684 --dry-run"]
+
+
+def test_houdini_rm_dry_run_flag_is_an_inert_alias_for_the_default(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("RPFARM_HOME", str(tmp_path))
     _write_cfg(tmp_path)
 
@@ -497,9 +522,29 @@ def test_houdini_rm_dry_run_shows_what_would_be_freed(tmp_path, monkeypatch, cap
 
     rc = cli.main(["houdini", "rm", "20.5.684", "--dry-run"])
     assert rc == 0
-    out = capsys.readouterr().out
-    assert "would free" in out and "5.0GB" in out
     assert fake_client.calls == ["python3 /opt/rpfarm/housekeeping.py houdini rm 20.5.684 --dry-run"]
+
+
+def test_houdini_rm_with_yes_actually_deletes(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("RPFARM_HOME", str(tmp_path))
+    _write_cfg(tmp_path)
+
+    fake_pod = {"id": "sync1", "name": "rpfarm-sync-tester"}
+    fake_client = FakeWorkerClient([
+        ("houdini rm 20.5.684", {
+            "exit_code": 0,
+            "stdout": json.dumps({"ok": True, "path": "/workspace/houdini/20.5.684", "bytes_freed": 5 * 2**30, "dry_run": False}),
+            "stderr": "",
+        }),
+    ])
+    monkeypatch.setattr(cli, "_connect_sync_pod", lambda api, cfg, token, log=print: (fake_pod, fake_client))
+
+    rc = cli.main(["houdini", "rm", "20.5.684", "--yes"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "freed" in out and "would free" not in out
+    # --dry-run must NOT be sent to housekeeping once --yes overrides it.
+    assert fake_client.calls == ["python3 /opt/rpfarm/housekeeping.py houdini rm 20.5.684"]
 
 
 def test_houdini_rm_not_found_exits_2(tmp_path, monkeypatch, capsys):

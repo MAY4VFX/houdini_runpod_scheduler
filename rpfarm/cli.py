@@ -656,12 +656,21 @@ def cmd_houdini_ls(args):
 
 
 def cmd_houdini_rm(args):
+    """Delete one installed Houdini version -- potentially tens of GB.
+    Same confirmation gate as ``storage prune`` (Ruling R30): defaults to
+    a dry run and requires ``--yes``/``--force`` to actually delete;
+    ``--dry-run`` is kept as an explicit, inert alias for the default.
+    Unlike ``storage rm``, ``pod/housekeeping.py``'s ``houdini rm`` already
+    has a native ``--dry-run`` mode, so the gate is just which of that or
+    a real delete gets sent -- no separate client-side-only refusal needed.
+    """
+    dry_run = not args.yes
     cfg = rpcfg.load()
     api = _make_api(cfg.api_key)
     token = rpcfg.session_token()
     _pod, client = _connect_sync_pod(api, cfg, token)
     cmd_str = f"houdini rm {shlex.quote(args.version)}"
-    if args.dry_run:
+    if dry_run:
         cmd_str += " --dry-run"
     exit_code, data, result = _housekeeping_exec(client, cmd_str, timeout_s=120)
     if exit_code != 0 or data is None:
@@ -670,8 +679,10 @@ def cmd_houdini_rm(args):
     if not data.get("ok"):
         print(data.get("error", "failed"), file=sys.stderr)
         return 2
-    verb = "would free" if args.dry_run else "freed"
-    print(f"{verb} {_fmt_bytes(data.get('bytes_freed'))}: {data.get('path')}")
+    if dry_run:
+        print(f"would free {_fmt_bytes(data.get('bytes_freed'))}: {data.get('path')} -- pass --yes to actually delete")
+    else:
+        print(f"freed {_fmt_bytes(data.get('bytes_freed'))}: {data.get('path')}")
     return 0
 
 
@@ -972,9 +983,10 @@ def build_parser():
     p_hi.add_argument("--tar", required=True, help="local path, or sftp://[user@]host/path")
     p_hi.add_argument("--version", default=None, help="defaults to config.toml's houdini_version")
     houdini_sub.add_parser("ls", help="list Houdini versions installed on the volume, with size")
-    p_hrm = houdini_sub.add_parser("rm", help="delete one installed Houdini version from the volume")
+    p_hrm = houdini_sub.add_parser("rm", help="delete one installed Houdini version from the volume (potentially tens of GB)")
     p_hrm.add_argument("version", help="e.g. 22.0.393, or \"legacy\" for a v1 flat install")
-    p_hrm.add_argument("--dry-run", action="store_true", help="show what would be freed; delete nothing")
+    p_hrm.add_argument("--dry-run", action="store_true", help="(default behaviour) show what would be freed; delete nothing")
+    p_hrm.add_argument("--yes", "--force", dest="yes", action="store_true", help="actually delete the version")
 
     p_storage = sub.add_parser("storage", help="inspect/manage the shared farm volume")
     storage_sub = p_storage.add_subparsers(dest="storage_command", required=True)
@@ -982,7 +994,7 @@ def build_parser():
     p_du = storage_sub.add_parser("du", help="sizes of the immediate children of a path on the volume")
     p_du.add_argument("path", help="an absolute path on the volume, e.g. /workspace/projects/may")
     p_rm = storage_sub.add_parser("rm", help="permanently delete one project directory (requires --force)")
-    p_rm.add_argument("user_project", metavar="USER/PROJECT")
+    p_rm.add_argument("user_project", metavar="USER/PROJECT", help="e.g. may/shotA -- the project directory to delete")
     p_rm.add_argument("--force", action="store_true", help="required for any deletion -- this is irreversible, shared, paid storage")
     p_prune = storage_sub.add_parser("prune", help="find (and, with --yes, delete) projects unused for --older-days")
     p_prune.add_argument("--older-days", type=float, default=30, help="candidate threshold in days (default 30)")
