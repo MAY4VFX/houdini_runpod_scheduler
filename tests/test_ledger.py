@@ -6,10 +6,12 @@ cook_summary record) -- see rpfarm/ledger.py's module docstring.
 """
 
 import json
+import os
 
 import pytest
 
 from rpfarm import ledger
+from rpfarm.sync import SftpTarget, SyncError
 
 
 # -- append / load_all -------------------------------------------------------
@@ -227,6 +229,22 @@ def test_sync_from_volume_pulls_missing_files(tmp_path):
     assert (local / "bob" / "bbbb2222.jsonl").read_text() == '{"cook_id": "bbbb2222"}\n'
 
 
+def test_sync_from_volume_pulls_other_users_records_too(tmp_path):
+    # Ruling R25: cross-user accounting is the whole point of this task --
+    # sync_from_volume must not scope its own `find` or its pull to just
+    # the calling user's own subtree.
+    client = FakeClient({
+        "/workspace/ledger/alice/1111aaaa.jsonl": '{"cook_id": "1111aaaa", "user": "alice"}\n',
+        "/workspace/ledger/bob/2222bbbb.jsonl": '{"cook_id": "2222bbbb", "user": "bob"}\n',
+        "/workspace/ledger/carol/3333cccc.jsonl": '{"cook_id": "3333cccc", "user": "carol"}\n',
+    })
+    local = tmp_path / "ledger"
+    n = ledger.sync_from_volume(client, local, "may")  # caller "may" owns none of these
+    assert n == 3
+    pulled_users = {p.name for p in local.iterdir()}
+    assert pulled_users == {"alice", "bob", "carol"}
+
+
 def test_sync_from_volume_skips_files_already_local(tmp_path):
     local = tmp_path / "ledger"
     (local / "may").mkdir(parents=True)
@@ -255,3 +273,51 @@ def test_sync_from_volume_returns_zero_on_find_failure(tmp_path):
 
     n = ledger.sync_from_volume(FailingClient(), tmp_path / "ledger", "may")
     assert n == 0
+
+
+# -- mirror_to_volume (Ruling R25) --------------------------------------------
+
+_FAKE_RCLONE_OK = """#!/usr/bin/env python3
+import json, sys
+print(json.dumps({"stats": {"bytes": 5, "totalBytes": 5, "speed": 1.0, "transfers": 1}}), file=sys.stderr, flush=True)
+sys.exit(0)
+"""
+
+_FAKE_RCLONE_FAIL = """#!/usr/bin/env python3
+import sys
+sys.exit(7)
+"""
+
+
+def _write_fake_rclone(tmp_path, body):
+    p = tmp_path / "fake_rclone.py"
+    p.write_text(body)
+    os.chmod(p, 0o755)
+    return str(p)
+
+
+def test_mirror_to_volume_pushes_single_file_package(tmp_path):
+    ledger_dir = tmp_path / "ledger"
+    ledger_dir.mkdir()
+    p = ledger_dir / "aaaa1111.jsonl"
+    p.write_text('{"cook_id": "aaaa1111"}\n')
+
+    rclone_bin = _write_fake_rclone(tmp_path, _FAKE_RCLONE_OK)
+    target = SftpTarget(host="h", port=22, key_path="/k")
+    # Would raise SyncError (ruling R8's invariant check inside
+    # build_rclone_args) if local_root/remote_root/remote didn't line up --
+    # succeeding here IS the proof they do.
+    stats = ledger.mirror_to_volume(p, "may", target, rclone_bin)
+    assert stats.files == 1
+
+
+def test_mirror_to_volume_raises_on_rclone_failure(tmp_path):
+    ledger_dir = tmp_path / "ledger"
+    ledger_dir.mkdir()
+    p = ledger_dir / "aaaa1111.jsonl"
+    p.write_text('{"cook_id": "aaaa1111"}\n')
+
+    rclone_bin = _write_fake_rclone(tmp_path, _FAKE_RCLONE_FAIL)
+    target = SftpTarget(host="h", port=22, key_path="/k")
+    with pytest.raises(SyncError):
+        ledger.mirror_to_volume(p, "may", target, rclone_bin)

@@ -341,6 +341,11 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         self._killed_over_budget = False
         self._last_pod_error = None
         self._last_scale_failure = 0.0
+        # Ruling R25: set by _mirror_ledger_to_volume in onStopCook, read
+        # by _update_status_text (before this reset runs -- see the call
+        # order in onStopCook) to tell the artist when the journal didn't
+        # make it to the volume this cook.
+        self._ledger_mirror_note = None
 
     @classmethod
     def templateName(cls):
@@ -1076,6 +1081,8 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         lines.append("cost: {:.3f} USD{}".format(
             self._cost_tracker.get("total_cost", 0.0),
             "" if max_cost in (0.0, float("inf")) else " of {:.2f} USD".format(max_cost)))
+        if self._ledger_mirror_note:
+            lines.append("ledger: {}".format(self._ledger_mirror_note))
         self._setStatusText("\n".join(lines))
 
     def _setStatusText(self, text):
@@ -1359,6 +1366,39 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
             timeout_s=30,
         )
 
+    def _mirror_ledger_to_volume(self):
+        """Push this cook's local ledger .jsonl up to the volume (Ruling
+        R25), reusing the sync pod connection onSetupCook already
+        established for this cook -- never creates a pod just for this.
+
+        Before this ruling, nothing ever wrote the volume's ledger tree, so
+        rpfarm.ledger.sync_from_volume (Refresh, on runpodfarm_stats) had
+        structurally nothing to pull and cross-user cost accounting never
+        actually worked. This closes that gap.
+
+        Never fails the cook: caught exceptions (and the "no sync pod"
+        case, e.g. a cook cancelled before onSetupCook finished) are logged
+        and recorded in self._ledger_mirror_note, which
+        _update_status_text surfaces to the artist as "ledger stayed
+        local-only" -- the journal itself is never lost, only not yet
+        shared.
+        """
+        if rpledger is None or not hasattr(rpledger, "mirror_to_volume"):
+            return  # dispatch.append_record stand-in has no mirror; nothing to push with
+        if self._sftp is None or self._cfg is None:
+            self._log("ledger mirror skipped: no sync pod this cook (ledger stayed local-only)")
+            self._ledger_mirror_note = "local-only (no sync pod this cook)"
+            return
+        try:
+            stats = rpledger.mirror_to_volume(
+                self._ledger_path, self._cfg.user, self._sftp, self._cfg.rclone_path)
+            self._log("ledger mirrored -> /workspace/ledger/{}/: {} file(s), {:.1f}s".format(
+                self._cfg.user, stats.files, stats.seconds))
+            self._ledger_mirror_note = None
+        except (rpsync.SyncError, OSError) as e:
+            self._log("ledger mirror failed (ledger stayed local-only): {}".format(e))
+            self._ledger_mirror_note = "local-only (volume mirror failed, see log)"
+
     # -- MQ (SimpleMQSchedulerMixin interface) --------------------------------
 
     def _startFarmMQ(self):
@@ -1587,6 +1627,12 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         self._log("cook {} done, ~${:.3f}, ledger {}".format(
             self._cook_id, self._cost_tracker.get("total_cost", 0.0),
             self._ledger_path))
+
+        # Ruling R25: mirror this cook's local ledger up to the volume so
+        # several people on one account end up with one shared record --
+        # before stopPollingClient/_reset_cook_state, while self._sftp
+        # (the sync pod connection this cook already holds) is still valid.
+        self._mirror_ledger_to_volume()
 
         # Stops the relay and the mqserver on the sync pod (via _killFarmMQ).
         self.stopPollingClient()
