@@ -54,7 +54,11 @@ def cfg():
     return Config(api_key="k", user="may", volume_id="v", template_id="t", gpu_priority=["g"])
 
 
-def test_ensure_sync_pod_creates_once():
+def test_ensure_sync_pod_creates_once(tmp_path, monkeypatch):
+    # ensure_sync_pod takes a file lock under $RPFARM_HOME/locks (Ruling
+    # R24) -- point it at a tmp dir so tests never touch the real
+    # ~/.rpfarm, matching the pattern test_config.py already uses.
+    monkeypatch.setenv("RPFARM_HOME", str(tmp_path))
     api = FakeAPI()
     p1 = pods.ensure_sync_pod(api, cfg(), "tok", "ssh-ed25519 AAA", client_factory=lambda pid: FakeClient(), sleep=lambda s: None)
     p2 = pods.ensure_sync_pod(api, cfg(), "tok", "ssh-ed25519 AAA", client_factory=lambda pid: FakeClient(), sleep=lambda s: None)
@@ -62,7 +66,8 @@ def test_ensure_sync_pod_creates_once():
     assert api.created[0]["RPFARM_ROLE"] == "sync" and api.created[0]["PUBLIC_KEY"].startswith("ssh-ed25519")
 
 
-def test_ensure_sync_pod_terminates_non_running_and_recreates():
+def test_ensure_sync_pod_terminates_non_running_and_recreates(tmp_path, monkeypatch):
+    monkeypatch.setenv("RPFARM_HOME", str(tmp_path))
     api = FakeAPI()
     api.pods["old1"] = {
         "id": "old1",
@@ -78,10 +83,11 @@ def test_ensure_sync_pod_terminates_non_running_and_recreates():
     assert len(api.created) == 1
 
 
-def test_ensure_sync_pod_does_not_adopt_prefix_match():
+def test_ensure_sync_pod_does_not_adopt_prefix_match(tmp_path, monkeypatch):
     # list_pods is a prefix match; sync_pod_name("may") == "rpfarm-sync-may"
     # is a prefix of another user's "rpfarm-sync-mayakovsky" pod. That other
     # user's RUNNING pod must never be adopted as "may"'s sync pod.
+    monkeypatch.setenv("RPFARM_HOME", str(tmp_path))
     api = FakeAPI()
     api.pods["alien1"] = {
         "id": "alien1",
