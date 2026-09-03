@@ -645,7 +645,12 @@ def test_houdini_rm_real_deletion_prunes_cache_entry(tmp_path):
     assert "22.0.393" not in data.get("_houdini", {})
 
 
-# -- fix round 2, "A": disk-usage only walks projects/, not houdini/apps/ledger --
+# -- fix round 2 "A" / fix round 3 "1": disk-usage uses the same plain
+# staleness-based caching for every zone as ls/houdini ls -- no special
+# "static zone" casing (round 2's first attempt at "A" tried that, but it
+# made the once-per-cook warm-up unconditionally expensive too, since
+# --refresh was the only way those zones were ever remeasured at all;
+# round 3 walked it back to the uniform mechanism below). -----------------
 
 
 def _count_size_calls(monkeypatch):
@@ -661,30 +666,30 @@ def _count_size_calls(monkeypatch):
     return calls
 
 
-def test_disk_usage_never_walks_static_zones_when_cached(tmp_path, monkeypatch):
+def test_disk_usage_costs_nothing_when_everything_is_fresh(tmp_path, monkeypatch):
     root = mk(tmp_path)
     hk.cmd_ls(root)  # populate every zone's cache once, for real
     calls = _count_size_calls(monkeypatch)
     hk.cmd_disk_usage(root, volume_size_gb=50)
-    # Only projects/ may be remeasured; houdini/apps/ledger must come
-    # straight from the cache dict, never through _size() at all.
-    assert all("houdini" not in p and "apps" not in p and "ledger" not in p for p in calls["paths"])
+    assert calls["n"] == 0  # nothing was stale -- served entirely from cache
 
 
-def test_disk_usage_measures_projects_fresh_even_when_stale(tmp_path, monkeypatch):
+def test_disk_usage_remeasures_stale_zones_including_houdini(tmp_path, monkeypatch):
     root = mk(tmp_path)
     hk.cmd_ls(root)
     calls = _count_size_calls(monkeypatch)
-    hk.cmd_disk_usage(root, volume_size_gb=50, max_age_s=0)  # force staleness
+    hk.cmd_disk_usage(root, volume_size_gb=50, max_age_s=0)  # force everything stale
+    assert any(p.endswith("houdini") for p in calls["paths"])
     assert any(p.endswith("projects") for p in calls["paths"])
 
 
-def test_disk_usage_partial_when_static_zone_never_measured(tmp_path):
+def test_disk_usage_no_prior_cache_still_succeeds_without_partial(tmp_path):
     root = mk(tmp_path)
-    # No prior ls/disk-usage call -- the _sizes cache is completely empty,
-    # so houdini/apps/ledger are "unknown", not just stale.
+    # No prior ls/disk-usage call -- every zone is measured fresh for the
+    # first time; on these tiny fixtures that succeeds well within budget.
+    # partial means a *timed-out* remeasure, not merely "wasn't cached yet".
     out = hk.cmd_disk_usage(root, volume_size_gb=50)
-    assert out["partial"] is True
+    assert out["partial"] is False
 
 
 def test_disk_usage_refresh_still_walks_everything(tmp_path, monkeypatch):
@@ -693,6 +698,23 @@ def test_disk_usage_refresh_still_walks_everything(tmp_path, monkeypatch):
     calls = _count_size_calls(monkeypatch)
     hk.cmd_disk_usage(root, volume_size_gb=50, refresh=True)
     assert any("houdini" in p for p in calls["paths"])
+
+
+# -- fix round 3, "1": the warm-up call itself (disk-usage --budget-s N,
+# deliberately no --refresh) must not force a re-walk of an already-fresh
+# zone -- otherwise the warm-up becomes the same "always expensive" call
+# --refresh was, just moved from every item to every cook. -----------------
+
+
+def test_warmup_style_disk_usage_does_not_rewalk_fresh_zones(tmp_path, monkeypatch):
+    """The exact shape of onSetupCook's _warmSizeCache() call: a generous
+    budget, no --refresh. Run it twice back to back -- the second run
+    (everything still fresh from the first) must cost zero _size() calls."""
+    root = mk(tmp_path)
+    hk.cmd_disk_usage(root, volume_size_gb=50, budget_s=90)  # first "warm-up": cold
+    calls = _count_size_calls(monkeypatch)
+    hk.cmd_disk_usage(root, volume_size_gb=50, budget_s=90)  # second "warm-up": warm
+    assert calls["n"] == 0
 
 
 # -- fix round 2, "B": touch invalidates the size cache on upload --------------
@@ -798,6 +820,68 @@ def test_size_cache_flush_does_not_resurrect_deleted_key(tmp_path):
     on_disk = hk._load_index(root)["_sizes"]
     assert "fresh_key" in on_disk
     assert "stale_key" not in on_disk
+
+
+# -- fix round 3, "2": invalidate <zone>, and the install preset using it --
+
+
+def test_invalidate_removes_zone_from_size_cache(tmp_path):
+    root = mk(tmp_path)
+    hk.cmd_ls(root)  # populate _sizes for every zone
+    index_path = os.path.join(root, ".rpfarm", "index.json")
+    with open(index_path) as f:
+        before = json.load(f)
+    assert "houdini" in before["_sizes"]
+
+    result = hk.cmd_invalidate(root, "houdini")
+    assert result == {"ok": True, "zone": "houdini"}
+
+    with open(index_path) as f:
+        after = json.load(f)
+    assert "houdini" not in after.get("_sizes", {})
+    # Untouched zones survive -- invalidate is scoped to the one zone.
+    assert "projects" in after.get("_sizes", {})
+
+
+def test_invalidate_rejects_unknown_zone(tmp_path):
+    root = mk(tmp_path)
+    with pytest.raises(hk.HousekeepingError):
+        hk.cmd_invalidate(root, "not-a-real-zone")
+
+
+def test_invalidate_houdini_forces_next_disk_usage_to_remeasure_it(tmp_path, monkeypatch):
+    """Simulates what the install preset's post-command now does: a
+    version lands under houdini/ (bytes change), then `invalidate houdini`
+    runs. The very next disk-usage (no --refresh, cache otherwise still
+    fresh from an earlier ls) must remeasure houdini specifically, not
+    silently keep serving the pre-install figure."""
+    root = mk(tmp_path)
+    hk.cmd_ls(root)  # cache is fresh for every zone, including houdini
+
+    # Simulate the install: a new version directory lands under houdini/.
+    (tmp_path / "houdini/22.0.500/bin").mkdir(parents=True)
+    (tmp_path / "houdini/22.0.500/bin/hython").write_bytes(b"x" * 999)
+    hk.cmd_invalidate(root, "houdini")
+
+    calls = _count_size_calls(monkeypatch)
+    out = hk.cmd_disk_usage(root, volume_size_gb=50)
+    assert any(p.endswith("houdini") for p in calls["paths"])
+    assert out["volume"]["used"] >= 999  # the newly-installed bytes are counted
+
+
+def test_main_invalidate(tmp_path, capsys, monkeypatch):
+    root = mk(tmp_path)
+    monkeypatch.setattr(hk, "DEFAULT_ROOT", root)
+    hk.cmd_ls(root)
+    rc = hk.main(["housekeeping.py", "invalidate", "houdini"])
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out == {"ok": True, "zone": "houdini"}
+
+
+def test_main_invalidate_rejects_bad_zone(capsys):
+    rc = hk.main(["housekeeping.py", "invalidate", "not-a-zone"])
+    assert rc == 2  # argparse's own `choices=` rejects it before cmd_invalidate runs
 
 
 # Reviewer-noted, intentionally NOT fixed (documented in the report):

@@ -20,6 +20,7 @@ Commands (see ``main()``/each ``cmd_*`` docstring for exact shapes)::
     housekeeping.py houdini rm <version> [--dry-run]
     housekeeping.py sync-idle
     housekeeping.py disk-usage [--volume-size-gb N] [--refresh] [--budget-s N] [--max-age-s N]
+    housekeeping.py invalidate <houdini|apps|projects|ledger>
 
 ``--volume-size-gb`` is the RunPod network volume's real provisioned size
 (the pod has no RunPod API key and cannot look this up itself -- callers
@@ -66,11 +67,6 @@ except ImportError:  # pragma: no cover - Windows dev boxes only, pods are Linux
 DEFAULT_ROOT = "/workspace"
 
 _ZONES = ("houdini", "apps", "projects", "ledger")
-# disk-usage (fix round 2, "A"): the only zone an upload can change is
-# projects/ -- houdini/apps/ledger are treated as static there and served
-# from cache however stale, never walked on that hot path.
-_DISK_USAGE_DYNAMIC_ZONE = "projects"
-_DISK_USAGE_STATIC_ZONES = tuple(z for z in _ZONES if z != _DISK_USAGE_DYNAMIC_ZONE)
 # Zone directory names that rm/prune/houdini-rm must never delete or descend
 # past. Relative to the volume root -- ported from v1's _PROTECTED_PREFIXES.
 _PROTECTED_ZONES = ("houdini", "ledger", ".rpfarm")
@@ -406,6 +402,21 @@ class _SizeCache:
     ``cache``, which still holds the full read-time view so ``get()``'s
     own within-sweep staleness logic is unaffected) and merging just
     those into a freshly re-read index at flush time, inside the lock.
+
+    Known residual (Ruling R28, parked -- not fixed): a merge-flush can
+    still resurrect a key another process invalidated (e.g.
+    ``cmd_touch``'s upload invalidation, fix round 2 "B") *during* this
+    sweep, between this process's own read and its flush -- the merge
+    reads fresh at flush time, but a key this sweep measured and the
+    other process deleted in between will still be written back by this
+    flush. With fix round 3 "1" landed, sweeps are seconds long (a single
+    zone's ``du -sb``, not a 90s multi-zone `--refresh` walk), which
+    shrinks that window to roughly the size of any other read-modify-
+    write in this module. The failure mode is a stale size for at most
+    ``max_age_s`` -- it self-corrects on the next sweep and is never
+    destructive (no deletion decision anywhere reads ``_sizes``). Task 13
+    inherits this as a known limitation, not a bug to silently reintroduce
+    a fix for without re-deriving why it was judged acceptable.
     """
 
     def __init__(self, root, index, namespace, refresh, max_age_s, budget_s):
@@ -614,11 +625,41 @@ def cmd_touch(root: str, user_project: str, event: str = "cook") -> dict:
     return {"ok": True, "user": user, "project": project, "event": event, **entry}
 
 
+def cmd_invalidate(root: str, zone: str) -> dict:
+    """Drop one zone's cached size so the next `ls`/`disk-usage` remeasures it.
+
+    ``invalidate <houdini|apps|projects|ledger>``. Review finding (fix
+    round 3, "2"): nothing invalidated ``_sizes["houdini"]`` when a
+    version was installed (only `houdini rm` pruned it, on deletion) --
+    a stale-but-present entry doesn't set ``partial`` either, so after
+    the Houdini-install preset (``rpfarm.packages.houdini_install_preset``)
+    added ~10GB, the 85%-full auto-grow guard compared against the old
+    figure with no signal at all that anything was wrong. The preset's
+    post-command now calls this once the install finishes.
+    """
+    if zone not in _ZONES:
+        raise HousekeepingError(f"unknown zone {zone!r}, expected one of {_ZONES}")
+    _invalidate_size_cache(root, [zone])
+    return {"ok": True, "zone": zone}
+
+
 def cmd_rm(root: str, user_project: str, force: bool = False) -> dict:
     """Delete a project directory.
 
     Refuses (``{"ok": False, ...}``) unless ``force`` or there is nothing
     pending download, and always refuses a protected path.
+
+    Known residual (reviewer-noted, parked -- not fixed): this removes
+    the project's *touch* index entry (``_remove_index_entry``) but does
+    not invalidate ``_sizes["projects"]`` or the deleted project's own
+    ``_sizes`` entry -- the ``projects`` zone total stays stale
+    (over-counting the just-deleted bytes) until it naturally expires
+    (``max_age_s``) or something else invalidates it. Over-stating a
+    zone's size is the safe direction for the 85%-full auto-grow guard
+    (it can only make the guard grow a little early, never miss a real
+    "getting full" case) -- unlike ``cmd_touch``'s upload invalidation
+    (fix round 2 "B"), which had to be fixed because *under*-stating is
+    the unsafe direction.
     """
     user, project = _parse_user_project(user_project)
     project_dir = _project_dir(root, user, project)
@@ -897,47 +938,36 @@ def cmd_disk_usage(
     no budget of its own -- see the Task 12 report) just to decide whether
     to grow the volume. Ruling R27: it also must never use
     ``shutil.disk_usage`` (see :func:`_volume_totals`) -- so ``used`` is
-    zone-summed, from the same ``_sizes`` cache ``ls`` uses (Ruling R26).
+    zone-summed, from the same ``_sizes`` cache ``ls`` uses (Ruling R26),
+    same staleness/``budget_s``/``partial`` semantics for every zone --
+    no special-casing.
 
-    Fix round 2 finding "A": summing all four zones still meant walking
-    ``houdini`` (~30s cold on the real farm's legacy install) on every
-    call whose cache had gone stale -- exactly the timeout race this
-    command was created to avoid, just moved one level down. Uploads only
-    ever change ``projects``, so that's the only zone measured fresh here
-    (bounded by ``budget_s``, ``--refresh`` still forces a full sweep);
-    ``houdini``/``apps``/``ledger`` are served straight from whatever the
-    ``_sizes`` cache already has, however stale -- warmed off this hot
-    path by the scheduler's ``onSetupCook`` (``_HOUSEKEEPING`` `disk-usage
-    --refresh`, once per cook). A static zone with *no* cache entry at all
-    (never measured by anything yet) contributes 0 and sets ``partial``,
-    same meaning as a timed-out measurement: this number is incomplete,
-    not wrong.
+    Fix round 2 finding "A" tried treating ``houdini``/``apps``/``ledger``
+    as permanently-cached "static" zones, measured fresh only with
+    ``--refresh``. Fix round 3 finding "1" walked that back: it made the
+    once-per-cook warm-up (``onSetupCook``'s ``_warmSizeCache``, below)
+    *unconditionally* expensive too, since ``--refresh`` is the only way
+    those zones are ever remeasured at all, defeating the warm-up's own
+    point. Plain staleness-based caching (this function, ``ls``,
+    ``houdini ls`` all now agree) gets both properties for free instead:
+    a zone under ``max_age_s`` old costs nothing to any caller; a zone
+    that's gone stale gets remeasured (bounded by ``budget_s``,
+    ``partial: true`` if that times out) whether the caller is a per-item
+    auto-grow check or the periodic warm-up. The warm-up's actual job is
+    keeping zones fresh often enough that the per-item hot path's calls
+    are the common, cheap case -- not preventing them from ever
+    remeasuring at all.
     """
     index = _load_index(root)
     size_cache = _SizeCache(root, index, "_sizes", refresh, max_age_s, budget_s)
-    static_cache = index.get("_sizes") or {}
 
     used = 0
-    unknown_static = False
-    for zone in _DISK_USAGE_STATIC_ZONES:
-        if refresh:
-            nbytes, _ = size_cache.get(zone, os.path.join(root, zone))
-            used += nbytes
-            continue
-        cached = static_cache.get(zone)
-        if cached is not None:
-            used += cached["bytes"]
-        else:
-            unknown_static = True
-
-    nbytes, _ = size_cache.get(_DISK_USAGE_DYNAMIC_ZONE, os.path.join(root, _DISK_USAGE_DYNAMIC_ZONE))
-    used += nbytes
+    for zone in _ZONES:
+        nbytes, _ = size_cache.get(zone, os.path.join(root, zone))
+        used += nbytes
     size_cache.flush()
 
-    return {
-        "volume": _volume_totals(used, volume_size_gb),
-        "partial": size_cache.partial or unknown_static,
-    }
+    return {"volume": _volume_totals(used, volume_size_gb), "partial": size_cache.partial}
 
 
 def cmd_sync_idle(root: str) -> dict:
@@ -1004,6 +1034,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p_disk_usage.add_argument("--max-age-s", type=float, default=_DEFAULT_MAX_AGE_S)
     p_disk_usage.add_argument("--refresh", action="store_true")
 
+    p_invalidate = sub.add_parser("invalidate")
+    p_invalidate.add_argument("zone", choices=_ZONES)
+
     return p
 
 
@@ -1047,6 +1080,8 @@ def main(argv: list[str]) -> int:
                 max_age_s=args.max_age_s,
                 budget_s=args.budget_s,
             )
+        elif args.command == "invalidate":
+            result = cmd_invalidate(DEFAULT_ROOT, args.zone)
         else:  # pragma: no cover - argparse enforces `command` is one of the above
             print(f"unknown command: {args.command}", file=sys.stderr)
             return 2

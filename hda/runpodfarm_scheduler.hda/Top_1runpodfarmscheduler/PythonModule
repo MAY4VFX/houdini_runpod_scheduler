@@ -1489,23 +1489,31 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
             "{} touch {} --event {}".format(_HOUSEKEEPING, _shquote(key), event), timeout_s=30)
 
     def _warmSizeCache(self):
-        """Refresh housekeeping's static-zone size cache once per cook.
+        """Refresh housekeeping's per-zone size cache once per cook.
 
-        Fix round 2, "A": `disk-usage` (what every upload item's
-        auto-grow check calls) treats `houdini`/`apps`/`ledger` as static
-        and serves them from cache however stale, precisely so that hot
-        path never walks the (potentially huge, ~30s+ cold on the real
-        farm's legacy install) `houdini` zone. Something still has to
-        keep that cache from going stale forever -- this is that
-        something: one `disk-usage --refresh` per cook, off the
-        per-upload-item hot path, generously timed out (it may do a full
-        cold walk) and never fatal to the cook if it fails or times out.
+        Fix round 2, "A": every upload item's auto-grow check calls
+        `disk-usage`, which can end up walking the (potentially huge,
+        ~30s+ cold on the real farm's legacy install) `houdini` zone if
+        its cached size has gone stale -- this keeps that rare by
+        refreshing once per cook, off the per-item hot path.
+
+        Fix round 3, "1": deliberately does NOT pass `--refresh` --
+        `_SizeCache.get()`'s early return is `if not refresh and not
+        stale`, so `--refresh` ignores freshness and re-measures every
+        zone unconditionally (confirmed live: 30.89s even with the
+        `houdini` entry already warm). Plain staleness-based caching
+        (the same the per-item hot path itself uses) gets both
+        properties for free: near-zero cost when nothing has actually
+        gone stale (e.g. two cooks close together), and a bounded
+        remeasure -- not a silent skip -- when something has. Generously
+        timed out (a cold walk can take a while) and never fatal to the
+        cook if it fails or times out.
         """
         if self._sync_client is None:
             return
         try:
             self._sync_client.exec(
-                "{} disk-usage --refresh --budget-s 90".format(_HOUSEKEEPING), timeout_s=110)
+                "{} disk-usage --budget-s 90".format(_HOUSEKEEPING), timeout_s=110)
         except Exception as e:  # noqa: BLE001 - a cache warm-up must never fail a cook
             self._verboseLog("size cache warm-up failed (continuing): {}".format(e))
 

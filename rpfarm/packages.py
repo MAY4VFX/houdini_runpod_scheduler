@@ -314,6 +314,14 @@ def houdini_install_preset(tar_local_path, version):
     ``/workspace/houdini/<version>``, and cleans the scratch dir up. The
     final ``ls`` both proves the binary landed and gives a work item a
     non-empty stdout to show for the whole preset.
+
+    Review finding (fix round 3, "2"): an install adds ~10GB to the
+    `houdini` zone, but nothing invalidated `_sizes["houdini"]` -- a
+    stale-but-present cache entry doesn't set `partial` either, so the
+    85%-full auto-grow guard would keep comparing against the pre-install
+    figure with no signal anything was wrong. The last step now
+    invalidates that zone (``housekeeping.py invalidate houdini``) right
+    where the write happens, so the next `ls`/`disk-usage` remeasures it.
     """
     tar_name = os.path.basename(tar_local_path)
     pairs = [(tar_local_path, "/workspace/apps/dist/")]
@@ -326,6 +334,7 @@ def houdini_install_preset(tar_local_path, version):
         "--no-install-license --no-install-menus "
         f"--install-dir {install_dir} --no-install-hfs-symlink && "
         "rm -rf /tmp/hou && "
+        "python3 /opt/rpfarm/housekeeping.py invalidate houdini && "
         f"ls {install_dir}/bin/hython"
     )
     return pairs, post_command
@@ -440,6 +449,19 @@ _AUTO_GROW_EXEC_TIMEOUT_S = 30.0
 
 
 def _volume_size_cache_path():
+    """``~/.rpfarm/volume_size_cache.json``.
+
+    Known residual (reviewer-noted, parked -- not fixed): reads and
+    writes here are plain, unlocked file I/O -- unlike
+    ``pod/housekeeping.py``'s ``_sizes``/``_houdini`` index cache (on the
+    pod, ``flock``-protected), this file lives on the artist's own
+    machine and is read/written by potentially-concurrent
+    ``package_runner.py`` processes with no lock at all. A lost update
+    here only means an extra, harmless RunPod ``get_volume`` call on the
+    next lookup (worst case) -- never a wrong size served silently
+    (a torn/corrupt read falls back to `{}`, i.e. "uncached", not a bad
+    value). Task 13 inherits this as a known limitation.
+    """
     from . import config as rpcfg  # local: packages.py has no other rpcfg dependency
 
     return rpcfg.home() / "volume_size_cache.json"
