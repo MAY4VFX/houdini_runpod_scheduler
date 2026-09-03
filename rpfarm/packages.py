@@ -161,7 +161,14 @@ def build_upload_items(mode, job_dir, user, project, custom, refs, package_gb):
         groups = []
         for local, remote_dir in custom:
             entries = list(_walk_custom_pair(local, remote_dir))
-            groups.append((local, remote_dir, entries))
+            # R8: local_root/rel and remote_root/rel must be the same rel.
+            # _walk_custom_pair's remote for a single FILE is
+            # remote_dir/basename(local); relpath(local, local) is "." --
+            # not basename(local) -- so local_root has to be the file's
+            # own containing directory here, not the file itself. For a
+            # directory pair, local IS already the walk root, so it stays.
+            local_root = os.path.dirname(local) if os.path.isfile(local) else local
+            groups.append((local_root, remote_dir, entries))
         return _items_from_groups(groups, max_bytes)
 
     if mode == "deps":

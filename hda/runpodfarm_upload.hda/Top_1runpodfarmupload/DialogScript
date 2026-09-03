@@ -1,0 +1,106 @@
+# Dialog script for runpodfarmupload automatically generated
+
+{
+    name	runpodfarmupload
+    script	runpodfarmupload
+    label	"RunPodFarm Upload"
+
+    help {
+    }
+
+    inputlabel	1	"Input 1"
+    inputlabel	2	"Input 2"
+    inputlabel	3	"Input 3"
+    inputlabel	4	"Input 4"
+
+    parm {
+        name    "rpfarm_mode"
+        label   "Mode"
+        type    string
+        default { "deps" }
+        help    "Project dependencies: hou.fileReferences() plus the hip file itself. Custom paths: exactly the local -> remote pairs below."
+        menu {
+            "deps"      "Project Dependencies"
+            "custom"    "Custom Paths"
+        }
+    }
+    parm {
+        name    "rpfarm_project"
+        label   "Project"
+        type    string
+        default { "" }
+        help    "Project folder on the network volume: /workspace/projects/<user>/<project>. Empty means the name of the $JOB directory."
+    }
+    parm {
+        name    "rpfarm_packagegb"
+        label   "Package Size (GB)"
+        type    float
+        default { "1.5" }
+        help    "Files are grouped into work items no larger than this (a single bigger file still gets its own item)."
+        range   { 0.1 16 }
+    }
+    parm {
+        name    "rpfarm_compress"
+        label   "Compression"
+        type    string
+        default { "auto" }
+        help    "auto compresses when no uplink measurement is available, or when uplink < 200 Mbps."
+        menu {
+            "auto"  "Auto"
+            "on"    "On"
+            "off"   "Off"
+        }
+    }
+    multiparm {
+        name    "rpfarm_custom"
+        label    "Custom Paths"
+        default 0
+
+        parm {
+            name    "rpfarm_local#"
+            label   "Local"
+            type    file
+            default { "" }
+        }
+        parm {
+            name    "rpfarm_remote#"
+            label   "Remote"
+            type    string
+            default { "" }
+        }
+    }
+
+    parm {
+        name    "rpfarm_postcmd"
+        label   "Post-command"
+        type    string
+        default { "" }
+        help    "Shell command run on the sync pod once, after every package in this cook has uploaded. Ignored when empty."
+    }
+    parm {
+        name    "rpfarm_preset"
+        label   "Preset"
+        type    string
+        default { "none" }
+        help    "Install Houdini from tarball computes Custom Paths + Post-command from the two fields below at generate time."
+        menu {
+            "none"              "None"
+            "install_houdini"   "Install Houdini from tarball"
+        }
+    }
+    parm {
+        name    "rpfarm_houtar"
+        label   "Houdini Tarball"
+        type    file
+        default { "" }
+        help    "Local path to houdini-<version>-linux_x86_64_gcc14.2.tar.gz."
+        hidewhen "{ rpfarm_preset != install_houdini }"
+    }
+    parm {
+        name    "rpfarm_houver"
+        label   "Houdini Version"
+        type    string
+        default { "22.0.393" }
+        hidewhen "{ rpfarm_preset != install_houdini }"
+    }
+}
