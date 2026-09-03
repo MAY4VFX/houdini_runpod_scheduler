@@ -96,7 +96,7 @@ def build_graph(args):
     return topnet, gen, sched, job
 
 
-def cook(topnet, gen, timeout):
+def cook(topnet, gen, sched, timeout):
     """Cook to completion, cancelling if the wall-clock guard expires."""
     ctx = topnet.getPDGGraphContext()
     expired = threading.Event()
@@ -115,13 +115,23 @@ def cook(topnet, gen, timeout):
 
     started = time.time()
     log("cooking (guard {}s)...".format(timeout))
+    failed = False
     try:
         gen.cookWorkItems(block=True, save_prompt=False)
+    except hou.OperationFailed as e:
+        # PDG reports a scheduler that refused to start as a bare "Failed to
+        # start scheduler", with the actual reason only on the node. Print it,
+        # then carry on so the caller still gets its item/ledger/pod report.
+        failed = True
+        log("COOK FAILED: {}".format(e))
+        for node in (sched, gen.parent(), gen):
+            for err in node.errors():
+                log("  {} error: {}".format(node.path(), err))
     finally:
         watchdog.cancel()
     elapsed = time.time() - started
     log("cook returned after {:.0f}s".format(elapsed))
-    return elapsed, expired.is_set()
+    return elapsed, expired.is_set() or failed
 
 
 def report_items(gen):
@@ -137,6 +147,13 @@ def report_items(gen):
         log("  {:<24} {:<16} {:.1f}s".format(item.name, state, item.cookDuration))
     if items:
         log("item command: {!r}".format(items[0].command))
+        # The mapping runpodfarm_download (Task 10) reads off its upstream
+        # items; empty here means the scheduler never stamped it.
+        try:
+            log("item rpfarm_pathmap: {}".format(
+                items[0].stringAttribValue("rpfarm_pathmap")))
+        except Exception as e:
+            log("item rpfarm_pathmap: MISSING ({})".format(e))
     return succeeded, len(items)
 
 
@@ -193,7 +210,7 @@ def main(argv):
     started = time.time()
     topnet, gen, sched, job = build_graph(args)
 
-    elapsed, timed_out = cook(topnet, gen, args.timeout)
+    elapsed, aborted = cook(topnet, gen, sched, args.timeout)
     succeeded, total = report_items(gen)
     records = report_ledger(started)
 
@@ -202,7 +219,7 @@ def main(argv):
             log("status text:\n" + sched.parm("rpfarm_status_text").evalAsString())
         report_pods()
 
-    ok = not timed_out and total > 0 and succeeded == total
+    ok = not aborted and total > 0 and succeeded == total
     log("RESULT: {} -- {}/{} items succeeded, {} ledger record(s), {:.0f}s".format(
         "PASS" if ok else "FAIL", succeeded, total, records, elapsed))
     return 0 if ok else 1
