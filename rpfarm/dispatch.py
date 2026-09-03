@@ -45,6 +45,20 @@ AUTOSCALE_THRESHOLD_MINUTES = 30
 AUTOSCALE_BATCH_MIN = 2
 AUTOSCALE_BATCH_MAX = 4
 
+# How many queued tasks per pod the scheduler accepts before telling PDG to
+# hold the rest back (v1's "* 3").
+BACKPRESSURE_DEPTH = 3
+
+# A pod that has answered /health and then goes quiet for this long is dead.
+POD_DEAD_AFTER_SECONDS = 60
+
+# How long a pod that has never answered /health gets to boot before it is
+# given up on. Deliberately generous and separate from the heartbeat above:
+# the image pulls Houdini off the network volume, which the spec measures at
+# 43.5s and which a cold cache makes much slower. It matches pods.wait_ready's
+# own timeout.
+POD_BOOT_TIMEOUT_SECONDS = 300
+
 # Budget thresholds as a fraction of the cook's cost limit.
 BUDGET_WARN = 0.8
 BUDGET_STOP = 1.0
@@ -232,6 +246,22 @@ class Dispatcher:
                 return new_task_id
         return None
 
+    def fail_pending(self, task_id) -> TaskState | None:
+        """Give up on a queued task: off the queue and onto :attr:`failed`.
+
+        The terminal path for a task that can never be submitted (a task_id
+        the worker keeps rejecting). Going through here rather than removing
+        it from :attr:`pending` by hand is what makes
+        :meth:`failed_since_last_call` -- and so the caller's single "tell PDG
+        this item failed" path -- see it.
+        """
+        for i, task in enumerate(self._pending):
+            if task.task_id == task_id:
+                self._pending.pop(i)
+                self.failed.append(task)
+                return task
+        return None
+
     def running_tasks(self) -> list[TaskState]:
         return list(self._running.values())
 
@@ -321,6 +351,46 @@ def autoscale_decision(
     ratio = remaining_min / threshold_min
     batch = min(AUTOSCALE_BATCH_MAX, max(AUTOSCALE_BATCH_MIN, int(ratio)))
     return min(batch, headroom)
+
+
+def should_defer(pending: int, pods: int, depth_per_pod: int = BACKPRESSURE_DEPTH) -> bool:
+    """Should ``onSchedule`` hand this work item back to PDG for now?
+
+    True once the queue is already ``depth_per_pod`` deep per pod, so PDG
+    keeps the rest of the graph on its own queue instead of ours. A pool of
+    zero pods still counts as one, so the very first item is always taken --
+    otherwise a cook whose pods have not registered yet would defer forever.
+
+    The caller must decide this **before** enqueueing: a deferred item is
+    re-offered to ``onSchedule`` later, and a task enqueued on the way out
+    would then be queued (and run) twice.
+    """
+    capacity = max(1, int(pods)) * int(depth_per_pod)
+    return int(pending) >= capacity
+
+
+def pod_timed_out(
+    pod: PodState,
+    now: float,
+    boot_seconds: float = POD_BOOT_TIMEOUT_SECONDS,
+    dead_seconds: float = POD_DEAD_AFTER_SECONDS,
+) -> str | None:
+    """``"boot"``, ``"dead"``, or None -- why to give up on a pod, if at all.
+
+    The two clocks are deliberately separate. A pod that has never answered
+    (``CREATED``) is still booting and gets ``boot_seconds`` from creation; a
+    pod that answered and went quiet (``RUNNING``) gets ``dead_seconds`` from
+    the last good answer. Judging a booting pod by the heartbeat clock -- as
+    this did before -- terminates it mid-boot, and the autoscaler then creates
+    a replacement that dies the same way, forever, with no cook error.
+    """
+    if pod.status == "CREATED":
+        if pod.created_at is None:
+            return None
+        return "boot" if now - pod.created_at > boot_seconds else None
+    if pod.status == "RUNNING" and pod.health_fail_since is not None:
+        return "dead" if now - pod.health_fail_since > dead_seconds else None
+    return None
 
 
 def budget_state(total_cost: float, max_cost: float) -> str:
