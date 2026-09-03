@@ -136,3 +136,14 @@ def test_balance_uses_graphql_endpoint():
     assert (m, url) == ("POST", "https://api.runpod.io/graphql")
     assert "clientBalance" in body["query"]
     assert headers["Authorization"] == "Bearer k"
+
+
+def test_every_request_carries_an_explicit_user_agent():
+    """Cloudflare 403s Python's default User-Agent on api.runpod.io."""
+    t = FakeTransport([(200, []), (200, {"data": {"myself": {"clientBalance": 1.0}}})])
+    api = ra.RunPodAPI("k", transport=t)
+    api.list_pods()
+    api.balance()
+    for _m, _url, _body, headers in t.calls:
+        assert headers["User-Agent"] == ra.USER_AGENT
+        assert "urllib" not in headers["User-Agent"]

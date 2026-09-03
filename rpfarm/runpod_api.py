@@ -14,8 +14,17 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+from . import VERSION
+
 BASE = "https://rest.runpod.io/v1"
 GRAPHQL_URL = "https://api.runpod.io/graphql"
+
+# api.runpod.io sits behind Cloudflare, which rejects Python's default
+# "Python-urllib/3.x" User-Agent with a 403 "error code: 1010" before the
+# request ever reaches RunPod. Any explicit User-Agent gets through; this is the
+# same header WorkerClient has to send to reach *.proxy.runpod.net. Verified
+# against the live endpoint: no header -> 403, "rpfarm/2.0.0" -> 200.
+USER_AGENT = "rpfarm/{}".format(VERSION)
 
 _BALANCE_QUERY = "{ myself { clientBalance } }"
 
@@ -44,6 +53,7 @@ class RunPodAPI:
         self._headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
+            "User-Agent": USER_AGENT,
         }
         self.base = base_url.rstrip("/")
         self._transport = transport
