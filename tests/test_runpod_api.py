@@ -25,6 +25,9 @@ def test_create_cpu_pod_builds_body():
     m, url, body, headers = t.calls[0]
     assert (m, url) == ("POST", "https://rest.runpod.io/v1/pods")
     assert body["computeType"] == "CPU" and body["networkVolumeId"] == "vol"
+    # "custom" honours the order of cpuFlavorIds; the default "availability"
+    # would ignore it and rent whatever RunPod has most of (ruling R18).
+    assert body["cpuFlavorPriority"] == "custom" and body["cpuFlavorIds"] == ["cpu3c", "cpu5c"]
     assert body["volumeMountPath"] == "/workspace" and body["env"] == {"A": "1"}
     assert headers["Authorization"] == "Bearer k"
 
@@ -32,12 +35,17 @@ def test_create_cpu_pod_builds_body():
 def test_create_gpu_pod_builds_body():
     t = FakeTransport([(200, {"id": "p1"})])
     api = ra.RunPodAPI("k", transport=t)
-    pod = api.create_gpu_pod("rpfarm-gpu", "tpl", ["NVIDIA A40"], "vol", {"A": "1"}, ["22/tcp"])
+    pod = api.create_gpu_pod(
+        "rpfarm-gpu", "tpl", ["NVIDIA RTX A4500", "NVIDIA A40"], "vol", {"A": "1"}, ["22/tcp"])
     assert pod["id"] == "p1"
     m, url, body, headers = t.calls[0]
     assert (m, url) == ("POST", "https://rest.runpod.io/v1/pods")
     assert body["computeType"] == "GPU"
-    assert body["gpuTypeIds"] == ["NVIDIA A40"]
+    # The artist's GPU Priority list is a cost decision, so the order has to
+    # be honoured: "availability" ignores it and picks whatever RunPod has
+    # most of (ruling R18 -- a live cook got a $0.740/h 4090 over an A4500).
+    assert body["gpuTypePriority"] == "custom"
+    assert body["gpuTypeIds"] == ["NVIDIA RTX A4500", "NVIDIA A40"]
     assert body["networkVolumeId"] == "vol"
     assert body["volumeMountPath"] == "/workspace"
 
