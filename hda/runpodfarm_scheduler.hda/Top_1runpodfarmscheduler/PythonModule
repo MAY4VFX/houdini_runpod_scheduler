@@ -24,96 +24,275 @@ from __future__ import print_function
 #
 # NAME:         PythonModule ( Python )
 #
-# COMMENTS:     Defines a RunPod Farm scheduler implementation of a PDG scheduler binding.
-#               Adapted from the AWS ECS Scheduler for RunPod GPU Pods with Redis-based
-#               task distribution, pod pool management, autoscaling, and budget tracking.
+# COMMENTS:     RunPodFarm v2 PDG scheduler.
+#
+#               Work items are dispatched over plain HTTP to a worker daemon on
+#               each pod (pod/worker.py); PDG's own mqserver runs on the shared
+#               CPU "sync" pod and is reached over its public TCP ports, so
+#               result data and attributes flow back through the standard PDG
+#               path. Files move by rclone over sftp to the same sync pod.
+#
+#               v1's Redis queue, Backblaze B2 sync, GraphQL pod API and local
+#               MQ are all gone. Every decision this scheduler makes (pod
+#               choice, retries, autoscale, budget) lives in rpfarm/dispatch.py
+#               so it can be tested without Houdini; this module is the glue
+#               between that and PDG.
 #
 
-import datetime
 import json
 import os
-import subprocess
+import pathlib
+import posixpath
+import sys
 import time
 import uuid
 
-try:
-    import requests
-except ModuleNotFoundError:
-    # Fall back to urllib if requests is not available
-    import urllib.request
-    import urllib.error
-    requests = None
+# The rpfarm package is not installed into Houdini's Python: it is found via
+# $RPFARM_ROOT (a checkout, used by tests and CI) or ~/.rpfarm/src (a symlink
+# to a checkout, created by `rpfarm setup`).
+_RPFARM_ROOT = pathlib.Path(
+    os.environ.get("RPFARM_ROOT", pathlib.Path.home() / ".rpfarm" / "src")
+)
+if str(_RPFARM_ROOT) not in sys.path:
+    sys.path.insert(0, str(_RPFARM_ROOT))
+
+from rpfarm import config as rpcfg
+from rpfarm import deps as rpdeps
+from rpfarm import dispatch as rpdispatch
+from rpfarm import pods as rppods
+from rpfarm import sync as rpsync
+from rpfarm.runpod_api import RunPodAPI, RunPodError, pod_public_endpoint
+from rpfarm.worker_client import WorkerClient, WorkerError
 
 try:
-    import redis
-except ModuleNotFoundError as e:
-    raise ModuleNotFoundError(
-        "The RunPodFarm Scheduler requires that the redis package be installed "
-        "to hython. Open a shell and run `hython -m pip install redis` to "
-        "install the package."
-    ) from e
+    # Task 11. Until it lands, dispatch.append_record is the ledger writer.
+    from rpfarm import ledger as rpledger
+except ImportError:  # pragma: no cover - exercised once Task 11 lands
+    rpledger = None
 
 from pdg import scheduleResult, tickResult, CookError
 from pdg import TypeRegistry
 
 from pdg.job.eventdispatch import EventDispatchMixin
 from pdg.scheduler import PyScheduler
-from pdg.utils.simple_mq import MQUtility, SimpleMQSchedulerMixin
+from pdg.utils.simple_mq import SimpleMQSchedulerMixin
 
 
-# Pod status constants returned by the RunPod API
-_POD_STATUS_RUNNING = "RUNNING"
-_POD_STATUS_EXITED = "EXITED"
-_POD_STATUS_TERMINATED = "TERMINATED"
-_POD_STATUS_CREATED = "CREATED"
+# Rolling window of work-item durations that feeds the autoscaler.
+_AUTOSCALE_HISTORY_SIZE = rpdispatch.AUTOSCALE_HISTORY_SIZE
 
-# Queue key templates for Redis
-_REDIS_TASK_QUEUE_KEY = "rp:tasks:{project_id}:{user_id}"
-_REDIS_RESULT_KEY = "rp:results:{task_id}"
-_REDIS_HEARTBEAT_KEY = "rp:heartbeat:{pod_id}"
+# A pod that has not answered /health for this long is declared dead and its
+# tasks are requeued (spec section 7).
+_POD_DEAD_AFTER_SECONDS = 60
 
-# Autoscaling constants
-_AUTOSCALE_HISTORY_SIZE = 10
-_AUTOSCALE_THRESHOLD_MINUTES = 30
-_AUTOSCALE_BATCH_MIN = 2
-_AUTOSCALE_BATCH_MAX = 4
-_POD_STARTUP_TIMEOUT_SECONDS = 300
-_POD_HEARTBEAT_TIMEOUT_SECONDS = 120
+# Minimum gap between /health polls of the same pod. The pod proxy sits behind
+# Cloudflare and onTick fires roughly once a second; there is nothing to gain
+# from polling a pod faster than this.
+_HEALTH_POLL_INTERVAL = 5.0
 
-# RunPod API base URL
-_RUNPOD_API_URL = "https://api.runpod.io/graphql"
+# How often the Status tab's text is rebuilt.
+_STATUS_REFRESH_SECONDS = 5.0
 
-# GPU type ordinal index -> RunPod gpuTypeId mapping
-_GPU_TYPE_MAP = {
-    0: "NVIDIA GeForce RTX 4090",
-    1: "NVIDIA RTX A5000 24GB",
-    2: "NVIDIA A100 80GB PCIe",
-    3: "NVIDIA GeForce RTX 4080",
-    4: "NVIDIA GeForce RTX 3090",
-    5: "NVIDIA L40S",
-    6: "NVIDIA GeForce RTX 5090",
-}
+# Cap on how long onStopCook will keep draining queued output downloads.
+_STOP_DRAIN_MAX_SECONDS = 600
+
+# Where the sync pod records the last time a cook used it, so the next cook can
+# retire it once it has been idle past rpfarm_syncidle. Keeping the decision on
+# the artist's side means the pod never needs a RunPod API key of its own.
+_SYNC_LAST_USED = "/workspace/.rpfarm/sync_last_used"
+
+_HOUSEKEEPING = "python3 /opt/rpfarm/housekeeping.py"
 
 
-def onGpuTypeChanged(kwargs):
+def _ledger_append(path, **record):
+    if rpledger is not None:
+        return rpledger.append(path, **record)
+    return rpdispatch.append_record(path, **record)
+
+
+# -----------------------------------------------------------------------------
+# Button callbacks (Farm / Volume tabs)
+#
+# These run on the node, not on a live scheduler instance, so they build their
+# own API client from ~/.rpfarm/config.toml.
+# -----------------------------------------------------------------------------
+
+
+def _node_config(node):
+    """(config, api) for a node's button callback.
+
+    The node's API Key parm wins over config.toml when it is set, so a user can
+    drive a second account without editing the config file.
     """
-    Callback when rpfarm_gputype ordinal changes.
-    Syncs the value to rpfarm_gputypeid string parameter.
-    """
-    node = kwargs.get("node")
-    if node is None:
+    cfg = rpcfg.load()
+    parm = node.parm("rpfarm_apikey")
+    api_key = (parm.evalAsString() if parm else "") or cfg.api_key
+    return cfg, RunPodAPI(api_key)
+
+
+def _set_text(node, parm_name, text):
+    parm = node.parm(parm_name)
+    if parm is not None:
+        parm.set(text)
+
+
+def _report(node, parm_name, text):
+    _set_text(node, parm_name, text)
+    print("[rpfarm] " + text, flush=True)
+
+
+def onKillAll(kwargs):
+    """Terminate every GPU pod belonging to this user, cook or no cook."""
+    node = kwargs["node"]
+    try:
+        cfg, api = _node_config(node)
+        orphans = rppods.find_orphans(api, cfg.user)
+        rppods.terminate_all(api, [p["id"] for p in orphans])
+        _report(
+            node,
+            "rpfarm_status_text",
+            "Killed {} pod(s): {}".format(
+                len(orphans), ", ".join(p.get("name", p["id"]) for p in orphans) or "-"
+            ),
+        )
+    except (rpcfg.ConfigError, RunPodError) as e:
+        _report(node, "rpfarm_status_text", "Kill all failed: {}".format(e))
+
+
+def onSyncLedger(kwargs):
+    """Pull ledger records off the volume into ~/.rpfarm/ledger."""
+    node = kwargs["node"]
+    try:
+        cfg, api = _node_config(node)
+        token = rpcfg.session_token()
+        pubkey = _read_pubkey(cfg)
+        pod = rppods.ensure_sync_pod(api, cfg, token, pubkey, log=print)
+        ip, port = pod_public_endpoint(pod, 22)
+        target = rpsync.SftpTarget(host=ip, port=port, key_path=cfg.ssh_key_path)
+        local = str(rpcfg.home() / "ledger")
+        os.makedirs(local, exist_ok=True)
+        stats = rpsync.rclone_copy_dir(
+            local, target, "down", cfg.rclone_path, remote_root="/workspace/ledger"
+        )
+        _report(
+            node,
+            "rpfarm_status_text",
+            "Ledger synced: {} file(s), {} bytes in {:.1f}s -> {}".format(
+                stats.files, stats.bytes, stats.seconds, local
+            ),
+        )
+    except (rpcfg.ConfigError, RunPodError, rpsync.SyncError, OSError, TimeoutError) as e:
+        _report(node, "rpfarm_status_text", "Ledger sync failed: {}".format(e))
+
+
+def _volume_exec(node, command, timeout_s=300):
+    """Run a housekeeping command on the sync pod, returning its stdout."""
+    cfg, api = _node_config(node)
+    token = rpcfg.session_token()
+    pod = rppods.ensure_sync_pod(api, cfg, token, _read_pubkey(cfg), log=print)
+    client = WorkerClient(pod["id"], token)
+    result = client.exec(command, timeout_s=timeout_s)
+    if result.get("exit_code") != 0:
+        raise RuntimeError(result.get("stderr") or "exit {}".format(result.get("exit_code")))
+    return result.get("stdout", "")
+
+
+def onVolumeRefresh(kwargs):
+    """List the volume's project zone with sizes."""
+    node = kwargs["node"]
+    try:
+        out = _volume_exec(node, "{} du /workspace/projects".format(_HOUSEKEEPING))
+        rows = json.loads(out or "[]")
+        lines = ["{:>10.2f} GB  {}".format(r["bytes"] / 2**30, r["path"]) for r in rows]
+        total = sum(r["bytes"] for r in rows)
+        lines.append("{:>10.2f} GB  TOTAL".format(total / 2**30))
+        _set_text(node, "rpfarm_volume_text", "\n".join(lines) or "(empty)")
+    except Exception as e:  # a button must never raise into the UI
+        _set_text(node, "rpfarm_volume_text", "Refresh failed: {}".format(e))
+
+
+def onVolumeDelete(kwargs):
+    """Delete one path under /workspace (asks for confirmation in the UI)."""
+    node = kwargs["node"]
+    target = node.parm("rpfarm_volume_target").evalAsString().strip()
+    if not target:
+        _set_text(node, "rpfarm_volume_text", "Set 'Target' to the path to delete.")
         return
-    idx = node.parm("rpfarm_gputype").eval()
-    gpu_id = _GPU_TYPE_MAP.get(idx, "")
-    if gpu_id:
-        node.parm("rpfarm_gputypeid").set(gpu_id)
+    # posixpath, not os.path: the target is a path on the Linux pod, and this
+    # callback also runs on Windows.
+    target = posixpath.normpath(target)
+    if not target.startswith("/workspace/") or target.count("/") < 3:
+        _set_text(
+            node,
+            "rpfarm_volume_text",
+            "Refusing to delete {!r}: must be a path under /workspace/<zone>/.".format(target),
+        )
+        return
+    import hou
+
+    if hou.isUIAvailable():
+        if hou.ui.displayMessage(
+            "Permanently delete {} from the network volume?".format(target),
+            buttons=("Delete", "Cancel"),
+            default_choice=1,
+            close_choice=1,
+            severity=hou.severityType.Warning,
+        ):
+            return
+    try:
+        _volume_exec(node, "rm -rf -- {}".format(_shquote(target)))
+        _set_text(node, "rpfarm_volume_text", "Deleted {}".format(target))
+    except Exception as e:
+        _set_text(node, "rpfarm_volume_text", "Delete failed: {}".format(e))
+
+
+def onVolumeGrow(kwargs):
+    """Grow the network volume by 'Grow By (GB)'."""
+    node = kwargs["node"]
+    try:
+        cfg, api = _node_config(node)
+        vol_parm = node.parm("rpfarm_networkvolumeid")
+        vid = (vol_parm.evalAsString() if vol_parm else "") or cfg.volume_id
+        grow = node.parm("rpfarm_volume_growgb").evalAsInt()
+        if grow <= 0:
+            _set_text(node, "rpfarm_volume_text", "Set 'Grow By (GB)' above zero.")
+            return
+        current = int((api.get_volume(vid) or {}).get("size") or 0)
+        new_size = current + grow
+        api.resize_volume(vid, new_size)
+        _set_text(
+            node,
+            "rpfarm_volume_text",
+            "Volume {} resized {} GB -> {} GB".format(vid, current, new_size),
+        )
+    except Exception as e:
+        _set_text(node, "rpfarm_volume_text", "Grow failed: {}".format(e))
+
+
+def _shquote(value):
+    return "'" + str(value).replace("'", "'\"'\"'") + "'"
+
+
+def _read_pubkey(cfg):
+    """Contents of the artist's public SSH key, for the pods' authorized_keys."""
+    path = cfg.ssh_key_path + ".pub"
+    try:
+        with open(path, "r") as f:
+            return f.read().strip()
+    except OSError as e:
+        raise CookError(
+            "Cannot read the SSH public key at {} ({}). Run `rpfarm setup`, or "
+            "`ssh-keygen -t ed25519 -N '' -f {}`.".format(path, e, cfg.ssh_key_path)
+        ) from e
 
 
 class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PyScheduler):
-    """
-    Scheduler implementation that interfaces with RunPod GPU Pods.
-    Manages a pool of pods, distributes work items via Redis, and supports
-    autoscaling and budget tracking.
+    """PDG scheduler backed by RunPod pods.
+
+    One CPU "sync" pod per user carries sshd (for rclone), the PDG mqserver for
+    the current cook, and housekeeping. GPU pods are created per cook, run the
+    same worker daemon, and are terminated when they go idle or when the cook
+    ends.
     """
 
     def __init__(self, scheduler, name):
@@ -121,25 +300,37 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         SimpleMQSchedulerMixin.__init__(self)
         EventDispatchMixin.__init__(self)
 
-        # Pod pool state: list of dicts with keys:
-        # {pod_id, status, created_at, last_heartbeat, idle_since}
-        self.pod_infos = []
-
-        # Mapping from task_id (str) to work_item for pending tasks
-        self.task_map = {}
-
         # The underscore-separated prefix used on all job parm names
         self.parmprefix = "rpfarm"
 
-        self._verbose = False
-        self._redis_client = None
-        self._runpod_headers = {}
+        self._verbose = 0
+        self._reset_cook_state()
 
-        # Cost tracking state, initialized in onStartCook
+    def _reset_cook_state(self):
+        self._cfg = None
+        self._api = None
+        self._token = ""
+        self._pubkey = ""
+        self._project = ""
+        self._cook_id = ""
+        self._job_dir = ""
+        self._remote_project = ""
+        self._gpu_list = []
+        self._dispatcher = rpdispatch.Dispatcher(1)
+        self._clients = {}
+        self._work_items = {}
+        self._sync_pod = None
+        self._sync_client = None
+        self._sftp = None
+        self._sync_queue = []
+        self._ledger_path = ""
+        self._pathmap = {}
         self._cost_tracker = {}
-
-        # Autoscaling: rolling window of recent render times (seconds)
         self._render_times = []
+        self._last_status_update = 0.0
+        self._last_health_poll = {}
+        self._killed_over_budget = False
+        self._last_pod_error = None
 
     @classmethod
     def templateName(cls):
@@ -151,139 +342,74 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
             "name": "runpodfarmscheduler",
             "parameters": [
                 # -- RunPod --
-                {
-                    "name": "rpfarm_apikey",
-                    "type": "String",
-                    "tag": ["pdg::scheduler"]
-                },
-                {
-                    "name": "rpfarm_gputype",
-                    "type": "Integer"
-                },
-                {
-                    "name": "rpfarm_gputypeid",
-                    "type": "String"
-                },
-                {
-                    "name": "rpfarm_templateid",
-                    "type": "String"
-                },
-                {
-                    "name": "rpfarm_networkvolumeid",
-                    "type": "String"
-                },
-                {
-                    "name": "rpfarm_datacenter",
-                    "type": "String"
-                },
+                {"name": "rpfarm_apikey", "type": "String", "tag": ["pdg::scheduler"]},
+                {"name": "rpfarm_project", "type": "String"},
+                {"name": "rpfarm_gpulist", "type": "String"},
+                {"name": "rpfarm_templateid", "type": "String"},
+                {"name": "rpfarm_networkvolumeid", "type": "String"},
+                {"name": "rpfarm_datacenter", "type": "String"},
+                {"name": "rpfarm_verbose", "type": "Integer"},
                 # -- Scaling --
-                {
-                    "name": "rpfarm_minpods",
-                    "type": "Integer"
-                },
-                {
-                    "name": "rpfarm_maxpods",
-                    "type": "Integer"
-                },
+                {"name": "rpfarm_minpods", "type": "Integer"},
+                {"name": "rpfarm_maxpods", "type": "Integer"},
+                {"name": "rpfarm_slots", "type": "Integer"},
+                {"name": "rpfarm_idletimeout", "type": "Integer"},
+                {"name": "rpfarm_syncidle", "type": "Integer"},
                 # -- Budget --
-                {
-                    "name": "rpfarm_maxcost",
-                    "type": "Float"
-                },
-                # -- Project --
-                {
-                    "name": "rpfarm_redisurl",
-                    "type": "String",
-                    "tag": ["pdg::scheduler"]
-                },
-                {
-                    "name": "rpfarm_projectid",
-                    "type": "String"
-                },
-                {
-                    "name": "rpfarm_userid",
-                    "type": "String"
-                },
+                {"name": "rpfarm_maxcost", "type": "Float"},
+                {"name": "rpfarm_minbalance", "type": "Float"},
+                # -- Outputs --
+                {"name": "rpfarm_downloadoutputs", "type": "Integer"},
                 # -- Paths --
-                {
-                    "name": "rpfarm_overrideremoteworkingdir",
-                    "type": "Integer"
-                },
-                {
-                    "name": "rpfarm_remoteworkingdir",
-                    "type": "String"
-                },
-                # -- Verbose --
-                {
-                    "name": "rpfarm_verbose",
-                    "type": "Integer"
-                },
+                {"name": "rpfarm_overrideremoteworkingdir", "type": "Integer"},
+                {"name": "rpfarm_remoteworkingdir", "type": "String"},
                 # -- Job Parms --
-                {
-                    "name": "rpfarm_pretaskcmd",
-                    "type": "String"
-                },
-                {
-                    "name": "rpfarm_posttaskcmd",
-                    "type": "String"
-                },
+                {"name": "rpfarm_pretaskcmd", "type": "String"},
+                {"name": "rpfarm_posttaskcmd", "type": "String"},
                 # -- Submit as Job --
-                {
-                    "name": "submitjobfile",
-                    "type": "Integer"
-                },
-                # -- B2 Storage --
-                {
-                    "name": "rpfarm_b2_enabled",
-                    "type": "Integer"
-                },
-                {
-                    "name": "rpfarm_b2_key_id",
-                    "type": "String",
-                    "tag": ["pdg::scheduler"]
-                },
-                {
-                    "name": "rpfarm_b2_app_key",
-                    "type": "String",
-                    "tag": ["pdg::scheduler"]
-                },
-                {
-                    "name": "rpfarm_b2_bucket",
-                    "type": "String"
-                },
-                {
-                    "name": "rpfarm_compression_enabled",
-                    "type": "Integer"
-                },
-                {
-                    "name": "rpfarm_compression_level",
-                    "type": "Integer"
-                }
+                {"name": "submitjobfile", "type": "Integer"},
             ]
         })
+
+    # -------------------------------------------------------------------------
+    # Logging
+    # -------------------------------------------------------------------------
+
+    def _verboseLog(self, *args, **kwargs):
+        """Mirror PDG's verbose log to stdout.
+
+        The PDG log only shows up in Houdini's own console; a headless hython
+        cook (the smoke test, `rpfarm smoke`, CI) needs these lines on stdout --
+        including "Got PDG MQ server info: ..." which SimpleMQSchedulerMixin
+        emits through this method.
+        """
+        if self._verbose or "force" in kwargs:
+            print("[rpfarm] " + " ".join(str(a) for a in args), flush=True)
+        PyScheduler._verboseLog(self, *args, **kwargs)
+
+    def _log(self, message):
+        """A cook milestone: always shown, verbose or not."""
+        print("[rpfarm] " + str(message), flush=True)
 
     # -------------------------------------------------------------------------
     # Application binary paths
     # -------------------------------------------------------------------------
 
     def _pythonBin(self, work_item):
-        """
-        Returns the path to a python executable on the RunPod pod.
-        Substituted in commands with the __PDG_PYTHON__ token.
-        """
+        """Path to python3 on the pod (the __PDG_PYTHON__ token)."""
         return "/usr/bin/python3"
 
     def _hythonBin(self, work_item):
+        """Path to hython on the pod (the __PDG_HYTHON__ token).
+
+        Houdini lives on the shared network volume under a per-version
+        directory, matching HFS as set by pod/entrypoint.sh.
         """
-        Returns the path to a hython executable on the RunPod pod.
-        Substituted in commands with the __PDG_HYTHON__ token.
-        """
-        return os.environ.get("PDG_HYTHON", "/workspace/houdini/bin/hython")
+        version = self._cfg.houdini_version if self._cfg else "22.0.393"
+        return "/workspace/houdini/{}/bin/hython".format(version)
 
     def applicationBin(self, name, work_item):
-        """
-        [virtual] Returns the path to the given application.
-        """
+        """[virtual] Returns the path to the given application."""
         if name == "python":
             return self._pythonBin(work_item)
         elif name == "hython":
@@ -294,9 +420,7 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
     # -------------------------------------------------------------------------
 
     def execEvent(self, event):
-        """
-        Override of EventDispatchMixin. Print all events when verbose.
-        """
+        """Override of EventDispatchMixin. Print all events when verbose."""
         if self._verbose > 0:
             self._verboseLog(repr(event))
         return EventDispatchMixin.execEvent(self, event)
@@ -338,8 +462,10 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         item_command = item_command.replace(
             "__PDG_SHARED_ROOT__", self.workingDir(False))
 
+        # $HFS on the pod, not on the artist's machine.
         item_command = item_command.replace(
-            "__PDG_HFS__", os.environ.get("HFS", ""))
+            "__PDG_HFS__", "/workspace/houdini/{}".format(
+                self._cfg.houdini_version if self._cfg else ""))
 
         return item_command
 
@@ -397,8 +523,11 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
                 setmap[var] = str(val)
             task_env.update(setmap)
 
-        # Writes the PDG path map info to the environment
+        # Writes the PDG path map info to the environment. The entries this
+        # scheduler registered in onStartCook are part of the global path map,
+        # so they come out of here automatically.
         self.resolvePathMapping(task_env)
+        self._ensurePathMapEnv(task_env)
 
         # Resolves the environment specified in the Job Parms scheduler section
         add_env, remove_env = self.resolveEnvParams(
@@ -412,499 +541,88 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
 
         return task_env
 
-    # -------------------------------------------------------------------------
-    # RunPod API methods
-    # -------------------------------------------------------------------------
+    def _ensurePathMapEnv(self, task_env):
+        """Backstop for $PDG_PATHMAP.
 
-    def _runpod_api(self, method, endpoint, data=None):
+        resolvePathMapping serialises the *global* PDG path map, which is where
+        _registerPathMap put this cook's entries. If that registration did not
+        take (an older Houdini without pdg.PathMap.edit, say), fall back to
+        rendering our own mapping. Skipped when the user has deliberately set
+        Path Mapping to "None".
         """
-        Helper to call the RunPod GraphQL API.
-
-        Args:
-            method: HTTP method (typically "POST" for GraphQL).
-            endpoint: The API endpoint URL.
-            data: Dictionary payload to send as JSON.
-
-        Returns:
-            Parsed JSON response dictionary.
-
-        Raises:
-            CookError: If the API call fails or returns errors.
-        """
-        if data is None:
-            data = {}
-
-        json_data = json.dumps(data)
-
-        if requests is not None:
-            # Use requests library
-            try:
-                resp = requests.request(
-                    method,
-                    endpoint,
-                    headers=self._runpod_headers,
-                    json=data,
-                    timeout=30,
-                )
-                resp.raise_for_status()
-                result = resp.json()
-            except requests.exceptions.RequestException as e:
-                raise CookError(
-                    f"RunPod API request failed: {e}"
-                ) from e
-        else:
-            # Fall back to urllib
-            try:
-                req = urllib.request.Request(
-                    endpoint,
-                    data=json_data.encode("utf-8"),
-                    headers=self._runpod_headers,
-                    method=method,
-                )
-                with urllib.request.urlopen(req, timeout=30) as resp:
-                    result = json.loads(resp.read().decode("utf-8"))
-            except (urllib.error.URLError, urllib.error.HTTPError) as e:
-                raise CookError(
-                    f"RunPod API request failed: {e}"
-                ) from e
-
-        # Check for GraphQL-level errors
-        if "errors" in result and result["errors"]:
-            error_msgs = "; ".join(
-                err.get("message", str(err)) for err in result["errors"]
-            )
-            raise CookError(f"RunPod API returned errors: {error_msgs}")
-
-        return result
-
-    def _create_pod(self, gpu_type_id=None):
-        """
-        Create a RunPod pod via the GraphQL API.
-
-        Uses scheduler parameters for GPU type, template ID, network volume,
-        and datacenter. Passes Redis connection info as environment variables
-        so the pod worker can connect to the task queue.
-
-        Args:
-            gpu_type_id: Optional GPU type override. If None, reads from
-                         rpfarm_gputype parameter.
-
-        Returns:
-            The pod ID string of the newly created pod.
-
-        Raises:
-            CookError: If pod creation fails.
-        """
-        if gpu_type_id is None:
-            gpu_type_id = self["rpfarm_gputypeid"].evaluateString()
-
-        template_id = self["rpfarm_templateid"].evaluateString()
-        network_volume_id = self["rpfarm_networkvolumeid"].evaluateString()
-        datacenter = self["rpfarm_datacenter"].evaluateString()
-        redis_url = self["rpfarm_redisurl"].evaluateString()
-        project_id = self["rpfarm_projectid"].evaluateString()
-        user_id = self["rpfarm_userid"].evaluateString()
-
-        # Build the environment variables for the pod
-        env_vars = {
-            "REDIS_URL": redis_url,
-            "PROJECT_ID": project_id,
-            "USER_ID": user_id,
-        }
-
-        # B2 sync settings
-        if self["rpfarm_b2_enabled"].evaluateInt():
-            env_vars["B2_KEY_ID"] = self["rpfarm_b2_key_id"].evaluateString()
-            env_vars["B2_APP_KEY"] = self["rpfarm_b2_app_key"].evaluateString()
-            env_vars["B2_BUCKET"] = self["rpfarm_b2_bucket"].evaluateString()
-            env_vars["COMPRESSION_ENABLED"] = str(self["rpfarm_compression_enabled"].evaluateInt())
-            env_vars["COMPRESSION_LEVEL"] = str(self["rpfarm_compression_level"].evaluateInt())
-
-        # Build environment as GraphQL-formatted list (unquoted keys)
-        env_entries = ", ".join(
-            '{key: "%s", value: "%s"}' % (k, v.replace('"', '\\"'))
-            for k, v in env_vars.items()
-        )
-        env_gql = "[%s]" % env_entries
-
-        # Construct the GraphQL mutation
-        mutation = """
-        mutation {{
-            podFindAndDeployOnDemand(input: {{
-                name: "rpfarm-{project_id}-{unique_id}"
-                gpuTypeId: "{gpu_type_id}"
-                templateId: "{template_id}"
-                {volume_clause}
-                {datacenter_clause}
-                env: {env_gql}
-            }}) {{
-                id
-                desiredStatus
-                imageName
-                machine {{
-                    podHostId
-                }}
-            }}
-        }}
-        """.format(
-            project_id=project_id,
-            unique_id=uuid.uuid4().hex[:8],
-            gpu_type_id=gpu_type_id,
-            template_id=template_id,
-            volume_clause=(
-                f'networkVolumeId: "{network_volume_id}"'
-                if network_volume_id else ""
-            ),
-            datacenter_clause=(
-                f'dataCenterId: "{datacenter}"'
-                if datacenter else ""
-            ),
-            env_gql=env_gql,
-        )
-
-        self._verboseLog(f"Creating RunPod pod with GPU type: {gpu_type_id}")
-
-        result = self._runpod_api("POST", _RUNPOD_API_URL, {
-            "query": mutation
-        })
-
-        pod_data = result.get("data", {}).get("podFindAndDeployOnDemand")
-        if not pod_data or "id" not in pod_data:
-            raise CookError(
-                f"Failed to create RunPod pod. API response: {result}"
-            )
-
-        pod_id = pod_data["id"]
-        self._verboseLog(f"Created RunPod pod: {pod_id}")
-
-        return pod_id
-
-    def _terminate_pod(self, pod_id):
-        """
-        Terminate a RunPod pod via the GraphQL API.
-
-        Args:
-            pod_id: The pod ID to terminate.
-
-        Raises:
-            CookError: If termination fails.
-        """
-        mutation = """
-        mutation {{
-            podTerminate(input: {{
-                podId: "{pod_id}"
-            }})
-        }}
-        """.format(pod_id=pod_id)
-
-        self._verboseLog(f"Terminating RunPod pod: {pod_id}")
-
-        try:
-            self._runpod_api("POST", _RUNPOD_API_URL, {"query": mutation})
-        except CookError as e:
-            # Log but don't raise -- pod may already be terminated
-            self._verboseLog(
-                f"Warning: Failed to terminate pod {pod_id}: {e}"
-            )
-
-    def _get_pod_status(self, pod_id):
-        """
-        Get the status of a RunPod pod via the GraphQL API.
-
-        Args:
-            pod_id: The pod ID to query.
-
-        Returns:
-            A dictionary with pod status information including at minimum:
-            {"id": str, "desiredStatus": str, "runtime": dict or None}
-
-        Raises:
-            CookError: If the query fails.
-        """
-        query = """
-        query {{
-            pod(input: {{
-                podId: "{pod_id}"
-            }}) {{
-                id
-                desiredStatus
-                runtime {{
-                    uptimeInSeconds
-                    gpus {{
-                        id
-                        gpuUtilPercent
-                        memoryUtilPercent
-                    }}
-                }}
-                costPerHr
-                gpuCount
-            }}
-        }}
-        """.format(pod_id=pod_id)
-
-        result = self._runpod_api("POST", _RUNPOD_API_URL, {"query": query})
-
-        pod_data = result.get("data", {}).get("pod")
-        if pod_data is None:
-            # Pod may have been terminated or not found
-            return {
-                "id": pod_id,
-                "desiredStatus": _POD_STATUS_TERMINATED,
-                "runtime": None,
-            }
-
-        return pod_data
-
-    # -------------------------------------------------------------------------
-    # Pod Pool Management
-    # -------------------------------------------------------------------------
-
-    def _scale_up(self, count):
-        """
-        Create `count` new pods and add them to self.pod_infos.
-
-        Args:
-            count: Number of pods to create.
-        """
-        max_pods = self["rpfarm_maxpods"].evaluateInt()
-        current_count = len(self.pod_infos)
-
-        # Clamp to max_pods
-        count = min(count, max_pods - current_count)
-        if count <= 0:
-            self._verboseLog(
-                f"Scale up requested but already at max pods ({max_pods})"
-            )
+        if self["pdg_mapmode"].evaluateInt() == 1 or not self._remote_project:
             return
-
-        self._verboseLog(f"Scaling up: creating {count} new pod(s)")
-
-        for i in range(count):
-            try:
-                pod_id = self._create_pod()
-                pod_info = {
-                    "pod_id": pod_id,
-                    "status": _POD_STATUS_CREATED,
-                    "created_at": datetime.datetime.now(),
-                    "last_heartbeat": datetime.datetime.now(),
-                    "idle_since": None,
-                    "cost_per_hr": 0.0,
-                }
-                self.pod_infos.append(pod_info)
-                self._verboseLog(
-                    f"Pod {i + 1}/{count} created: {pod_id}"
-                )
-            except CookError as e:
-                self._verboseLog(
-                    f"Failed to create pod {i + 1}/{count}: {e}"
-                )
-
-    def _scale_down(self, count):
-        """
-        Terminate `count` idle pods, preferring the oldest ones.
-
-        Args:
-            count: Number of pods to terminate.
-        """
-        min_pods = self["rpfarm_minpods"].evaluateInt()
-        current_count = len(self.pod_infos)
-
-        # Ensure we keep at least min_pods running
-        count = min(count, current_count - min_pods)
-        if count <= 0:
-            self._verboseLog(
-                f"Scale down requested but already at min pods ({min_pods})"
-            )
+        if self._remote_project in (task_env.get("PDG_PATHMAP") or ""):
             return
-
-        # Find idle pods (those with idle_since set) and sort by
-        # created_at ascending (oldest first)
-        idle_pods = [
-            p for p in self.pod_infos
-            if p.get("idle_since") is not None
-        ]
-        idle_pods.sort(key=lambda p: p["created_at"])
-
-        terminated_count = 0
-        for pod_info in idle_pods:
-            if terminated_count >= count:
-                break
-
-            pod_id = pod_info["pod_id"]
-            self._verboseLog(f"Scaling down: terminating idle pod {pod_id}")
-            self._terminate_pod(pod_id)
-            self.pod_infos.remove(pod_info)
-            terminated_count += 1
-
-        self._verboseLog(
-            f"Scale down complete: terminated {terminated_count} pod(s), "
-            f"{len(self.pod_infos)} remaining"
-        )
-
-    def _get_active_pod_count(self):
-        """
-        Return the count of pods in RUNNING state.
-
-        Returns:
-            Integer count of running pods.
-        """
-        return sum(
-            1 for p in self.pod_infos
-            if p.get("status") == _POD_STATUS_RUNNING
-        )
+        task_env["PDG_PATHMAP"] = rpdeps.pathmap_env(self._pathmap)
+        task_env["PDG_DELOCALIZE"] = "0"
 
     # -------------------------------------------------------------------------
-    # Redis methods
+    # Path map
     # -------------------------------------------------------------------------
 
-    def _redis_connect(self):
+    def _registerPathMap(self):
+        """Put this cook's local <-> farm mappings into the global PDG path map.
+
+        Two directions are needed, and they are separate entries:
+
+        - LINUX zone, local -> farm: what the job on the pod applies to every
+          path it is handed (pdgcmd's _buildPathMap).
+        - this machine's zone, farm -> local: what localizePath applies to the
+          paths work items report back, so downstream nodes and the output
+          downloader see real local files.
+
+        Entries are tagged with this scheduler's name so onStopCook can drop
+        exactly ours and leave any hand-authored mappings alone.
         """
-        Connect to Redis using the rpfarm_redisurl parameter.
-
-        Returns:
-            A redis.Redis client instance.
-
-        Raises:
-            CookError: If connection fails.
-        """
-        redis_url = self["rpfarm_redisurl"].evaluateString()
-
-        if not redis_url:
-            raise CookError("Redis URL is not configured (rpfarm_redisurl).")
+        import pdg
 
         try:
-            client = redis.Redis.from_url(
-                redis_url,
-                decode_responses=True,
-                socket_timeout=10,
-                socket_connect_timeout=10,
-                retry_on_timeout=True,
-            )
-            # Test the connection
-            client.ping()
-            self._verboseLog(f"Connected to Redis")
-            return client
-        except redis.exceptions.RedisError as e:
-            raise CookError(
-                f"Failed to connect to Redis at {redis_url}: {e}"
-            ) from e
+            with pdg.PathMap.edit() as pmap:
+                pmap.clearSchedulerMappings(self.name)
+                local_zone = pdg.PathMap.mappingZone()
+                for local, remote in self._pathmap.items():
+                    pmap.addPathMapping(pdg.PathMap.LinuxZone, local, remote, self.name)
+                    if local_zone and local_zone != pdg.PathMap.LinuxZone:
+                        pmap.addPathMapping(local_zone, remote, local, self.name)
+        except AttributeError as e:
+            # Older PDG without the edit-block API: _ensurePathMapEnv still
+            # gets the job side right, only localizePath is degraded.
+            self._verboseLog("path map registration unavailable: {}".format(e))
 
-    def _get_queue_key(self):
-        """
-        Returns the Redis key for the task queue.
-        """
-        project_id = self["rpfarm_projectid"].evaluateString()
-        user_id = self["rpfarm_userid"].evaluateString()
-        return _REDIS_TASK_QUEUE_KEY.format(
-            project_id=project_id,
-            user_id=user_id,
-        )
-
-    def _push_task(self, task_data):
-        """
-        Push a task onto the Redis task queue.
-
-        Args:
-            task_data: Dictionary containing task information to be serialized
-                       as JSON and pushed to the queue.
-
-        Raises:
-            CookError: If the push fails.
-        """
-        if self._redis_client is None:
-            raise CookError("Redis client is not connected.")
-
-        queue_key = self._get_queue_key()
-        task_json = json.dumps(task_data)
+    def _clearPathMap(self):
+        import pdg
 
         try:
-            self._redis_client.lpush(queue_key, task_json)
-            self._verboseLog(
-                f"Pushed task {task_data.get('task_id', 'unknown')} "
-                f"to queue {queue_key}"
-            )
-        except redis.exceptions.RedisError as e:
-            raise CookError(
-                f"Failed to push task to Redis queue: {e}"
-            ) from e
+            with pdg.PathMap.edit() as pmap:
+                pmap.clearSchedulerMappings(self.name)
+        except AttributeError:
+            pass
 
-    def _get_results(self):
+    def _loadPathMap(self):
+        """Build {local prefix: farm prefix} for this cook.
+
+        Always contains the job directory. runpodfarm_upload (Task 9) writes
+        the external-reference entries it uploaded to
+        $JOB/.rpfarm_pathmap.json; they are merged in when that file exists.
         """
-        Non-blocking check for results from all pending tasks.
-        Reads from rp:results:{task_id} for each task in self.task_map.
+        pmap = {self._job_dir: self._remote_project}
+        local_root = self.workingDir(True)
+        if local_root and local_root not in pmap:
+            pmap[local_root] = self.workingDir(False)
 
-        Returns:
-            A list of (task_id, result_dict) tuples for completed tasks.
-        """
-        if self._redis_client is None:
-            return []
-
-        completed = []
-        task_ids = list(self.task_map.keys())
-
-        for task_id in task_ids:
-            result_key = _REDIS_RESULT_KEY.format(task_id=task_id)
-
-            try:
-                # Non-blocking: get all results for this task
-                results = self._redis_client.lrange(result_key, 0, -1)
-                if results:
-                    # Trim the list (consume the results)
-                    self._redis_client.ltrim(result_key, len(results), -1)
-
-                    for result_json in results:
-                        try:
-                            result_data = json.loads(result_json)
-                            completed.append((task_id, result_data))
-                        except (json.JSONDecodeError, TypeError):
-                            self._verboseLog(
-                                f"Warning: Invalid JSON in result "
-                                f"for task {task_id}"
-                            )
-            except redis.exceptions.RedisError as e:
+        ext = os.path.join(self._job_dir, ".rpfarm_pathmap.json")
+        try:
+            with open(ext, "r") as f:
+                extra = json.load(f)
+            if isinstance(extra, dict):
+                for local, remote in extra.items():
+                    pmap.setdefault(str(local), str(remote))
                 self._verboseLog(
-                    f"Warning: Failed to read results for "
-                    f"task {task_id}: {e}"
-                )
-
-        return completed
-
-    def _get_queue_depth(self):
-        """
-        Get the current depth of the task queue.
-
-        Returns:
-            Integer queue depth, or 0 if unavailable.
-        """
-        if self._redis_client is None:
-            return 0
-
-        queue_key = self._get_queue_key()
-
-        try:
-            return self._redis_client.llen(queue_key)
-        except redis.exceptions.RedisError as e:
-            self._verboseLog(
-                f"Warning: Failed to get queue depth: {e}"
-            )
-            return 0
-
-    def _clear_queue(self):
-        """
-        Clear all tasks from the Redis task queue.
-        """
-        if self._redis_client is None:
-            return
-
-        queue_key = self._get_queue_key()
-
-        try:
-            self._redis_client.delete(queue_key)
-            self._verboseLog("Cleared task queue")
-        except redis.exceptions.RedisError as e:
-            self._verboseLog(
-                f"Warning: Failed to clear task queue: {e}"
-            )
+                    "path map: {} extra entries from {}".format(len(extra), ext))
+        except (OSError, ValueError):
+            pass
+        return pmap
 
     # -------------------------------------------------------------------------
     # Working directory management
@@ -913,34 +631,30 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
     def _updateWorkingDir(self):
         """
         Sets the full path to the local and remote working directory.
+
+        The remote side defaults to this cook's project directory on the shared
+        volume, so PDG's temp/script/data directories land under
+        /workspace/projects/<user>/<project>/pdgtemp -- the same place the path
+        map sends everything else.
         """
         working_dir = self["pdg_workingdir"].evaluateString()
 
         if self["rpfarm_overrideremoteworkingdir"].evaluateBool():
             remote_working_dir = self["rpfarm_remoteworkingdir"].evaluateString()
         else:
-            remote_working_dir = working_dir
+            remote_working_dir = self._remote_project
 
-        # Normalize paths
-        working_dir = os.path.normpath(working_dir)
-        remote_working_dir = os.path.normpath(remote_working_dir)
-
-        # Normalize path separators
-        working_dir = working_dir.replace("\\", "/")
-        remote_working_dir = remote_working_dir.replace("\\", "/")
+        working_dir = os.path.normpath(working_dir).replace("\\", "/")
+        remote_working_dir = posixpath.normpath(remote_working_dir)
 
         self.setWorkingDir(working_dir, remote_working_dir)
 
     def _initWorkingDir(self):
         """
-        Sanity check the local shared root and create working dir if needed.
-        Unlike the ECS version, we do not require a mount point since RunPod
-        uses network volumes that are mounted inside the pods.
+        Sanity check the local shared root and create the working dir if needed.
         """
-        # Re-cache working dir
         self._updateWorkingDir()
 
-        # Create working dir if needed
         working_dir_local = self.workingDir(True)
         if working_dir_local is None:
             raise CookError("Could not resolve working directory.")
@@ -959,486 +673,597 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
             os.makedirs(self.tempDir(True))
 
     # -------------------------------------------------------------------------
-    # Asset Manifest
+    # v2: farm plumbing
     # -------------------------------------------------------------------------
 
-    def _create_manifest(self, work_item):
-        """
-        Build a file manifest for B2 sync from the work item's file dependencies.
-        Includes SHA-256 checksums and compression strategy for each file.
-        """
-        b2_enabled = self["rpfarm_b2_enabled"].evaluateInt()
-        if not b2_enabled:
-            return None
-
-        import hashlib
-        import hou
-
-        # Compression strategy classification (inline — can't import worker modules)
-        _SKIP_EXTS = {".bgeo.sc", ".rat", ".tex"}
-        _ZSTD_EXTS = {".abc", ".usd", ".usdc", ".bgeo", ".geo",
-                       ".hip", ".hipnc", ".hda", ".py", ".json", ".txt"}
-        _TAR_ZSTD_EXTS = {".vdb"}
-
-        def _classify(path):
-            lower = path.lower()
-            for ext in _SKIP_EXTS:
-                if lower.endswith(ext):
-                    return "SKIP"
-            if lower.endswith(".exr"):
-                return "ZSTD"  # simplified — worker will re-check EXR header
-            for ext in _TAR_ZSTD_EXTS:
-                if lower.endswith(ext):
-                    return "TAR_ZSTD"
-            for ext in _ZSTD_EXTS:
-                if lower.endswith(ext):
-                    return "ZSTD"
-            return "PROBE"
-
-        def _sha256(filepath):
-            h = hashlib.sha256()
-            try:
-                with open(filepath, "rb") as f:
-                    for chunk in iter(lambda: f.read(1048576), b""):
-                        h.update(chunk)
-                return h.hexdigest()
-            except OSError:
-                return ""
-
-        manifest = {}
-        job_dir = os.environ.get("JOB", "")
-        hip_dir = os.environ.get("HIP", os.path.dirname(hou.hipFile.path()))
-
-        try:
-            refs = hou.fileReferences()
-        except Exception:
-            self._verboseLog("Warning: could not gather file references")
-            return None
-
-        tex_exts = {".exr", ".rat", ".tex", ".png", ".jpg", ".jpeg", ".tif",
-                    ".tiff", ".hdr", ".tga", ".bmp"}
-        geo_exts = {".bgeo", ".bgeo.sc", ".abc", ".obj", ".fbx", ".usd",
-                    ".usda", ".usdc", ".usdz", ".vdb"}
-        cache_exts = {".sim", ".simdata", ".gz"}
-        scene_exts = {".hip", ".hipnc", ".hiplc", ".py"}
-
-        for parm_ref, file_path in refs:
-            if not file_path:
-                continue
-
-            resolved = file_path
-            resolved = resolved.replace("$HIP", hip_dir)
-            resolved = resolved.replace("$JOB", job_dir)
-            resolved = resolved.replace("${HIP}", hip_dir)
-            resolved = resolved.replace("${JOB}", job_dir)
-
-            if "$F" in resolved or "%(UDIM)" in resolved:
-                import re
-                resolved = re.sub(r'\$F\d*', '*', resolved)
-                resolved = re.sub(r'%\(UDIM\)d', '*', resolved)
-                resolved = os.path.dirname(resolved)
-                if not resolved:
-                    continue
-
-            resolved = os.path.normpath(resolved)
-
-            if job_dir and resolved.startswith(job_dir):
-                rel_path = os.path.relpath(resolved, job_dir)
-            elif hip_dir and resolved.startswith(hip_dir):
-                rel_path = os.path.relpath(resolved, hip_dir)
-            else:
-                continue
-
-            if rel_path.startswith(".."):
-                continue
-
-            rel_path = rel_path.replace("\\", "/")
-
-            lower = rel_path.lower()
-            if any(lower.endswith(ext) for ext in tex_exts):
-                file_type = "texture"
-            elif any(lower.endswith(ext) for ext in geo_exts):
-                file_type = "geo"
-            elif any(lower.endswith(ext) for ext in cache_exts):
-                file_type = "cache"
-            elif any(lower.endswith(ext) for ext in scene_exts):
-                file_type = "scene"
-            else:
-                file_type = "other"
-
-            full_path = os.path.join(job_dir or hip_dir, rel_path)
-            try:
-                size = os.path.getsize(full_path) if os.path.isfile(full_path) else 0
-            except OSError:
-                size = 0
-
-            sha256 = _sha256(full_path) if os.path.isfile(full_path) else ""
-            strategy = _classify(rel_path)
-
-            manifest[rel_path] = {
-                "size": size,
-                "type": file_type,
-                "sha256": sha256,
-                "strategy": strategy,
-            }
-
-        self._verboseLog(
-            f"Manifest created: {len(manifest)} files "
-            f"({sum(1 for v in manifest.values() if v['type'] == 'texture')} tex, "
-            f"{sum(1 for v in manifest.values() if v['type'] == 'geo')} geo, "
-            f"{sum(1 for v in manifest.values() if v['type'] == 'scene')} scene)"
-        )
-
-        return manifest if manifest else None
-
-    def _upload_project_to_b2(self):
-        """Upload project files to B2 via rclone with compression."""
-        if not self["rpfarm_b2_enabled"].evaluateInt():
+    def _scale_up(self, count):
+        """Create up to `count` GPU pods, clamped by Max Pods."""
+        max_pods = self["rpfarm_maxpods"].evaluateInt()
+        count = min(count, max_pods - len(self._dispatcher.pods))
+        if count <= 0:
             return
 
-        import hou
-        b2_key_id = self["rpfarm_b2_key_id"].evaluateString()
-        b2_app_key = self["rpfarm_b2_app_key"].evaluateString()
-        b2_bucket = self["rpfarm_b2_bucket"].evaluateString()
-        project_id = self["rpfarm_projectid"].evaluateString()
-        compression = self["rpfarm_compression_enabled"].evaluateInt()
-        comp_level = self["rpfarm_compression_level"].evaluateInt()
-
-        job_dir = os.environ.get("JOB", os.path.dirname(hou.hipFile.path()))
-
-        # Write rclone config
-        rclone_conf = os.path.join(job_dir, ".rclone_rpfarm.conf")
-        with open(rclone_conf, "w") as f:
-            f.write(f"[b2]\ntype = b2\naccount = {b2_key_id}\nkey = {b2_app_key}\n")
-
-        # Build and save manifest
-        manifest = {}
-        # Use the scene manifest we already built
-        if hasattr(self, '_current_manifest') and self._current_manifest:
-            manifest = self._current_manifest
-
-        if not manifest:
-            self._verboseLog("No manifest to upload")
-            return
-
-        # Upload files to B2
-        remote = f"b2:{b2_bucket}/projects/{project_id}/"
-        local = job_dir + "/"
-
-        start = time.time()
-        try:
-            cmd = [
-                "rclone", "copy", local, remote,
-                "--config", rclone_conf,
-                "--checksum",
-                "--transfers", "8",
-                "--checkers", "16",
-                "--stats-one-line", "-q",
-            ]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
-            elapsed = time.time() - start
-
-            if result.returncode == 0:
-                self._verboseLog(f"Project uploaded to B2 in {elapsed:.1f}s")
-            else:
-                self._verboseLog(f"B2 upload warning (rc={result.returncode}): {result.stderr[:200]}")
-        except Exception as e:
-            self._verboseLog(f"B2 upload failed: {e}")
-
-        # Upload manifest
-        import json as _json
-        manifest_path = os.path.join(job_dir, ".manifest.json")
-        with open(manifest_path, "w") as f:
-            _json.dump(manifest, f, indent=2)
-
-        try:
-            manifest_remote = f"b2:{b2_bucket}/projects/{project_id}/.manifest.json"
-            subprocess.run(
-                ["rclone", "copyto", manifest_path, manifest_remote,
-                 "--config", rclone_conf, "-q"],
-                capture_output=True, text=True, timeout=60,
+        slots = self["rpfarm_slots"].evaluateInt()
+        for _ in range(count):
+            name = rppods.pod_name(
+                self._cfg.user, self._project, self._cook_id,
+                len(self._dispatcher.pods) + 1,
             )
-        except Exception as e:
-            self._verboseLog(f"Manifest upload failed: {e}")
+            env = rppods.pod_env(self._cfg, "gpu", self._token, slots, self._pubkey)
+            try:
+                pod = self._api.create_gpu_pod(
+                    name, self._templateId(), self._gpu_list, self._volumeId(),
+                    env, rppods.PORTS,
+                )
+            except RunPodError as e:
+                self._log("pod create failed ({}): {}".format(", ".join(self._gpu_list), e))
+                self._last_pod_error = str(e)
+                continue
+            pod_id = pod["id"]
+            self._dispatcher.add_pod(pod_id, 0.0, status="CREATED", created_at=time.time())
+            self._clients[pod_id] = WorkerClient(pod_id, self._token)
+            self._last_pod_error = None
+            self._log("pod created {} {}".format(name, pod_id))
 
-        # Also publish manifest to Redis
+    def _templateId(self):
+        return self["rpfarm_templateid"].evaluateString() or self._cfg.template_id
+
+    def _volumeId(self):
+        return self["rpfarm_networkvolumeid"].evaluateString() or self._cfg.volume_id
+
+    def _poll_pods(self):
+        """Track pod health: CREATED -> RUNNING on the first /health, and
+        RUNNING -> dead after _POD_DEAD_AFTER_SECONDS without one."""
+        now = time.time()
+        for pod in list(self._dispatcher.pods.values()):
+            if now - self._last_health_poll.get(pod.pod_id, 0.0) < _HEALTH_POLL_INTERVAL:
+                continue
+            self._last_health_poll[pod.pod_id] = now
+
+            client = self._clients.get(pod.pod_id)
+            health = client.health() if client else None
+            if health:
+                pod.health_fail_since = None
+                if pod.status != "RUNNING":
+                    self._promote_pod(pod, health)
+                continue
+
+            if pod.health_fail_since is None:
+                pod.health_fail_since = now
+                continue
+            if now - pod.health_fail_since <= _POD_DEAD_AFTER_SECONDS:
+                continue
+
+            self._log("pod {} unreachable for {}s, requeueing {} task(s)".format(
+                pod.pod_id, _POD_DEAD_AFTER_SECONDS, len(pod.running)))
+            self._dispatcher.pod_dead(pod.pod_id)
+            self._reportFailures()
+            self._clients.pop(pod.pod_id, None)
+            self._last_health_poll.pop(pod.pod_id, None)
+            try:
+                self._api.terminate_pod(pod.pod_id)
+            except RunPodError as e:
+                self._verboseLog("terminate {} failed: {}".format(pod.pod_id, e))
+
+    def _promote_pod(self, pod, health):
+        """A pod answered /health for the first time: record its price and GPU."""
         try:
-            user_id = self["rpfarm_userid"].evaluateString()
-            key = f"rp:manifest:{project_id}:{user_id}"
-            self._redis_client.set(key, _json.dumps(manifest), ex=86400)
-        except Exception as e:
-            self._verboseLog(f"Redis manifest publish failed: {e}")
+            info = self._api.get_pod(pod.pod_id) or {}
+        except RunPodError as e:
+            self._verboseLog("get_pod {} failed: {}".format(pod.pod_id, e))
+            info = {}
+        pod.cost_per_hr = float(info.get("costPerHr") or 0.0)
+        gpus = health.get("gpus") or []
+        pod.gpu = gpus[0].get("name", "") if gpus else str(info.get("machineType") or "")
+        pod.status = "RUNNING"
+        pod.idle_since = time.time()
+        boot = time.time() - (pod.created_at or time.time())
+        self._log("pod {} RUNNING after {:.0f}s, ${:.3f}/h, gpu={}".format(
+            pod.pod_id, boot, pod.cost_per_hr, pod.gpu or "?"))
 
-    def _download_results_from_b2(self, task_id, result_data):
-        """Download render results from B2 to local workstation."""
-        if not self["rpfarm_b2_enabled"].evaluateInt():
-            return
-
-        import hou
-        b2_key_id = self["rpfarm_b2_key_id"].evaluateString()
-        b2_app_key = self["rpfarm_b2_app_key"].evaluateString()
-        b2_bucket = self["rpfarm_b2_bucket"].evaluateString()
-        project_id = self["rpfarm_projectid"].evaluateString()
-
-        job_dir = os.environ.get("JOB", os.path.dirname(hou.hipFile.path()))
-
-        rclone_conf = os.path.join(job_dir, ".rclone_rpfarm.conf")
-        if not os.path.exists(rclone_conf):
-            with open(rclone_conf, "w") as f:
-                f.write(f"[b2]\ntype = b2\naccount = {b2_key_id}\nkey = {b2_app_key}\n")
-
-        remote = f"b2:{b2_bucket}/projects/{project_id}/results/"
-        local = os.path.join(job_dir, "results") + "/"
-        os.makedirs(local, exist_ok=True)
-
-        start = time.time()
-        try:
-            cmd = [
-                "rclone", "copy", remote, local,
-                "--config", rclone_conf,
-                "--checksum",
-                "--transfers", "8",
-                "--stats-one-line", "-q",
-            ]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
-            elapsed = time.time() - start
-
-            if result.returncode == 0:
-                self._verboseLog(f"Results downloaded from B2 in {elapsed:.1f}s")
-                self._update_transfer_metrics({"download_time": elapsed})
-            else:
-                self._verboseLog(f"B2 download error: {result.stderr[:200]}")
-        except Exception as e:
-            self._verboseLog(f"B2 download failed: {e}")
-
-    def _update_transfer_metrics(self, metrics):
-        """Update transfer metrics UI parameters."""
-        try:
-            node = self.node()
-            if not node:
+    def _dispatch_pending(self):
+        """Submit queued tasks to pods with free slots."""
+        while self._dispatcher.pending:
+            pod = self._dispatcher.pick_pod()
+            if not pod:
                 return
-            if "upload_size" in metrics:
-                node.parm("rpfarm_metrics_upload_size").set(
-                    metrics["upload_size"] / (1024 * 1024))
-            if "upload_compressed" in metrics:
-                node.parm("rpfarm_metrics_upload_compressed").set(
-                    metrics["upload_compressed"] / (1024 * 1024))
-            if "upload_ratio" in metrics:
-                node.parm("rpfarm_metrics_upload_ratio").set(metrics["upload_ratio"])
-            if "upload_time" in metrics:
-                node.parm("rpfarm_metrics_upload_time").set(metrics["upload_time"])
-            if "download_time" in metrics:
-                node.parm("rpfarm_metrics_download_time").set(metrics["download_time"])
+            task = self._dispatcher.pending[0]
+            client = self._clients.get(pod.pod_id)
+            if client is None:
+                self._dispatcher.mark_full(pod.pod_id)
+                continue
+            try:
+                result = client.submit(
+                    task.task_id, task.command, task.env, log_path=task.log_path)
+            except WorkerError as e:
+                # A transport hiccup or an unexpected status: skip the pod for
+                # this tick. _poll_pods decides whether it is actually dead.
+                self._verboseLog("submit to {} failed: {}".format(pod.pod_id, e))
+                self._dispatcher.mark_full(pod.pod_id)
+                continue
+
+            if result == "accepted":
+                self._dispatcher.assign(task.task_id, pod.pod_id)
+                task.started = time.time()
+                self._verboseLog("task {} -> pod {} (item {})".format(
+                    task.task_id, pod.pod_id, task.work_item_id))
+            elif result == "busy":
+                # The pod's own slot count disagrees with ours; believe the pod.
+                self._dispatcher.mark_full(pod.pod_id)
+            else:  # "duplicate" -- the id was used before; mint a fresh one once
+                if task.task_id.endswith("-r"):
+                    self._log("task {} rejected as duplicate twice, failing item {}".format(
+                        task.task_id, task.work_item_id))
+                    self._dispatcher.pending.remove(task)
+                    self.workItemFailed(task.work_item_id, -1)
+                else:
+                    self._dispatcher.retask(task.task_id, uuid.uuid4().hex + "-r")
+
+    def _poll_tasks(self):
+        """Ask each pod about the tasks it is running and retire the finished."""
+        for task in self._dispatcher.running_tasks():
+            client = self._clients.get(task.pod_id)
+            status = client.status(task.task_id) if client else None
+            if not status or status.get("state") == "running":
+                continue
+
+            ok = status.get("state") == "succeeded"
+            duration = int(status.get("duration_s") or 0)
+            pod = self._dispatcher.pods.get(task.pod_id)
+            self._dispatcher.complete(task.task_id, ok)
+
+            _ledger_append(
+                self._ledger_path,
+                cook_id=self._cook_id,
+                user=self._cfg.user,
+                project=self._project,
+                work_item=task.work_item_id,
+                work_item_name=self._itemName(task.work_item_id),
+                pod=task.pod_id,
+                gpu=pod.gpu if pod else "",
+                started=task.started,
+                ended=time.time(),
+                duration_s=duration,
+                exit_code=status.get("exit_code"),
+                cost_est=(pod.cost_per_hr if pod else 0.0) * duration / 3600.0,
+            )
+
+            work_item = self._work_items.pop(task.work_item_id, None)
+            if ok:
+                self.workItemSucceeded(task.work_item_id, -1, duration)
+                self._render_times = (
+                    self._render_times + [duration])[-_AUTOSCALE_HISTORY_SIZE:]
+                if work_item is not None:
+                    self._download_outputs(work_item)
+            else:
+                self._logTaskFailure(task, status)
+                self.workItemFailed(task.work_item_id, -1)
+
+    def _itemName(self, work_item_id):
+        item = self._work_items.get(work_item_id)
+        return item.name if item is not None else str(work_item_id)
+
+    def _logTaskFailure(self, task, status):
+        """Put the tail of a failed task's log where the artist will see it."""
+        tail = status.get("tail") or []
+        self._log("item {} failed on pod {} (exit {}), log {}".format(
+            task.work_item_id, task.pod_id, status.get("exit_code"), task.log_path))
+        for line in tail[-20:]:
+            self._log("  | {}".format(line))
+
+    def _reportFailures(self):
+        """Tell PDG about tasks the dispatcher has given up retrying."""
+        for task in self._dispatcher.failed_since_last_call():
+            self._log("item {} failed after {} attempt(s)".format(
+                task.work_item_id, task.attempts))
+            self._work_items.pop(task.work_item_id, None)
+            self.workItemFailed(task.work_item_id, -1)
+
+    # -------------------------------------------------------------------------
+    # Output download
+    # -------------------------------------------------------------------------
+
+    def _download_outputs(self, work_item):
+        """Queue this work item's outputs for download, right away.
+
+        The item reports its outputs over MQ while it runs, so by the time we
+        see it succeed they are in work_item.resultData as farm paths.
+        localizePath turns each one into the local path the ROP was aimed at.
+
+        Entries are grouped by (local dir, farm dir): rclone's --files-from
+        lines have to be relative to both roots at once (ruling R8), and one
+        directory pair per package makes that hold by construction.
+        """
+        if not self["rpfarm_downloadoutputs"].evaluateInt():
+            return
+        groups = {}
+        for rd in work_item.resultData:
+            remote = rd[0] if isinstance(rd, (tuple, list)) else str(rd)
+            local = self.localizePath(remote)
+            if not local or local == remote:
+                # Not under any mapping we know: nothing to pull it to.
+                continue
+            key = (os.path.dirname(local), posixpath.dirname(remote))
+            groups.setdefault(key, []).append(
+                rpsync.FileEntry(local=local, remote=remote, size=0))
+        for (local_root, remote_root), entries in groups.items():
+            self._sync_queue.append((local_root, remote_root, entries))
+        if groups:
+            self._verboseLog("queued {} output(s) of item {} for download".format(
+                sum(len(v) for v in groups.values()), work_item.id))
+
+    def _drain_sync_queue(self, block=False, deadline=None):
+        """Run queued downloads. Failures go back on the queue and are retried
+        on a later tick; when blocking, until the deadline passes."""
+        while self._sync_queue:
+            local_root, remote_root, entries = self._sync_queue.pop(0)
+            try:
+                os.makedirs(local_root, exist_ok=True)
+                rpsync.rclone_copy(
+                    entries, self._sftp, "down", self._cfg.rclone_path,
+                    local_root=local_root, remote_root=remote_root,
+                )
+                self._verboseLog("downloaded {} file(s) to {}".format(
+                    len(entries), local_root))
+            except (rpsync.SyncError, OSError) as e:
+                self._verboseLog("download failed ({}), will retry: {}".format(
+                    remote_root, e))
+                self._sync_queue.append((local_root, remote_root, entries))
+                if not block:
+                    return
+                if deadline is not None and time.time() > deadline:
+                    self._log("giving up on {} queued download(s)".format(
+                        len(self._sync_queue)))
+                    return
+                time.sleep(2)
+
+    # -------------------------------------------------------------------------
+    # Cost
+    # -------------------------------------------------------------------------
+
+    def _update_cost_tracking(self):
+        """Accumulate this cook's GPU spend and act on the budget."""
+        if not self._cost_tracker:
+            return "ok"
+        now = time.time()
+        total = 0.0
+        for pod in self._dispatcher.pods.values():
+            started = pod.created_at or self._cost_tracker["start_time"]
+            total += pod.cost_per_hr * (now - started) / 3600.0
+        total += self._cost_tracker.get("retired_cost", 0.0)
+        self._cost_tracker["total_cost"] = total
+
+        state = rpdispatch.budget_state(total, self._cost_tracker["max_cost"])
+        self._cost_tracker["over_budget"] = state in ("stop", "kill")
+        if state != self._cost_tracker.get("state"):
+            self._cost_tracker["state"] = state
+            if state != "ok":
+                self._log("budget {}: ${:.2f} of ${:.2f}".format(
+                    state, total, self._cost_tracker["max_cost"]))
+        return state
+
+    def _retire_pod_cost(self, pod):
+        """Bank a terminated pod's spend so it stays in the cook total."""
+        started = pod.created_at or self._cost_tracker.get("start_time", time.time())
+        self._cost_tracker["retired_cost"] = self._cost_tracker.get(
+            "retired_cost", 0.0) + pod.cost_per_hr * (time.time() - started) / 3600.0
+
+    def _terminate_pod(self, pod_id):
+        pod = self._dispatcher.pods.get(pod_id)
+        if pod is not None:
+            self._retire_pod_cost(pod)
+        self._clients.pop(pod_id, None)
+        self._last_health_poll.pop(pod_id, None)
+        try:
+            self._api.terminate_pod(pod_id)
+        except RunPodError as e:
+            self._verboseLog("terminate {} failed: {}".format(pod_id, e))
+
+    # -------------------------------------------------------------------------
+    # Status tab
+    # -------------------------------------------------------------------------
+
+    def _update_status_text(self, force=False):
+        now = time.time()
+        if not force and now - self._last_status_update < _STATUS_REFRESH_SECONDS:
+            return
+        self._last_status_update = now
+
+        lines = ["cook {}  project {}".format(self._cook_id, self._project)]
+        if self._sync_pod:
+            lines.append("sync pod {}".format(self._sync_pod["id"]))
+        for pod in sorted(self._dispatcher.pods.values(), key=lambda p: p.pod_id):
+            lines.append("  {} {:<8} {:<28} {}/{} busy  ${:.3f}/h".format(
+                pod.pod_id, pod.status, pod.gpu or "-",
+                len(pod.running), pod.slots, pod.cost_per_hr))
+        if not self._dispatcher.pods:
+            lines.append("  (no GPU pods)")
+        lines.append("tasks: {} pending, {} running, {} failed".format(
+            len(self._dispatcher.pending), len(self._dispatcher.running_tasks()),
+            len(self._dispatcher.failed)))
+        if self._sync_queue:
+            lines.append("downloads queued: {}".format(len(self._sync_queue)))
+        max_cost = self._cost_tracker.get("max_cost", 0.0)
+        lines.append("cost: ${:.3f}{}".format(
+            self._cost_tracker.get("total_cost", 0.0),
+            "" if max_cost in (0.0, float("inf")) else " of ${:.2f}".format(max_cost)))
+        try:
+            self.setParameter("rpfarm_status_text", "\n".join(lines))
         except Exception:
             pass
 
     # -------------------------------------------------------------------------
-    # PDG Scheduler Interface
+    # Scheduler callbacks
     # -------------------------------------------------------------------------
 
     def onStart(self):
-        """
-        onStart(self) -> boolean
-
-        [virtual] Scheduler start callback.
-        """
+        """[virtual] Scheduler start callback."""
         return True
 
     def onStop(self):
-        """
-        onStop(self) -> boolean
-
-        [virtual] Called before the underlying scheduler PDG node is destroyed.
-        """
+        """[virtual] Called before the underlying scheduler PDG node is destroyed."""
         return True
 
     def onStartCook(self, static, cook_set):
+        """[virtual] Cook start callback.
+
+        Loads ~/.rpfarm/config.toml, builds the RunPod client, names the cook,
+        registers the path map and checks for money and orphan pods. No pod is
+        created here -- that is onSetupCook's job.
         """
-        onStartCook(self, static, cook_set) -> boolean
+        import hou
 
-        [virtual] Cook start callback. Validates parameters, sets up RunPod API
-        headers, connects to Redis, and initializes cost tracking.
-        """
-        # 1. Validate required parameters
-        api_key = self["rpfarm_apikey"].evaluateString()
-        redis_url = self["rpfarm_redisurl"].evaluateString()
-        template_id = self["rpfarm_templateid"].evaluateString()
+        self._reset_cook_state()
 
-        if not api_key:
-            raise CookError(
-                "RunPod API Key is not provided. Set the rpfarm_apikey "
-                "parameter before starting a cook."
-            )
-        if not redis_url:
-            raise CookError(
-                "Redis URL is not provided. Set the rpfarm_redisurl "
-                "parameter before starting a cook."
-            )
-        if not template_id:
-            raise CookError(
-                "RunPod Template ID is not provided. Set the rpfarm_templateid "
-                "parameter before starting a cook."
-            )
-
-        # 1.5 Validate B2 settings if enabled
-        b2_enabled = self["rpfarm_b2_enabled"].evaluateInt()
-        if b2_enabled:
-            b2_key = self["rpfarm_b2_key_id"].evaluateString()
-            b2_secret = self["rpfarm_b2_app_key"].evaluateString()
-            if not b2_key or not b2_secret:
-                raise CookError(
-                    "B2 sync is enabled but credentials are missing. "
-                    "Set rpfarm_b2_key_id and rpfarm_b2_app_key."
-                )
-
-        # 2. Set up RunPod API headers
-        self._runpod_headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
-        }
-
-        # 3. Connect to Redis
-        self._redis_client = self._redis_connect()
-
-        # 4. Read verbose setting
         self._verbose = max(
             self["rpfarm_verbose"].evaluateInt(),
             int(os.environ.get("PDG_VERBOSE", "0")),
         )
 
-        # 5. Init cost tracker
+        try:
+            self._cfg = rpcfg.load()
+        except rpcfg.ConfigError as e:
+            raise CookError(
+                "{}\nRunPodFarm reads its settings from {}.".format(
+                    e, rpcfg.home() / rpcfg.CONFIG_FILENAME)) from e
+
+        api_key = self["rpfarm_apikey"].evaluateString() or self._cfg.api_key
+        if not api_key:
+            raise CookError(
+                "No RunPod API key. Set the API Key parameter, or run `rpfarm setup`.")
+        self._api = RunPodAPI(api_key)
+
+        if not self._templateId():
+            raise CookError(
+                "No RunPod template id. Set the Template ID parameter, or run "
+                "`rpfarm setup`.")
+
+        self._token = rpcfg.session_token()
+        self._pubkey = _read_pubkey(self._cfg)
+
+        job_dir = hou.getenv("JOB") or hou.getenv("HIP") or os.getcwd()
+        self._job_dir = os.path.normpath(job_dir).replace("\\", "/")
+        self._project = (
+            self["rpfarm_project"].evaluateString()
+            or os.path.basename(self._job_dir)
+            or "default"
+        )
+        self._cook_id = uuid.uuid4().hex[:8]
+        self._remote_project = "/workspace/projects/{}/{}".format(
+            self._cfg.user, self._project)
+
+        gpus = self["rpfarm_gpulist"].evaluateString()
+        self._gpu_list = [g.strip() for g in gpus.split(",") if g.strip()]
+        if not self._gpu_list:
+            self._gpu_list = list(self._cfg.gpu_priority)
+        if not self._gpu_list:
+            raise CookError(
+                "No GPU types listed. Fill in GPU Priority on the Farm tab, or "
+                "set gpu_priority in ~/.rpfarm/config.toml.")
+
+        self._dispatcher = rpdispatch.Dispatcher(
+            self["rpfarm_slots"].evaluateInt(), max_attempts=3)
+        self._ledger_path = str(
+            rpcfg.home() / "ledger" / "{}.jsonl".format(self._cook_id))
+        self._last_pod_error = None
+
         max_cost = self["rpfarm_maxcost"].evaluateFloat()
         self._cost_tracker = {
-            "start_time": datetime.datetime.now(),
+            "start_time": time.time(),
             "total_cost": 0.0,
+            "retired_cost": 0.0,
             "max_cost": max_cost if max_cost > 0.0 else float("inf"),
+            "state": "ok",
+            "over_budget": False,
         }
 
-        # Reset state
-        self.pod_infos = []
-        self.task_map = {}
-        self._render_times = []
+        # The working dir has to be set before the path map, which uses it.
+        self._initWorkingDir()
+        self._pathmap = self._loadPathMap()
+        self._registerPathMap()
 
-        # 6. Build and upload project manifest to B2
-        self._current_manifest = None
-        if self["rpfarm_b2_enabled"].evaluateInt():
-            self._current_manifest = self._create_manifest(None)
-            self._upload_project_to_b2()
+        self._checkBalance()
+        self._retireStaleSyncPod()
+        self._warnAboutOrphans()
 
-        self._verboseLog(
-            f"RunPodFarm Scheduler started. Max cost: "
-            f"${self._cost_tracker['max_cost']:.2f}"
-        )
-
+        self._log("cook {} project '{}' -> {} (gpus: {})".format(
+            self._cook_id, self._project, self._remote_project,
+            ", ".join(self._gpu_list)))
         return True
 
+    def _checkBalance(self):
+        """Warn, but do not block, when the RunPod balance is low."""
+        threshold = self["rpfarm_minbalance"].evaluateFloat()
+        if threshold <= 0:
+            return
+        try:
+            balance = self._api.balance()
+        except (RunPodError, KeyError, ValueError, TypeError) as e:
+            self._verboseLog("balance check failed: {}".format(e))
+            return
+        if balance >= threshold:
+            self._verboseLog("RunPod balance ${:.2f}".format(balance))
+            return
+        message = "RunPod balance is ${:.2f}, below the ${:.2f} warning threshold.".format(
+            balance, threshold)
+        self._log(message)
+        import hou
+
+        if hou.isUIAvailable():
+            hou.ui.displayMessage(message, severity=hou.severityType.Warning)
+
+    def _retireStaleSyncPod(self):
+        """Terminate the sync pod when it has been unused past Sync Pod Idle.
+
+        The pod cannot do this itself without holding a RunPod API key, so the
+        next cook to start does it instead, reading the timestamp the previous
+        cook left on the volume.
+        """
+        idle_min = self["rpfarm_syncidle"].evaluateInt()
+        if idle_min <= 0:
+            return
+        name = rppods.sync_pod_name(self._cfg.user)
+        try:
+            existing = [p for p in self._api.list_pods(name) if p.get("name") == name]
+        except RunPodError as e:
+            self._verboseLog("sync pod lookup failed: {}".format(e))
+            return
+        for pod in existing:
+            if pod.get("desiredStatus") != "RUNNING":
+                continue
+            stamp = WorkerClient(pod["id"], self._token).read_file(_SYNC_LAST_USED)
+            try:
+                last_used = float((stamp or "").strip())
+            except ValueError:
+                continue
+            idle_for = time.time() - last_used
+            if idle_for > idle_min * 60:
+                self._log("sync pod {} idle for {:.0f} min, terminating".format(
+                    pod["id"], idle_for / 60.0))
+                try:
+                    self._api.terminate_pod(pod["id"])
+                except RunPodError as e:
+                    self._verboseLog("terminate sync pod failed: {}".format(e))
+
+    def _warnAboutOrphans(self):
+        """Offer to kill this user's leftover GPU pods from an earlier cook."""
+        try:
+            orphans = rppods.find_orphans(self._api, self._cfg.user)
+        except RunPodError as e:
+            self._verboseLog("orphan check failed: {}".format(e))
+            return
+        if not orphans:
+            return
+        names = ", ".join(p.get("name", p["id"]) for p in orphans)
+        self._log("{} orphan GPU pod(s) still running: {}".format(len(orphans), names))
+        import hou
+
+        if not hou.isUIAvailable():
+            # Never kill someone else's cook without being asked.
+            self._log("  (headless: leaving them alone -- use Kill All Pods or "
+                      "`rpfarm farm kill`)")
+            return
+        if hou.ui.displayMessage(
+            "{} RunPod GPU pod(s) from an earlier cook are still running:\n\n{}\n\n"
+            "They keep costing money until they are terminated.".format(
+                len(orphans), names),
+            buttons=("Kill them", "Keep them"),
+            default_choice=0,
+            close_choice=1,
+            severity=hou.severityType.Warning,
+        ) == 0:
+            rppods.terminate_all(self._api, [p["id"] for p in orphans])
+            self._log("terminated {} orphan pod(s)".format(len(orphans)))
+
     def onSetupCook(self):
-        """
-        [virtual] Called after onStartCook. Sets up working directory,
-        copies job support files, creates the initial pod pool, and starts
-        MQ polling.
-        """
-        self._verboseLog("Setting up RunPodFarm Scheduler for cook...")
+        """[virtual] Called after onStartCook.
 
-        # 1. Update working dir
+        Brings up the sync pod, ships PDG's job scripts to the farm, starts the
+        MQ there and creates the initial GPU pods.
+        """
         self._initWorkingDir()
-
-        # 2. Copy job support files
         self._copyJobSupportFiles()
 
-        # 3. Create initial pod pool
-        min_pods = self["rpfarm_minpods"].evaluateInt()
-        if min_pods > 0:
-            self._verboseLog(
-                f"Creating initial pod pool with {min_pods} pod(s)..."
-            )
-            self._scale_up(min_pods)
+        self._log("waiting for sync pod {}...".format(
+            rppods.sync_pod_name(self._cfg.user)))
+        self._sync_pod = rppods.ensure_sync_pod(
+            self._api, self._cfg, self._token, self._pubkey,
+            log=self._log, cancel=lambda: self.context.canceling,
+        )
+        self._sync_client = WorkerClient(self._sync_pod["id"], self._token)
+        ip, port = pod_public_endpoint(self._sync_pod, 22)
+        self._sftp = rpsync.SftpTarget(
+            host=ip, port=port, key_path=self._cfg.ssh_key_path)
+        self._log("sync pod {} ready ({}:{})".format(self._sync_pod["id"], ip, port))
+        self._touchSyncPod()
 
-            # 4. Wait for pods to be RUNNING (with timeout)
-            self._wait_for_pods_ready(timeout=_POD_STARTUP_TIMEOUT_SECONDS)
+        # PDG's own job scripts and any serialized work item data.
+        self._uploadPdgTemp()
 
-        # 5. Start MQ polling client
+        # startPollingClient() calls _startFarmMQ() below, which runs mqserver
+        # on the sync pod and points the relay at its public ports.
         self.startPollingClient()
 
-    def _wait_for_pods_ready(self, timeout=_POD_STARTUP_TIMEOUT_SECONDS):
-        """
-        Wait until all pods in self.pod_infos reach RUNNING state,
-        or until timeout.
+        self._scale_up(max(1, self["rpfarm_minpods"].evaluateInt()))
+        self._update_status_text(force=True)
 
-        Args:
-            timeout: Maximum seconds to wait.
+    def _uploadPdgTemp(self):
+        """Ship the local pdgtemp tree (scripts, serialized items) to the farm."""
+        local = self.tempDir(True)
+        remote = self.tempDir(False)
+        try:
+            stats = rpsync.rclone_copy_dir(
+                local, self._sftp, "up", self._cfg.rclone_path, remote_root=remote)
+        except (rpsync.SyncError, OSError) as e:
+            raise CookError(
+                "Could not upload PDG job scripts to {}: {}".format(remote, e)) from e
+        self._log("pdgtemp -> {}: {} file(s), {} bytes, {:.1f}s".format(
+            remote, stats.files, stats.bytes, stats.seconds))
 
-        Raises:
-            CookError: If timeout is exceeded.
-        """
-        start_time = time.time()
-        self._verboseLog(
-            f"Waiting for {len(self.pod_infos)} pod(s) to become RUNNING "
-            f"(timeout: {timeout}s)..."
+    def _touchSyncPod(self):
+        """Record 'in use now' on the sync pod so it survives the idle check."""
+        if self._sync_client is None:
+            return
+        self._sync_client.exec(
+            "mkdir -p {} && echo {} > {}".format(
+                posixpath.dirname(_SYNC_LAST_USED), int(time.time()), _SYNC_LAST_USED),
+            timeout_s=30,
         )
 
-        while True:
-            elapsed = time.time() - start_time
-            if elapsed > timeout:
-                running = self._get_active_pod_count()
-                total = len(self.pod_infos)
-                raise CookError(
-                    f"Timed out waiting for pods to start. "
-                    f"{running}/{total} pods are RUNNING after {timeout}s."
-                )
+    # -- MQ (SimpleMQSchedulerMixin interface) --------------------------------
 
-            # Check if user cancelled
-            if self.context.canceling:
-                raise CookError("Cook canceled while waiting for pods.")
+    def _startFarmMQ(self):
+        """Start PDG's mqserver on the sync pod and connect the relay to it.
 
-            all_running = True
-            for pod_info in self.pod_infos:
-                if pod_info["status"] == _POD_STATUS_RUNNING:
-                    continue
+        Called by SimpleMQSchedulerMixin._getOrStartMQ when Message Queue is set
+        to Farm. rppods.start_mq starts the server, waits for its connection
+        file on the volume and rewrites the address in it to the pod's public IP
+        and mapped ports, which is what the relay (here) and the render pods
+        (via PDG_RESULT_SERVER) both have to dial.
+        """
+        if self._sync_client is None or self._sync_pod is None:
+            raise CookError("MQ requested before the sync pod was ready.")
+        try:
+            conn_line = rppods.start_mq(self._sync_client, self._sync_pod, self._cook_id)
+        except (TimeoutError, RunPodError, ValueError) as e:
+            raise CookError(
+                "mqserver did not start on sync pod {}: {}\nIts log is at "
+                "/workspace/ledger/logs/mq_{}.log on the volume.".format(
+                    self._sync_pod["id"], e, self._cook_id)) from e
+        if not self._setMQAddressFromString(conn_line):
+            raise CookError("Could not parse the MQ address: {!r}".format(conn_line))
 
-                # Query the pod status
-                try:
-                    status_data = self._get_pod_status(pod_info["pod_id"])
-                    desired_status = status_data.get("desiredStatus", "")
-                    runtime = status_data.get("runtime")
+    def _killFarmMQ(self):
+        if self._sync_client is not None:
+            try:
+                rppods.stop_mq(self._sync_client)
+            except Exception as e:  # never let cleanup break a cook's teardown
+                self._verboseLog("stop_mq failed: {}".format(e))
 
-                    # A pod is considered running if it has a runtime object
-                    if runtime is not None:
-                        pod_info["status"] = _POD_STATUS_RUNNING
-                        pod_info["last_heartbeat"] = datetime.datetime.now()
-                        cost_per_hr = status_data.get("costPerHr", 0.0)
-                        if cost_per_hr:
-                            pod_info["cost_per_hr"] = float(cost_per_hr)
-                        self._verboseLog(
-                            f"Pod {pod_info['pod_id']} is now RUNNING "
-                            f"(${pod_info['cost_per_hr']:.3f}/hr)"
-                        )
-                    elif desired_status in (
-                        _POD_STATUS_EXITED, _POD_STATUS_TERMINATED
-                    ):
-                        self._verboseLog(
-                            f"Pod {pod_info['pod_id']} has "
-                            f"status: {desired_status}"
-                        )
-                        all_running = False
-                    else:
-                        all_running = False
-                except CookError:
-                    all_running = False
-
-            if all_running and self.pod_infos:
-                self._verboseLog("All pods are RUNNING")
-                break
-
-            time.sleep(3)
+    # -- scheduling -----------------------------------------------------------
 
     def onSchedule(self, work_item):
-        """
-        onSchedule(self, pdg.PyWorkItem) -> pdg.SchedulerResult
-
-        Schedules the work item by serializing it and pushing a task to the
-        Redis queue for pod workers to consume.
-        """
+        """[virtual] Queue a work item and try to place it on a pod."""
         # 1. Ensure directories exist and serialize the work item
         self.createJobDirsAndSerializeWorkItems(work_item)
 
@@ -1456,578 +1281,228 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
             ),
             work_item,
         )
-        item_command = self.expandCommandTokens(
-            work_item.command, work_item
-        )
+        item_command = self.expandCommandTokens(work_item.command, work_item)
 
         # 3. Build full command with pre/post task commands
         full_command = item_command
         if pre_task_command:
-            full_command = f"{pre_task_command} && {full_command}"
+            full_command = "{} && {}".format(pre_task_command, full_command)
         if post_task_command:
-            full_command = f"{full_command} && {post_task_command}"
+            full_command = "{} && {}".format(full_command, post_task_command)
 
         # 4. Prepare task env
         task_env = self._prepareTaskEnv(work_item.node, work_item)
 
-        # 5. Create task dict
-        task_id = str(uuid.uuid4())
+        # 5. Serialized item data only exists as a file when the data source is
+        #    JSON File; the pod needs it before the task runs. The default
+        #    (RPC Message) fetches it over MQ instead and skips this entirely.
+        if int(self.workItemDataSource) == 0:
+            self._uploadItemData()
 
-        # Build asset manifest for B2 sync
-        manifest = self._create_manifest(work_item)
+        # 6. Queue and place
+        task = rpdispatch.TaskState(
+            task_id=uuid.uuid4().hex,
+            work_item_id=work_item.id,
+            command=full_command,
+            env=task_env,
+            pod_id=None,
+            attempts=0,
+            started=None,
+            log_path="/workspace/ledger/logs/{}/{}.log".format(
+                self._cook_id, work_item.name),
+        )
+        self._work_items[work_item.id] = work_item
+        self._dispatcher.enqueue(task)
+        self._dispatch_pending()
 
-        task_data = {
-            "task_id": task_id,
-            "work_item_id": work_item.id,
-            "work_item_name": work_item.name,
-            "command": full_command,
-            "env": task_env,
-            "created_at": datetime.datetime.now().isoformat(),
-        }
-
-        if manifest:
-            task_data["manifest"] = manifest
-
-        # Determine output type for sync agent
-        # intermediate: if work item has downstream dependencies
-        # final: if work item is a leaf (no downstream)
-        try:
-            has_downstream = len(work_item.dependents) > 0
-        except Exception:
-            has_downstream = False
-        task_data["output_type"] = "intermediate" if has_downstream else "final"
-
-        # Include B2 config in task data
-        if self["rpfarm_b2_enabled"].evaluateInt():
-            task_data["b2_config"] = {
-                "key_id": self["rpfarm_b2_key_id"].evaluateString(),
-                "app_key": self["rpfarm_b2_app_key"].evaluateString(),
-                "bucket": self["rpfarm_b2_bucket"].evaluateString(),
-                "compression_enabled": bool(self["rpfarm_compression_enabled"].evaluateInt()),
-                "compression_level": self["rpfarm_compression_level"].evaluateInt(),
-            }
-
-        # 6. Push to Redis queue
-        self._push_task(task_data)
-
-        # 7. Store mapping: task_id -> work_item info
-        self.task_map[task_id] = {
-            "work_item": work_item,
-            "start_time": datetime.datetime.now(),
-        }
-
-        # 8. Check queue depth for backpressure
-        queue_depth = self._get_queue_depth()
-        active_pods = self._get_active_pod_count()
-
-        # If the queue is significantly deeper than the number of active pods,
-        # signal busy to apply backpressure
-        if active_pods > 0 and queue_depth > active_pods * 3:
-            self._verboseLog(
-                f"Queue depth ({queue_depth}) exceeds threshold, "
-                f"signaling SchedulerBusy"
-            )
+        # Backpressure: let PDG keep feeding us until the queue is a few times
+        # deeper than the pool can chew through.
+        capacity = max(1, len(self._dispatcher.pods)) * 3
+        if len(self._dispatcher.pending) > capacity:
             return scheduleResult.SchedulerBusy
-
         return scheduleResult.Succeeded
 
+    def _uploadItemData(self):
+        """Push the serialized work item JSON to the farm (JSON File mode)."""
+        try:
+            rpsync.rclone_copy_dir(
+                self.dataDir(True), self._sftp, "up", self._cfg.rclone_path,
+                remote_root=self.dataDir(False),
+            )
+        except (rpsync.SyncError, OSError) as e:
+            self._verboseLog("work item data upload failed: {}".format(e))
+
     def onTick(self):
-        """
-        [virtual] Called during a cook. Checks on jobs in flight, processes
-        results, performs autoscaling, tracks budget, and monitors pod health.
-        """
-        # 1. Check MQ polling client health
+        """[virtual] Called during a cook: poll pods and tasks, scale, spend."""
         if not self.checkPollingClient():
             return tickResult.SchedulerCancelCook
 
-        # 2. Poll Redis for results
-        completed_tasks = self._get_results()
-        for task_id, result_data in completed_tasks:
-            task_info = self.task_map.get(task_id)
-            if task_info is None:
-                self._verboseLog(
-                    f"Warning: Received result for unknown task {task_id}"
-                )
-                continue
+        self._dispatcher.release_full()
+        self._poll_pods()
+        self._dispatch_pending()
+        self._poll_tasks()
+        self._reportFailures()
+        self._drain_sync_queue()
 
-            work_item = task_info["work_item"]
-            start_time = task_info["start_time"]
-            end_time = datetime.datetime.now()
-            duration = end_time - start_time
-            total_render_time = int(duration.total_seconds())
+        budget = self._update_cost_tracking()
+        if budget == "kill" and not self._killed_over_budget:
+            self._killed_over_budget = True
+            self._log("budget exceeded by 20%: terminating every pod in this cook")
+            for pod_id in list(self._dispatcher.pods):
+                self._terminate_pod(pod_id)
+                self._dispatcher.remove_pod(pod_id)
+            self.cookError(
+                "RunPodFarm budget exceeded: ${:.2f} spent against a ${:.2f} limit. "
+                "All pods for this cook were terminated.".format(
+                    self._cost_tracker["total_cost"], self._cost_tracker["max_cost"]))
+            return tickResult.SchedulerCancelCook
 
-            status = result_data.get("status", "failed")
-            exit_code = result_data.get("exit_code", -1)
-
-            if status in ("success", "succeeded") and exit_code == 0:
-                self._verboseLog(
-                    f"Task {task_id} succeeded "
-                    f"(work_item={work_item.name}, "
-                    f"duration={total_render_time}s)"
-                )
-                self.workItemSucceeded(work_item.id, -1, total_render_time)
-
-                # Download results from B2 if sync is enabled
-                output_type = result_data.get("output_type", "final")
-                if output_type == "final":
-                    self._download_results_from_b2(task_id, result_data)
-                elif output_type == "intermediate":
-                    # Update manifest for downstream tasks
-                    try:
-                        intermediate_manifest = result_data.get("intermediate_manifest")
-                        if intermediate_manifest:
-                            import json as _json
-                            project_id = self["rpfarm_projectid"].evaluateString()
-                            key = f"rp:manifest:intermediate:{task_id}"
-                            self._redis_client.set(key, _json.dumps(intermediate_manifest), ex=86400)
-                    except Exception:
-                        pass
-
-                self._render_times.append(total_render_time)
-                # Keep only the last N render times
-                if len(self._render_times) > _AUTOSCALE_HISTORY_SIZE:
-                    self._render_times = (
-                        self._render_times[-_AUTOSCALE_HISTORY_SIZE:]
-                    )
-            else:
-                error_msg = result_data.get("error", "Unknown error")
-                self._verboseLog(
-                    f"Task {task_id} failed "
-                    f"(work_item={work_item.name}, "
-                    f"exit_code={exit_code}, error={error_msg})"
-                )
-                self.workItemFailed(work_item.id, -1)
-
-            # Remove from task_map
-            del self.task_map[task_id]
-
-        # 3. Autoscaling logic
         self._autoscale()
+        self._retireIdlePods()
+        self._update_status_text()
 
-        # 4. Budget check
-        self._update_cost_tracking()
-
-        # 5. Check pod heartbeats via Redis
-        self._check_pod_heartbeats()
-
-        # Brief sleep to avoid hammering Redis
         time.sleep(1)
-
         return tickResult.SchedulerReady
 
     def _autoscale(self):
-        """
-        Autoscaling logic based on queue depth and rolling average render time.
-        Scales up in batches of 2-4 when estimated remaining time is high,
-        scales down when queue is empty and pods are idle.
-        """
-        active_pods = self._get_active_pod_count()
-        max_pods = self["rpfarm_maxpods"].evaluateInt()
-        queue_depth = self._get_queue_depth()
-        remaining_tasks = len(self.task_map) + queue_depth
+        pending = len(self._dispatcher.pending)
+        count = rpdispatch.autoscale_decision(
+            pending=pending,
+            active_pods=self._dispatcher.active_pods(),
+            max_pods=self["rpfarm_maxpods"].evaluateInt(),
+            render_times=self._render_times,
+            over_budget=self._cost_tracker.get("over_budget", False),
+        )
+        # A pod that exists but has not booted yet already covers pending work.
+        count -= sum(1 for p in self._dispatcher.pods.values() if p.status == "CREATED")
+        if count > 0:
+            self._log("autoscale: {} pending, adding {} pod(s)".format(pending, count))
+            self._scale_up(count)
 
-        # Scale down: if queue is empty and there are idle pods
-        if queue_depth == 0 and not self.task_map:
-            idle_pods = [
-                p for p in self.pod_infos
-                if p.get("idle_since") is not None
-            ]
-            if idle_pods:
-                self._verboseLog(
-                    f"No pending work. Scaling down {len(idle_pods)} "
-                    f"idle pod(s)."
-                )
-                self._scale_down(len(idle_pods))
+    def _retireIdlePods(self):
+        """Terminate pods that have had nothing to do for Idle Timeout seconds.
+
+        Min Pods is honoured only while there is still work queued: once the
+        cook has nothing pending, an idle pod is pure cost.
+        """
+        now = time.time()
+        self._dispatcher.touch_idle(now)
+        timeout = self["rpfarm_idletimeout"].evaluateInt()
+        if timeout <= 0:
             return
-
-        # Mark pods as idle or busy
-        for pod_info in self.pod_infos:
-            if pod_info["status"] == _POD_STATUS_RUNNING:
-                if queue_depth == 0 and not self.task_map:
-                    if pod_info.get("idle_since") is None:
-                        pod_info["idle_since"] = datetime.datetime.now()
-                else:
-                    pod_info["idle_since"] = None
-
-        # Scale up: compute estimated remaining time
-        if self._render_times and active_pods > 0 and remaining_tasks > 0:
-            avg_time = sum(self._render_times) / len(self._render_times)
-            remaining_time_seconds = (avg_time * remaining_tasks) / active_pods
-            remaining_time_minutes = remaining_time_seconds / 60.0
-
-            if (
-                remaining_time_minutes > _AUTOSCALE_THRESHOLD_MINUTES
-                and active_pods < max_pods
-            ):
-                # Determine batch size based on how far over threshold
-                ratio = remaining_time_minutes / _AUTOSCALE_THRESHOLD_MINUTES
-                batch_size = min(
-                    _AUTOSCALE_BATCH_MAX,
-                    max(_AUTOSCALE_BATCH_MIN, int(ratio)),
-                )
-                self._verboseLog(
-                    f"Autoscale: estimated {remaining_time_minutes:.1f}min "
-                    f"remaining with {active_pods} pod(s). "
-                    f"Scaling up by {batch_size}."
-                )
-
-                # Budget check before scaling
-                if self._cost_tracker.get("over_budget", False):
-                    self._verboseLog(
-                        "Autoscale: over budget, not scaling up."
-                    )
-                    return
-
-                self._scale_up(batch_size)
-        elif active_pods == 0 and remaining_tasks > 0:
-            # No active pods but we have tasks -- scale up to minimum
-            min_pods = self["rpfarm_minpods"].evaluateInt()
-            scale_count = max(1, min_pods)
-            self._verboseLog(
-                f"Autoscale: no active pods but {remaining_tasks} tasks "
-                f"pending. Scaling up by {scale_count}."
-            )
-            self._scale_up(scale_count)
-
-    def _update_cost_tracking(self):
-        """
-        Update cost tracking based on elapsed time and pod hourly rates.
-        Warns and stops scaling if over budget.
-        """
-        if not self._cost_tracker:
-            return
-
-        now = datetime.datetime.now()
-        start_time = self._cost_tracker["start_time"]
-        elapsed_hours = (now - start_time).total_seconds() / 3600.0
-
-        # Calculate total cost from all pods
-        total_cost = 0.0
-        for pod_info in self.pod_infos:
-            cost_per_hr = pod_info.get("cost_per_hr", 0.0)
-            pod_created = pod_info.get("created_at", start_time)
-            pod_hours = (now - pod_created).total_seconds() / 3600.0
-            total_cost += cost_per_hr * pod_hours
-
-        self._cost_tracker["total_cost"] = total_cost
-        max_cost = self._cost_tracker["max_cost"]
-
-        if total_cost >= max_cost:
-            if not self._cost_tracker.get("over_budget", False):
-                self._verboseLog(
-                    f"WARNING: Budget exceeded! "
-                    f"Total cost: ${total_cost:.2f}, "
-                    f"Max cost: ${max_cost:.2f}. "
-                    f"No more pods will be created."
-                )
-                self._cost_tracker["over_budget"] = True
-        elif total_cost >= max_cost * 0.9:
-            self._verboseLog(
-                f"Budget warning: ${total_cost:.2f} / ${max_cost:.2f} "
-                f"({total_cost / max_cost * 100:.1f}% used)"
-            )
-
-    def _check_pod_heartbeats(self):
-        """
-        Check pod heartbeats via Redis. If a pod has not sent a heartbeat
-        within the timeout, mark it as potentially unhealthy.
-        """
-        if self._redis_client is None:
-            return
-
-        now = datetime.datetime.now()
-        unhealthy_pods = []
-
-        for pod_info in self.pod_infos:
-            if pod_info["status"] != _POD_STATUS_RUNNING:
-                continue
-
-            pod_id = pod_info["pod_id"]
-            heartbeat_key = _REDIS_HEARTBEAT_KEY.format(pod_id=pod_id)
-
-            try:
-                heartbeat = self._redis_client.get(heartbeat_key)
-                if heartbeat:
-                    pod_info["last_heartbeat"] = datetime.datetime.fromisoformat(
-                        heartbeat
-                    )
-                else:
-                    # No heartbeat key found -- could be normal during startup
-                    pass
-            except (redis.exceptions.RedisError, ValueError):
-                pass
-
-            # Check if heartbeat is stale
-            last_hb = pod_info.get("last_heartbeat")
-            if last_hb is not None:
-                stale_seconds = (now - last_hb).total_seconds()
-                if stale_seconds > _POD_HEARTBEAT_TIMEOUT_SECONDS:
-                    unhealthy_pods.append(pod_info)
-
-        # Handle unhealthy pods
-        pods_to_remove = []
-        for pod_info in unhealthy_pods:
-            pod_id = pod_info["pod_id"]
-
-            # Double check with the RunPod API
-            try:
-                status_data = self._get_pod_status(pod_id)
-                runtime = status_data.get("runtime")
-                if runtime is None:
-                    self._verboseLog(
-                        f"Pod {pod_id} appears to have stopped. "
-                        f"Removing from pool."
-                    )
-                    pod_info["status"] = _POD_STATUS_EXITED
-                    pods_to_remove.append(pod_info)
-                else:
-                    # Update heartbeat -- pod is still running
-                    pod_info["last_heartbeat"] = datetime.datetime.now()
-            except CookError:
-                self._verboseLog(
-                    f"Warning: Cannot query status of pod {pod_id}"
-                )
-
-        # Remove dead pods from pool after iteration
-        for pod_info in pods_to_remove:
-            self.pod_infos.remove(pod_info)
+        floor = self["rpfarm_minpods"].evaluateInt() if self._dispatcher.pending else 0
+        for pod in self._dispatcher.idle_pods(now, timeout):
+            if len(self._dispatcher.pods) <= floor:
+                break
+            self._log("pod {} idle for {}s, terminating".format(pod.pod_id, timeout))
+            self._terminate_pod(pod.pod_id)
+            self._dispatcher.remove_pod(pod.pod_id)
 
     def onStopCook(self, cancel):
-        """
-        [virtual] Callback invoked by PDG when graph cook ends. Can be called
-        multiple times. Handles cleanup of pods, Redis queues, and MQ.
-        """
-        self._verboseLog(
-            f"onStopCook called (cancel={cancel}). "
-            f"Active pods: {len(self.pod_infos)}, "
-            f"Pending tasks: {len(self.task_map)}"
-        )
+        """[virtual] Called when the cook ends. May be called more than once."""
+        if self._api is None:
+            return True
+
+        self._log("cook {} stopping (cancel={}), {} pod(s), {} task(s) in flight".format(
+            self._cook_id, cancel, len(self._dispatcher.pods),
+            len(self._dispatcher.running_tasks())))
 
         if cancel:
-            # Cancel mode: clear queue and terminate all pods immediately
-            self._clear_queue()
+            for task in self._dispatcher.running_tasks():
+                client = self._clients.get(task.pod_id)
+                if client is not None:
+                    client.kill(task.task_id)
 
-            for pod_info in self.pod_infos:
-                self._terminate_pod(pod_info["pod_id"])
-        else:
-            # Normal completion: wait briefly for any in-flight results,
-            # then terminate pods
-            wait_start = time.time()
-            max_wait = 30  # seconds
+        for pod_id in list(self._dispatcher.pods):
+            self._terminate_pod(pod_id)
+            self._dispatcher.remove_pod(pod_id)
 
-            while self.task_map and (time.time() - wait_start) < max_wait:
-                completed = self._get_results()
-                for task_id, result_data in completed:
-                    task_info = self.task_map.get(task_id)
-                    if task_info is not None:
-                        work_item = task_info["work_item"]
-                        start_time = task_info["start_time"]
-                        duration = (
-                            datetime.datetime.now() - start_time
-                        ).total_seconds()
+        if not cancel and self._sync_queue:
+            self._log("finishing {} queued download(s)...".format(len(self._sync_queue)))
+            self._drain_sync_queue(
+                block=True, deadline=time.time() + _STOP_DRAIN_MAX_SECONDS)
 
-                        status = result_data.get("status", "failed")
-                        exit_code = result_data.get("exit_code", -1)
+        # The sync pod stays up for the next cook; stamp it so a later cook can
+        # retire it once it has been idle long enough.
+        self._touchSyncPod()
 
-                        if status in ("success", "succeeded") and exit_code == 0:
-                            self.workItemSucceeded(
-                                work_item.id, -1, int(duration)
-                            )
-                        else:
-                            self.workItemFailed(work_item.id, -1)
+        _ledger_append(
+            self._ledger_path,
+            record="cook_summary",
+            cook_id=self._cook_id,
+            user=self._cfg.user if self._cfg else "",
+            project=self._project,
+            started=self._cost_tracker.get("start_time"),
+            ended=time.time(),
+            canceled=bool(cancel),
+            items_failed=len(self._dispatcher.failed),
+            cost_est=self._cost_tracker.get("total_cost", 0.0),
+        )
+        self._log("cook {} done, ~${:.3f}, ledger {}".format(
+            self._cook_id, self._cost_tracker.get("total_cost", 0.0),
+            self._ledger_path))
 
-                        del self.task_map[task_id]
-
-                if self.task_map:
-                    time.sleep(1)
-
-            # Terminate all pods
-            for pod_info in self.pod_infos:
-                self._terminate_pod(pod_info["pod_id"])
-
-        # Log final cost
-        if self._cost_tracker:
-            total_cost = self._cost_tracker.get("total_cost", 0.0)
-            elapsed = datetime.datetime.now() - self._cost_tracker["start_time"]
-            self._verboseLog(
-                f"Cook completed. Total cost: ${total_cost:.2f}, "
-                f"Duration: {elapsed}"
-            )
-
-        # Stop MQ polling
+        # Stops the relay and the mqserver on the sync pod (via _killFarmMQ).
         self.stopPollingClient()
-
-        # Reset state
-        self.pod_infos = []
-        self.task_map = {}
-        self._render_times = []
-        self._redis_client = None
-        self._runpod_headers = {}
-        self._cost_tracker = {}
-
+        self._clearPathMap()
+        self._update_status_text(force=True)
+        self._reset_cook_state()
         return True
 
+    # -------------------------------------------------------------------------
+    # Submit as Job
+    # -------------------------------------------------------------------------
+
     def submitAsJob(self, graph_file, node_name):
-        """
-        Called by pressing the 'Submit as Job' button on the scheduler node
-        UI. Creates a job which cooks that TOP graph using hython on a
-        RunPod pod.
-        """
-        # Set up API connection
-        api_key = self["rpfarm_apikey"].evaluateString()
-        self._runpod_headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
-        }
+        """Cook the whole TOP graph in one hython task on a farm pod."""
+        self.onStartCook(False, None)
+        self.onSetupCook()
 
-        self._redis_client = self._redis_connect()
-        self._initWorkingDir()
-
-        # Write the job script
         self.transferFile(os.path.expandvars("$HHP/pdgjob/topcook.py"))
-
-        # Copy the hip file and all supporting scripts
         hip_local = os.path.expandvars("$HIPFILE")
         hip_remote = "__PDG_DIR__/" + os.path.basename(hip_local)
         self.transferFile(hip_local)
         self._copyJobSupportFiles()
+        self._uploadPdgTemp()
 
-        # Job command will run the generated script
         cmd = (
-            f'"__PDG_HYTHON__" --pdg "__PDG_SCRIPTDIR__/topcook.py" '
-            f'--report none --hip "{hip_remote}" --verbosity 2 '
-            f"--toppath {node_name} "
+            '"__PDG_HYTHON__" --pdg "__PDG_SCRIPTDIR__/topcook.py" '
+            '--report none --hip "{}" --verbosity 2 '
+            "--toppath {} ".format(hip_remote, node_name)
         )
-
         cmd = self.expandCommandTokens(cmd)
         if self["submitjobfile"].evaluateBool():
-            cmd += f'--taskgraphout "__PDG_DIR__/{graph_file}.post.py"'
+            cmd += '--taskgraphout "__PDG_DIR__/{}.post.py"'.format(graph_file)
 
         task_env = self._prepareTaskEnv(None, None)
         task_env["PDG_SUBMIT_AS_JOB"] = "True"
 
-        # Create a pod for the job and push the task
-        task_id = str(uuid.uuid4())
-        task_data = {
-            "task_id": task_id,
-            "work_item_id": -1,
-            "work_item_name": "submit_as_job",
-            "command": cmd,
-            "env": task_env,
-            "warmup_paths": "",
-            "created_at": datetime.datetime.now().isoformat(),
-        }
-
-        pod_id = self._create_pod()
-        self._push_task(task_data)
-
+        task = rpdispatch.TaskState(
+            task_id=uuid.uuid4().hex,
+            work_item_id=-1,
+            command=cmd,
+            env=task_env,
+            log_path="/workspace/ledger/logs/{}/submitasjob.log".format(self._cook_id),
+        )
+        self._dispatcher.enqueue(task)
+        self._dispatch_pending()
+        pod_id = task.pod_id or next(iter(self._dispatcher.pods), None)
         return pod_id, None
 
     def getLogURI(self, work_item):
-        """
-        [virtual]
-        Returns the log URL for the task corresponding to the given work item.
-        """
-        return ""
+        """[virtual] Log URL for the task corresponding to the given work item."""
+        task = self._dispatcher.task_for_work_item(work_item.id)
+        if task is None or not task.pod_id:
+            return ""
+        return "https://{}-8000.proxy.runpod.net/tasks/{}/log".format(
+            task.pod_id, task.task_id)
 
     def getStatusURI(self, work_item):
-        """
-        [virtual]
-        Return the status URL for the task corresponding to the given work item.
-        """
-        return ""
-
-    # -------------------------------------------------------------------------
-    # MQ Farm Start/Kill (SimpleMQSchedulerMixin interface)
-    # -------------------------------------------------------------------------
-
-    def _startFarmMQ(self):
-        """
-        Starts an MQ server locally. Since we use Redis for task distribution,
-        the MQ is only needed for work item result reporting back to PDG.
-        The MQ runs on the local machine, not on a remote pod.
-        """
-        local_conn_file, remote_conn_file = self._getMQConnectionFilePaths()
-        taskcallbackport, mqrelayport = self._parsePortParms()
-
-        mq_cmd_exe = "mqserver$PDG_EXE"
-        loglvl = min(3, self._verbose + 1)
-        mq_cmd_args = (
-            f"-p {mqrelayport} -n {MQUtility.MaxConnections} -l {loglvl} "
-            f'-c "{local_conn_file}" -w {taskcallbackport} '
-            f"{MQUtility.MaxHTTPConnections} {MQUtility.HTTPResult}"
-        )
-
-        mq_cmd = f'"{mq_cmd_exe}" {mq_cmd_args}'
-        expanded_mq_cmd = self.expandCommandTokens(mq_cmd, None)
-
-        # Start the MQ server locally as a subprocess
-        self._verboseLog(f"Starting local MQ server: {expanded_mq_cmd}")
-
-        try:
-            self._mq_process = subprocess.Popen(
-                expanded_mq_cmd,
-                shell=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-        except OSError as e:
-            raise CookError(f"Failed to start MQ server: {e}") from e
-
-        self._verboseLog("Waiting for local MQ server to start...")
-
-        try:
-            with self._disableConnectionFileTimeout():
-                timeout_start = time.time()
-                while True:
-                    if self.context.canceling:
-                        raise CookError(
-                            "Cook canceled while connecting to MQ."
-                        )
-
-                    time.sleep(0.66)
-
-                    # Check if process is still running
-                    if self._mq_process.poll() is not None:
-                        exit_code = self._mq_process.returncode
-                        raise CookError(
-                            f"MQ server exited unexpectedly "
-                            f"with code {exit_code}."
-                        )
-
-                    # Check for connection file
-                    self._getMQAddressFromConnectionFile(local_conn_file)
-                    if self.workItemResultServerAddr():
-                        break
-
-                    # Safety timeout (5 minutes)
-                    if time.time() - timeout_start > 300:
-                        raise CookError(
-                            "Timed out waiting for MQ connection file."
-                        )
-
-        except Exception as e:
-            self.setWorkItemResultServerAddr("")
-            self._killFarmMQ()
-            raise CookError(
-                f"Exception while waiting for MQ connection file: {e}"
-            ) from e
-
-    def _killFarmMQ(self):
-        """
-        Stops the local MQ server process.
-        """
-        mq_process = getattr(self, "_mq_process", None)
-        if mq_process is not None:
-            try:
-                mq_process.terminate()
-                mq_process.wait(timeout=5)
-            except (subprocess.TimeoutExpired, OSError):
-                try:
-                    mq_process.kill()
-                except OSError:
-                    pass
-            self._mq_process = None
+        """[virtual] Status URL for the task corresponding to the given work item."""
+        task = self._dispatcher.task_for_work_item(work_item.id)
+        if task is None or not task.pod_id:
+            return ""
+        return "https://www.runpod.io/console/pods/{}".format(task.pod_id)
 
 
 def submitGraphAsJob(kwargs, node):
