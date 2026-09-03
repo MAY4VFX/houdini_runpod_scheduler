@@ -195,6 +195,24 @@ def main():
         log("FAIL: Export CSV did not produce exactly one new file: {}".format(new_csvs))
         ok = False
 
+    # -- 3b. two exports in immediate succession must not collide -----------------
+    # Review finding: the export path used to be second-granularity with a
+    # plain open(path, "w") -- two exports inside the same second silently
+    # overwrote each other. _unique_csv_path fixes that; prove it here by
+    # firing the button twice back to back (well inside one second).
+    before2 = set(glob.glob(os.path.join(rpfarm_home, "exports", "*.csv")))
+    stats.hm().onExportCsv({"node": stats})
+    stats.hm().onExportCsv({"node": stats})
+    after2 = set(glob.glob(os.path.join(rpfarm_home, "exports", "*.csv")))
+    new_csvs2 = after2 - before2
+    if len(new_csvs2) == 2:
+        log("OK: two back-to-back exports produced 2 distinct files (no overwrite): {}".format(
+            sorted(os.path.basename(p) for p in new_csvs2)))
+    else:
+        log("FAIL: two back-to-back exports produced {} file(s), expected 2: {}".format(
+            len(new_csvs2), new_csvs2))
+        ok = False
+
     shutil.rmtree(rpfarm_home, ignore_errors=True)
 
     log("RESULT: {}".format("PASS" if ok else "FAIL"))

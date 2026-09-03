@@ -6,6 +6,7 @@ cook_summary record) -- see rpfarm/ledger.py's module docstring.
 """
 
 import json
+import logging
 import os
 
 import pytest
@@ -35,6 +36,26 @@ def test_append_creates_parent_dirs(tmp_path):
     p = tmp_path / "nested" / "dir" / "c2.jsonl"
     ledger.append(p, cook_id="c2", pod="p1", duration_s=1)
     assert p.exists()
+
+
+def test_append_swallows_oserror_and_logs(tmp_path, caplog):
+    # A path that IS a directory can never be open()'d for writing -- a
+    # reliable way to trigger a real OSError without permission-bit
+    # gymnastics. Matches rpfarm.dispatch.append_record's own behavior
+    # (the stand-in this module replaces): a write failure is bookkeeping
+    # gone wrong, never a reason to raise into onStopCook/_poll_tasks.
+    bad_path = tmp_path / "not_a_file"
+    bad_path.mkdir()
+    with caplog.at_level(logging.WARNING):
+        ledger.append(bad_path, cook_id="x")  # must not raise
+    assert bad_path.is_dir()  # nothing wrote to it; still just a directory
+    assert any("ledger append" in r.message for r in caplog.records)
+
+
+def test_append_cook_summary_swallows_oserror(tmp_path):
+    bad_path = tmp_path / "not_a_file"
+    bad_path.mkdir()
+    ledger.append_cook_summary(bad_path, cook_id="x", user="u", project="p")  # must not raise
 
 
 def test_load_all_multiple_files_and_missing_dir(tmp_path):
@@ -120,6 +141,33 @@ def test_merge_billing_passes_through_cook_summary():
     recs = [{"record": "cook_summary", "cook_id": "c", "cost_est": 1.0}]
     out = ledger.merge_billing(recs, [])
     assert out == recs
+
+
+def test_merge_billing_passes_through_records_without_pod_field():
+    # Not expected from the scheduler (every task record carries "pod"),
+    # but merge_billing must not silently drop a record just because it
+    # doesn't -- same treatment as "no matching billing entry".
+    recs = [{"cook_id": "c", "user": "u", "project": "p", "duration_s": 10, "cost_est": 0.001}]
+    out = ledger.merge_billing(recs, [])
+    assert out == recs
+
+
+def test_merge_billing_caps_task_costs_when_duration_exceeds_billed_seconds():
+    # A task straddling a billing-period boundary: local duration_s sums
+    # to more (600s) than this period's billing rows show as billed
+    # (400s) -- e.g. only part of a still-running pod's time fell inside
+    # the queried window.
+    recs = [
+        {"cook_id": "c", "user": "u", "project": "p", "pod": "p1", "duration_s": 300},
+        {"cook_id": "c", "user": "u", "project": "p", "pod": "p1", "duration_s": 300},
+    ]
+    billing = [{"podId": "p1", "amount": 1.0, "timeBilledMs": 400000}]
+    out = ledger.merge_billing(recs, billing)
+    tasks = [r for r in out if r.get("kind") == "task"]
+    idle = [r for r in out if r.get("kind") == "idle"]
+    assert abs(sum(t["cost"] for t in tasks) - 1.0) < 1e-9  # never exceeds the actual bill
+    assert abs(tasks[0]["cost"] - 0.5) < 1e-9 and abs(tasks[1]["cost"] - 0.5) < 1e-9  # split by duration share
+    assert len(idle) == 1 and idle[0]["cost"] == 0.0 and idle[0]["duration_s"] == 0.0
 
 
 # -- summarize ------------------------------------------------------------

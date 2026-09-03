@@ -31,26 +31,38 @@ from __future__ import annotations
 
 import csv
 import json
+import logging
 import os
 import posixpath
 from pathlib import Path
 
 from rpfarm.sync import FileEntry, rclone_copy
 
+log = logging.getLogger(__name__)
+
 
 def append(path, **record) -> None:
     """Append one JSON object as a line to *path*, creating parent dirs.
 
-    Never raises OSError from a missing parent directory -- everything
-    else (a full disk, a permissions error) is the caller's problem, same
-    as the stand-in it replaces.
+    Signature-compatible with ``rpfarm.dispatch.append_record``, the
+    stand-in this module replaces -- and matches its error handling too:
+    an ``OSError`` (a full disk, a missing/unwritable parent, a
+    permissions error, ...) is logged and swallowed, never raised.
+    Writing the ledger is bookkeeping alongside a cook, never the cook
+    itself, and neither scheduler call site (``_poll_tasks``,
+    ``onStopCook``) wraps this call -- letting it raise would abort
+    ``onStopCook`` mid-way, skipping ``stopPollingClient()``/
+    ``_reset_cook_state()`` and leaving the scheduler inconsistent.
     """
     path = str(path)
-    parent = os.path.dirname(path)
-    if parent:
-        os.makedirs(parent, exist_ok=True)
-    with open(path, "a") as f:
-        f.write(json.dumps(record, default=str) + "\n")
+    try:
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(path, "a") as f:
+            f.write(json.dumps(record, default=str) + "\n")
+    except OSError as e:
+        log.warning("ledger append to %s failed, record dropped: %s", path, e)
 
 
 def append_cook_summary(path, cook_id, user, project, pods=None, **extra) -> None:
@@ -65,6 +77,10 @@ def append_cook_summary(path, cook_id, user, project, pods=None, **extra) -> Non
     sum((terminated - created) / 3600 * cost_per_hr). Any of the real
     fields (``started, ended, canceled, items_failed, cost_est``) passed
     via ``**extra`` win over the derived value.
+
+    Delegates the actual write to :func:`append`, so it inherits the same
+    swallow-and-log behavior on ``OSError`` -- a failed cook_summary write
+    is never raised into the caller.
     """
     record = {"record": "cook_summary", "cook_id": cook_id, "user": user, "project": project}
     if pods:
@@ -123,7 +139,20 @@ def merge_billing(records, billing_pods) -> list[dict]:
     always exceeds the sum of its task durations (boot, idle between
     tasks), and that remainder becomes one synthetic ``kind="idle"``
     record per pod so the group's total ``cost`` always reconciles to the
-    bill.
+    bill. A record with no ``pod`` field at all (not expected from the
+    scheduler, but not assumed either) passes through unmodified rather
+    than being silently dropped from the group.
+
+    A pod's summed ``duration_s`` can exceed its billed seconds for this
+    period -- a task straddling a billing-period boundary, most commonly
+    -- in which case prorating against ``timeBilledSeconds`` alone would
+    let the group's task costs sum to more than the pod actually billed.
+    The denominator is capped at ``max(timeBilledSeconds, task_seconds)``
+    instead: within budget, that is still ``timeBilledSeconds`` and
+    behaves exactly as above; over budget, it becomes ``task_seconds``,
+    which splits ``amount`` across the tasks purely by duration share and
+    pins the idle remainder to zero rather than letting the group exceed
+    the actual bill.
 
     A billed ``podId`` with no matching local record at all -- the sync
     pod, an orphan, another machine's cook not yet synced, or truly
@@ -139,11 +168,13 @@ def merge_billing(records, billing_pods) -> list[dict]:
     through unmodified -- they have no ``pod``/``duration_s`` to prorate.
     """
     by_pod: dict[str, list[dict]] = {}
+    passthrough: list[dict] = []
     for rec in records:
         if rec.get("record") == "cook_summary":
             continue
         pod = rec.get("pod")
         if pod is None:
+            passthrough.append(rec)
             continue
         by_pod.setdefault(pod, []).append(rec)
 
@@ -156,7 +187,7 @@ def merge_billing(records, billing_pods) -> list[dict]:
         agg["amount"] += float(b.get("amount") or 0.0)
         agg["ms"] += float(b.get("timeBilledMs") or 0.0)
 
-    out: list[dict] = []
+    out: list[dict] = list(passthrough)
     for pod, recs in by_pod.items():
         billing = billed_by_pod.get(pod)
         if billing is None:
@@ -165,17 +196,19 @@ def merge_billing(records, billing_pods) -> list[dict]:
 
         billed_seconds = billing["ms"] / 1000.0
         amount = billing["amount"]
-        task_seconds = 0.0
+        task_seconds = sum(float(rec.get("duration_s") or 0.0) for rec in recs)
+        # See the docstring: capped at task_seconds so an over-subscribed
+        # pod's task costs can never sum to more than `amount`.
+        denom = max(billed_seconds, task_seconds)
         for rec in recs:
             duration = float(rec.get("duration_s") or 0.0)
-            task_seconds += duration
             merged = dict(rec)
-            merged["cost"] = (duration / billed_seconds * amount) if billed_seconds else 0.0
+            merged["cost"] = (duration / denom * amount) if denom else 0.0
             merged["kind"] = "task"
             out.append(merged)
 
         idle_seconds = max(billed_seconds - task_seconds, 0.0)
-        idle_cost = max(amount - (task_seconds / billed_seconds * amount if billed_seconds else 0.0), 0.0)
+        idle_cost = max(amount - (task_seconds / denom * amount if denom else 0.0), 0.0)
         sample = recs[0]
         out.append({
             "cook_id": sample.get("cook_id"),
