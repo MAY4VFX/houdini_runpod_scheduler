@@ -1,0 +1,78 @@
+= RunPodFarm Download =
+
+#type: node
+#context: top
+#internal: runpodfarmdownload
+#icon: TOP/pythonprocessor
+
+"""Download files from the RunPodFarm volume to local disk, as a normal TOP
+work item generator -- progress is visible per package as it cooks."""
+
+Work item = one package of files. Each package cooks on PDG's *local*
+scheduler (this node overrides `Scheduler` to its own internal
+`localscheduler`, never `runpodfarm_scheduler` -- same reasoning as the
+upload node: this download has to run on the machine that owns the local
+disk it's downloading to, not dispatch onto the farm itself). The override
+is a Python expression on the internal Python Processor's `Scheduler` parm
+re-resolving the sibling `localscheduler` node's absolute path at cook
+time -- see [Node:top/runpodfarm_upload]'s Help for why a bare relative
+name doesn't work here. This node's `OnCreated` event re-asserts the same
+expression once more when a new instance is made.
+
+Packages cook *out of process* by default (Ruling R22), through the same
+`rpfarm.package_runner` module the upload node uses (`rpfarm/package_runner.py`)
+-- each work item's command is `python3 -m rpfarm.package_runner <item.json>`,
+whose payload's `"kind": "download"` selects `rpfarm.packages.run_download_item`
+over the upload path. See [Node:top/runpodfarm_upload]'s Help for why PDG's
+Python Processor requires a shell `.command` for genuine out-of-process
+dispatch, and why a plain `python3` (not `hython`) runs it. The Cook In
+Process toggle below switches back to the old callback-only path (this
+node's `cooktask`) for debugging.
+
+@parameters
+
+Mode:
+    #id: rpfarm_mode
+    `Upstream outputs` reads each upstream work item's `resultData` (farm
+    paths reported while it ran) and localizes them via the `rpfarm_pathmap`
+    attribute the scheduler stamps onto every item it schedules -- no
+    upstream input means nothing to download (a warning, not an error).
+    `Custom paths` downloads exactly the remote -> local directory pairs
+    below; the files under each remote directory are listed on the sync pod
+    (`find <dir> -type f -printf '%s %p\n'`) at generate time, since they
+    only exist on the farm volume.
+
+Package Size (GB):
+    #id: rpfarm_packagegb
+
+    Files are grouped into work items no larger than this (a single file
+    bigger than the limit still gets its own item). Packages never span two
+    (local dir, farm dir) pairs -- see `rpfarm.packages.group_download_pairs`.
+
+Overwrite:
+    #id: rpfarm_overwrite
+
+    `newer` (default) skips a local file that is not older than its remote
+    counterpart (`rclone --update`). `always` re-downloads unconditionally.
+    `never` skips anything that already exists locally, regardless of mtime
+    (`rclone --ignore-existing`).
+
+Custom Paths:
+    #id: rpfarm_custom
+
+    Multiparm of remote -> local directory pairs, used in Custom mode.
+
+Cook In Process (debug):
+    #id: rpfarm_inprocess
+
+    Off (default): packages download out of process, in parallel, without
+    blocking Houdini (Ruling R22; see above). On: cook in this Houdini
+    session instead -- blocks the UI, one package at a time, useful for
+    stepping through `run_download_item()` directly while debugging.
+
+@related
+
+- [Node:top/runpodfarm_upload]
+- [Node:top/runpodfarm_scheduler]
+- [Node:top/pythonprocessor]
+- [Node:top/localscheduler]
