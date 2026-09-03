@@ -103,4 +103,11 @@
         default { "22.0.393" }
         hidewhen "{ rpfarm_preset != install_houdini }"
     }
+    parm {
+        name    "rpfarm_inprocess"
+        label   "Cook In Process (debug)"
+        type    toggle
+        default { "0" }
+        help    "Off (default): packages upload out of process, in parallel, without blocking Houdini. On: cook in this Houdini session instead -- blocks the UI, one package at a time, useful for debugging."
+    }
 }
