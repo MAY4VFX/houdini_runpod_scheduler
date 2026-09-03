@@ -11,6 +11,8 @@ from rpfarm.dispatch import (
     append_record,
     autoscale_decision,
     budget_state,
+    pod_timed_out,
+    should_defer,
 )
 
 
@@ -301,3 +303,86 @@ def test_pod_state_free_slots():
 def test_pod_state_non_running_has_no_free_slots(status):
     p = PodState(pod_id="a", cost_per_hr=1.0, slots=4, status=status)
     assert p.free_slots() == 0
+
+
+# -- fix round 1: backpressure, boot budget, terminal path -------------------
+
+
+def test_should_defer_accepts_the_first_item_with_no_pods_yet():
+    """onSetupCook creates the first pod, but onSchedule can still arrive
+    before it registers. Deferring everything then would deadlock the cook."""
+    assert should_defer(pending=0, pods=0) is False
+
+
+def test_should_defer_at_capacity():
+    # One pod, depth 3: three queued is full, two is not.
+    assert should_defer(pending=2, pods=1) is False
+    assert should_defer(pending=3, pods=1) is True
+    # More pods, more room.
+    assert should_defer(pending=3, pods=2) is False
+    assert should_defer(pending=6, pods=2) is True
+
+
+def test_should_defer_honours_a_custom_depth():
+    assert should_defer(pending=1, pods=1, depth_per_pod=1) is True
+    assert should_defer(pending=1, pods=1, depth_per_pod=2) is False
+
+
+def test_deferring_before_enqueue_keeps_the_queue_honest():
+    """The bug this replaces: onSchedule enqueued the task and *then* returned
+    a busy result, so PDG's re-offer of the same work item enqueued it twice
+    and it would have run twice."""
+    d = Dispatcher(slots_per_pod=1)
+    d.add_pod("a", 1.0)
+    for i in range(3):
+        d.enqueue(T(i))
+    assert should_defer(len(d.pending), len(d.pods)) is True
+    # The caller returns Deferred here without enqueueing; PDG re-offers the
+    # same item later, and the queue still holds exactly one copy of each.
+    assert [t.task_id for t in d.pending] == ["t0", "t1", "t2"]
+
+
+def test_pod_timed_out_gives_a_booting_pod_its_own_budget():
+    """A CREATED pod is not yet expected to answer /health. Judging it by the
+    RUNNING heartbeat killed pods mid-boot: the live smoke saw pods answer at
+    25-37s and the spec measures 43.5s, against a 60s heartbeat clock that
+    started at creation."""
+    pod = PodState(pod_id="a", status="CREATED", created_at=1000.0)
+    pod.health_fail_since = 1005.0  # stamped by the first poll after creation
+    assert pod_timed_out(pod, now=1100.0, boot_seconds=300, dead_seconds=60) is None
+    assert pod_timed_out(pod, now=1301.0, boot_seconds=300, dead_seconds=60) == "boot"
+
+
+def test_pod_timed_out_still_kills_a_silent_running_pod():
+    pod = PodState(pod_id="a", status="RUNNING", created_at=1000.0)
+    assert pod_timed_out(pod, now=1100.0, boot_seconds=300, dead_seconds=60) is None
+    pod.health_fail_since = 1100.0
+    assert pod_timed_out(pod, now=1150.0, boot_seconds=300, dead_seconds=60) is None
+    assert pod_timed_out(pod, now=1161.0, boot_seconds=300, dead_seconds=60) == "dead"
+
+
+def test_pod_timed_out_without_a_creation_time():
+    pod = PodState(pod_id="a", status="CREATED", created_at=None)
+    assert pod_timed_out(pod, now=9999.0, boot_seconds=300, dead_seconds=60) is None
+
+
+def test_fail_pending_moves_a_queued_task_to_failed():
+    """The duplicate-task_id path used to reach into .pending and report the
+    item itself, skipping .failed -- so the give-up was invisible to
+    failed_since_last_call() and the item was reported by a different code
+    path than every other failure."""
+    d = Dispatcher(slots_per_pod=1)
+    d.enqueue(T(1))
+    d.enqueue(T(2))
+    task = d.fail_pending("t1")
+    assert task is not None and task.work_item_id == 1
+    assert [t.task_id for t in d.pending] == ["t2"]
+    assert [t.task_id for t in d.failed] == ["t1"]
+    assert [t.task_id for t in d.failed_since_last_call()] == ["t1"]
+
+
+def test_fail_pending_ignores_an_unknown_task():
+    d = Dispatcher(slots_per_pod=1)
+    d.enqueue(T(1))
+    assert d.fail_pending("nope") is None
+    assert len(d.pending) == 1 and d.failed == []
