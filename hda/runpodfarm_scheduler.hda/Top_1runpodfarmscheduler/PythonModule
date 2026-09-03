@@ -81,14 +81,21 @@ from pdg.utils.simple_mq import SimpleMQSchedulerMixin
 # Rolling window of work-item durations that feeds the autoscaler.
 _AUTOSCALE_HISTORY_SIZE = rpdispatch.AUTOSCALE_HISTORY_SIZE
 
-# A pod that has not answered /health for this long is declared dead and its
-# tasks are requeued (spec section 7).
-_POD_DEAD_AFTER_SECONDS = 60
-
 # Minimum gap between /health polls of the same pod. The pod proxy sits behind
 # Cloudflare and onTick fires roughly once a second; there is nothing to gain
 # from polling a pod faster than this.
 _HEALTH_POLL_INTERVAL = 5.0
+
+# Same idea for GET /tasks/<id>. Without it every running task is polled on
+# every tick: four pods of four slots is ~16 requests a second through
+# Cloudflare, and because a failed poll is swallowed as None, a network
+# partition turns each one into a 30s timeout and the tick stops doing
+# anything else for minutes.
+_TASK_POLL_INTERVAL = 2.0
+
+# After a failed pod create, wait this long before asking RunPod again --
+# out-of-stock GPUs stay out of stock for more than a tick.
+_SCALE_RETRY_BACKOFF = 15.0
 
 # How often the Status tab's text is rebuilt.
 _STATUS_REFRESH_SECONDS = 5.0
@@ -329,8 +336,10 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         self._render_times = []
         self._last_status_update = 0.0
         self._last_health_poll = {}
+        self._last_task_poll = {}
         self._killed_over_budget = False
         self._last_pod_error = None
+        self._last_scale_failure = 0.0
 
     @classmethod
     def templateName(cls):
@@ -701,9 +710,10 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         max_pods = self["rpfarm_maxpods"].evaluateInt()
         count = min(count, max_pods - len(self._dispatcher.pods))
         if count <= 0:
-            return
+            return 0
 
         slots = self["rpfarm_slots"].evaluateInt()
+        created = 0
         for _ in range(count):
             name = rppods.pod_name(
                 self._cfg.user, self._project, self._cook_id,
@@ -723,7 +733,13 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
             self._dispatcher.add_pod(pod_id, 0.0, status="CREATED", created_at=time.time())
             self._clients[pod_id] = WorkerClient(pod_id, self._token)
             self._last_pod_error = None
+            created += 1
             self._log("pod created {} {}".format(name, pod_id))
+        if created == 0:
+            # Nothing was created: back off before asking again, and leave
+            # _last_pod_error where the Status tab can show it.
+            self._last_scale_failure = time.time()
+        return created
 
     def _templateId(self):
         return self["rpfarm_templateid"].evaluateString() or self._cfg.template_id
@@ -732,8 +748,13 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         return self["rpfarm_networkvolumeid"].evaluateString() or self._cfg.volume_id
 
     def _poll_pods(self):
-        """Track pod health: CREATED -> RUNNING on the first /health, and
-        RUNNING -> dead after _POD_DEAD_AFTER_SECONDS without one."""
+        """Track pod health: CREATED -> RUNNING on the first /health, and give
+        up on a pod that never boots or that stops answering.
+
+        The two deadlines are different and dispatch.pod_timed_out keeps them
+        apart: a booting pod has not failed a heartbeat, it has simply not
+        started one yet.
+        """
         now = time.time()
         for pod in list(self._dispatcher.pods.values()):
             if now - self._last_health_poll.get(pod.pod_id, 0.0) < _HEALTH_POLL_INTERVAL:
@@ -750,20 +771,28 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
 
             if pod.health_fail_since is None:
                 pod.health_fail_since = now
-                continue
-            if now - pod.health_fail_since <= _POD_DEAD_AFTER_SECONDS:
-                continue
 
-            self._log("pod {} unreachable for {}s, requeueing {} task(s)".format(
-                pod.pod_id, _POD_DEAD_AFTER_SECONDS, len(pod.running)))
-            self._dispatcher.pod_dead(pod.pod_id)
-            self._reportFailures()
-            self._clients.pop(pod.pod_id, None)
-            self._last_health_poll.pop(pod.pod_id, None)
-            try:
-                self._api.terminate_pod(pod.pod_id)
-            except RunPodError as e:
-                self._verboseLog("terminate {} failed: {}".format(pod.pod_id, e))
+            reason = rpdispatch.pod_timed_out(pod, now)
+            if reason is not None:
+                self._giveUpOnPod(pod, reason)
+
+    def _giveUpOnPod(self, pod, reason):
+        """Terminate a pod and requeue whatever it was running.
+
+        _terminate_pod first, while the pod is still in the pool: it banks the
+        pod's spend into the cook total, which a bare api.terminate_pod would
+        have thrown away along with the budget decision and the ledger's
+        cook_summary.
+        """
+        if reason == "boot":
+            self._log("pod {} never answered in {:.0f}s, giving up on it".format(
+                pod.pod_id, rpdispatch.POD_BOOT_TIMEOUT_SECONDS))
+        else:
+            self._log("pod {} unreachable for {:.0f}s, requeueing {} task(s)".format(
+                pod.pod_id, rpdispatch.POD_DEAD_AFTER_SECONDS, len(pod.running)))
+        self._terminate_pod(pod.pod_id)
+        self._dispatcher.pod_dead(pod.pod_id)
+        self._reportFailures()
 
     def _promote_pod(self, pod, health):
         """A pod answered /health for the first time: record its price and GPU."""
@@ -818,21 +847,31 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
                 if task.task_id.endswith("-r"):
                     self._log("task {} rejected as duplicate twice, failing item {}".format(
                         task.task_id, task.work_item_id))
-                    self._dispatcher.pending.remove(task)
-                    self.workItemFailed(task.work_item_id, -1)
+                    # onto dispatcher.failed, so _reportFailures tells PDG on
+                    # the next tick -- the same single path every other failure
+                    # takes, instead of reporting the item from here.
+                    self._dispatcher.fail_pending(task.task_id)
                 else:
                     self._dispatcher.retask(task.task_id, uuid.uuid4().hex + "-r")
 
     def _poll_tasks(self):
         """Ask each pod about the tasks it is running and retire the finished."""
+        now = time.time()
         for task in self._dispatcher.running_tasks():
+            if now - self._last_task_poll.get(task.task_id, 0.0) < _TASK_POLL_INTERVAL:
+                continue
+            self._last_task_poll[task.task_id] = now
+
             client = self._clients.get(task.pod_id)
             status = client.status(task.task_id) if client else None
             if not status or status.get("state") == "running":
                 continue
+            self._last_task_poll.pop(task.task_id, None)
 
             ok = status.get("state") == "succeeded"
-            duration = int(status.get("duration_s") or 0)
+            # Keep the fraction: the ledger is a cost record, and int() made
+            # every sub-second task cost exactly nothing.
+            duration = round(float(status.get("duration_s") or 0.0), 3)
             pod = self._dispatcher.pods.get(task.pod_id)
             self._dispatcher.complete(task.task_id, ok)
 
@@ -860,8 +899,11 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
                 if work_item is not None:
                     self._download_outputs(work_item)
             else:
+                # complete(ok=False) has already put the task on
+                # dispatcher.failed; _reportFailures is the single place that
+                # tells PDG. Reporting it here as well made every pod-side
+                # failure arrive at workItemFailed twice.
                 self._logTaskFailure(task, status)
-                self.workItemFailed(task.work_item_id, -1)
 
     def _itemName(self, work_item_id):
         item = self._work_items.get(work_item_id)
@@ -918,7 +960,13 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
 
     def _drain_sync_queue(self, block=False, deadline=None):
         """Run queued downloads. Failures go back on the queue and are retried
-        on a later tick; when blocking, until the deadline passes."""
+        on a later tick; when blocking, until the deadline passes.
+
+        Non-blocking, this moves **one** package per call: rclone runs
+        synchronously with no timeout, so draining the whole queue inside a
+        tick lets one heavy sequence stall pod polling and dispatch behind it.
+        onStopCook passes block=True and drains the lot under its deadline.
+        """
         while self._sync_queue:
             local_root, remote_root, entries = self._sync_queue.pop(0)
             try:
@@ -929,6 +977,8 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
                 )
                 self._verboseLog("downloaded {} file(s) to {}".format(
                     len(entries), local_root))
+                if not block:
+                    return
             except (rpsync.SyncError, OSError) as e:
                 self._verboseLog("download failed ({}), will retry: {}".format(
                     remote_root, e))
@@ -981,13 +1031,21 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         try:
             self._api.terminate_pod(pod_id)
         except RunPodError as e:
-            self._verboseLog("terminate {} failed: {}".format(pod_id, e))
+            # Always visible: a pod that would not terminate is still being
+            # billed, and the artist has to know to go and kill it.
+            self._log("TERMINATE FAILED for pod {}: {} -- it may still be "
+                      "running and billing. Use Kill All Pods.".format(pod_id, e))
 
     # -------------------------------------------------------------------------
     # Status tab
     # -------------------------------------------------------------------------
 
     def _update_status_text(self, force=False):
+        if not self._cook_id:
+            # No cook running. onStopCook resets the state and PDG can still
+            # fire one more onTick afterwards; writing then would wipe the
+            # finished cook's summary off the tab just as it is wanted.
+            return
         now = time.time()
         if not force and now - self._last_status_update < _STATUS_REFRESH_SECONDS:
             return
@@ -1010,6 +1068,8 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
             len(self._dispatcher.failed)))
         if self._sync_queue:
             lines.append("downloads queued: {}".format(len(self._sync_queue)))
+        if self._last_pod_error:
+            lines.append("last pod create error: {}".format(self._last_pod_error))
         max_cost = self._cost_tracker.get("max_cost", 0.0)
         lines.append("cost: {:.3f} USD{}".format(
             self._cost_tracker.get("total_cost", 0.0),
@@ -1262,7 +1322,16 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         # on the sync pod and points the relay at its public ports.
         self.startPollingClient()
 
-        self._scale_up(max(1, self["rpfarm_minpods"].evaluateInt()))
+        wanted = max(1, self["rpfarm_minpods"].evaluateInt())
+        if not self._scale_up(wanted):
+            # Nothing to run on and no reason to think the next tick will do
+            # better: fail the cook here with RunPod's own words rather than
+            # leave the artist watching an empty farm.
+            raise CookError(
+                "Could not create any GPU pod for this cook (asked for {}, "
+                "GPU priority: {}).\n{}".format(
+                    wanted, ", ".join(self._gpu_list),
+                    self._last_pod_error or "RunPod returned no pod and no error."))
         self._update_status_text(force=True)
 
     def _uploadPdgTemp(self):
@@ -1322,6 +1391,19 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
 
     def onSchedule(self, work_item):
         """[virtual] Queue a work item and try to place it on a pod."""
+        # Backpressure first, before any work and before the enqueue below.
+        # scheduleResult.Deferred puts the item back on PDG's own queue and it
+        # is offered again later (pdg/staticcook.py:136), so enqueueing and
+        # *then* declining would queue -- and run -- the same item twice.
+        # (There is also FullDeferred, which additionally stops PDG offering
+        # any further item this pass; Deferred is the conservative choice.)
+        if rpdispatch.should_defer(
+                len(self._dispatcher.pending), len(self._dispatcher.pods)):
+            self._verboseLog("deferring item {}: {} queued for {} pod(s)".format(
+                work_item.id, len(self._dispatcher.pending),
+                len(self._dispatcher.pods)))
+            return scheduleResult.Deferred
+
         # 0. Stamp this cook's local <-> farm mapping onto the item, before it
         #    is serialized. runpodfarm_download (Task 10) reads it off its
         #    upstream items to turn the farm paths in resultData back into
@@ -1378,12 +1460,6 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         self._work_items[work_item.id] = work_item
         self._dispatcher.enqueue(task)
         self._dispatch_pending()
-
-        # Backpressure: let PDG keep feeding us until the queue is a few times
-        # deeper than the pool can chew through.
-        capacity = max(1, len(self._dispatcher.pods)) * 3
-        if len(self._dispatcher.pending) > capacity:
-            return scheduleResult.SchedulerBusy
         return scheduleResult.Succeeded
 
     def _uploadItemData(self):
@@ -1429,6 +1505,10 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         return tickResult.SchedulerReady
 
     def _autoscale(self):
+        if time.time() - self._last_scale_failure < _SCALE_RETRY_BACKOFF:
+            # RunPod just refused; out-of-stock GPUs do not come back within a
+            # tick, and retrying every second only burns API calls.
+            return
         pending = len(self._dispatcher.pending)
         count = rpdispatch.autoscale_decision(
             pending=pending,
