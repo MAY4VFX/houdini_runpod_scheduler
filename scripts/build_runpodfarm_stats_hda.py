@@ -285,12 +285,28 @@ def onRefresh(kwargs):
         node.addWarning("refresh failed: {}".format(e))
 
 
+def _unique_csv_path(out_dir, stamp):
+    """rpfarm_stats_<stamp>.csv, or the same with a "-2", "-3", ... suffix
+    if that name is already taken -- the timestamp alone is only
+    second-granularity, so two exports (or export + a leftover from a
+    prior run) in the same second would otherwise silently overwrite each
+    other's CSV via to_csv's plain open(path, "w")."""
+    path = out_dir / "rpfarm_stats_{}.csv".format(stamp)
+    n = 2
+    while path.exists():
+        path = out_dir / "rpfarm_stats_{}-{}.csv".format(stamp, n)
+        n += 1
+    return path
+
+
 def onExportCsv(kwargs):
     node = kwargs["node"]
     try:
         filtered, by_project, by_user, cleanup, vol_total, usebilling = compute(node)
         out_dir = rpcfg.home() / "exports"
-        path = out_dir / "rpfarm_stats_{}.csv".format(time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()))
+        out_dir.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        path = _unique_csv_path(out_dir, stamp)
         rpledger.to_csv(filtered, path)
         current = node.parm("rpfarm_summary").evalAsString()
         _set_summary(node, "Exported {} record(s) -> {}\\n\\n{}".format(len(filtered), path, current))
