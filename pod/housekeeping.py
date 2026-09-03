@@ -11,6 +11,7 @@ stdlib only -- deployed as-is to Ubuntu 22.04 / python3.10 pods alongside
 Commands (see ``main()``/each ``cmd_*`` docstring for exact shapes)::
 
     housekeeping.py ls [--root /workspace] [--refresh] [--budget-s N] [--max-age-s N]
+                       [--volume-size-gb N]
     housekeeping.py du <path>
     housekeeping.py touch <user>/<project> [--event cook|upload|download]
     housekeeping.py rm <user>/<project> [--force]
@@ -18,7 +19,15 @@ Commands (see ``main()``/each ``cmd_*`` docstring for exact shapes)::
     housekeeping.py houdini ls [--refresh]
     housekeeping.py houdini rm <version> [--dry-run]
     housekeeping.py sync-idle
-    housekeeping.py disk-usage
+    housekeeping.py disk-usage [--volume-size-gb N] [--refresh] [--budget-s N] [--max-age-s N]
+
+``--volume-size-gb`` is the RunPod network volume's real provisioned size
+(the pod has no RunPod API key and cannot look this up itself -- callers
+pass ``RunPodAPI.get_volume(cfg.volume_id)["size"]``). Without it, `ls`/
+`disk-usage` report ``total``/``used_pct`` as ``null`` rather than ever
+deriving them from ``shutil.disk_usage`` -- inside a pod that reports the
+backing storage pool's capacity, not the volume's own size (Ruling R27,
+confirmed live: a real 50GB volume read back as ~2.14 PiB).
 
 ``ls``/``houdini ls`` serve cached sizes from ``/workspace/.rpfarm/index.json``
 when under 900s old and re-measure (bounded, see ``cmd_ls``/``cmd_houdini_ls``)
@@ -93,6 +102,8 @@ _DEFAULT_BUDGET_S = 120.0
 # How long a cached size is served before ls/houdini ls re-measures it
 # (Ruling R26 point 2); --refresh forces a re-measure regardless of age.
 _DEFAULT_MAX_AGE_S = 900.0
+
+_GB = 2**30
 
 
 # ---------------------------------------------------------------------------
@@ -426,19 +437,51 @@ class _SizeCache:
 # ---------------------------------------------------------------------------
 
 
+def _volume_totals(used: int, volume_size_gb) -> dict:
+    """``{"used", "total", "used_pct"[, "note"]}`` for the volume-wide figure.
+
+    Ruling R27: ``shutil.disk_usage(root)`` inside a pod reports the
+    *backing storage pool's* capacity, not the RunPod network volume's own
+    provisioned/billed size -- confirmed live, a real 50GB volume read
+    back as ~2.14 PiB. Never used here or anywhere else in this module.
+    ``used`` is always the real, zone-summed byte count the caller already
+    measured; ``total``/``used_pct`` require the caller to supply the
+    volume's actual size (``volume_size_gb`` -- the pod has no RunPod API
+    key and cannot look this up itself; callers get it from
+    ``RunPodAPI.get_volume(cfg.volume_id)["size"]``). Without it, both are
+    ``None`` and ``note`` says why, rather than silently reporting a
+    number that means nothing.
+    """
+    result = {"used": used, "total": None, "used_pct": None}
+    if volume_size_gb:
+        total = int(float(volume_size_gb) * _GB)
+        result["total"] = total
+        result["used_pct"] = round(100.0 * used / total, 2) if total else None
+    else:
+        result["note"] = (
+            "no --volume-size-gb given; total/used_pct unknown -- "
+            "shutil.disk_usage() inside a pod reports the backing storage "
+            "pool's capacity, not the network volume's real size (Ruling R27)"
+        )
+    return result
+
+
 def cmd_ls(
     root: str,
     refresh: bool = False,
     max_age_s: float = _DEFAULT_MAX_AGE_S,
     budget_s: float = _DEFAULT_BUDGET_S,
+    volume_size_gb=None,
 ) -> dict:
     """Zones, per-project usage, and volume totals.
 
     ``{"zones": {"houdini": bytes, "apps": bytes, "projects": bytes,
     "ledger": bytes}, "projects": [{"user", "project", "bytes", "last_used",
-    "last_cook", "outputs_pending"}], "volume": {"used": bytes, "total":
-    bytes}, "partial": bool}``. Projects are sorted by (user, project) for
-    a stable order.
+    "last_cook", "outputs_pending"}], "volume": {"used", "total",
+    "used_pct"[, "note"]}, "partial": bool}``. Projects are sorted by
+    (user, project) for a stable order. See :func:`_volume_totals` for
+    ``volume``'s shape and why it needs ``volume_size_gb`` (CLI
+    ``--volume-size-gb``) rather than ``shutil.disk_usage``.
 
     Sizes come from the ``_sizes`` cache (zone and per-project entries) in
     ``/workspace/.rpfarm/index.json`` when they're under ``max_age_s`` old
@@ -491,11 +534,7 @@ def cmd_ls(
 
     size_cache.flush("_sizes")
 
-    try:
-        usage = shutil.disk_usage(root)
-        volume = {"used": usage.used, "total": usage.total}
-    except OSError:
-        volume = {"used": 0, "total": 0}
+    volume = _volume_totals(sum(zones.values()), volume_size_gb)
 
     return {
         "zones": zones,
@@ -689,7 +728,31 @@ def cmd_houdini_ls(
     return {"versions": versions, "partial": size_cache.partial}
 
 
-def cmd_houdini_rm(root: str, version: str, dry_run: bool = False) -> dict:
+def _prune_houdini_cache(root: str, names) -> None:
+    """Drop ``names`` from the ``_houdini`` size cache (entries that no
+    longer exist after a real deletion)."""
+    names = list(names)
+    if not names:
+        return
+
+    def _mutate(index):
+        cache = dict(index.get("_houdini") or {})
+        for name in names:
+            cache.pop(name, None)
+        index["_houdini"] = cache
+        return index
+
+    _save_index(root, _mutate)
+
+
+def cmd_houdini_rm(
+    root: str,
+    version: str,
+    dry_run: bool = False,
+    refresh: bool = False,
+    max_age_s: float = _DEFAULT_MAX_AGE_S,
+    budget_s: float = _DEFAULT_BUDGET_S,
+) -> dict:
     """Delete one installed Houdini version (or report what would be deleted).
 
     ``version="legacy"`` removes every top-level entry under
@@ -699,27 +762,41 @@ def cmd_houdini_rm(root: str, version: str, dry_run: bool = False) -> dict:
     (CLI ``--dry-run``) computes and reports the same ``removed``/
     ``bytes_freed`` shape without deleting anything -- Task 14's
     destructive step is expected to run this first.
+
+    Sizes come from the same ``_houdini`` cache :func:`cmd_houdini_ls`
+    uses (review follow-up: this used to always measure every entry
+    fresh -- 48s for the real farm's 14-entry legacy install -- even
+    right after a `houdini ls` had just cached the same numbers). A real
+    (non-dry-run) deletion prunes the removed names from the cache.
     """
     if not version or version in (".", "..") or "/" in version or "\\" in version:
         raise HousekeepingError(f"invalid version {version!r}")
     houdini_root = os.path.normpath(os.path.join(root, "houdini"))
+    index = _load_index(root)
+    size_cache = _SizeCache(root, index, "_houdini", refresh, max_age_s, budget_s)
 
     if version == LEGACY_VERSION:
         if not os.path.isdir(houdini_root):
             return {"ok": False, "error": "not found", "path": houdini_root}
         removed = []
+        removed_names = []
         freed = 0
         for name in sorted(os.listdir(houdini_root)):
             if name.startswith(".") or _VERSION_RE.match(name):
                 continue
             entry = os.path.join(houdini_root, name)
-            freed += _size(entry)
+            nbytes, _ = size_cache.get(name, entry)
+            freed += nbytes
             if not dry_run:
                 if os.path.isdir(entry) and not os.path.islink(entry):
                     shutil.rmtree(entry)
                 else:
                     os.remove(entry)
+                removed_names.append(name)
             removed.append(entry)
+        size_cache.flush("_houdini")
+        if removed_names:
+            _prune_houdini_cache(root, removed_names)
         if not removed:
             return {"ok": False, "error": "no legacy entries found", "path": houdini_root}
         return {
@@ -728,6 +805,7 @@ def cmd_houdini_rm(root: str, version: str, dry_run: bool = False) -> dict:
             "removed": removed,
             "bytes_freed": freed,
             "dry_run": dry_run,
+            "partial": size_cache.partial,
         }
 
     vdir = os.path.normpath(os.path.join(root, "houdini", version))
@@ -735,32 +813,48 @@ def cmd_houdini_rm(root: str, version: str, dry_run: bool = False) -> dict:
         raise HousekeepingError(f"resolved path escapes houdini/: {vdir}")
     if not os.path.isdir(vdir):
         return {"ok": False, "error": "not found", "path": vdir}
-    freed = _size(vdir)
+    freed, _ = size_cache.get(version, vdir)
+    size_cache.flush("_houdini")
     if not dry_run:
         shutil.rmtree(vdir)
-    return {"ok": True, "path": vdir, "bytes_freed": freed, "dry_run": dry_run}
+        _prune_houdini_cache(root, [version])
+    return {
+        "ok": True,
+        "path": vdir,
+        "bytes_freed": freed,
+        "dry_run": dry_run,
+        "partial": size_cache.partial,
+    }
 
 
-def cmd_disk_usage(root: str) -> dict:
-    """``{"volume": {"used": bytes, "total": bytes}}`` -- just
-    ``shutil.disk_usage(root)``, nothing else.
+def cmd_disk_usage(
+    root: str,
+    volume_size_gb=None,
+    refresh: bool = False,
+    max_age_s: float = _DEFAULT_MAX_AGE_S,
+    budget_s: float = _DEFAULT_BUDGET_S,
+) -> dict:
+    """``{"volume": {"used", "total", "used_pct"[, "note"]}, "partial": bool}``.
 
-    Ruling R26 review finding: ``maybe_grow_volume`` only ever needs the
-    volume's real used/total bytes (a single, instant OS statvfs call) to
-    decide whether to grow -- it does not need ``ls``'s zone/project
-    breakdown at all, and ``ls`` computing that breakdown (even bounded by
-    its own ``--budget-s``) still means the whole `housekeeping.py ls`
-    process can run past a short exec timeout, because per-project
-    ``outputs_pending`` scanning has no budget of its own (a separate,
-    still-open perf question -- see the Task 12 report). This command
-    exists so callers that only care about disk_usage never depend on any
-    of that.
+    Ruling R26 review finding: ``maybe_grow_volume`` doesn't need ``ls``'s
+    full project listing/``outputs_pending`` scanning (that scanning has
+    no budget of its own -- see the Task 12 report) just to decide whether
+    to grow the volume. Ruling R27: it also must never use
+    ``shutil.disk_usage`` (see :func:`_volume_totals`) -- so ``used`` here
+    is the sum of the four zone sizes, from the *same* ``_sizes`` cache
+    ``ls`` uses (Ruling R26: warm is instant, cold is bounded by
+    ``budget_s`` the same way, and ``partial`` means the same thing). This
+    is `ls` minus the per-project walk, not a different measurement.
     """
-    try:
-        usage = shutil.disk_usage(root)
-        return {"volume": {"used": usage.used, "total": usage.total}}
-    except OSError:
-        return {"volume": {"used": 0, "total": 0}}
+    index = _load_index(root)
+    size_cache = _SizeCache(root, index, "_sizes", refresh, max_age_s, budget_s)
+    used = 0
+    for zone in _ZONES:
+        nbytes, _ = size_cache.get(zone, os.path.join(root, zone))
+        used += nbytes
+    size_cache.flush("_sizes")
+
+    return {"volume": _volume_totals(used, volume_size_gb), "partial": size_cache.partial}
 
 
 def cmd_sync_idle(root: str) -> dict:
@@ -795,6 +889,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_ls.add_argument("--refresh", action="store_true")
     p_ls.add_argument("--budget-s", type=float, default=_DEFAULT_BUDGET_S)
     p_ls.add_argument("--max-age-s", type=float, default=_DEFAULT_MAX_AGE_S)
+    p_ls.add_argument("--volume-size-gb", type=float, default=None)
 
     p_du = sub.add_parser("du")
     p_du.add_argument("path")
@@ -820,7 +915,11 @@ def _build_parser() -> argparse.ArgumentParser:
     p_houdini_rm.add_argument("--dry-run", action="store_true")
 
     sub.add_parser("sync-idle")
-    sub.add_parser("disk-usage")
+    p_disk_usage = sub.add_parser("disk-usage")
+    p_disk_usage.add_argument("--volume-size-gb", type=float, default=None)
+    p_disk_usage.add_argument("--budget-s", type=float, default=_DEFAULT_BUDGET_S)
+    p_disk_usage.add_argument("--max-age-s", type=float, default=_DEFAULT_MAX_AGE_S)
+    p_disk_usage.add_argument("--refresh", action="store_true")
 
     return p
 
@@ -836,7 +935,11 @@ def main(argv: list[str]) -> int:
     try:
         if args.command == "ls":
             result = cmd_ls(
-                args.root, refresh=args.refresh, max_age_s=args.max_age_s, budget_s=args.budget_s
+                args.root,
+                refresh=args.refresh,
+                max_age_s=args.max_age_s,
+                budget_s=args.budget_s,
+                volume_size_gb=args.volume_size_gb,
             )
         elif args.command == "du":
             result = du(args.path)
@@ -854,7 +957,13 @@ def main(argv: list[str]) -> int:
         elif args.command == "sync-idle":
             result = cmd_sync_idle(DEFAULT_ROOT)
         elif args.command == "disk-usage":
-            result = cmd_disk_usage(DEFAULT_ROOT)
+            result = cmd_disk_usage(
+                DEFAULT_ROOT,
+                volume_size_gb=args.volume_size_gb,
+                refresh=args.refresh,
+                max_age_s=args.max_age_s,
+                budget_s=args.budget_s,
+            )
         else:  # pragma: no cover - argparse enforces `command` is one of the above
             print(f"unknown command: {args.command}", file=sys.stderr)
             return 2

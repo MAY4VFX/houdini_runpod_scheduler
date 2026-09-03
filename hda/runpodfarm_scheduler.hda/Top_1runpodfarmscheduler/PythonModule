@@ -206,10 +206,23 @@ def _volume_exec(node, command, timeout_s=300):
 
 
 def onVolumeRefresh(kwargs):
-    """List the volume's zones, per-project usage, and totals (Task 12 `ls`)."""
+    """List the volume's zones, per-project usage, and totals (Task 12 `ls`).
+
+    Ruling R27: passes ``--volume-size-gb`` (RunPod's own
+    ``get_volume``, cached via ``rpfarm.packages.get_volume_size_gb``) so
+    the percent-full figure below is never derived from the pod's own
+    ``shutil.disk_usage`` -- confirmed live to report the backing storage
+    pool's capacity, not the network volume's real size (a real 50GB
+    volume read back as ~2.14 PiB).
+    """
     node = kwargs["node"]
     try:
-        out = _volume_exec(node, "{} ls".format(_HOUSEKEEPING))
+        cfg, api = _node_config(node)
+        volume_size_gb = rppkg.get_volume_size_gb(api, cfg)
+        command = "{} ls".format(_HOUSEKEEPING)
+        if volume_size_gb:
+            command += " --volume-size-gb {}".format(volume_size_gb)
+        out = _volume_exec(node, command)
         info = json.loads(out or "{}")
 
         lines = ["Zones:"]
@@ -230,12 +243,22 @@ def onVolumeRefresh(kwargs):
             )
 
         volume = info.get("volume", {})
-        used, total = volume.get("used", 0), volume.get("total", 0)
-        pct = (100.0 * used / total) if total else 0.0
+        used = volume.get("used") or 0
+        total = volume.get("total")
         lines.append("")
-        lines.append(
-            "Volume: {:.2f} / {:.2f} GB ({:.0f}% full)".format(used / 2**30, total / 2**30, pct)
-        )
+        if total:
+            pct = volume.get("used_pct")
+            if pct is None:
+                pct = 100.0 * used / total
+            lines.append(
+                "Volume: {:.2f} / {:.2f} GB ({:.0f}% full)".format(used / 2**30, total / 2**30, pct)
+            )
+        else:
+            # Ruling R27: no real size available (get_volume failed/uncached)
+            # -- show used bytes alone rather than a bogus %, and never fall
+            # back to shutil.disk_usage's backing-pool number.
+            lines.append("Volume: {:.2f} GB used (total unknown -- {})".format(
+                used / 2**30, volume.get("note", "RunPod get_volume unavailable")))
         if info.get("partial"):
             # Ruling R26: ls serves cached sizes and re-measures stale ones
             # within a shared time budget -- if that budget ran out, some

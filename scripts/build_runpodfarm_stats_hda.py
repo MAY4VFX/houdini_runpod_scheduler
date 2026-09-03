@@ -71,6 +71,7 @@ if str(_RPFARM_ROOT) not in sys.path:
 
 from rpfarm import config as rpcfg
 from rpfarm import ledger as rpledger
+from rpfarm import packages as rppkg
 from rpfarm import pods as rppods
 from rpfarm.runpod_api import RunPodAPI, RunPodError
 from rpfarm.worker_client import WorkerClient
@@ -130,6 +131,14 @@ def _storage_snapshot(cfg, node):
     (the common local-only view works with none at all, same as billing);
     any other failure (RunPod unreachable, sync pod wouldn't come up, a
     stale pod image with no housekeeping ``ls``) leaves a node warning.
+
+    Ruling R27: ``ls``'s ``total`` is only meaningful with
+    ``--volume-size-gb`` (the pod's own ``shutil.disk_usage`` reports the
+    backing storage pool, not the volume's real size -- confirmed live, a
+    50GB volume read back as ~2.14 PiB). The real size comes from
+    ``RunPodAPI.get_volume`` via :func:`rpfarm.packages.get_volume_size_gb`
+    (cached on disk, same file `maybe_grow_volume` uses) -- without it,
+    ``vol_bytes`` stays ``None`` just like an unreachable pod would leave it.
     """
     quiet = cfg is None
     try:
@@ -138,9 +147,13 @@ def _storage_snapshot(cfg, node):
         token = rpcfg.session_token()
         pubkey = _read_pubkey(cfg)
         api = RunPodAPI(cfg.api_key)
+        volume_size_gb = rppkg.get_volume_size_gb(api, cfg)
         pod = rppods.ensure_sync_pod(api, cfg, token, pubkey)
         client = WorkerClient(pod["id"], token)
-        result = client.exec("python3 /opt/rpfarm/housekeeping.py ls", timeout_s=60)
+        command = "python3 /opt/rpfarm/housekeeping.py ls"
+        if volume_size_gb:
+            command += " --volume-size-gb {}".format(volume_size_gb)
+        result = client.exec(command, timeout_s=60)
         if result.get("exit_code") != 0:
             node.addWarning("storage sizes unavailable: {}".format(
                 result.get("stderr") or "housekeeping ls failed"))
