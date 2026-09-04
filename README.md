@@ -203,6 +203,33 @@ python3 -m rpfarm smoke
 каждую задачу с `exit_code 0` и `cook_summary` со стоимостью, а на аккаунте не
 осталось ни одного пода. Любой промах — ненулевой код возврата.
 
+Как выглядит успешный прогон (реальный вывод, 2026-09-04):
+
+```
+stage                            detail                   time
+-------------------------------  -----------------------  ----
+scene load                       smoke.hip                1.7s
+upload                           2 item(s), 786.7KB       68s
+farm ready                       sync pod + MQ + GPU pod  12s
+probe                            1 item(s)                7.2s
+render                           3 item(s)                65s
+download                         3 item(s)                11s
+pod rpfarm-sync-may              $0.060/h                 12s
+pod rpfarm-may-smoke-071c3129-1  $0.740/h                 12s
+total                            wall clock               201s
+
+cook cost  $0.025   (rpfarm-sync-may $0.060/h, rpfarm-may-smoke-071c3129-1 $0.740/h)
+cook id    071c3129
+outputs    3 frame(s), 1 probe file(s) in tmp/smoke_20260904-114949
+ledger     4 task record(s)
+
+OK: 3 frame(s) rendered on the farm and downloaded to the ROP's own paths in 3m21s
+```
+
+У строк `pod …` время значит другое, чем у стадий: сколько прошло от появления
+пода в `GET /pods` до появления у него публичного IP. Стоимость — из
+`cook_summary`, который пишет сам планировщик, а не оценка теста.
+
 Поды гасятся на **любом** пути выхода, включая падение или таймаут `hython`:
 чистку делает родительский процесс, а не сам кук. `--keep` оставляет ферму как
 есть (обычное продакшн-поведение, где sync-под живёт дальше) —
