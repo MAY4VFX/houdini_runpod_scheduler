@@ -289,3 +289,37 @@ def test_no_parameter_was_lost_in_the_reshuffle():
         "rpfarm_usehoudinimaxthreads", "rpfarm_houdinimaxthreads",
     }
     assert expected <= names, sorted(expected - names)
+
+
+def test_download_generate_never_warns_through_the_houdini_node():
+    """`hou.Node.addWarning` from inside PDG generate() is not a warning.
+
+    Houdini refuses to badge a node other than the one being cooked and raises
+    hou.OperationFailed("Cannot set error badges on other nodes"), so the call
+    aborts generate() and the node produces ZERO work items -- a strictly worse
+    outcome than the condition being reported. Warnings go through `self`, the
+    pdg.Node, which owns the TOP-side badge. Guarded here because the failure
+    only appears on an error path that a green cook never touches.
+    """
+    generate = _download_generate_source()
+
+    assert "node.addWarning(" not in generate
+    assert "node.addError(" not in generate
+    assert "_warn(" in generate
+    assert "self.addWarning(message)" in generate
+
+
+def test_download_generate_does_not_trust_stats_exit_code():
+    """`stat` exits non-zero if any path is missing but still prints the rest."""
+    generate = _download_generate_source()
+
+    assert "parse_stat_sizes" in generate
+    assert 'result.get("exit_code") == 0' not in generate
+
+
+def _download_generate_source():
+    """The generate script as it is checked into the expanded HDA."""
+    path = (pathlib.Path(__file__).resolve().parent.parent / "hda"
+            / "runpodfarm_download.hda" / "Top_1runpodfarmdownload"
+            / "Contents.dir" / "Contents.mime")
+    return path.read_text(encoding="utf-8", errors="replace")
