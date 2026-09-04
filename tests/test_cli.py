@@ -819,10 +819,16 @@ def test_farm_kill_sync_terminates_matching_pod_only(tmp_path, monkeypatch, caps
         raise AssertionError((method, url))
 
     monkeypatch.setattr(cli, "_transport", transport)
+    monkeypatch.setattr(cli, "_health_probe", _idle_health)
     rc = cli.main(["farm", "kill", "--sync"])
     assert rc == 0
     assert terminated == ["https://rest.runpod.io/v1/pods/sync1"]
     assert "terminated rpfarm-sync-tester" in capsys.readouterr().out
+
+
+def _idle_health(pod):
+    """Every pod answers "nobody has touched me in ages"."""
+    return {"busy": 0, "idle_s": 9999}
 
 
 def _farm_kill_transport(pods, terminated):
@@ -849,6 +855,7 @@ def test_farm_kill_all_only_terminates_this_users_own_pods(tmp_path, monkeypatch
     ]
     terminated = []
     monkeypatch.setattr(cli, "_transport", _farm_kill_transport(pods, terminated))
+    monkeypatch.setattr(cli, "_health_probe", _idle_health)
 
     rc = cli.main(["farm", "kill", "--all"])
     assert rc == 0
@@ -868,8 +875,11 @@ def test_farm_kill_everyone_terminates_every_rpfarm_pod(tmp_path, monkeypatch, c
     ]
     terminated = []
     monkeypatch.setattr(cli, "_transport", _farm_kill_transport(pods, terminated))
+    monkeypatch.setattr(cli, "_health_probe", _idle_health)
 
-    rc = cli.main(["farm", "kill", "--everyone"])
+    # --everyone reaches other users' pods, so it confirms; --yes stands in for
+    # the human typing "yes".
+    rc = cli.main(["farm", "kill", "--everyone", "--yes"])
     assert rc == 0
     assert sorted(terminated) == sorted(f"https://rest.runpod.io/v1/pods/{p['id']}" for p in pods)
 
@@ -884,20 +894,151 @@ def test_farm_kill_no_flag_refuses(tmp_path, monkeypatch, capsys):
 
 
 def test_farm_kill_pod_terminates_exact_id(tmp_path, monkeypatch, capsys):
+    """--pod now looks the pod up first, so it can tell whether it is busy."""
     monkeypatch.setenv("RPFARM_HOME", str(tmp_path))
-    _write_cfg(tmp_path)
+    _write_cfg(tmp_path, user="tester")
+    pods = [{"id": "abc123", "name": "rpfarm-tester-shotA-c-0",
+             "env": {"RPFARM_USER": "tester"}}]
     terminated = []
+    monkeypatch.setattr(cli, "_transport", _farm_kill_transport(pods, terminated))
+    monkeypatch.setattr(cli, "_health_probe", _idle_health)
 
-    def transport(method, url, body, headers):
-        if method == "DELETE":
-            terminated.append(url)
-            return 204, b""
-        raise AssertionError((method, url))
-
-    monkeypatch.setattr(cli, "_transport", transport)
     rc = cli.main(["farm", "kill", "--pod", "abc123"])
     assert rc == 0
     assert terminated == ["https://rest.runpod.io/v1/pods/abc123"]
+
+
+# -- the guards that make the default incapable of the real incident ---------
+
+
+def _busy_health(pod):
+    return {"busy": 1, "idle_s": 2}
+
+
+def _recently_used_health(pod):
+    """No task running, but a scheduler spoke to it 36 seconds ago -- exactly
+    the window in which a real cook was nearly destroyed."""
+    return {"busy": 0, "idle_s": 36}
+
+
+def _kill_setup(tmp_path, monkeypatch, pods, health):
+    monkeypatch.setenv("RPFARM_HOME", str(tmp_path))
+    _write_cfg(tmp_path, user="tester")
+    terminated = []
+    monkeypatch.setattr(cli, "_transport", _farm_kill_transport(pods, terminated))
+    monkeypatch.setattr(cli, "_health_probe", health)
+    return terminated
+
+
+def test_farm_kill_all_skips_a_pod_with_a_live_cook(tmp_path, monkeypatch, capsys):
+    pods = [{"id": "busy1", "name": "rpfarm-tester-shotA-c-0",
+             "env": {"RPFARM_USER": "tester"}}]
+    terminated = _kill_setup(tmp_path, monkeypatch, pods, _busy_health)
+
+    rc = cli.main(["farm", "kill", "--all"])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert terminated == []
+    assert "[SKIP]" in out and "running 1 task(s)" in out
+    assert "--even-if-running" in out          # says how, if you really mean it
+
+
+def test_farm_kill_all_skips_a_pod_touched_seconds_ago(tmp_path, monkeypatch, capsys):
+    pods = [{"id": "warm1", "name": "rpfarm-tester-shotA-c-0",
+             "env": {"RPFARM_USER": "tester"}}]
+    terminated = _kill_setup(tmp_path, monkeypatch, pods, _recently_used_health)
+
+    rc = cli.main(["farm", "kill", "--all"])
+
+    assert rc == 0
+    assert terminated == []
+    assert "36s ago" in capsys.readouterr().out
+
+
+def test_farm_kill_all_skips_a_pod_it_cannot_reach(tmp_path, monkeypatch, capsys):
+    """Not knowing resolves to leaving it alone: a few cents against a render."""
+    def unreachable(pod):
+        raise OSError("connection refused")
+
+    pods = [{"id": "gone1", "name": "rpfarm-tester-shotA-c-0",
+             "env": {"RPFARM_USER": "tester"}}]
+    terminated = _kill_setup(tmp_path, monkeypatch, pods, unreachable)
+
+    rc = cli.main(["farm", "kill", "--all"])
+
+    assert rc == 0
+    assert terminated == []
+    assert "connection refused" in capsys.readouterr().out
+
+
+def test_even_if_running_takes_a_busy_pod_but_only_after_confirmation(tmp_path, monkeypatch, capsys):
+    pods = [{"id": "busy1", "name": "rpfarm-tester-shotA-c-0",
+             "env": {"RPFARM_USER": "tester"}}]
+    terminated = _kill_setup(tmp_path, monkeypatch, pods, _busy_health)
+
+    # says no
+    rc = cli.main(["farm", "kill", "--all", "--even-if-running"], prompt=lambda _p: "n")
+    assert rc == 1
+    assert terminated == []
+    assert "cancelled" in capsys.readouterr().out
+
+    # says yes
+    rc = cli.main(["farm", "kill", "--all", "--even-if-running"], prompt=lambda _p: "yes")
+    assert rc == 0
+    assert terminated == ["https://rest.runpod.io/v1/pods/busy1"]
+
+
+def test_everyone_needs_confirmation_before_taking_another_users_pod(tmp_path, monkeypatch, capsys):
+    pods = [{"id": "other1", "name": "rpfarm-other-shotC-g-0",
+             "env": {"RPFARM_USER": "other"}}]
+    terminated = _kill_setup(tmp_path, monkeypatch, pods, _idle_health)
+
+    rc = cli.main(["farm", "kill", "--everyone"], prompt=lambda _p: "no")
+
+    assert rc == 1
+    assert terminated == []
+
+
+def test_all_never_touches_another_users_pod_even_idle(tmp_path, monkeypatch, capsys):
+    pods = [{"id": "other1", "name": "rpfarm-other-shotC-g-0",
+             "env": {"RPFARM_USER": "other"}}]
+    terminated = _kill_setup(tmp_path, monkeypatch, pods, _idle_health)
+
+    rc = cli.main(["farm", "kill", "--everyone"], prompt=lambda _p: "no")
+    assert terminated == []
+
+    # and --all does not even offer it
+    terminated.clear()
+    rc = cli.main(["farm", "kill", "--all"])
+    assert rc == 0
+    assert terminated == []
+
+
+def test_kill_pod_by_id_refuses_a_busy_pod_without_the_override(tmp_path, monkeypatch, capsys):
+    pods = [{"id": "busy1", "name": "rpfarm-tester-shotA-c-0",
+             "env": {"RPFARM_USER": "tester"}}]
+    terminated = _kill_setup(tmp_path, monkeypatch, pods, _busy_health)
+
+    rc = cli.main(["farm", "kill", "--pod", "busy1"])
+    err = capsys.readouterr().err
+
+    assert rc == 2
+    assert terminated == []
+    assert "running 1 task(s)" in err
+    assert "--even-if-running" in err
+
+
+def test_kill_pod_by_id_with_the_override_still_asks(tmp_path, monkeypatch, capsys):
+    pods = [{"id": "busy1", "name": "rpfarm-tester-shotA-c-0",
+             "env": {"RPFARM_USER": "tester"}}]
+    terminated = _kill_setup(tmp_path, monkeypatch, pods, _busy_health)
+
+    rc = cli.main(["farm", "kill", "--pod", "busy1", "--even-if-running"],
+                  prompt=lambda _p: "yes")
+
+    assert rc == 0
+    assert terminated == ["https://rest.runpod.io/v1/pods/busy1"]
 
 
 # -- costs ------------------------------------------------------------------
