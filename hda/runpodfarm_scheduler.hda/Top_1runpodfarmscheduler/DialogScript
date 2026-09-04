@@ -361,6 +361,25 @@
             type    toggle
             default { "0" }
         }
+        parm {
+            name    "rpfarm_capacitywait"
+            label   "Wait For Capacity (min)"
+            type    integer
+            default { [ "hou.phm().cfg_default_int(\"capacity_wait_min\", 15)" python ] }
+            range   { 0 120 }
+            help    "How long a work item waits for a free machine before that ONE item fails. RunPod pods are not spot instances -- a pod you already have is never taken away -- so a shortage is a queue, not an eviction, and the cook waits instead of dying. Past this deadline only the items still waiting are failed, so a re-cook retries just those and the rest of the graph keeps what it computed. 0 waits forever. Shows capacity_wait_min from ~/.rpfarm/config.toml, which is what this node will actually use; type your own and the literal replaces the expression and wins."
+        }
+        parm {
+            name    "rpfarm_cloudtype"
+            label   "Cloud Type"
+            type    string
+            default { [ "hou.phm().cfg_default(\"cloud_type\", \"SECURE\")" python ] }
+            menureplace {
+                "SECURE"    "Secure (vetted datacentres)"
+                "COMMUNITY" "Community (cheaper, often has machines when Secure is empty)"
+            }
+            help    "Which RunPod capacity pool to rent from. Community is cheaper and frequently has GPUs when Secure is out, so it is the practical answer to a capacity shortage. Shows cloud_type from ~/.rpfarm/config.toml, which is what this node will actually use; type your own and the literal replaces the expression and wins."
+        }
         groupsimple {
             name    "folder_adv_remote"
             label   "Remote Shared Path"

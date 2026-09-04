@@ -257,3 +257,72 @@ def test_default_transport_turns_network_errors_into_runpoderror(monkeypatch):
     with pytest.raises(ra.RunPodError) as excinfo:
         ra._urllib_transport("GET", "https://rest.runpod.io/v1/pods", None, {})
     assert excinfo.value.status == 0
+
+
+# ---------------------------------------------------------------------------
+# cloud type + is_capacity_error
+# ---------------------------------------------------------------------------
+
+
+def test_cloud_type_reaches_the_request_body_for_both_pod_kinds():
+    sent = {}
+
+    def transport(method, url, body, headers):
+        sent.clear()
+        sent.update(body or {})
+        return 200, b'{"id": "p"}'
+
+    api = ra.RunPodAPI("key", transport=transport)
+
+    api.create_gpu_pod("n", "tpl", ["A4500"], "vol", {}, [22],
+                       cloud_type=ra.CLOUD_TYPE_COMMUNITY)
+    assert sent["cloudType"] == "COMMUNITY"
+
+    api.create_cpu_pod("n", "tpl", "vol", {}, [22], cloud_type=ra.CLOUD_TYPE_COMMUNITY)
+    assert sent["cloudType"] == "COMMUNITY"
+
+
+def test_cloud_type_defaults_to_secure():
+    sent = {}
+
+    def transport(method, url, body, headers):
+        sent.update(body or {})
+        return 200, b'{"id": "p"}'
+
+    ra.RunPodAPI("key", transport=transport).create_gpu_pod(
+        "n", "tpl", ["A4500"], "vol", {}, [22])
+
+    assert sent["cloudType"] == "SECURE"
+
+
+def test_interruptible_is_never_sent():
+    """Leaving it unset is what guarantees a pod we hold is not taken back --
+    the premise the whole wait-for-capacity design rests on."""
+    sent = {}
+
+    def transport(method, url, body, headers):
+        sent.update(body or {})
+        return 200, b'{"id": "p"}'
+
+    ra.RunPodAPI("key", transport=transport).create_gpu_pod(
+        "n", "tpl", ["A4500"], "vol", {}, [22], cloud_type=ra.CLOUD_TYPE_COMMUNITY)
+
+    assert "interruptible" not in sent
+
+
+def test_is_capacity_error_waits_on_5xx_and_gives_up_on_4xx():
+    body = ('{"error":"create pod: There are no longer any instances available '
+            'with the requested specifications."}')
+
+    assert ra.is_capacity_error(ra.RunPodError(500, body)) is True
+    assert ra.is_capacity_error(ra.RunPodError(502, "bad gateway")) is True
+
+    # No amount of waiting fixes a bad key or a bad request.
+    assert ra.is_capacity_error(ra.RunPodError(401, "unauthorized")) is False
+    assert ra.is_capacity_error(ra.RunPodError(403, "forbidden")) is False
+    assert ra.is_capacity_error(ra.RunPodError(400, "malformed")) is False
+    assert ra.is_capacity_error(ra.RunPodError(404, "no such template")) is False
+
+
+def test_is_capacity_error_is_false_for_anything_without_a_status():
+    assert ra.is_capacity_error(ValueError("not a runpod error")) is False

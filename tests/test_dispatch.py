@@ -474,3 +474,92 @@ def test_terminate_retries_are_ordered_deterministically():
     r.add("c", now=-100.0)
     assert r.pending() == ["a", "b", "c"]
     assert r.due(now=TERMINATE_RETRY_SECONDS) == ["c", "a", "b"]
+
+
+# ---------------------------------------------------------------------------
+# capacity_expired
+#
+# RunPod pods are not spot instances (cloudType SECURE/COMMUNITY,
+# `interruptible` never set), so a pod we already hold is never taken back --
+# the only question is whether a free one exists yet. That makes a shortage a
+# QUEUE, not a failure, and onSetupCook used to kill the whole cook on it.
+# These pin the backstop: past a per-item deadline, individual items give up
+# so a re-cook retries only them.
+# ---------------------------------------------------------------------------
+
+
+def _task(task_id="t1", work_item_id=1):
+    return TaskState(task_id=task_id, work_item_id=work_item_id, command="c", env={})
+
+
+def test_enqueue_stamps_when_the_task_started_waiting():
+    d = Dispatcher()
+    t = _task()
+
+    d.enqueue(t, now=1000.0)
+
+    assert t.queued_at == 1000.0
+
+
+def test_nothing_expires_before_the_deadline():
+    d = Dispatcher()
+    d.enqueue(_task(), now=1000.0)
+
+    assert d.capacity_expired(1000.0 + 899, 900) == []
+
+
+def test_a_task_expires_once_it_has_waited_long_enough():
+    d = Dispatcher()
+    t = _task()
+    d.enqueue(t, now=1000.0)
+
+    assert d.capacity_expired(1000.0 + 900, 900) == [t]
+
+
+def test_only_the_tasks_past_the_deadline_expire():
+    """The point of doing this per item: a re-cook must retry only these."""
+    d = Dispatcher()
+    old = _task("old", 1)
+    new = _task("new", 2)
+    d.enqueue(old, now=1000.0)
+    d.enqueue(new, now=1800.0)
+
+    expired = d.capacity_expired(1900.0, 900)
+
+    assert [t.task_id for t in expired] == ["old"]
+    assert [t.task_id for t in d.pending] == ["old", "new"]  # caller fails them
+
+
+def test_zero_wait_means_wait_forever():
+    d = Dispatcher()
+    d.enqueue(_task(), now=0.0)
+
+    assert d.capacity_expired(1e9, 0) == []
+    assert d.capacity_expired(1e9, -1) == []
+
+
+def test_expired_tasks_go_through_fail_pending_so_pdg_hears_about_them():
+    d = Dispatcher()
+    t = _task()
+    d.enqueue(t, now=1000.0)
+
+    for expired in d.capacity_expired(2000.0, 900):
+        d.fail_pending(expired.task_id)
+
+    assert d.pending == []
+    assert [x.task_id for x in d.failed_since_last_call()] == ["t1"]
+
+
+def test_a_requeued_task_restarts_its_capacity_clock():
+    """It had a machine and lost it; the wait it already served says nothing
+    about whether RunPod has capacity now."""
+    d = Dispatcher()
+    d.add_pod("pod1")
+    t = _task()
+    d.enqueue(t, now=1000.0)
+    d.assign(t.task_id, "pod1")
+
+    d.pod_dead("pod1", now=5000.0)
+
+    assert t.queued_at == 5000.0
+    assert d.capacity_expired(5100.0, 900) == []

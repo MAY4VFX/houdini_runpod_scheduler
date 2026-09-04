@@ -32,6 +32,39 @@ USER_AGENT = "rpfarm/{}".format(VERSION)
 # that is in its own.
 DEFAULT_DATACENTER = "EU-RO-1"
 
+# RunPod's OpenAPI enum for `cloudType`. SECURE is vetted datacentre capacity;
+# COMMUNITY is cheaper hosts and often has machines when SECURE is empty --
+# which makes it the practical answer to a capacity shortage.
+#
+# Note what is deliberately absent: `interruptible`. Leaving it unset (RunPod
+# defaults it false) is what guarantees a pod we already hold is never taken
+# back, and that guarantee is the whole reason a shortage can be treated as
+# waiting rather than as failure. Do not add it.
+CLOUD_TYPE_SECURE = "SECURE"
+CLOUD_TYPE_COMMUNITY = "COMMUNITY"
+CLOUD_TYPES = (CLOUD_TYPE_SECURE, CLOUD_TYPE_COMMUNITY)
+
+
+def is_capacity_error(exc) -> bool:
+    """Is this RunPod refusal a temporary shortage of machines?
+
+    Those are worth waiting out; a 4xx (bad key, bad template, malformed
+    request) is not, and no amount of waiting fixes it. RunPod reports a
+    shortage as a 500 whose body says "no longer any instances available with
+    the requested specifications", so the status alone is not specific enough
+    to key on -- but any 5xx is at least *plausibly* transient, and treating
+    one as waiting costs a retry while treating a real shortage as fatal costs
+    the artist the whole cook. Anything below 500 is taken at its word.
+    """
+    status = getattr(exc, "status", None)
+    if status is None:
+        return False
+    if 400 <= int(status) < 500:
+        return False
+    if int(status) >= 500:
+        return True
+    return False
+
 _BALANCE_QUERY = "{ myself { clientBalance } }"
 
 
@@ -86,7 +119,8 @@ class RunPodAPI:
 
     # -- pods ------------------------------------------------------------
 
-    def _pod_body(self, name, template_id, volume_id, env, ports, datacenter=DEFAULT_DATACENTER):
+    def _pod_body(self, name, template_id, volume_id, env, ports,
+                  datacenter=DEFAULT_DATACENTER, cloud_type=CLOUD_TYPE_SECURE):
         """The fields every pod create shares.
 
         ``datacenter`` used to be the hardcoded :data:`DEFAULT_DATACENTER`
@@ -105,13 +139,13 @@ class RunPodAPI:
             "volumeMountPath": "/workspace",
             "env": env,
             "ports": list(ports),
-            "cloudType": "SECURE",
+            "cloudType": cloud_type or CLOUD_TYPE_SECURE,
             "supportPublicIp": True,
             "dataCenterIds": [datacenter or DEFAULT_DATACENTER],
         }
 
     def create_gpu_pod(self, name, template_id, gpu_type_ids, volume_id, env, ports,
-                       datacenter=DEFAULT_DATACENTER):
+                       datacenter=DEFAULT_DATACENTER, cloud_type=CLOUD_TYPE_SECURE):
         """Create a GPU pod, trying ``gpu_type_ids`` in the order given.
 
         ``gpuTypePriority`` defaults to ``"availability"``, which picks
@@ -122,7 +156,8 @@ class RunPodAPI:
         GPU types in the order specified in gpuTypeIds." The artist's
         priority list is a cost decision, so it is ``"custom"`` here.
         """
-        body = self._pod_body(name, template_id, volume_id, env, ports, datacenter)
+        body = self._pod_body(name, template_id, volume_id, env, ports, datacenter,
+                              cloud_type=cloud_type)
         body.update(
             {
                 "computeType": "GPU",
@@ -134,7 +169,7 @@ class RunPodAPI:
         return self._call("POST", "/pods", body)
 
     def create_cpu_pod(self, name, template_id, volume_id, env, ports, vcpu=2, flavors=("cpu3c", "cpu5c"),
-                       datacenter=DEFAULT_DATACENTER):
+                       datacenter=DEFAULT_DATACENTER, cloud_type=CLOUD_TYPE_SECURE):
         """Create a CPU pod, trying ``flavors`` in the order given.
 
         Same reasoning as :meth:`create_gpu_pod`. The openapi spec: "set to
@@ -143,7 +178,8 @@ class RunPodAPI:
         cpuFlavorIds." The default flavours are cheapest-first ($0.06/h for
         cpu3c against $0.07/h for cpu5c), so the order is the point.
         """
-        body = self._pod_body(name, template_id, volume_id, env, ports, datacenter)
+        body = self._pod_body(name, template_id, volume_id, env, ports, datacenter,
+                              cloud_type=cloud_type)
         body.update(
             {
                 "computeType": "CPU",

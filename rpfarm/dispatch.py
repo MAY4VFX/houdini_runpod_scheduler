@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from dataclasses import dataclass, field
 
 # Rolling window of recent work-item durations used to predict how much
@@ -106,6 +107,11 @@ class TaskState:
     attempts: int = 0
     started: float | None = None
     log_path: str = ""
+    # When this task first joined the queue, i.e. when it started waiting for
+    # a machine. Not the same as `started` (when a pod picked it up): a task
+    # can sit here for minutes while RunPod has no free instances, and that
+    # wait is what capacity_expired() measures.
+    queued_at: float | None = None
 
 
 class Dispatcher:
@@ -142,15 +148,15 @@ class Dispatcher:
         self.pods[pod_id] = pod
         return pod
 
-    def remove_pod(self, pod_id) -> list[TaskState]:
+    def remove_pod(self, pod_id, now: float | None = None) -> list[TaskState]:
         """Drop a pod from the pool, requeueing whatever it was running.
 
         Same bookkeeping as :meth:`pod_dead`; the two differ only in intent
         (a deliberate idle scale-down vs. a pod that stopped answering).
         """
-        return self.pod_dead(pod_id)
+        return self.pod_dead(pod_id, now=now)
 
-    def pod_dead(self, pod_id) -> list[TaskState]:
+    def pod_dead(self, pod_id, now: float | None = None) -> list[TaskState]:
         """Give up on a pod: requeue its tasks and drop it from the pool.
 
         Each requeued task's ``attempts`` goes up by one. A task that has
@@ -162,6 +168,7 @@ class Dispatcher:
         pod = self.pods.pop(pod_id, None)
         if pod is None:
             return []
+        now = time.time() if now is None else now
         pod.status = "DEAD"
 
         retry = []
@@ -175,6 +182,10 @@ class Dispatcher:
             if task.attempts >= self.max_attempts:
                 self.failed.append(task)
             else:
+                # The capacity clock restarts: this task DID get a machine, it
+                # just lost it, so the wait it has already served says nothing
+                # about whether RunPod has capacity now.
+                task.queued_at = now
                 self._pending.append(task)
                 retry.append(task)
         pod.running.clear()
@@ -210,7 +221,9 @@ class Dispatcher:
     def pending(self) -> list[TaskState]:
         return self._pending
 
-    def enqueue(self, task: TaskState) -> TaskState:
+    def enqueue(self, task: TaskState, now: float | None = None) -> TaskState:
+        if task.queued_at is None:
+            task.queued_at = time.time() if now is None else now
         self._pending.append(task)
         return task
 
@@ -270,6 +283,28 @@ class Dispatcher:
                 self.failed.append(task)
                 return task
         return None
+
+    def capacity_expired(self, now: float, wait_seconds: float) -> list[TaskState]:
+        """Pending tasks that have waited longer than ``wait_seconds`` for a pod.
+
+        A cook with no machines is a *wait*, not a failure: RunPod pods are not
+        spot instances (``cloudType`` SECURE, ``interruptible`` unset), so one
+        already running is never taken away -- the only question is whether a
+        free one exists yet, and that answer changes minute to minute. So the
+        queue simply holds, and this is the backstop: past the deadline, give
+        up on individual items rather than on the cook.
+
+        Per task, deliberately. The caller fails each one through
+        :meth:`fail_pending`, so PDG marks exactly those items failed and a
+        re-cook retries only them -- the rest of the graph keeps whatever it
+        already computed.
+
+        ``wait_seconds <= 0`` means wait forever and returns nothing.
+        """
+        if wait_seconds <= 0:
+            return []
+        return [t for t in self._pending
+                if t.queued_at is not None and (now - t.queued_at) >= wait_seconds]
 
     def running_tasks(self) -> list[TaskState]:
         return list(self._running.values())
