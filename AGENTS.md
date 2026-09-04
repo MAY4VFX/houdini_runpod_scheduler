@@ -18,183 +18,113 @@ issues, статусы на доске, push).
      НИКОГДА не трогает project-register --update. -->
 <!-- /hub-kit identity block -->
 
-## Деплой (где живёт)
+## Что это
 
-<!-- поддерживается явными задачами; сводка задеплоенного — departments/vfx/map.md штаба -->
-- Хостинг: см. `departments/vfx/map.md` в штабе (карта от 2026-07-07)
-
-# CLAUDE.md
-
-This file provides guidance to Claude Code when working with code in this repository.
-
-## Project Overview
-
-RunPodFarm — distributed VFX rendering/simulation pipeline on RunPod GPU Pods for SideFX Houdini. Based on the AWS ECS Scheduler from a SideFX content library example (MIT license, 2024), adapted for RunPod with Redis-based task queue, Network Volume shared storage, and a full management stack.
-
-## Architecture
-
-PDG-native scheduling: no separate Scheduler Server. Each Houdini instance runs its own RunPodFarm Scheduler HDA which manages pods directly via RunPod API and distributes tasks via Redis queue.
+RunPodFarm v2 — рендер/симуляционная ферма для SideFX Houdini на RunPod GPU Pods.
+Управляется целиком из Houdini: **сервера нет, Redis нет, B2 нет, dashboard нет**.
+Каждая сессия Houdini сама поднимает и гасит поды через RunPod REST API, раздаёт
+задачи по HTTP на воркер внутри пода и делит с ним общий Network Volume.
 
 ```
-Houdini (Scheduler HDA) → Redis queue → RunPod Pods (Worker daemon)
-                                      ↕
-                              Network Volume (/workspace)
-                         (shared NVMe storage between pods)
-                                      ↕
-Desktop App → Auth API → project config → upload to Network Volume (S3 API / rsync)
-                                      ↕
-Dashboard (Web UI) ← Monitoring API ← Redis (read-only)
+Houdini (PDG)
+  runpodfarm_scheduler ──REST──> RunPod API      (создать/убить GPU-поды)
+        │            └───HTTP──> worker.py на поде (submit/poll/kill задач)
+  runpodfarm_upload   ──sftp───> sync-под (CPU) ─┐
+  runpodfarm_download <──sftp─── sync-под (CPU) ─┤
+  runpodfarm_stats                                │
+                                                  ▼
+                              Network Volume `2ze7qdwkt3` (EU-RO-1, /workspace)
+                              зоны: houdini/ apps/ projects/ ledger/
 ```
 
-### Storage Architecture
-- **Network Volume** (RunPod NVMe): Primary shared storage between pods. Houdini install + project files + render output.
-- **Backblaze B2**: Archive for completed projects. NOT used during active rendering.
-- **JuiceFS**: Optional, artist-side only (local FUSE mount). NOT available on RunPod (no FUSE support).
-- FUSE is not supported on RunPod — confirmed platform limitation.
+Лицензии — sesinetd через Oracle (`lic.ai-vfx.com:1715` → socat `lic-proxy.service`
+→ 192.168.2.134:1715). Поду не нужен ни ключ RunPod, ни доступ к чему-либо,
+кроме тома и лицензий.
 
-## Repository Structure
+## Структура
 
 ```
-worker/                    — Worker daemon (Python) running on RunPod pods
-  config.py                  Config from env vars
-  daemon.py                  Main loop: BRPOP tasks, execute, push results
-  executor.py                Task execution (hython/husk subprocess)
-  heartbeat.py               Heartbeat thread (Redis SET with TTL)
-  requirements.txt           redis>=5.0.0, psutil>=5.9.0
+rpfarm/           — общий Python-слой (только stdlib), его же импортируют HDA
+  cli.py            CLI `python3 -m rpfarm`: setup, doctor, houdini, storage, farm, costs
+  config.py         ~/.rpfarm/config.toml (RPFARM_HOME переопределяет), token, rclone
+  runpod_api.py     REST + GraphQL RunPod (поды, тома, шаблоны, биллинг, наличие GPU)
+  pods.py           жизненный цикл подов, sync-под, env пода
+  worker_client.py  HTTP-клиент воркера пода (/health /tasks /exec)
+  dispatch.py       раздача work items по подам и слотам
+  sync.py           rclone/sftp-перегон, планирование пакетов, сжатие
+  packages.py       планы upload/download, пресет установки Houdini, авторост тома
+  deps.py           сбор зависимостей hip-файла и их path-map
+  ledger.py         локальный журнал куков и стоимости (~/.rpfarm/ledger)
+  package_runner.py запуск одного work item вне hython
+  houdini_local.py  поиск локальных установок Houdini, установка HDA
+  compression.py    упаковка перед заливкой
+  tls.py            самоподписанный TLS для воркера
 
-hda/runpodfarm_scheduler.hda/  — Houdini Digital Asset (expanded format)
-  Top_1runpodfarmscheduler/
-    PythonModule             RunPodFarmScheduler class (1635 lines)
-    DialogScript             Parameter UI definition (603 lines)
-    CreateScript             Node creation script
-    Help                     Help card (274 lines)
-    Tools.shelf              Shelf tool definition
+pod/              — образ пода (CI собирает ghcr.io/may4vfx/rpfarm-pod)
+  Dockerfile        база + rpfarm/, без Houdini (Houdini берётся с тома)
+  entrypoint.sh     монтирование тома, HFS с тома, hserver на лицензии, запуск воркера
+  worker.py         HTTP-воркер: /health, /tasks (submit/poll/kill), /exec (только sync)
+  housekeeping.py   обслуживание тома: ls, du, touch, rm, prune, houdini ls|rm,
+                    invalidate <zone>, disk-usage, sync-idle
 
-docker/                    — Docker image for RunPod pods
-  Dockerfile                 Ubuntu 22.04 + CUDA 12.4 + Worker daemon
-  entrypoint.sh              Setup project dir → setup Houdini from Network Volume → start worker
-  docker-compose.dev.yml     Local dev environment with Redis
-  .dockerignore
+hda/              — четыре HDA в развёрнутом (expanded) виде
+  runpodfarm_scheduler.hda   PDG-шедулер: поды, слоты, бюджет, вкладка Volume
+  runpodfarm_upload.hda      заливка (deps/custom) + пресет установки Houdini
+  runpodfarm_download.hda    выкачивание (outputs/custom)
+  runpodfarm_stats.hda       статистика кука
 
-auth-api/                  — Auth API (Cloudflare Workers + Hono + KV) [LEGACY]
-  src/index.ts               Main entry, CORS, routing
-  src/types.ts               TypeScript interfaces
-  src/auth.ts                JWT, password hashing, API key generation
-  src/routes/auth.ts         POST /auth/login, /auth/register
-  src/routes/projects.ts     CRUD projects, artists, config endpoint
-  wrangler.toml              Cloudflare Workers config
-
-server/                    — Node.js server (Hono + SQLite) — replaces auth-api for Dokploy
-  src/index.ts               Main entry, CORS, routing, static file serving
-  src/types.ts               TypeScript interfaces
-  src/db.ts                  SQLite storage layer (better-sqlite3)
-  src/auth.ts                JWT, password hashing (Node.js crypto), API key generation
-  src/routes/auth.ts         POST /api/auth/login, /api/auth/register
-  src/routes/projects.ts     CRUD projects, artists, config endpoint
-  src/routes/monitoring.ts   GET /api/monitoring/jobs|pods|costs|logs (Redis read-only)
-  Dockerfile                 Production Docker image
-  docker-compose.yml         Local dev with Docker
-
-dashboard/                 — Monitoring Web UI (React + TypeScript + Vite + Tailwind)
-  src/pages/Dashboard.tsx    Active jobs, pods, cost overview
-  src/pages/Projects.tsx     Project management
-  src/pages/ProjectDetail.tsx  Jobs, pods, artists per project
-  src/pages/Login.tsx        Authentication
-  src/components/Layout.tsx  Sidebar navigation
-  src/lib/api.ts             API client
-  src/store/auth.ts          Zustand auth store
-
-desktop-app/               — Desktop App (Tauri 2.0 + React + TypeScript)
-  src-tauri/src/main.rs      Rust backend: JuiceFS mount, system tray, Houdini detection
-  src-tauri/tauri.conf.json  App configuration
-  src/App.tsx                Connect/Status/Settings views
-  src/components/            ConnectForm, StatusPanel, Settings
-  src/lib/tauri.ts           Typed Tauri command wrappers
-
-infrastructure/            — Setup scripts and configs
-  setup-redis.sh             Upstash Redis provisioning guide
-  setup-juicefs.sh           JuiceFS format with B2 backend
-  example.env                Template for all env vars
-
-AWSECS/                    — Original AWS ECS Scheduler (reference)
+scripts/          — сборка HDA (build_runpodfarm_*_hda.py) и headless-смоуки
+tests/            — pytest, без сети и без Houdini
+docs/superpowers/ — спека и план v2
 ```
 
-## Key Commands
+## Команды
 
 ```bash
-# Worker (local dev)
-cd docker && docker compose -f docker-compose.dev.yml up
+python3 -m pytest -q                 # тесты (ничего наружу не ходят)
 
-# Auth API (legacy CF Workers)
-cd auth-api && npm install && npm run dev    # Local dev
-cd auth-api && npm run deploy                # Deploy to CF Workers
+python3 -m rpfarm setup              # ~/.rpfarm, том, шаблон, HDA — безопасно перезапускать
+python3 -m rpfarm doctor             # сквозная проверка: ключ, том, шаблон, HDA, наличие GPU
+python3 -m rpfarm houdini ls         # версии Houdini на томе
+python3 -m rpfarm houdini install --tar <путь|sftp://host/путь> --version 22.0.393
+python3 -m rpfarm houdini rm <версия|legacy> --yes
+python3 -m rpfarm storage ls|du|rm|prune|grow|recreate
+python3 -m rpfarm farm status        # живые поды rpfarm-* со ставкой и оценкой стоимости
+python3 -m rpfarm farm kill --all    # погасить всё
+python3 -m rpfarm costs              # журнал + биллинг
 
-# Server (Node.js — for Dokploy deployment)
-cd server && npm install && npm run dev      # Local dev (tsx watch)
-cd server && npm run build && npm start      # Production build + start
+# HDA пересобрать и поставить в ~/Library/Preferences/houdini/22.0/otls/
+python3 scripts/build_runpodfarm_upload_hda.py
 
-# Dashboard
-cd dashboard && npm install && npm run dev   # Dev server
-cd dashboard && npm run build                # Production build
-
-# Deploy to Dokploy
-./infrastructure/deploy-dokploy.sh           # Full build + deploy
-
-# Desktop App
-cd desktop-app && npm install
-cd desktop-app && cargo tauri dev            # Dev mode
-cd desktop-app && cargo tauri build          # Production build
-
-# Docker image
-docker build -f docker/Dockerfile -t runpodfarm-worker .
+# смоук против живой фермы (тратит деньги, поднимает под)
+RPFARM_ROOT=$PWD hython scripts/smoke_scheduler_headless.py
+# то же бесплатно, на локальном шедулере PDG:
+RPFARM_ROOT=$PWD hython scripts/smoke_scheduler_headless.py --scheduler localscheduler
 ```
 
-## HDA Parameter Prefix
+**Удаление всегда с явным подтверждением**: `--dry-run` — поведение по умолчанию,
+реальное удаление требует `--yes`/`--force`.
 
-All scheduler parameters use `rpfarm_` prefix (e.g., `rpfarm_apikey`, `rpfarm_redisurl`).
+## Что где живёт
 
-## Redis Key Namespace
+- Конфиг артиста: `~/.rpfarm/config.toml` (chmod 600) — ключ RunPod, id тома и
+  шаблона, датацентр, версия Houdini, лицензионный хост, список GPU. В репо его нет.
+- Том `2ze7qdwkt3` (EU-RO-1, 50 ГБ), зоны `/workspace/{houdini,apps,projects,ledger}`.
+  `houdini` и `ledger` защищены от `prune`/`rm`.
+- Шаблон RunPod `rpfarm-pod` = `3i1l2ufjts`, образ `ghcr.io/may4vfx/rpfarm-pod`.
+  CI (`.github/workflows/docker-build.yml`) на пуш в `pod/**` собирает образ и
+  двигает шаблон; id шаблона — переменная репо `RPFARM_TEMPLATE_ID`, ключ — секрет
+  `RUNPOD_API_KEY`.
+- Префикс параметров HDA — `rpfarm_`.
 
-```
-rp:tasks:{project_id}:{user_id}   — Task queue (BRPOP)
-rp:results:{task_id}               — Task results (SET with TTL)
-rp:heartbeat:{pod_id}              — Pod heartbeats (SET with 30s TTL)
-rp:logs:{task_id}                  — Task logs (RPUSH with TTL)
-rp:pods:{project_id}:{user_id}    — Pod registry
-rp:metrics:*                       — Metrics and cost tracking
-juicefs:*                          — JuiceFS metadata (managed by JuiceFS)
-```
+## Правила
 
-## Dependencies
+- Комментарии вида «ported from v1's `worker/…`, `infrastructure/…`, `docker/…`» ссылаются
+  на код v1, удалённый в Task 14: искать его в истории git (до коммита чистки), в рабочем
+  дереве этих каталогов больше нет.
 
-- **Worker**: Python 3.10+, redis, psutil
-- **HDA**: Houdini 20.0+ with PDG, redis (pip install to hython)
-- **Auth API (legacy)**: Node.js 18+, hono, jose
-- **Server**: Node.js 20+, hono, @hono/node-server, jose, better-sqlite3, ioredis
-- **Dashboard**: Node.js 18+, React 18, Vite, Tailwind
-- **Desktop App**: Rust 1.70+, Node.js 18+, Tauri 2.0
-
-## Manual Testing
-
-No automated tests yet. Test flow:
-1. Infrastructure: upload files to Network Volume → start pod → files visible at /workspace/projects
-2. Worker: start pod → worker connects to Redis → heartbeat visible → push test task → result in Redis
-3. HDA: Houdini → TOP Network → RunPodFarm Scheduler → cook → frames render on pods → results in /project/renders/
-### Dokploy Server
-- **Host**: 192.168.2.140
-- **Dokploy API**: порт 3001
-- **SSH Access**: `ssh -o StrictHostKeyChecking=no root@192.168.2.140`
-- **Auto-deploy**: Enabled — пуш в ветку `feature/runpodfarm-full-stack` автоматически запускает деплой
-- **Dokploy API Key** x-api-key: REDACTED-DOKPLOY-KEY
-- делай коммит и пуш после правок
-- никогда не собирать докер композы в ручную, только через Dokploy и репозиторий
-
-### Deployed RunPodFarm Server
-- **URL**: http://192.168.2.140:3200
-- **Health**: http://192.168.2.140:3200/health
-- **Dashboard**: http://192.168.2.140:3200/
-- **API**: http://192.168.2.140:3200/api/
-- **Dokploy Project ID**: jCFMhgtnykHDGvETwx4Vr
-- **Dokploy Application ID**: vX-EGp8IGf_-8ATUf_Ehp
-- **Build**: multi-stage Docker (dashboard + server), Dockerfile at `server/Dockerfile`, context: repo root
-- **Branch**: feature/runpodfarm-full-stack
+- Секреты никогда не коммитятся; ключ RunPod читается из `~/.rpfarm/config.toml`
+  в момент использования, домашние IP в отслеживаемые файлы не пишем.
+- Не оставлять поды running: любой сценарий, поднимающий под, гасит его в `finally`.
+- Никаких новых зависимостей: `rpfarm/` и `pod/` — только стандартная библиотека.
+- Коммит и пуш после правок; conventional commits.
