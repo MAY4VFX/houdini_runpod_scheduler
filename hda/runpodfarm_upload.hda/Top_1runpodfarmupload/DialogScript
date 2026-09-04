@@ -28,8 +28,8 @@
         name    "rpfarm_project"
         label   "Project"
         type    string
-        default { "" }
-        help    "Project folder on the network volume: /workspace/projects/<user>/<project>. Empty means the name of the $JOB directory."
+        default { [ "hou.phm().project_default()" python ] }
+        help    "Project folder on the network volume: /workspace/projects/<user>/<project>. Shows the name of the $JOB directory until you type your own."
     }
     parm {
         name    "rpfarm_packagegb"
@@ -100,7 +100,8 @@
         name    "rpfarm_houver"
         label   "Houdini Version"
         type    string
-        default { "22.0.393" }
+        default { [ "hou.phm().cfg_default(\"houdini_version\")" python ] }
+        help    "Shows houdini_version from ~/.rpfarm/config.toml -- the version the farm pods run. Type your own to install a different one. Empty means there is no config yet: run `rpfarm setup`."
         hidewhen "{ rpfarm_preset != install_houdini }"
     }
     parm {

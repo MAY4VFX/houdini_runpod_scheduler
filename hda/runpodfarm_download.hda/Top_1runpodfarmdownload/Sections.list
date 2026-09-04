@@ -4,5 +4,6 @@ CreateScript	CreateScript
 InternalFileOptions	InternalFileOptions
 Contents.gz	Contents.gz
 Help	Help
+IconSVG	IconSVG
 OnCreated	OnCreated
 ExtraFileOptions	ExtraFileOptions

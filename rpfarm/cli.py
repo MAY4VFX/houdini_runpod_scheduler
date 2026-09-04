@@ -464,6 +464,15 @@ def cmd_setup(args, prompt=input):
         for r in results:
             if not r["ok"]:
                 print(f"    [WARN] {r['name']}: {r['error']}")
+        # The HDAs carry their own icons (an IconSVG section each), but a
+        # node SHAPE can only live in a config directory Houdini searches,
+        # so it ships beside them or the four nodes fall back to a plain
+        # rectangle.
+        shape = houdini_local.install_node_shape(inst)
+        if shape["ok"]:
+            print(f"[OK] Houdini {inst.version}: node shape -> {shape['installed_to']}")
+        else:
+            print(f"    [WARN] node shape: {shape['error']}")
         houdini_local.write_rpfarm_root_env(inst)
 
     print()
@@ -598,6 +607,12 @@ def cmd_doctor(args):
         else:
             newest = max((otls / f"{n}.hda").stat().st_mtime for n in houdini_local.HDA_NAMES)
             ok(f"Houdini {inst.version}: all 4 HDAs installed (last updated {time.ctime(newest)})")
+        shape_target = houdini_local.node_shape_target(inst)
+        if shape_target.exists():
+            ok(f"Houdini {inst.version}: node shape installed ({shape_target})")
+        else:
+            warn(f"Houdini {inst.version}: node shape missing at {shape_target} -- the four farm "
+                 f"nodes will draw as plain rectangles; rerun `rpfarm setup`")
 
     sync_pod = _find_running_sync_pod(api, cfg)
     if sync_pod is None:

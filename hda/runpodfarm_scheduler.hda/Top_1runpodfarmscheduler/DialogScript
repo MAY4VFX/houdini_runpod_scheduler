@@ -10,65 +10,9 @@
     }
 
     group {
-        name    "folder0"
-        label   "Farm"
+        name    "folder_cook"
+        label   "Cook"
 
-        parm {
-            name    "rpfarm_apikey"
-            label   "API Key"
-            type    string
-            default { "" }
-            help    "RunPod API key. Leave empty to use the key in ~/.rpfarm/config.toml (written by `rpfarm setup`)."
-        }
-        parm {
-            name    "rpfarm_project"
-            label   "Project"
-            type    string
-            default { "" }
-            help    "Project folder on the network volume: /workspace/projects/<user>/<project>. Empty means the name of the $JOB directory."
-        }
-        parm {
-            name    "rpfarm_gpulist"
-            label   "GPU Priority"
-            type    string
-            default { "" }
-            help    "Comma-separated RunPod GPU type names, most wanted first; the first one in stock is used. Empty means gpu_priority from ~/.rpfarm/config.toml."
-        }
-        parm {
-            name    "rpfarm_templateid"
-            label   "Template ID"
-            type    string
-            default { "" }
-            help    "RunPod template for the pod image. Empty means template_id from ~/.rpfarm/config.toml."
-        }
-        parm {
-            name    "rpfarm_networkvolumeid"
-            label   "Network Volume ID"
-            type    string
-            default { "" }
-            help    "Shared network volume mounted at /workspace on every pod. Empty means volume_id from ~/.rpfarm/config.toml."
-        }
-        parm {
-            name    "rpfarm_datacenter"
-            label   "Datacenter"
-            type    string
-            default { "" }
-            menu {
-                ""          "(from config.toml)"
-                "EU-RO-1"   "EU Romania"
-                "EU-CZ-1"   "EU Czech Republic"
-                "EU-SE-1"   "EU Sweden"
-                "US-TX-3"   "US Texas"
-                "CA-MTL-1"  "CA Montreal"
-            }
-            help    "Must be the datacenter the network volume lives in. Empty means datacenter from ~/.rpfarm/config.toml, which `rpfarm setup` fills in from the volume's own region."
-        }
-        parm {
-            name    "sepparm_scaling"
-            label   "Separator"
-            type    separator
-            default { "" }
-        }
         parm {
             name    "rpfarm_minpods"
             label   "Min Pods"
@@ -102,14 +46,6 @@
             help    "Terminate a GPU pod after this many seconds with nothing to run. 0 disables it."
         }
         parm {
-            name    "rpfarm_syncidle"
-            label   "Sync Pod Idle (min)"
-            type    integer
-            default { "15" }
-            range   { 0 240 }
-            help    "The shared CPU sync pod is retired at the start of the next cook once it has gone unused for this long. 0 keeps it forever."
-        }
-        parm {
             name    "sepparm_budget"
             label   "Separator"
             type    separator
@@ -124,14 +60,6 @@
             help    "Warn at 80%, stop adding pods at 100%, terminate everything and fail the cook at 120%. 0 means no limit."
         }
         parm {
-            name    "rpfarm_minbalance"
-            label   "Warn Below Balance ($)"
-            type    float
-            default { "5.0" }
-            range   { 0 100 }
-            help    "Warn before the cook when the RunPod account balance is below this. 0 skips the check."
-        }
-        parm {
             name    "sepparm_outputs"
             label   "Separator"
             type    separator
@@ -144,11 +72,90 @@
             default { "1" }
             help    "Pull each work item's output files back from the volume as soon as it finishes, to the paths the ROP was aimed at."
         }
+    }
+
+    group {
+        name    "folder0"
+        label   "Farm"
+
         parm {
-            name    "rpfarm_verbose"
-            label   "Verbose Logging"
-            type    toggle
-            default { "0" }
+            name    "rpfarm_apikey"
+            label   "API Key"
+            type    string
+            default { "" }
+            help    "Leave this EMPTY: the key is read from ~/.rpfarm/config.toml (chmod 600), written by `rpfarm setup`, and Key In Use below shows which one that is. It is deliberately the one field that does not display its configured value -- a key typed here is saved into the .hip in cleartext, and that file travels to the farm and into backups. Typing one still works, and still overrides the config, if you really need a second account for one node."
+        }
+        parm {
+            name    "rpfarm_apikeystatus"
+            label   "Key In Use"
+            type    string
+            default { [ "hou.phm().apiKeyStatus()" python ] }
+            disablewhen "{ rpfarm_verbose >= 0 }"
+            help    "Read-only. Masked on purpose: enough to tell which key is in play, not enough to use it. Says NOT CONFIGURED before `rpfarm setup` has run, and warns if the API Key field above has been filled in by hand."
+        }
+        parm {
+            name    "rpfarm_project"
+            label   "Project"
+            type    string
+            default { [ "hou.phm().project_default()" python ] }
+            help    "Project folder on the network volume: /workspace/projects/<user>/<project>. Shows the name of the $JOB directory -- what this cook will really use -- until you type your own."
+        }
+        parm {
+            name    "rpfarm_gpulist"
+            label   "GPU Priority"
+            type    string
+            default { [ "hou.phm().cfg_default(\"gpu_priority\")" python ] }
+            help    "Comma-separated RunPod GPU type names, most wanted first; the first one in stock is used. Shows gpu_priority from ~/.rpfarm/config.toml, which is what this node will actually use; type your own and the literal replaces the expression and wins. Empty means there is no config yet -- run `rpfarm setup`."
+        }
+        parm {
+            name    "rpfarm_templateid"
+            label   "Template ID"
+            type    string
+            default { [ "hou.phm().cfg_default(\"template_id\")" python ] }
+            help    "RunPod template for the pod image. Shows template_id from ~/.rpfarm/config.toml, which is what this node will actually use; type your own and the literal replaces the expression and wins. Empty means there is no config yet -- run `rpfarm setup`."
+        }
+        parm {
+            name    "rpfarm_networkvolumeid"
+            label   "Network Volume ID"
+            type    string
+            default { [ "hou.phm().cfg_default(\"volume_id\")" python ] }
+            help    "Shared network volume mounted at /workspace on every pod. Shows volume_id from ~/.rpfarm/config.toml, which is what this node will actually use; type your own and the literal replaces the expression and wins. Empty means there is no config yet -- run `rpfarm setup`."
+        }
+        parm {
+            name    "rpfarm_datacenter"
+            label   "Datacenter"
+            type    string
+            default { [ "hou.phm().cfg_default(\"datacenter\")" python ] }
+            menureplace {
+                "EU-RO-1"   "EU Romania"
+                "EU-CZ-1"   "EU Czech Republic"
+                "EU-SE-1"   "EU Sweden"
+                "US-TX-3"   "US Texas"
+                "CA-MTL-1"  "CA Montreal"
+            }
+            help    "Must be the datacenter the network volume lives in -- a pod cannot mount a volume in another region. Shows datacenter from ~/.rpfarm/config.toml, which is what this node will actually use; type your own and the literal replaces the expression and wins. Empty means there is no config yet -- run `rpfarm setup`. WARNING: a scene saved before this parameter's default became an expression may carry a literal EU-RO-1 that silently overrides the config; the scheduler refuses to cook on that mismatch rather than burning pods in the wrong region."
+        }
+        parm {
+            name    "sepparm_scaling"
+            label   "Separator"
+            type    separator
+            default { "" }
+        }
+        parm {
+            name    "rpfarm_syncidle"
+            label   "Sync Pod Idle (min)"
+            type    integer
+            default { "15" }
+            range   { 0 240 }
+            help    "The shared CPU sync pod is retired at the start of the next cook once it has gone unused for this long. 0 keeps it forever."
+        }
+        parm {
+            name    "rpfarm_minbalance"
+            label   "Warn Below Balance ($)"
+            type    float
+            default { "5.0" }
+            range   { 0 100 }
+            help    "Warn before the cook when the RunPod account balance is below this. 0 skips the check."
         }
     }
 
@@ -256,22 +263,6 @@
             help    "Local root of the project. PDG's temp, script and data directories live under it, and it is the local half of the path map."
         }
         parm {
-            name    "rpfarm_overrideremoteworkingdir"
-            label   "Override Remote Shared Path"
-            type    toggle
-            nolabel
-            joinnext
-            default { "0" }
-        }
-        parm {
-            name    "rpfarm_remoteworkingdir"
-            label   "Remote Shared Path"
-            type    string
-            default { "" }
-            disablewhen "{ rpfarm_overrideremoteworkingdir == 0 }"
-            help    "Defaults to /workspace/projects/<user>/<project> on the volume."
-        }
-        parm {
             name    "pdg_workitemdatasource"
             label   "Load Item Data From"
             type    ordinal
@@ -357,6 +348,120 @@
                 "MAC"   "MAC"
             }
             parmtag { "script_callback_language" "python" }
+        }
+    }
+
+    group {
+        name    "folder_advanced"
+        label   "Advanced"
+
+        parm {
+            name    "rpfarm_verbose"
+            label   "Verbose Logging"
+            type    toggle
+            default { "0" }
+        }
+        groupsimple {
+            name    "folder_adv_remote"
+            label   "Remote Shared Path"
+
+            parm {
+                name    "rpfarm_overrideremoteworkingdir"
+                label   "Override Remote Shared Path"
+                type    toggle
+                nolabel
+                joinnext
+                default { "0" }
+            }
+            parm {
+                name    "rpfarm_remoteworkingdir"
+                label   "Remote Shared Path"
+                type    string
+                default { "" }
+                disablewhen "{ rpfarm_overrideremoteworkingdir == 0 }"
+                help    "Defaults to /workspace/projects/<user>/<project> on the volume."
+            }
+        }
+
+        groupsimple {
+            name    "folder7_cmds"
+            label   "Commands"
+
+            parm {
+                name    "rpfarm_pretaskcmd"
+                label   "Pre Task Command"
+                type    string
+                default { "" }
+                parmtag { "pdg::scheduler" "" }
+            }
+            parm {
+                name    "rpfarm_posttaskcmd"
+                label   "Post Task Command"
+                type    string
+                default { "" }
+                parmtag { "pdg::scheduler" "" }
+            }
+        }
+
+        groupsimple {
+            name    "folder7_env"
+            label   "Task Environment"
+
+            parm {
+                name    "rpfarm_inheritlocalenv"
+                label   "Inherit Local Environment"
+                type    toggle
+                default { "0" }
+                parmtag { "pdg::scheduler" "" }
+            }
+            parm {
+                name    "rpfarm_envunset"
+                label   "Unset Variables"
+                type    string
+                default { "" }
+                parmtag { "pdg::scheduler" "" }
+                parmtag { "script_callback_language" "python" }
+            }
+            multiparm {
+                name    "rpfarm_envmulti"
+                label    "Environment Variables"
+
+                parm {
+                    name    "rpfarm_envname#"
+                    label   "Name"
+                    type    string
+                    default { "" }
+                    parmtag { "pdg::nocopy" "" }
+                    parmtag { "pdg::scheduler" "" }
+                }
+                parm {
+                    name    "rpfarm_envvalue#"
+                    label   "Value"
+                    type    string
+                    default { "" }
+                    parmtag { "pdg::nocopy" "" }
+                    parmtag { "pdg::scheduler" "" }
+                }
+            }
+
+            parm {
+                name    "rpfarm_usehoudinimaxthreads"
+                label   "Use Max Threads"
+                type    toggle
+                nolabel
+                joinnext
+                default { "0" }
+                parmtag { "pdg::scheduler" "" }
+            }
+            parm {
+                name    "rpfarm_houdinimaxthreads"
+                label   "Max Threads"
+                type    integer
+                default { "0" }
+                disablewhen "{ rpfarm_usehoudinimaxthreads == 0 }"
+                range   { 0 10 }
+                parmtag { "pdg::scheduler" "" }
+            }
         }
     }
 
@@ -524,92 +629,6 @@
             type    toggle
             default { "1" }
             parmtag { "script_callback_language" "python" }
-        }
-    }
-
-    group {
-        name    "folder7"
-        label   "Job Parms"
-
-        groupsimple {
-            name    "folder7_cmds"
-            label   "Commands"
-
-            parm {
-                name    "rpfarm_pretaskcmd"
-                label   "Pre Task Command"
-                type    string
-                default { "" }
-                parmtag { "pdg::scheduler" "" }
-            }
-            parm {
-                name    "rpfarm_posttaskcmd"
-                label   "Post Task Command"
-                type    string
-                default { "" }
-                parmtag { "pdg::scheduler" "" }
-            }
-        }
-
-        groupsimple {
-            name    "folder7_env"
-            label   "Task Environment"
-
-            parm {
-                name    "rpfarm_inheritlocalenv"
-                label   "Inherit Local Environment"
-                type    toggle
-                default { "0" }
-                parmtag { "pdg::scheduler" "" }
-            }
-            parm {
-                name    "rpfarm_envunset"
-                label   "Unset Variables"
-                type    string
-                default { "" }
-                parmtag { "pdg::scheduler" "" }
-                parmtag { "script_callback_language" "python" }
-            }
-            multiparm {
-                name    "rpfarm_envmulti"
-                label    "Environment Variables"
-
-                parm {
-                    name    "rpfarm_envname#"
-                    label   "Name"
-                    type    string
-                    default { "" }
-                    parmtag { "pdg::nocopy" "" }
-                    parmtag { "pdg::scheduler" "" }
-                }
-                parm {
-                    name    "rpfarm_envvalue#"
-                    label   "Value"
-                    type    string
-                    default { "" }
-                    parmtag { "pdg::nocopy" "" }
-                    parmtag { "pdg::scheduler" "" }
-                }
-            }
-
-            parm {
-                name    "rpfarm_usehoudinimaxthreads"
-                label   "Use Max Threads"
-                type    toggle
-                nolabel
-                joinnext
-                default { "0" }
-                parmtag { "pdg::scheduler" "" }
-            }
-            parm {
-                name    "rpfarm_houdinimaxthreads"
-                label   "Max Threads"
-                type    integer
-                default { "0" }
-                disablewhen "{ rpfarm_usehoudinimaxthreads == 0 }"
-                range   { 0 10 }
-                parmtag { "pdg::scheduler" "" }
-            }
         }
     }
 }

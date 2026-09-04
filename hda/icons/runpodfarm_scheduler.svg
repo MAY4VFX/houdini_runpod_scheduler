@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!-- RunPodFarm node icon. One of a family of four (scheduler, upload,
+     download, stats): 48x48 like Houdini's own TOP icons, flat, and all
+     four open with the same "farm bar", the network volume every one of
+     these nodes talks to.
+     Two rules keep these readable everywhere they are drawn. Every
+     load bearing shape is light (#eeeeec / #babdb6) with a dark outline,
+     because a node icon sits on the NODE BODY, which for these four is
+     violet: a violet silhouette would vanish into it, and a dark one
+     vanishes into the network editor's grey. Violet (#8b5cf6) therefore
+     only ever fills a shape enclosed by a light one, where it reads on any
+     background. Nothing is thinner than about 2 units, so the icon
+     survives being drawn at 16 px.
+     Also: no "-" pairs inside these comments, Qt's SVG reader rejects them. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="48px" height="48px" viewBox="0 0 48 48" version="1.1">
+  <rect x="5" y="4" width="38" height="8" rx="2" fill="#eeeeec" stroke="#2e3436" stroke-width="1.5"/>
+  <rect x="7.5" y="6.5" width="33" height="3" rx="1" fill="#8b5cf6"/>
+  <path d="M 24 12 L 24 17 M 10 17 L 38 17 M 10 17 L 10 26 M 24 17 L 24 26 M 38 17 L 38 26"
+        fill="none" stroke="#eeeeec" stroke-width="3"/>
+  <rect x="4"  y="26" width="12" height="17" rx="2" fill="#babdb6" stroke="#2e3436" stroke-width="1.5"/>
+  <rect x="18" y="26" width="12" height="17" rx="2" fill="#babdb6" stroke="#2e3436" stroke-width="1.5"/>
+  <rect x="32" y="26" width="12" height="17" rx="2" fill="#babdb6" stroke="#2e3436" stroke-width="1.5"/>
+</svg>

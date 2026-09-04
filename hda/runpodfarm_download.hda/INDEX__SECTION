@@ -1,7 +1,7 @@
 Operator:     runpodfarmdownload
 Label:        RunPodFarm Download
 Path:         oplib:/Top/runpodfarmdownload?Top/runpodfarmdownload
-Icon:         TOP_subnet
+Icon:         opdef:/Top/runpodfarmdownload?IconSVG
 Table:        Top
 License:      
 Extra:        
@@ -10,5 +10,5 @@ Inputs:       0 to 1
 Subnet:       true
 Python:       false
 Empty:        false
-Modified:     Fri Sep  4 11:48:50 2026
+Modified:     Fri Sep  4 13:37:59 2026
 

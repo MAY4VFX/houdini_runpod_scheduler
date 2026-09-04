@@ -1,0 +1,57 @@
+"""Parameter-default helpers for runpodfarm_upload.
+
+Task 17: the fields that are read from ~/.rpfarm/config.toml now SHOW what
+they will use. They used to sit empty while the code behind them did
+`parm or config`, so an empty field read as "not configured" even though
+everything worked, and there was no way to tell a field that still needs
+filling in from one that is already answered.
+
+The mechanism is Houdini's own: the parm's DEFAULT is an expression calling
+into here. While the artist has not touched the field it evaluates live from
+the config; the moment they type something, the literal replaces the
+expression and wins -- exactly "an override overrides the config", with no
+change needed to the `parm or cfg` code that reads it.
+
+Two rules for everything in this module, because a parm default expression
+is re-evaluated on every UI refresh and runs while the parameter dialog is
+being drawn:
+  * it must be cheap -- rpfarm.config.load_cached() re-reads config.toml
+    only when its mtime/size change; and
+  * it must never raise -- no config yet (before `rpfarm setup`), no rpfarm
+    on sys.path at all, a corrupt config: every one of those has to come
+    back as an empty field, not a node that throws while drawing itself.
+"""
+
+import os
+import pathlib
+import sys
+
+_RPFARM_ROOT = pathlib.Path(os.environ.get("RPFARM_ROOT", pathlib.Path.home() / ".rpfarm" / "src"))
+if str(_RPFARM_ROOT) not in sys.path:
+    sys.path.insert(0, str(_RPFARM_ROOT))
+
+
+def cfg_default(name, fallback=""):
+    """The value ~/.rpfarm/config.toml gives *name*, or *fallback*."""
+    try:
+        from rpfarm import config as rpcfg
+
+        return rpcfg.config_value(name, fallback)
+    except Exception:
+        return fallback
+
+
+def project_default():
+    """What onGenerate would fall back to for Project: the $JOB basename.
+
+    Not a config field -- the project is per scene -- but the same problem:
+    an empty Project field never said which folder on the volume the upload
+    was actually going to.
+    """
+    try:
+        import hou
+
+        job = hou.getenv("JOB") or hou.expandString("$HIP") or ""
+        return os.path.basename(os.path.normpath(job)) if job else ""
+    except Exception:
+        return ""

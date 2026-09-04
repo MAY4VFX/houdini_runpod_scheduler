@@ -1,4 +1,6 @@
 node = kwargs["node"]
+node.setColor(hou.Color((0.549, 0.361, 0.882)))
+node.setUserData("nodeshape", "rpfarm")
 pp = node.node("pythonprocessor1")
 if pp is not None:
     try:

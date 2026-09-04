@@ -137,6 +137,84 @@ def _ledger_append(path, **record):
 
 
 # -----------------------------------------------------------------------------
+# Parameter defaults (Task 17)
+#
+# The Farm tab's identity fields SHOW what they will use. They used to sit
+# empty while the code behind them did `parm or config`, so an empty field
+# read as "not configured" even though everything worked, and nothing told
+# an artist which fields still needed filling in.
+#
+# The mechanism is Houdini's own: the parm's DEFAULT is an expression
+# calling into here. Untouched, it evaluates live from ~/.rpfarm/config.toml;
+# the moment the artist types something, that literal replaces the
+# expression and wins -- exactly "an override overrides the config", and it
+# needs no change to _templateId/_volumeId/_datacenterId, whose `parm or
+# cfg` stays correct either way.
+#
+# Two rules hold for everything in this block, because a parm default
+# expression is re-evaluated on every UI refresh, while the parameter
+# dialog is being drawn:
+#   * it must be cheap -- rpcfg.load_cached() re-reads config.toml only when
+#     its mtime/size change, so a refresh does not stat+parse per field; and
+#   * it must never raise -- no config yet (before `rpfarm setup`), or a
+#     corrupt one, has to come back as an empty field, never as a node that
+#     throws while drawing itself.
+# -----------------------------------------------------------------------------
+
+
+def cfg_default(name, fallback=""):
+    """The value ~/.rpfarm/config.toml gives *name*, for a parm default."""
+    try:
+        return rpcfg.config_value(name, fallback)
+    except Exception:
+        return fallback
+
+
+def project_default():
+    """What onStartCook would fall back to for Project: the $JOB basename.
+
+    Not a config field (the project is per scene) but the same problem: an
+    empty Project field never said which folder on the volume this cook was
+    actually going to write to.
+    """
+    try:
+        import hou
+
+        job = hou.getenv("JOB") or hou.getenv("HIP") or ""
+        return os.path.basename(os.path.normpath(job)) if job else ""
+    except Exception:
+        return ""
+
+
+def apiKeyStatus():
+    """Text for the read-only "Key In Use" field beside API Key.
+
+    The API key is the one identity field that is deliberately NOT
+    substituted into its parm the way the others are: a value in a parm is
+    saved into the .hip, and that file travels to the farm and into backups
+    in cleartext. So the field stays empty and this masked line sits beside
+    it -- which answers the only question an artist actually has ("is a key
+    configured, and is it the one I think it is") without putting the secret
+    on screen. A key typed into the parm anyway still wins at cook time, so
+    this says so, and says what it costs.
+    """
+    node_key = ""
+    try:
+        import hou
+
+        node = hou.pwd()
+        parm = node.parm("rpfarm_apikey") if node is not None else None
+        node_key = parm.evalAsString() if parm is not None else ""
+    except Exception:
+        node_key = ""
+    try:
+        cfg = rpcfg.load_cached()
+        return rpcfg.api_key_status(cfg.api_key if cfg else "", node_key)
+    except Exception:
+        return rpcfg.api_key_status("", node_key)
+
+
+# -----------------------------------------------------------------------------
 # Button callbacks (Farm / Volume tabs)
 #
 # These run on the node, not on a live scheduler instance, so they build their
@@ -1513,11 +1591,12 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
             "from the volume's own region). A pod created outside its volume's "
             "region cannot mount /workspace at all, so every task of this cook "
             "would fail.\n"
-            "This is almost always a scene saved before the Datacenter parameter's "
-            "default changed from EU-RO-1 to empty: the old default is baked into "
-            "the .hip and silently overrides the config.\n"
-            "Fix: on the Farm tab set Datacenter back to '(from config.toml)' -- "
-            "the empty menu entry -- or to {cfg}, then save the scene.".format(
+            "This is almost always a scene saved before the Datacenter parameter "
+            "started reading the config: the old hardcoded EU-RO-1 is baked into "
+            "the .hip and silently overrides it.\n"
+            "Fix: on the Farm tab, right-click Datacenter > Revert to Defaults so "
+            "it reads the config again (it will then show {cfg}), and save the "
+            "scene. Setting it to {cfg} by hand works too.".format(
                 node=node_dc, vol=self._cfg.volume_id, cfg=self._cfg.datacenter))
 
     def _checkBalance(self):

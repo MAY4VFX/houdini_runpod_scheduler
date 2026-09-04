@@ -30,12 +30,43 @@ format and silently produce an interface-less asset here (verified on the
 upload node; see its own docstring).
 """
 import os
+import pathlib
 import sys
 
 import hou
 import pdg
 
 OUT_HDA = sys.argv[1] if len(sys.argv) > 1 else "/tmp/runpodfarm_download.hda"
+
+# -- the family look (Task 17) ------------------------------------------------
+#
+# All four RunPodFarm nodes share one colour, one node shape and one icon
+# family, so a farm node is recognisable at a glance among stock TOP nodes.
+# Violet because it is RunPod's own colour and is essentially absent from
+# stock Houdini.
+#
+# The icon travels INSIDE the asset as an ``IconSVG`` section referenced by
+# ``opdef:.?IconSVG``, so it needs no installation. The node shape cannot:
+# Houdini resolves a shape by name out of ``config/NodeShapes`` on
+# HOUDINI_PATH, so ``rpfarm setup`` copies hda/nodeshapes/rpfarm.json into
+# the user pref dir (rpfarm.houdini_local.install_node_shape) and ``rpfarm
+# doctor`` checks it is there. Without it the nodes simply draw as plain
+# rectangles -- they still work.
+REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
+NODE_COLOR = (0.549, 0.361, 0.882)
+NODE_SHAPE = "rpfarm"
+ICON_SVG = (REPO_ROOT / "hda" / "icons" / "runpodfarm_download.svg").read_text()
+
+# Colour is applied in OnCreated because a definition carries none: a node
+# coloured before createDigitalAsset comes back grey on the next instance
+# (verified in Houdini 22.0.368). The shape does survive -- setUserData
+# below bakes an ``opuserdata`` line into the generated CreateScript -- but
+# it is re-asserted here too, so one mechanism failing is not the whole
+# look failing.
+FAMILY_ONCREATED = (
+    'node.setColor(hou.Color((0.549, 0.361, 0.882)))\n'
+    'node.setUserData("nodeshape", "rpfarm")\n'
+)
 
 GENERATE_CODE = '''\
 # Called when this node should generate new work items from upstream items.
@@ -520,6 +551,10 @@ def main():
 
     sn.setParmTemplateGroup(ptg)
 
+    # Baked into the generated CreateScript as an "opuserdata" line, so
+    # every instance is the right shape from the moment it is created.
+    sn.setUserData("nodeshape", NODE_SHAPE)
+
     if os.path.exists(OUT_HDA):
         os.remove(OUT_HDA)
 
@@ -534,6 +569,11 @@ def main():
 
     definition = new_type.type().definition()
     definition.addSection("Help", HELP_TEXT)
+    # The icon rides inside the asset rather than as a file on disk:
+    # nothing to install, nothing to lose, and it follows the .hda
+    # wherever it is copied.
+    definition.addSection("IconSVG", ICON_SVG)
+    definition.setIcon("opdef:.?IconSVG")
     # See the upload node's builder for why this has to be set on the
     # DEFINITION's own template group too, not just the live instance.
     definition.setParmTemplateGroup(ptg)
@@ -541,6 +581,7 @@ def main():
     definition.addSection(
         "OnCreated",
         'node = kwargs["node"]\n'
+        + FAMILY_ONCREATED +
         'pp = node.node("pythonprocessor1")\n'
         'if pp is not None:\n'
         '    try:\n'

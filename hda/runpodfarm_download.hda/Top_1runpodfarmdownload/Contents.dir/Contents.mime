@@ -63,6 +63,10 @@ Content-Type: text/plain
 	"___Version___":{
 		"type":"string",
 		"value":""
+	},
+	"nodeshape":{
+		"type":"string",
+		"value":"rpfarm"
 	}
 }
 

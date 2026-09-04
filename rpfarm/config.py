@@ -135,6 +135,104 @@ def load() -> Config:
     return Config(**kwargs)
 
 
+# -- cached read, for UI code -----------------------------------------------
+#
+# Task 17: the HDAs' farm-identity parms (Template ID, Network Volume ID,
+# Datacenter, GPU Priority, Project, Houdini Version) now DISPLAY what they
+# will actually use, as a default expression that reads this config -- an
+# empty field used to read as "not configured" while everything worked,
+# because the code behind it is `parm or cfg`. A parm default expression is
+# re-evaluated on every UI refresh, so it must not stat+parse config.toml
+# each time, and it must never raise inside the parameter dialog.
+
+_CACHE = {"path": None, "stamp": None, "config": None}
+
+
+def load_cached() -> "Config | None":
+    """:func:`load`, re-reading config.toml only when it has changed.
+
+    Returns ``None`` instead of raising when there is no config yet (or it
+    is unreadable): the caller is a UI expression, and a node that throws
+    while drawing its own parameters is worse than a blank field.
+
+    The cache key is the file's path plus (mtime_ns, size), so a rewritten
+    config is picked up on the next evaluation, and ``$RPFARM_HOME``
+    pointing somewhere else (as tests do) is never served a stale value.
+    """
+    path = home() / CONFIG_FILENAME
+    try:
+        st = os.stat(path)
+    except OSError:
+        _CACHE.update(path=str(path), stamp=None, config=None)
+        return None
+    stamp = (st.st_mtime_ns, st.st_size)
+    if _CACHE["path"] == str(path) and _CACHE["stamp"] == stamp:
+        return _CACHE["config"]
+    try:
+        cfg = load()
+    except (ConfigError, OSError, ValueError, TypeError):
+        cfg = None
+    _CACHE.update(path=str(path), stamp=stamp, config=cfg)
+    return cfg
+
+
+def config_value(name: str, default: str = "") -> str:
+    """One config field as the string a parm should show.
+
+    Never raises and never returns ``None``: an unset field, a missing
+    config or an unparseable one all come back as ``default`` (empty), which
+    is exactly what the parms meant before this existed. A list field
+    (``gpu_priority``) comes back comma-separated -- the format its parm
+    documents and :meth:`onStartCook` already splits on.
+    """
+    cfg = load_cached()
+    if cfg is None:
+        return default
+    value = getattr(cfg, name, None)
+    if value is None or value == "":
+        return default
+    if isinstance(value, (list, tuple)):
+        joined = ", ".join(str(v) for v in value if str(v))
+        return joined or default
+    return str(value)
+
+
+def mask_secret(value: str | None) -> str:
+    """``rpa_ABCD...7f3c`` -- enough to recognise a key, not enough to use."""
+    if not value:
+        return ""
+    if len(value) <= 8:
+        return "(set)"
+    return "{}...{}".format(value[:4], value[-4:])
+
+
+def api_key_status(config_key: str | None, node_key: str = "") -> str:
+    """One line saying where the RunPod API key is coming from.
+
+    The API key is the one identity field that must NOT be substituted into
+    a parameter the way :func:`config_value` does for the others: a value in
+    a parm is saved into the ``.hip``, and that file travels to the farm and
+    into backups in cleartext. So the field stays empty and this line is
+    shown beside it instead -- which answers the only question the artist
+    actually has ("is a key configured, and is it the one I think it is")
+    without putting the secret on screen.
+
+    A key the artist typed in anyway still wins at cook time (that is the
+    documented override), so this says so, and says what it costs.
+    """
+    node_key = (node_key or "").strip()
+    if node_key:
+        return (
+            "set on this node ({}) -- WARNING: a key typed into a parameter is saved "
+            "into the .hip in cleartext, and that file travels to the farm and into "
+            "backups. Clear it and run `rpfarm setup` to keep the key in "
+            "~/.rpfarm/config.toml (chmod 600) instead.".format(mask_secret(node_key))
+        )
+    if config_key:
+        return "from config ({})".format(mask_secret(config_key))
+    return "NOT CONFIGURED -- run `rpfarm setup`"
+
+
 # -- session token ----------------------------------------------------------
 
 
