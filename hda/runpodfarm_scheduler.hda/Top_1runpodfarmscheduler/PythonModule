@@ -1755,6 +1755,15 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
 
         self._log("waiting for sync pod {}...".format(
             rppods.sync_pod_name(self._cfg.user)))
+        # State what this cook will actually use, once, before it uses it. The
+        # capacity wait spent a while silently reading 0 instead of 15 because
+        # an integer parm cannot coerce cfg_default's string; a line in the log
+        # is how that gets noticed next time instead of being reasoned about.
+        self._log("cloud type {}, wait for capacity {} min, datacenter {}".format(
+            self._cloudType(),
+            self["rpfarm_capacitywait"].evaluateInt(),
+            self._datacenterId()))
+
         # The sync pod comes up before anything else, and without it the cook
         # does not start at all -- so it gets the same wait-out-a-shortage rule
         # as the GPU pods (Ruling R32), driven by the same two parms. If it
