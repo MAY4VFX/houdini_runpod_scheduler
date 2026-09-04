@@ -371,6 +371,53 @@ def test_sync_idle_reports_elapsed(tmp_path):
     assert out["idle_seconds"] >= 119
 
 
+def test_sync_touch_writes_a_stamp_both_readers_parse(tmp_path):
+    """The one writer's output must satisfy both readers.
+
+    Final-review finding 1: the stamp has two readers that both parse the
+    file's *content* as a float -- cmd_sync_idle here, and the scheduler
+    HDA's _retireStaleSyncPod, which does `float(read_file(path).strip())`
+    over the raw bytes. A bare `touch` (what rpfarm/packages.py used to
+    run) leaves an empty file that neither can parse.
+    """
+    root = mk(tmp_path)
+    out = hk.cmd_sync_touch(root)
+
+    raw = (tmp_path / ".rpfarm" / "sync_last_used").read_text()
+    assert raw.strip(), "a bare `touch` would leave this empty"
+    # reader 1: the scheduler HDA, verbatim
+    assert float(raw.strip()) == pytest.approx(out["last_used"], abs=0.01)
+    # reader 2: housekeeping itself
+    assert hk.cmd_sync_idle(root)["idle_seconds"] == pytest.approx(0.0, abs=5.0)
+
+
+def test_sync_touch_creates_the_rpfarm_dir_if_missing(tmp_path):
+    """A brand-new volume has no /workspace/.rpfarm yet."""
+    root = str(tmp_path)
+    hk.cmd_sync_touch(root)
+    assert hk.cmd_sync_idle(root)["idle_seconds"] is not None
+
+
+def test_sync_touch_overwrites_an_older_stamp(tmp_path):
+    """`touch` on an existing file never rewrote its content -- this must."""
+    root = mk(tmp_path)
+    (tmp_path / ".rpfarm" / "sync_last_used").write_text(str(time.time() - 3600))
+    hk.cmd_sync_touch(root)
+    assert hk.cmd_sync_idle(root)["idle_seconds"] < 60
+
+
+def test_sync_touch_is_reachable_from_the_command_line(tmp_path):
+    """The command rpfarm.packages.SYNC_TOUCH_COMMAND actually sends."""
+    root = str(tmp_path)
+    monkeyroot = hk.DEFAULT_ROOT
+    hk.DEFAULT_ROOT = root
+    try:
+        assert hk.main(["housekeeping.py", "sync-touch"]) == 0
+        assert hk.cmd_sync_idle(root)["idle_seconds"] is not None
+    finally:
+        hk.DEFAULT_ROOT = monkeyroot
+
+
 # -- protection: rm/prune never reach into houdini/ledger/.rpfarm -----------
 
 

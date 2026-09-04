@@ -980,6 +980,34 @@ def cmd_disk_usage(
     return {"volume": _volume_totals(used, volume_size_gb), "partial": size_cache.partial}
 
 
+def cmd_sync_touch(root: str) -> dict:
+    """Stamp ``.rpfarm/sync_last_used`` with the current epoch seconds.
+
+    The **single writer** for that file. Everything that keeps the sync
+    pod alive -- the scheduler HDA's ``_touchSyncPod`` and
+    ``rpfarm.packages``' upload/download items -- calls this rather than
+    formatting the stamp itself, because both readers
+    (:func:`cmd_sync_idle` and the HDA's ``_retireStaleSyncPod``) parse
+    the file's *content* as a float.
+
+    Final-review fix: the package path used to run a bare ``touch``,
+    which creates an **empty** file and never rewrites an existing one's
+    content. After the README's own first-run sequence (``rpfarm houdini
+    install`` creates the sync pod, and its upload item wrote the empty
+    stamp) neither reader could parse it, so the pod could never be
+    auto-retired -- the likely cause of the ~8h idle sync pod recorded as
+    R32 -- and ``rpfarm farm status`` silently dropped its idle line.
+    """
+    path = os.path.join(root, _SYNC_LAST_USED_REL)
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    now = time.time()
+    with open(path, "w") as f:
+        f.write("{:.3f}\n".format(now))
+    return {"last_used": now}
+
+
 def cmd_sync_idle(root: str) -> dict:
     """Seconds since ``.rpfarm/sync_last_used`` was last touched.
 
@@ -1038,6 +1066,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_houdini_rm.add_argument("--dry-run", action="store_true")
 
     sub.add_parser("sync-idle")
+    sub.add_parser("sync-touch")
     p_disk_usage = sub.add_parser("disk-usage")
     p_disk_usage.add_argument("--volume-size-gb", type=float, default=None)
     p_disk_usage.add_argument("--budget-s", type=float, default=_DEFAULT_BUDGET_S)
@@ -1082,6 +1111,8 @@ def main(argv: list[str]) -> int:
                 result = cmd_houdini_rm(DEFAULT_ROOT, args.version, dry_run=args.dry_run)
         elif args.command == "sync-idle":
             result = cmd_sync_idle(DEFAULT_ROOT)
+        elif args.command == "sync-touch":
+            result = cmd_sync_touch(DEFAULT_ROOT)
         elif args.command == "disk-usage":
             result = cmd_disk_usage(
                 DEFAULT_ROOT,
