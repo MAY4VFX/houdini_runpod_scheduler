@@ -207,6 +207,72 @@ def test_houdini_preset_disables_avahi_and_bin_symlink():
     assert "--no-install-bin-symlink" in post
 
 
+def test_houdini_preset_accepts_the_install_by_running_it_not_by_ls():
+    """Task 14 review, Critical #1. The preset used to end in
+    `ls <dir>/bin/hython`, and that check PASSED on the broken install: an
+    interrupted run left 11GB with `bin/hython` present but no `python/`,
+    so the binary existed and died on startup with
+    "libpython3.13.so.1.0: cannot open shared object file".
+
+    Acceptance must therefore execute Houdini and check what it reports.
+    """
+    _pairs, post = houdini_install_preset("/dl/houdini-22.0.393-linux_x86_64_gcc14.2.tar.gz", "22.0.393")
+
+    # the old existence-only check is gone as the acceptance step
+    assert not post.rstrip().endswith("ls /workspace/houdini/22.0.393/bin/hython")
+
+    check = post.split("invalidate houdini && ", 1)[1]
+    assert "import hou" in check and "applicationVersionString" in check
+    assert "./bin/hython" in check
+    assert 'source ./houdini_setup_bash' in check  # the install we just made, not the pod's HFS
+    assert '[ "$ver" = "22.0.393" ]' in check      # exact version, not merely "it started"
+    assert "exit 1" in check                       # and it fails loudly
+
+
+def test_houdini_preset_version_check_runs_last(tmp_path):
+    """The check has to be the final step -- a verification that runs before
+    the install finishes proves nothing."""
+    _pairs, post = houdini_install_preset("/dl/houdini-22.0.393-linux_x86_64_gcc14.2.tar.gz", "22.0.393")
+    assert post.index("./houdini.install") < post.index("applicationVersionString")
+    assert post.index("invalidate houdini") < post.index("applicationVersionString")
+
+
+def test_houdini_preset_version_check_shell_is_valid_and_gates_on_the_result(tmp_path):
+    """Runs the generated check for real against a stub hython: it must pass
+    a healthy install, and fail both a hython that cannot start (the Task 14
+    breakage) and one reporting the wrong version."""
+    import subprocess
+
+    install_dir = tmp_path / "22.0.393"
+    (install_dir / "bin").mkdir(parents=True)
+    (install_dir / "houdini_setup_bash").write_text("")
+    hython = install_dir / "bin" / "hython"
+
+    _pairs, post = houdini_install_preset("/dl/houdini-22.0.393-linux_x86_64_gcc14.2.tar.gz", "22.0.393")
+    check = post.split("invalidate houdini && ", 1)[1].replace("/workspace/houdini/22.0.393", str(install_dir))
+
+    def run():
+        return subprocess.run(["bash", "-c", check], capture_output=True, text=True)
+
+    # healthy: a warning line first, then the version -- exactly what the real
+    # hython prints ("opalias: ... is not a known operator")
+    hython.write_text("#!/bin/bash\necho 'opalias: not a known operator.'\necho 22.0.393\n")
+    hython.chmod(0o755)
+    assert run().returncode == 0
+
+    # broken install: binary present, cannot start
+    hython.write_text("#!/bin/bash\necho 'libpython3.13.so.1.0: cannot open shared object file' >&2\nexit 127\n")
+    hython.chmod(0o755)
+    failed = run()
+    assert failed.returncode != 0 and "install check FAILED" in failed.stderr
+
+    # wrong version on the volume
+    hython.write_text("#!/bin/bash\necho 20.5.684\n")
+    hython.chmod(0o755)
+    wrong = run()
+    assert wrong.returncode != 0 and "20.5.684" in wrong.stderr
+
+
 def test_houdini_preset_removes_uploaded_tarball_after_success():
     """The ~4.3GB tarball is dead weight on the volume once installed, but
     only removed on success (an && chain) so a failed install can be
@@ -221,12 +287,12 @@ def test_houdini_preset_invalidates_houdini_zone_cache(tmp_path):
     """Fix round 3, "2": an install adds bytes to the houdini zone but
     doesn't touch a project, so cmd_touch's upload-invalidation (fix
     round 2, "B") never fires for it -- the preset must invalidate that
-    zone itself, and it must run *before* the final `ls` proof step
+    zone itself, and it must run *before* the final proof step
     (an install that fails partway shouldn't leave the cache invalidated
     based on a step that never actually ran)."""
     _pairs, post = houdini_install_preset("/dl/houdini-22.0.393-linux_x86_64_gcc14.2.tar.gz", "22.0.393")
     assert "housekeeping.py invalidate houdini" in post
-    assert post.index("invalidate houdini") < post.index("ls /workspace/houdini/22.0.393/bin/hython")
+    assert post.index("invalidate houdini") < post.index("applicationVersionString")
 
 
 def test_houdini_preset_pair_feeds_build_upload_items(tmp_path):
