@@ -42,7 +42,7 @@ Only ``rm``, ``prune`` and ``houdini rm`` are destructive, and only within
 ``/workspace/projects/<user>/<project>`` or ``/workspace/houdini/<version>``
 respectively: ``/workspace/houdini`` (the zone itself), ``/workspace/ledger``
 and ``/workspace/.rpfarm`` are never touched by them (ported from v1's
-``worker/cache_manager.py::_is_protected``). The CLI hardcodes
+``worker/cache_manager.py::_is_protected``, v1, removed in Task 14). The CLI hardcodes
 ``root="/workspace"`` for every command except ``ls`` and ``du`` (read-only,
 so a ``--root`` override is harmless and useful for debugging) -- there is
 no flag to point a destructive command anywhere else.
@@ -630,12 +630,20 @@ def cmd_invalidate(root: str, zone: str) -> dict:
 
     ``invalidate <houdini|apps|projects|ledger>``. Review finding (fix
     round 3, "2"): nothing invalidated ``_sizes["houdini"]`` when a
-    version was installed (only `houdini rm` pruned it, on deletion) --
-    a stale-but-present entry doesn't set ``partial`` either, so after
-    the Houdini-install preset (``rpfarm.packages.houdini_install_preset``)
-    added ~10GB, the 85%-full auto-grow guard compared against the old
-    figure with no signal at all that anything was wrong. The preset's
-    post-command now calls this once the install finishes.
+    version was installed -- a stale-but-present entry doesn't set
+    ``partial`` either, so after the Houdini-install preset
+    (``rpfarm.packages.houdini_install_preset``) added ~10GB, the
+    85%-full auto-grow guard compared against the old figure with no
+    signal at all that anything was wrong. The preset's post-command now
+    calls this once the install finishes.
+
+    Task 14 found the deletion side had the same hole, despite the note
+    that once stood here: :func:`cmd_houdini_rm` pruned the per-version
+    ``_houdini`` cache but left ``_sizes["houdini"]`` alone, so right
+    after deleting the 10.8GB legacy install ``storage ls`` still billed
+    the zone at 23.4GB (stale legacy + the new 12.6GB install) and the
+    volume looked half again as full as it was. ``houdini rm`` now
+    invalidates the zone itself on a real deletion.
     """
     if zone not in _ZONES:
         raise HousekeepingError(f"unknown zone {zone!r}, expected one of {_ZONES}")
@@ -894,6 +902,7 @@ def cmd_houdini_rm(
         size_cache.flush()
         if removed_names:
             _prune_houdini_cache(root, removed_names)
+            _invalidate_size_cache(root, ["houdini"])
         if not removed:
             return {"ok": False, "error": "no legacy entries found", "path": houdini_root}
         return {
@@ -915,6 +924,7 @@ def cmd_houdini_rm(
     if not dry_run:
         shutil.rmtree(vdir)
         _prune_houdini_cache(root, [version])
+        _invalidate_size_cache(root, ["houdini"])
     return {
         "ok": True,
         "path": vdir,
