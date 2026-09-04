@@ -1,6 +1,10 @@
+import contextlib
+
 import pytest
 
+from rpfarm import config as rpcfg
 from rpfarm import pods
+from rpfarm import pods as rppods
 
 
 class FakeAPI:
@@ -220,3 +224,151 @@ def test_stop_mq_kills_mqserver():
     c = FakeClient()
     pods.stop_mq(c)
     assert "pkill -f mqserver" in c.execs[0]
+
+
+# ---------------------------------------------------------------------------
+# ensure_sync_pod waits out a shortage of CPU machines (Ruling R32)
+#
+# RunPod had no CPU capacity in EU-RO-1 for ~2.5 minutes and killed two cooks
+# at second zero with a raw 500. The sync pod comes up before anything else
+# and nothing starts without it, so this is the more damaging of the two
+# capacity paths -- and it had no retry at all.
+# ---------------------------------------------------------------------------
+
+
+class _CapacityAPI:
+    """create_cpu_pod fails `failures` times, then succeeds."""
+
+    def __init__(self, failures, status=500, body="no longer any instances available"):
+        self.failures = failures
+        self.status = status
+        self.body = body
+        self.creates = 0
+        self.bodies = []
+
+    def list_pods(self, prefix=""):
+        return []
+
+    def terminate_pod(self, pod_id):
+        pass
+
+    def create_cpu_pod(self, name, template_id, volume_id, env, ports,
+                       vcpu=2, flavors=("cpu3c", "cpu5c"),
+                       datacenter=None, cloud_type=None):
+        self.creates += 1
+        self.bodies.append({"cloud_type": cloud_type, "datacenter": datacenter})
+        if self.creates <= self.failures:
+            raise rppods.RunPodError(self.status, self.body)
+        return {"id": "sync1", "name": name, "desiredStatus": "RUNNING"}
+
+
+def _cfg_for_capacity(tmp_path, wait_min=15, cloud="SECURE"):
+    cfg = rpcfg.Config(api_key="k", user="u", volume_id="v", template_id="t")
+    cfg.datacenter = "EU-RO-1"
+    cfg.capacity_wait_min = wait_min
+    cfg.cloud_type = cloud
+    cfg.ssh_key_path = str(tmp_path / "id")
+    return cfg
+
+
+def _acquire(api, cfg, clock, sleeps, **kw):
+    return rppods._acquire_sync_pod(
+        api, cfg, "token", "pub", log=lambda m: None,
+        cloud_type=kw.get("cloud_type", cfg.cloud_type),
+        capacity_wait_s=kw.get("capacity_wait_s", cfg.capacity_wait_min * 60),
+        sleep=sleeps.append, cancel=kw.get("cancel", lambda: False),
+        clock=clock, rand=lambda a, b: 1.0,
+    )
+
+
+def test_a_shortage_is_waited_out_and_then_succeeds(tmp_path, monkeypatch):
+    monkeypatch.setattr(rppods, "_file_lock", _nolock)
+    api = _CapacityAPI(failures=3)
+    cfg = _cfg_for_capacity(tmp_path)
+    ticks = iter([0, 0, 10, 30, 60])   # deadline, started, one per refusal
+    sleeps = []
+
+    pod = _acquire(api, cfg, lambda: next(ticks), sleeps)
+
+    assert pod["id"] == "sync1"
+    assert api.creates == 4          # three refusals, then a machine
+    assert len(sleeps) == 3
+    assert sleeps == sorted(sleeps)  # backoff grows
+
+
+def test_the_wait_gives_up_with_a_message_a_person_can_act_on(tmp_path, monkeypatch):
+    monkeypatch.setattr(rppods, "_file_lock", _nolock)
+    api = _CapacityAPI(failures=99)
+    cfg = _cfg_for_capacity(tmp_path, wait_min=1)
+    ticks = iter([0, 0, 61])
+    sleeps = []
+
+    with pytest.raises(rppods.SyncPodCapacityError) as excinfo:
+        _acquire(api, cfg, lambda: next(ticks), sleeps)
+
+    message = str(excinfo.value)
+    assert "EU-RO-1" in message
+    assert "Community" in message                      # the actionable way out
+    assert "no longer any instances" in message        # RunPod's own last word
+    assert "1m 01s" in message or "61s" in message     # how long it actually waited
+
+
+def test_a_4xx_is_never_waited_on(tmp_path, monkeypatch):
+    """No amount of waiting fixes a bad key or a missing template."""
+    monkeypatch.setattr(rppods, "_file_lock", _nolock)
+    api = _CapacityAPI(failures=99, status=401, body="unauthorized")
+    cfg = _cfg_for_capacity(tmp_path)
+    sleeps = []
+
+    with pytest.raises(rppods.RunPodError):
+        _acquire(api, cfg, lambda: 0, sleeps)
+
+    assert api.creates == 1
+    assert sleeps == []
+
+
+def test_zero_wait_means_wait_forever_like_the_parm_says(tmp_path, monkeypatch):
+    """Same meaning as Wait For Capacity 0 on the GPU side: no deadline."""
+    monkeypatch.setattr(rppods, "_file_lock", _nolock)
+    api = _CapacityAPI(failures=5)
+    cfg = _cfg_for_capacity(tmp_path, wait_min=0)
+    sleeps = []
+
+    pod = _acquire(api, cfg, lambda: 0, sleeps, capacity_wait_s=0)
+
+    assert pod["id"] == "sync1"
+    assert api.creates == 6      # kept waiting well past any 15-minute budget
+    assert len(sleeps) == 5
+
+
+def test_cloud_type_reaches_the_sync_pod_create(tmp_path, monkeypatch):
+    monkeypatch.setattr(rppods, "_file_lock", _nolock)
+    api = _CapacityAPI(failures=0)
+    cfg = _cfg_for_capacity(tmp_path, cloud="COMMUNITY")
+
+    _acquire(api, cfg, lambda: 0, [])
+
+    assert api.bodies[0]["cloud_type"] == "COMMUNITY"
+    assert api.bodies[0]["datacenter"] == "EU-RO-1"
+
+
+def test_cancelling_stops_the_wait(tmp_path, monkeypatch):
+    monkeypatch.setattr(rppods, "_file_lock", _nolock)
+    api = _CapacityAPI(failures=99)
+    cfg = _cfg_for_capacity(tmp_path)
+
+    with pytest.raises(rppods.SyncPodCapacityError, match="cancelled"):
+        _acquire(api, cfg, lambda: 0, [], cancel=lambda: True)
+
+    assert api.creates == 0
+
+
+def test_backoff_never_overshoots_the_remaining_deadline():
+    assert rppods._capacity_backoff(1, remaining=3.0, rand=lambda a, b: 1.0) == 3.0
+    assert rppods._capacity_backoff(9, remaining=None, rand=lambda a, b: 1.0) == 60.0
+    assert rppods._capacity_backoff(1, remaining=None, rand=lambda a, b: 1.0) == 10.0
+
+
+@contextlib.contextmanager
+def _nolock(*_args, **_kwargs):
+    yield

@@ -588,3 +588,19 @@ def test_the_transient_flag_comes_from_is_capacity_error():
 
     assert "self._last_pod_error_transient = is_capacity_error(e)" in src
     assert "cloud_type=self._cloudType()" in src
+
+
+def test_setup_cook_turns_a_sync_pod_shortage_into_a_cook_error():
+    """The GPU side fails items; the sync pod has nothing to fail item by item.
+
+    Without it the cook never starts, so the whole cook failing IS the right
+    answer -- but with the human text the exception already carries, not a raw
+    RunPod 500 in the artist's face.
+    """
+    src = MODULE.read_text()
+
+    assert "except rppods.SyncPodCapacityError as e:" in src
+    assert "raise CookError(str(e))" in src
+    # and it is given the same two parms, not a second set of knobs
+    assert "capacity_wait_s=self._capacityWaitSeconds()," in src
+    assert "cloud_type=self._cloudType()," in src

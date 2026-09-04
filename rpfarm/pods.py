@@ -26,7 +26,12 @@ import platform
 import time
 
 from . import config as rpcfg
-from .runpod_api import RunPodError, pod_public_endpoint
+from .runpod_api import (
+    CLOUD_TYPE_SECURE,
+    RunPodError,
+    is_capacity_error,
+    pod_public_endpoint,
+)
 from .worker_client import WorkerClient
 
 PORTS = ["22/tcp", "4440/tcp", "4442/tcp", "8000/http"]
@@ -163,6 +168,42 @@ def _file_lock(path, timeout=_SYNC_POD_LOCK_TIMEOUT_S, poll=0.2, sleep=time.slee
 
 # -- sync pod -----------------------------------------------------------
 
+# Backoff between attempts to create the sync pod while RunPod has no CPU
+# machines. Jittered so several waiters on one account do not all ask again on
+# the same second and hand the winner to whoever happens to be first.
+_CAPACITY_RETRY_FIRST_S = 10.0
+_CAPACITY_RETRY_MAX_S = 60.0
+_CAPACITY_RETRY_GROWTH = 1.6
+_CAPACITY_RETRY_JITTER = 0.2
+
+
+class SyncPodCapacityError(RuntimeError):
+    """RunPod had no CPU machine for the whole wait.
+
+    Distinct from :class:`RunPodError` because the caller acts on it
+    differently: the scheduler turns this one into a ``CookError``. Unlike a
+    GPU shortage there is nothing to fail item by item -- without the sync pod
+    the cook never starts at all -- so failing the cook IS the right answer
+    here, and the message is written to be read by a person.
+    """
+
+
+def _capacity_backoff(attempt, remaining=None, rand=None):
+    """Seconds to wait before create attempt ``attempt`` (1-based), jittered.
+
+    Clamped to ``remaining`` so the last sleep never overshoots the deadline
+    and turn a 15-minute wait into a 16-minute one.
+    """
+    import random
+
+    rand = rand or random.uniform
+    delay = min(_CAPACITY_RETRY_MAX_S,
+                _CAPACITY_RETRY_FIRST_S * (_CAPACITY_RETRY_GROWTH ** max(0, attempt - 1)))
+    delay *= rand(1.0 - _CAPACITY_RETRY_JITTER, 1.0 + _CAPACITY_RETRY_JITTER)
+    if remaining is not None:
+        delay = min(delay, max(0.0, remaining))
+    return delay
+
 
 def _dedupe_running(api, running, log):
     """Keep the oldest of several exact-name RUNNING sync pods, terminate
@@ -181,7 +222,7 @@ def _dedupe_running(api, running, log):
     return [keep]
 
 
-def _find_or_create_sync_pod(api, cfg, token, pubkey, log):
+def _find_or_create_sync_pod(api, cfg, token, pubkey, log, cloud_type=None):
     name = sync_pod_name(cfg.user)
     # list_pods is a prefix match, and sync_pod_name has no trailing
     # delimiter, so "rpfarm-sync-may" would also match another user's
@@ -197,7 +238,7 @@ def _find_or_create_sync_pod(api, cfg, token, pubkey, log):
     # in the same region as the network volume it mounts (finding 5).
     pod = api.create_cpu_pod(
         name, cfg.template_id, cfg.volume_id, pod_env(cfg, "sync", token, SYNC_SLOTS, pubkey), PORTS,
-        datacenter=cfg.datacenter,
+        datacenter=cfg.datacenter, cloud_type=cloud_type or CLOUD_TYPE_SECURE,
     )
     log(f"sync pod created: {pod['id']}")
     return pod
@@ -213,6 +254,10 @@ def ensure_sync_pod(
     sleep=time.sleep,
     timeout=300,
     cancel=lambda: False,
+    capacity_wait_s=None,
+    cloud_type=None,
+    clock=time.monotonic,
+    rand=None,
 ):
     """Find the user's CPU sync pod (creating it if missing) and wait for it
     to become reachable. A sync pod that exists but isn't ``RUNNING`` (e.g.
@@ -227,15 +272,92 @@ def ensure_sync_pod(
     existing pod exactly the same way a lock holder would, just without
     the exclusivity guarantee for that one attempt -- the dedup pass in
     :func:`_find_or_create_sync_pod` is what keeps that safe.
+
+    A shortage of CPU machines is waited out rather than raised (Ruling R32):
+    see :func:`_acquire_sync_pod`. ``capacity_wait_s`` defaults to the
+    config's ``capacity_wait_min``, and ``cloud_type`` to its ``cloud_type``,
+    so every caller -- the scheduler, ``package_runner``, the stats and
+    download nodes -- gets the same behaviour without passing anything; the
+    scheduler passes its own parm values explicitly.
     """
     client_factory = client_factory or (lambda pid: WorkerClient(pid, token))
-    try:
-        with _file_lock(_sync_pod_lock_path(), timeout=_SYNC_POD_LOCK_TIMEOUT_S, sleep=sleep):
-            pod = _find_or_create_sync_pod(api, cfg, token, pubkey, log)
-    except TimeoutError as e:
-        log(f"sync pod lock not acquired ({e}); proceeding unlocked")
-        pod = _find_or_create_sync_pod(api, cfg, token, pubkey, log)
+    if capacity_wait_s is None:
+        capacity_wait_s = max(0, int(getattr(cfg, "capacity_wait_min", 0) or 0)) * 60
+    cloud_type = cloud_type or getattr(cfg, "cloud_type", None) or CLOUD_TYPE_SECURE
+
+    pod = _acquire_sync_pod(
+        api, cfg, token, pubkey, log,
+        cloud_type=cloud_type, capacity_wait_s=capacity_wait_s,
+        sleep=sleep, cancel=cancel, clock=clock, rand=rand,
+    )
     return wait_ready(api, client_factory(pod["id"]), pod["id"], timeout=timeout, cancel=cancel, sleep=sleep, log=log)
+
+
+def _acquire_sync_pod(api, cfg, token, pubkey, log, cloud_type, capacity_wait_s,
+                      sleep, cancel, clock, rand):
+    """Find or create the sync pod, waiting out a shortage of CPU machines.
+
+    The same rule the GPU side follows (Ruling R32): no machine is a *wait*,
+    not a refusal -- our pods are not spot instances, so the only question is
+    whether a free one exists yet, and that answer changes minute to minute.
+    Verified live: RunPod had no CPU capacity in EU-RO-1 for ~2.5 minutes and
+    killed two cooks at second zero; the sixth attempt a few minutes later
+    succeeded.
+
+    Each attempt takes and releases the lock rather than holding it across the
+    whole wait: another waiter on this machine can then adopt a pod that
+    appeared in the meantime instead of queueing behind a sleeper.
+
+    A 4xx is raised immediately -- a bad key or a missing template is not
+    something waiting fixes.
+    """
+    deadline = None if capacity_wait_s <= 0 else clock() + capacity_wait_s
+    started = clock()
+    attempt = 0
+    last_error = None
+    while True:
+        attempt += 1
+        if cancel():
+            raise SyncPodCapacityError("cancelled while waiting for a sync pod")
+        try:
+            try:
+                with _file_lock(_sync_pod_lock_path(), timeout=_SYNC_POD_LOCK_TIMEOUT_S, sleep=sleep):
+                    return _find_or_create_sync_pod(api, cfg, token, pubkey, log, cloud_type)
+            except TimeoutError as e:
+                log(f"sync pod lock not acquired ({e}); proceeding unlocked")
+                return _find_or_create_sync_pod(api, cfg, token, pubkey, log, cloud_type)
+        except RunPodError as e:
+            if not is_capacity_error(e):
+                raise
+            last_error = e
+            # One clock read per attempt: reading twice let the reported wait
+            # come from an earlier instant than the deadline check, so a run
+            # that gave up after 61s could report "0s".
+            now = clock()
+            waited = now - started
+            remaining = None if deadline is None else deadline - now
+            if remaining is not None and remaining <= 0:
+                raise SyncPodCapacityError(
+                    "No CPU machine for the sync pod in {} after waiting {}. "
+                    "The cook cannot start without it.\n"
+                    "RunPod has no free instances of this size right now -- this "
+                    "usually clears in a few minutes, so try again shortly. You can "
+                    "also set Cloud Type to Community on the scheduler (cheaper, and "
+                    "often has machines when Secure is empty), or raise Wait For "
+                    "Capacity.\nLast word from RunPod: {}".format(
+                        cfg.datacenter, _fmt_wait(waited), last_error)) from e
+            delay = _capacity_backoff(attempt, remaining=remaining, rand=rand)
+            log("no CPU machine for the sync pod in {} ({}) -- waited {}, "
+                "retrying in {:.0f}s (attempt {})".format(
+                    cfg.datacenter, cloud_type, _fmt_wait(waited), delay, attempt + 1))
+            sleep(delay)
+
+
+def _fmt_wait(seconds):
+    seconds = int(max(0, seconds))
+    if seconds < 60:
+        return "{}s".format(seconds)
+    return "{}m {:02d}s".format(seconds // 60, seconds % 60)
 
 
 # -- MQ -----------------------------------------------------------------
