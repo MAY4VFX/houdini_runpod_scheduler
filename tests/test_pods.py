@@ -484,3 +484,85 @@ def test_pod_env_carries_identity_readable_from_get_pods(tmp_path):
     assert env["RPFARM_USER"] == "may"
     assert env["RPFARM_COOK"] == "abc12345"
     assert env["RPFARM_PROJECT"] == "demo"
+
+
+# ---------------------------------------------------------------------------
+# a pod that vanishes while we wait for it
+#
+# Real incident: a sync pod was terminated out from under an in-flight
+# ensure_sync_pod, and `RunPod 404 pod not found` came out of wait_ready and
+# failed a download work item. A pod can disappear legitimately -- host
+# failure, a manual delete, someone else's kill -- so this is the same family
+# as R32: get another machine, do not fail the item.
+# ---------------------------------------------------------------------------
+
+
+class _VanishingAPI(_CapacityAPI):
+    """get_pod 404s `vanish_times` times, then answers normally."""
+
+    def __init__(self, vanish_times=1):
+        super().__init__(failures=0)
+        self.vanish_times = vanish_times
+        self.get_calls = 0
+
+    def get_pod(self, pod_id):
+        self.get_calls += 1
+        if self.get_calls <= self.vanish_times:
+            raise rppods.RunPodError(404, "pod not found")
+        return {"id": pod_id, "name": "rpfarm-sync-u", "desiredStatus": "RUNNING",
+                "portMappings": {"22": 12345}, "publicIp": "1.2.3.4"}
+
+
+def test_wait_ready_reports_a_vanished_pod_as_its_own_kind_of_problem():
+    api = _VanishingAPI()
+
+    with pytest.raises(rppods.PodGoneError, match="disappeared"):
+        rppods.wait_ready(api, _HealthyClient(), "sync1", timeout=30, sleep=lambda _s: None)
+
+
+def test_wait_ready_still_raises_an_auth_failure_untouched():
+    """403 is not about this pod and waiting never fixes it."""
+
+    class _Forbidden(_CapacityAPI):
+        def get_pod(self, pod_id):
+            raise rppods.RunPodError(403, "forbidden")
+
+    with pytest.raises(rppods.RunPodError):
+        rppods.wait_ready(_Forbidden(0), _HealthyClient(), "sync1", timeout=30,
+                          sleep=lambda _s: None)
+
+
+def test_ensure_sync_pod_finds_another_when_the_first_disappears(tmp_path, monkeypatch):
+    monkeypatch.setattr(rppods, "_file_lock", _nolock)
+    api = _VanishingAPI(vanish_times=1)
+    cfg = _cfg_for_capacity(tmp_path)
+
+    pod = rppods.ensure_sync_pod(
+        api, cfg, "token", "pub", log=lambda m: None,
+        client_factory=lambda _pid: _HealthyClient(),
+        sleep=lambda _s: None, timeout=30, clock=lambda: 0.0,
+        rand=lambda a, b: 1.0)
+
+    assert pod["id"] == "sync1"
+    assert api.creates == 2          # the vanished one, then a replacement
+
+
+def test_a_pod_that_keeps_vanishing_past_the_deadline_gives_up_readably(tmp_path, monkeypatch):
+    monkeypatch.setattr(rppods, "_file_lock", _nolock)
+    api = _VanishingAPI(vanish_times=99)
+    cfg = _cfg_for_capacity(tmp_path, wait_min=1)
+    ticks = iter([0, 0, 0, 0, 61, 61, 61, 61])
+
+    with pytest.raises(rppods.SyncPodCapacityError) as excinfo:
+        rppods.ensure_sync_pod(
+            api, cfg, "token", "pub", log=lambda m: None,
+            client_factory=lambda _pid: _HealthyClient(),
+            sleep=lambda _s: None, timeout=30,
+            clock=lambda: next(ticks), rand=lambda a, b: 1.0)
+
+    assert "kept disappearing" in str(excinfo.value)
+
+
+class _HealthyClient:
+    def health(self):
+        return {"busy": 0, "idle_s": 9999}

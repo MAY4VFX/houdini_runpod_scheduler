@@ -723,3 +723,17 @@ def test_the_asset_declares_a_minimum_and_checks_it_before_importing_symbols():
 
     assert '_MIN_RPFARM_VERSION = "' in src
     assert "raise ImportError(_stale)" in src
+
+
+def test_the_demo_scene_never_enables_both_download_paths():
+    """Guarding the builder, not just the built scene: the trap is that both
+    settings are individually reasonable and only their combination is wrong."""
+    builder = (pathlib.Path(__file__).resolve().parent.parent
+               / "scripts" / "build_demo_scene.py").read_text(encoding="utf-8")
+
+    # greedy download stays on -- frames appear while the farm still renders
+    assert 'sched.parm("rpfarm_downloadoutputs").set(1)' in builder
+    # ...so no download node may be created in the chain
+    assert 'createNode("runpodfarmdownload"' not in builder
+    # and _verify refuses a scene where one came back
+    assert 'hou.node("/obj/topnet1/download") is None' in builder

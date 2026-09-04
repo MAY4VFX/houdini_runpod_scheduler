@@ -393,3 +393,23 @@ def test_prefirstcreate_explains_a_failed_module_instead_of_an_attributeerror():
     assert "ПЕРЕЗАПУСТИТЕ HOUDINI" in src
     assert "from None" in src          # or the AttributeError comes back as context
     ast.parse(src)
+
+
+def test_download_node_warns_when_the_scheduler_already_downloads_outputs():
+    """Both mechanisms on fetches every output twice.
+
+    The scheduler's "Download Outputs" pulls each item's outputs the moment it
+    succeeds; this node in Outputs mode pulls the same files again at the end
+    of the cook. The demo scene shipped with both on and an artist noticed the
+    files arriving twice -- the second pass re-transferred every frame and
+    re-acquired the sync pod to size them. Silence is the bug; the node has to
+    say it.
+    """
+    generate = _download_generate_source()
+
+    assert "_scheduler_downloads_outputs" in generate
+    assert "rpfarm_downloadoutputs" in generate
+    assert "a second time" in generate
+    # and it is checked in the outputs branch, before anything is planned
+    assert generate.index("_scheduler_downloads_outputs()") < generate.index(
+        "Outputs mode with no upstream input")

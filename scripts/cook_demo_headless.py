@@ -50,8 +50,8 @@ from rpfarm import smoke as rpsmoke  # noqa: E402
 
 DEFAULT_SCENE = os.path.expanduser("~/Desktop/rpfarm_demo/rpfarm_demo.hip")
 TOPNET = "/obj/topnet1"
-COOK_NODE = TOPNET + "/download"
-NODE_NAMES = ("upload", "render", "download")
+COOK_NODE = TOPNET + "/render"
+NODE_NAMES = ("upload", "render")
 RENDER_SUBDIR = "render"
 
 # Margin between the parent's kill-the-process-group deadline and the child's
