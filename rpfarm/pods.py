@@ -498,10 +498,8 @@ def _acquire_sync_pod(api, cfg, token, pubkey, log, cloud_type, capacity_wait_s,
                     "No CPU machine for the sync pod in {} after waiting {}. "
                     "The cook cannot start without it.\n"
                     "RunPod has no free instances of this size right now -- this "
-                    "usually clears in a few minutes, so try again shortly. You can "
-                    "also set Cloud Type to Community on the scheduler (cheaper, and "
-                    "often has machines when Secure is empty), or raise Wait For "
-                    "Capacity.\nLast word from RunPod: {}".format(
+                    "usually clears in a few minutes, so try again shortly, or "
+                    "raise Wait For Capacity.\nLast word from RunPod: {}".format(
                         cfg.datacenter, _fmt_wait(waited), last_error)) from e
             delay = _capacity_backoff(attempt, remaining=remaining, rand=rand)
             log("no CPU machine for the sync pod in {} ({}) -- waited {}, "

@@ -118,7 +118,7 @@
             }
             parmtag { "script_callback" "hou.phm().onAddGpu(kwargs)" }
             parmtag { "script_callback_language" "python" }
-            help    "Pick a card to add to the set above. Houdini has no multi-select parameter, so this menu appends to that list and empties itself. A * marks one already in the set. Prices come from RunPod's live catalogue for your datacenter and are a RELATIVE hint only -- measured the same day, a 4090 the catalogue priced at $0.34/h billed at $0.740/h while an RTX PRO 4000 at $0.50/h billed at $0.250/h. Cards with no price have no capacity in your datacenter at this moment; they stay pickable because stock returns, and they are tried last."
+            help    "Pick a card to add to the set above. Houdini has no multi-select parameter, so this menu appends to that list and empties itself. A * marks one already in the set. Prices are RunPod's on-demand rate for YOUR datacenter and YOUR Cloud Type, and they match the bill to the cent (a 4090 shown at $0.74/h bills at $0.740/h). Cards with no price have no capacity there at this moment; they stay pickable because stock returns, and they are tried last. Change Datacenter or Cloud Type and the prices and the availability change with it."
         }
         parm {
             name    "rpfarm_gpuconsumer"
@@ -398,7 +398,7 @@
                 "SECURE"    "Secure (vetted datacentres)"
                 "COMMUNITY" "Community (cheaper, often has machines when Secure is empty)"
             }
-            help    "Which RunPod capacity pool to rent from. Community is cheaper and frequently has GPUs when Secure is out, so it is the practical answer to a capacity shortage. Shows cloud_type from ~/.rpfarm/config.toml, which is what this node will actually use; type your own and the literal replaces the expression and wins."
+            help    "Which RunPod capacity pool to rent from. This only means anything together with Datacenter: a cloud can be completely empty in one region and full in another. In EU-RO-1 as measured, Community had 0 of 48 GPU types available while Secure had 9, so switching there is not a fix for a shortage in that region -- check the prices in the Add A GPU menu, which follow this setting. Shows cloud_type from ~/.rpfarm/config.toml; type your own and the literal replaces the expression and wins."
         }
         groupsimple {
             name    "folder_adv_remote"

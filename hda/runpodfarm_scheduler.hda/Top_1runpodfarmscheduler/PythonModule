@@ -164,6 +164,7 @@ from rpfarm import packages as rppkg
 from rpfarm import pods as rppods
 from rpfarm import sync as rpsync
 from rpfarm.runpod_api import (
+    CLOUD_TYPE_COMMUNITY,
     CLOUD_TYPE_SECURE,
     CLOUD_TYPES,
     RunPodAPI,
@@ -298,7 +299,12 @@ def _gpu_catalogue(node):
         cfg = rpcfg.load()
         api = RunPodAPI((node.parm("rpfarm_apikey").evalAsString() or "") or cfg.api_key)
         dc = node.parm("rpfarm_datacenter").evalAsString() or cfg.datacenter
-        return rpgpus.catalogue(api, dc), dc
+        cloud = (node.parm("rpfarm_cloudtype").evalAsString() or cfg.cloud_type or "SECURE")
+        secure = cloud.strip().upper() != "COMMUNITY"
+        # Priced for the cloud these pods will really be created in. Asked
+        # without that, RunPod answers with the lowest across all clouds --
+        # a 4090 at $0.34/h that bills at $0.740/h.
+        return rpgpus.catalogue(api, dc, secure_cloud=secure), dc
     except Exception:
         return [], ""
 
@@ -1748,7 +1754,9 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         # comparable per-type number RunPod offers, so it orders the set; it is
         # never shown as a cost.
         try:
-            rows = rpgpus.catalogue(self._api, self._datacenterId())
+            rows = rpgpus.catalogue(
+                self._api, self._datacenterId(),
+                secure_cloud=self._cloudType() != CLOUD_TYPE_COMMUNITY)
             self._gpu_list = rpgpus.order_for_request(chosen, rows)
             if rows and self._gpu_list != chosen:
                 self._log("GPU order (cheapest first): {}".format(
@@ -2416,14 +2424,20 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
                     task.work_item_id, self["rpfarm_capacitywait"].evaluateInt()))
             self._dispatcher.fail_pending(task.task_id)
         if expired:
+            # No blanket "try Community": in EU-RO-1 Community has 0 of 48
+            # types priced, so that advice sends someone to wait for a machine
+            # that cannot arrive. Only said when the other cloud really has
+            # something, and then with the card and the price.
+            hint = rpgpus.other_cloud_hint(
+                self._api, self._datacenterId(),
+                secure_cloud=self._cloudType() != CLOUD_TYPE_COMMUNITY)
             self._capacity_give_up_reason = (
                 "Waited {} min for a free machine in {} ({}) and RunPod never "
-                "had one.\nTry again later, pick a different GPU in GPU "
-                "Priority, or set Cloud Type to Community -- it is cheaper and "
-                "often has machines when Secure is empty.\nLast word from "
-                "RunPod: {}".format(
+                "had one.\nTry again later, or add another card to GPUs To Use "
+                "on the Farm tab.{}\nLast word from RunPod: {}".format(
                     self["rpfarm_capacitywait"].evaluateInt(), self._datacenterId(),
                     self._cloudType(),
+                    "\n" + hint if hint else "",
                     self._last_pod_error or "no error reported"))
             self._reportFailures()
 

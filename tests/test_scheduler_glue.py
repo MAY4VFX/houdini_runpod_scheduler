@@ -503,6 +503,9 @@ class _CapacityScheduler(FakeScheduler):
     def _cloudType(self):
         return self._parms["rpfarm_cloudtype"]
 
+    def _datacenterId(self):
+        return "EU-RO-1"
+
     def _capacityWaitSeconds(self):
         return max(0, int(self._parms["rpfarm_capacitywait"])) * 60
 
@@ -510,10 +513,20 @@ class _CapacityScheduler(FakeScheduler):
         self.reported.append(self._capacity_give_up_reason)
 
 
+class _NoOtherCloud:
+    """Community has nothing in EU-RO-1, so there is no hint to give."""
+
+    @staticmethod
+    def other_cloud_hint(*_a, **_kw):
+        return ""
+
+
 def _capacity_ns(now):
     return load_methods(
         ["_expireWaitingItems"],
-        extra_globals={"time": types.SimpleNamespace(time=lambda: now)},
+        extra_globals={"time": types.SimpleNamespace(time=lambda: now),
+                       "rpgpus": _NoOtherCloud,
+                       "CLOUD_TYPE_COMMUNITY": "COMMUNITY"},
     )
 
 
@@ -545,7 +558,10 @@ def test_an_item_past_the_deadline_fails_and_says_why():
     assert len(sched.reported) == 1
     reason = sched.reported[0]
     assert "15 min" in reason and "EU-RO-1" in reason
-    assert "Community" in reason                     # the actionable way out
+    assert "GPUs To Use" in reason                   # the actionable way out
+    # The other cloud is named only when it actually has capacity; here it
+    # does not, so the message must not send anyone there.
+    assert "Community has" not in reason
     assert "no longer any instances" in reason       # RunPod's own last word
 
 
