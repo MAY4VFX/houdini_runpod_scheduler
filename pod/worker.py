@@ -47,6 +47,13 @@ WORKSPACE_ROOT = "/workspace"
 # detached run with the same read path it uses for anything else.
 EXEC_DIR_REL = ".rpfarm/exec"
 
+# How long DetachedRuns.status() will wait for a finished run's wrapper to
+# actually exit once its .rc file has appeared. The wrapper writes .rc and
+# then runs `exit $rc`, so the two are never simultaneous -- but the gap is
+# microseconds, and this is only ever paid inside it. See status() for why
+# reporting "done" without reaping is the bug.
+DETACHED_REAP_GRACE_S = 2.0
+
 # Hard ceiling on the *synchronous* `/exec` path (Ruling R31). RunPod's
 # pod proxy sits behind Cloudflare, which cuts a response at roughly 100
 # seconds -- measured live in Task 14, where a 4.35GB Houdini install
@@ -354,6 +361,19 @@ class DetachedRuns:
             self._procs[handle] = proc
         return {"handle": handle, "log_path": paths["log"], "rc_path": paths["rc"]}
 
+    @staticmethod
+    def _reaped(proc, wait):
+        """Has ``proc`` been reaped? With ``wait``, give it a moment first."""
+        if proc.poll() is not None:
+            return True
+        if not wait:
+            return False
+        try:
+            proc.wait(timeout=DETACHED_REAP_GRACE_S)
+        except subprocess.TimeoutExpired:
+            return False
+        return True
+
     def status(self, handle):
         paths = self.paths(handle)
         if not os.path.isfile(paths["script"]):
@@ -361,16 +381,32 @@ class DetachedRuns:
 
         with self._lock:
             proc = self._procs.get(handle)
-        if proc is not None:
-            proc.poll()  # reap it; otherwise a finished child stays a zombie
 
-        # The .rc file is the authority, not Popen: it is what survives a
+        # The .rc file is the authority on the *code*: it is what survives a
         # worker restart, and it is written only once the command is done.
         exit_code = None
         try:
             with open(paths["rc"]) as f:
                 exit_code = int(f.read().strip())
         except (OSError, ValueError):
+            exit_code = None
+
+        # ... but it is not on its own the authority on "finished". The
+        # wrapper writes .rc and only *then* runs `exit $rc`, so between
+        # those two there is a window in which the file already says the run
+        # is over while the bash that wrote it is still alive -- and
+        # therefore has not been reaped. Reporting "done" from inside that
+        # window hands the caller a result and leaves a zombie behind, which
+        # is precisely the fingerprint Task 14 chased (`<defunct>` with
+        # PPID 1, because the worker is PID 1 in the container and inherits
+        # orphans without reaping them). So when .rc is there, wait for the
+        # wrapper to actually go; if it somehow does not, say "running"
+        # rather than claim a completion nobody has collected.
+        #
+        # proc is None after a worker restart -- there is no child of ours to
+        # reap and .rc alone is all the evidence there is, which is the whole
+        # point of writing it to the volume.
+        if proc is not None and not self._reaped(proc, wait=exit_code is not None):
             exit_code = None
 
         running = exit_code is None
@@ -380,6 +416,11 @@ class DetachedRuns:
             "exit_code": exit_code,
             "log_path": paths["log"],
             "rc_path": paths["rc"],
+            # The wrapper's pid, or None after a worker restart. Diagnostic:
+            # it is what an operator greps for when a run looks stuck on a
+            # pod, and what a test uses to ask about *this* run's child
+            # rather than about every child the process happens to have.
+            "pid": proc.pid if proc is not None else None,
         }
 
 
