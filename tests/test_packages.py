@@ -6,12 +6,15 @@ import pytest
 from rpfarm.packages import (
     build_download_items,
     build_upload_items,
+    delocalize_via_pathmap,
     get_volume_size_gb,
     group_download_pairs,
     houdini_install_preset,
     localize_via_pathmap,
+    map_output_pair,
     maybe_grow_volume,
     resolve_compress_flag,
+    result_data_path,
     run_download_item,
     run_upload_item,
     write_pathmap,
@@ -661,6 +664,101 @@ def test_localize_via_pathmap_does_not_match_unrelated_sibling_prefix():
     # counts (the trailing "/" check in the implementation).
     path_map = {"/job": "/workspace/projects/may/shot"}
     assert localize_via_pathmap("/workspace/projects/may/shot2/x", path_map) is None
+
+
+# -- delocalize_via_pathmap / map_output_pair -------------------------------------
+
+PMAP = {"/job": "/workspace/projects/may/shot"}
+
+
+def test_delocalize_via_pathmap_basic():
+    assert delocalize_via_pathmap("/job/render/a.exr", PMAP) == \
+        "/workspace/projects/may/shot/render/a.exr"
+
+
+def test_delocalize_via_pathmap_exact_root_match():
+    assert delocalize_via_pathmap("/job", PMAP) == "/workspace/projects/may/shot"
+
+
+def test_delocalize_via_pathmap_longest_prefix_wins():
+    path_map = {"/job": "/workspace/projects/may/shot",
+                "/job/render": "/elsewhere/render"}
+    assert delocalize_via_pathmap("/job/render/a.exr", path_map) == "/elsewhere/render/a.exr"
+
+
+def test_delocalize_via_pathmap_no_match_returns_none():
+    assert delocalize_via_pathmap("/somewhere/else/a.exr", PMAP) is None
+
+
+def test_delocalize_via_pathmap_does_not_match_a_sibling_prefix():
+    assert delocalize_via_pathmap("/job2/a.exr", PMAP) is None
+
+
+def test_map_output_pair_from_a_farm_path():
+    assert map_output_pair("/workspace/projects/may/shot/render/a.exr", PMAP) == (
+        "/workspace/projects/may/shot/render/a.exr", "/job/render/a.exr")
+
+
+def test_map_output_pair_from_an_already_local_path():
+    """PDG can hand the reported output over already translated for this
+    machine. localizePath alone returns such a path unchanged, which is
+    indistinguishable from "not mapped" -- and three rendered EXRs were
+    dropped exactly that way."""
+    assert map_output_pair("/job/render/a.exr", PMAP) == (
+        "/workspace/projects/may/shot/render/a.exr", "/job/render/a.exr")
+
+
+def test_map_output_pair_unrelated_path_is_none():
+    assert map_output_pair("/tmp/whatever.exr", PMAP) is None
+
+
+def test_map_output_pair_empty_is_none():
+    assert map_output_pair("", PMAP) is None
+
+
+# -- result_data_path -------------------------------------------------------------
+
+
+class _FakeFile:
+    """Stands in for pdg.File, whose repr is not its path."""
+
+    def __init__(self, path, tag=""):
+        self.path = path
+        self.tag = tag
+
+    def __repr__(self):
+        return "<{} tag={!r} owned=true>".format(self.path, self.tag)
+
+
+def test_result_data_path_from_a_pdg_file_object():
+    assert result_data_path(_FakeFile("/workspace/a.exr", "file/image")) == "/workspace/a.exr"
+
+
+def test_result_data_path_from_bytes():
+    """str() on bytes yields the literal "b'/workspace/...'" and bytes[0] is
+    an int -- both silently produce a path that matches nothing."""
+    assert result_data_path(b"/workspace/a.exr") == "/workspace/a.exr"
+
+
+def test_result_data_path_from_a_tuple():
+    assert result_data_path(("/workspace/a.exr", "file/image", 0)) == "/workspace/a.exr"
+
+
+def test_result_data_path_from_a_plain_string():
+    assert result_data_path("/workspace/a.exr") == "/workspace/a.exr"
+
+
+def test_result_data_path_falls_back_to_str():
+    """pdg.File's __str__ is its path even though its repr is not, so str()
+    stays the last resort rather than dropping an entry outright."""
+
+    class Stringy:
+        def __str__(self):
+            return "/workspace/a.exr"
+
+    assert result_data_path(Stringy()) == "/workspace/a.exr"
+    assert map_output_pair(result_data_path(object()), PMAP) is None
+    assert result_data_path(()) == ""
 
 
 # -- group_download_pairs ------------------------------------------------------

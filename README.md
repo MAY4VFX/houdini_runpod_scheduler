@@ -27,6 +27,7 @@
   — если Houdini на волюм фермы ещё не ставили.
 
 ```bash
+# v2 пока живёт в своей ветке; после мержа берите main
 git clone -b v2 https://github.com/MAY4VFX/houdini_runpod_scheduler
 cd houdini_runpod_scheduler
 
@@ -335,9 +336,23 @@ RPFARM_ROOT=$PWD <hython> scripts/smoke_stats_headless.py   # без сети и
 Общие части (сторож времени, отчёт по work item'ам, журнал, гашение подов)
 живут в `rpfarm/smoke.py` — там же, где сам `rpfarm smoke`.
 
-HDA лежат в репозитории в разобранном виде (`hda/*.hda/`, `hotl -t`) и
-собираются скриптами `scripts/build_runpodfarm_*_hda.py`; `rpfarm setup`
-схлопывает их (`hotl -l`) и ставит в `<prefs>/otls/`.
+HDA лежат в репозитории в разобранном виде (`hda/*.hda/`, форма `hotl -t`).
+Upload, Download и Stats пересобираются скриптами
+`scripts/build_runpodfarm_*_hda.py`; у Scheduler'а сборщика нет — его
+`PythonModule` правится прямо в `hda/runpodfarm_scheduler.hda/…/PythonModule`.
+Что бы вы ни поменяли, `rpfarm setup` (или
+`houdini_local.build_and_install_hdas`) схлопывает всё это `hotl -l` и кладёт
+в `<prefs>/otls/`.
+
+Сцена-фикстура для `rpfarm smoke` пересобирается так:
+
+```bash
+RPFARM_ROOT=$PWD <hython> scripts/build_smoke_fixture.py
+```
+
+Скрипт сам себя проверяет: перезагружает сохранённый файл и сверяет диапазоны
+кадров и `roppath` (`verify: OK`). Диапазон, молча оставшийся сценным `1–240`,
+стоил бы оплаченному поду 240 рендеров вместо трёх.
 
 Секреты в репозиторий не попадают: значения живут только в
 `~/.rpfarm/config.toml` (chmod 600) и в env подов, в репозитории — только имена.

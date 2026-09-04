@@ -316,12 +316,20 @@ if mode == \"outputs\":
         except ValueError:
             path_map = {}
         item_pairs = []
-        for rd in up.resultData:
-            remote = rd[0] if isinstance(rd, (tuple, list)) else str(rd)
-            local = rppkg.localize_via_pathmap(remote, path_map)
-            if local:
-                item_pairs.append((remote, local))
+        result_data = list(up.resultData)
+        for rd in result_data:
+            pair = rppkg.map_output_pair(rppkg.result_data_path(rd), path_map)
+            if pair:
+                item_pairs.append(pair)
         if not item_pairs:
+            if result_data:
+                # Reported outputs that map to nothing local is a real fault
+                # (a missing or wrong rpfarm_pathmap), not \"nothing to do\" --
+                # say so instead of quietly planning zero work items.
+                node.addWarning(
+                    \"upstream item {} reported {} output(s), none of which mapped \"
+                    \"back to a local path (rpfarm_pathmap has {} entry(ies))\".format(
+                        up.name, len(result_data), len(path_map)))
             continue
         sizes = _stat_sizes(sorted({r for r, _l in item_pairs}))
         for it in rppkg.build_download_items(mode, item_pairs, package_gb, sizes):
