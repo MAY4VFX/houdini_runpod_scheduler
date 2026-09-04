@@ -18,6 +18,11 @@ def srv(tmp_path, monkeypatch):
     monkeypatch.setenv("RPFARM_ROLE", "sync")
     monkeypatch.setenv("RPFARM_SLOTS", "1")
     monkeypatch.setenv("HFS", str(tmp_path / "nohfs"))
+    # make_server builds the detached-exec dir from WORKSPACE_ROOT, so this
+    # has to be redirected BEFORE the server exists -- otherwise a test run
+    # reaches for the real /workspace (the same class of mistake that had
+    # the suite overwriting the artist's real Houdini prefs).
+    monkeypatch.setattr(worker, "WORKSPACE_ROOT", str(tmp_path))
     s = worker.make_server("127.0.0.1", 0, log_dir=str(tmp_path))
     threading.Thread(target=s.serve_forever, daemon=True).start()
     yield s.server_address[1]
@@ -105,3 +110,99 @@ def test_files_reads_under_workspace(srv, tmp_path, monkeypatch):
     f.write_text("hello world")
     st, body = req(srv, "GET", "/files?path=" + quote(str(f)))
     assert st == 200 and "hello world" in body
+
+
+# -- Ruling R31: detached exec ------------------------------------------------
+
+
+def _wait_done(port, handle, timeout=20):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        st, body = req(port, "GET", "/exec/" + handle)
+        assert st == 200, body
+        if body["state"] == "done":
+            return body
+        time.sleep(0.1)
+    raise AssertionError("detached run never finished")
+
+
+def test_exec_detached_outlives_the_request_and_reports_its_exit_code(srv, tmp_path):
+    """The bug this exists to prevent (Task 14): a command that runs longer
+    than the HTTP request must keep running after the response is sent, and
+    its exit code must still be retrievable afterwards.
+
+    The synchronous path cannot do this -- the RunPod proxy cuts the response
+    at ~100s and the pod-side timeout SIGKILLs the shell, closing the pipe a
+    surviving grandchild then dies on.
+    """
+    st, body = req(srv, "POST", "/exec", {"command": "sleep 1; echo finished-after-response; exit 7", "detach": True})
+    assert st == 202
+    handle = body["handle"]
+
+    # The response came back immediately, while the command is still running.
+    st_now, running = req(srv, "GET", "/exec/" + handle)
+    assert st_now == 200 and running["state"] == "running" and running["exit_code"] is None
+
+    done = _wait_done(srv, handle)
+    assert done["exit_code"] == 7
+
+    log = open(body["log_path"]).read()
+    assert "finished-after-response" in log
+
+
+def test_exec_detached_leaves_no_zombie(srv):
+    """A finished detached child must be reaped. As PID 1 in the container the
+    worker inherits orphans and never reaps them -- Task 14 found the dead
+    installer as `[houdini.install] <defunct>` with PPID 1, which is how the
+    cause was identified in the first place.
+
+    Checked by asking the OS: once the run reports done, this process must
+    have no unreaped children left, i.e. `waitpid(-1, WNOHANG)` raises
+    ChildProcessError rather than handing back a corpse.
+    """
+    st, body = req(srv, "POST", "/exec", {"command": "true", "detach": True})
+    assert st == 202
+    _wait_done(srv, body["handle"])
+
+    with pytest.raises(ChildProcessError):
+        os.waitpid(-1, os.WNOHANG)
+
+    # and the exit code survives being reaped
+    _st, again = req(srv, "GET", "/exec/" + body["handle"])
+    assert again["state"] == "done" and again["exit_code"] == 0
+
+
+def test_exec_detached_writes_its_output_to_a_file_not_the_http_pipe(srv):
+    st, body = req(srv, "POST", "/exec", {"command": "echo to-a-file; echo to-stderr 1>&2", "detach": True})
+    assert st == 202
+    _wait_done(srv, body["handle"])
+    log = open(body["log_path"]).read()
+    assert "to-a-file" in log and "to-stderr" in log  # stderr is merged into the same file
+
+
+def test_exec_status_unknown_handle_is_404(srv):
+    assert req(srv, "GET", "/exec/exec-doesnotexist")[0] == 404
+
+
+def test_exec_sync_timeout_is_clamped_to_the_proxy_ceiling(srv, monkeypatch):
+    """A caller may ask for 829s (the size-derived figure that Task 14's
+    install used); the transport cannot deliver a response that long, so the
+    handler must not pretend it can."""
+    seen = {}
+
+    real_run = worker.subprocess.run
+
+    def spy(cmd, **kw):
+        seen["timeout"] = kw.get("timeout")
+        return real_run(cmd, **kw)
+
+    monkeypatch.setattr(worker.subprocess, "run", spy)
+    st, body = req(srv, "POST", "/exec", {"command": "true", "timeout_s": 829})
+    assert st == 200 and body["exit_code"] == 0
+    assert seen["timeout"] == worker.EXEC_SYNC_CEILING_S
+
+
+def test_exec_sync_timeout_response_points_at_the_detached_path(srv):
+    st, body = req(srv, "POST", "/exec", {"command": "sleep 5", "timeout_s": 1})
+    assert st == 504
+    assert "detach" in body["hint"]

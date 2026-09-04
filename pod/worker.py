@@ -29,6 +29,7 @@ import signal
 import subprocess
 import threading
 import time
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -39,6 +40,20 @@ START = time.time()
 # Root the /files endpoint is confined to. Tests monkeypatch this constant
 # (module-level, read at request time) to point at a tmp_path sandbox.
 WORKSPACE_ROOT = "/workspace"
+
+# Where detached `/exec` runs keep their script, log and exit-code files.
+# Under WORKSPACE_ROOT on purpose: the volume outlives the pod *and* the
+# `/files` endpoint can already serve from there, so a caller polls a
+# detached run with the same read path it uses for anything else.
+EXEC_DIR_REL = ".rpfarm/exec"
+
+# Hard ceiling on the *synchronous* `/exec` path (Ruling R31). RunPod's
+# pod proxy sits behind Cloudflare, which cuts a response at roughly 100
+# seconds -- measured live in Task 14, where a 4.35GB Houdini install
+# asked for 829s and got a literal "error code: 524" at 125s. Anything
+# above this ceiling is a request the transport cannot deliver, so the
+# handler clamps to it rather than pretending otherwise.
+EXEC_SYNC_CEILING_S = 90
 
 
 def get_gpu_info():
@@ -230,11 +245,119 @@ def _under_workspace(path):
     return real == root or real.startswith(root + os.sep)
 
 
+class DetachedRuns:
+    """Detached `/exec` runs (Ruling R31).
+
+    The synchronous `/exec` path cannot carry a long command: RunPod's
+    proxy cuts the HTTP response at ~100s, and `subprocess.run(timeout=)`
+    SIGKILLs the shell it spawned and closes its stdout pipe -- which does
+    not stop a grandchild like SideFX's `houdini.install`, it just makes
+    the grandchild die of SIGPIPE at its next progress write. Task 14 lost
+    a Houdini install to exactly that and got a partial tree that looked
+    complete on disk.
+
+    A detached run therefore gets:
+
+    - its own **file** for stdout/stderr, never the HTTP pipe, so nothing
+      the request does can SIGPIPE it;
+    - its own session (``start_new_session``), so no signal aimed at the
+      request's process group reaches it;
+    - an exit code written to ``<handle>.rc`` by the wrapper itself, so the
+      result survives even a worker restart, and read back through the
+      existing ``/files`` endpoint;
+    - a live ``Popen`` this class reaps in :meth:`status`, so a finished
+      child does not sit around as a zombie (as PID 1 in the container the
+      worker inherits orphans and never reaps them; that zombie was the
+      fingerprint that identified the bug).
+    """
+
+    def __init__(self, exec_dir, runner=subprocess.Popen):
+        self.exec_dir = exec_dir
+        self._runner = runner
+        self._procs = {}
+        self._lock = threading.Lock()
+
+    def paths(self, handle):
+        base = os.path.join(self.exec_dir, handle)
+        return {"script": base + ".sh", "log": base + ".log", "rc": base + ".rc"}
+
+    def start(self, command, handle=None):
+        handle = handle or "exec-{}".format(uuid.uuid4().hex[:16])
+        paths = self.paths(handle)
+        os.makedirs(self.exec_dir, exist_ok=True)
+
+        # The wrapper writes its own exit code, and writes it *last*, so a
+        # present .rc always means "finished" and never "finished, but the
+        # code is still on its way".
+        with open(paths["script"], "w") as f:
+            # The command runs in a subshell so that an `exit` inside it --
+            # ordinary in an install script -- ends the command, not the
+            # wrapper, which would skip the .rc write and leave the run
+            # looking forever "running". (Caught by
+            # test_exec_detached_outlives_the_request_and_reports_its_exit_code.)
+            f.write(
+                "#!/bin/bash\n"
+                + "(\n"
+                + build_shell_command(command)
+                + "\n)\n"
+                + "rc=$?\n"
+                + 'printf %s "$rc" > {}.tmp\n'.format(paths["rc"])
+                + "mv {0}.tmp {0}\n".format(paths["rc"])
+                + "exit $rc\n"
+            )
+        os.chmod(paths["script"], 0o755)
+
+        log = open(paths["log"], "wb")
+        try:
+            proc = self._runner(
+                ["bash", paths["script"]],
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                env=build_env({}),
+                start_new_session=True,
+            )
+        finally:
+            log.close()
+        with self._lock:
+            self._procs[handle] = proc
+        return {"handle": handle, "log_path": paths["log"], "rc_path": paths["rc"]}
+
+    def status(self, handle):
+        paths = self.paths(handle)
+        if not os.path.isfile(paths["script"]):
+            return None
+
+        with self._lock:
+            proc = self._procs.get(handle)
+        if proc is not None:
+            proc.poll()  # reap it; otherwise a finished child stays a zombie
+
+        # The .rc file is the authority, not Popen: it is what survives a
+        # worker restart, and it is written only once the command is done.
+        exit_code = None
+        try:
+            with open(paths["rc"]) as f:
+                exit_code = int(f.read().strip())
+        except (OSError, ValueError):
+            exit_code = None
+
+        running = exit_code is None
+        return {
+            "handle": handle,
+            "state": "running" if running else "done",
+            "exit_code": exit_code,
+            "log_path": paths["log"],
+            "rc_path": paths["rc"],
+        }
+
+
 def make_server(host, port, log_dir="/workspace/ledger/logs"):
     token = os.environ.get("RPFARM_TOKEN", "")
     role = os.environ.get("RPFARM_ROLE", "gpu")
     slots = int(os.environ.get("RPFARM_SLOTS", "1"))
     registry = Registry(slots, log_dir)
+    detached = DetachedRuns(os.path.join(WORKSPACE_ROOT, EXEC_DIR_REL))
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -305,6 +428,8 @@ def make_server(host, port, log_dir="/workspace/ledger/logs"):
             if parsed.path == "/files":
                 path = (parse_qs(parsed.query).get("path") or [""])[0]
                 return self._handle_get_file(path)
+            if parts[:1] == ["exec"] and len(parts) == 2:
+                return self._handle_exec_status(parts[1])
             self._send_json(404, {"error": "no route"})
 
         def do_POST(self):
@@ -394,13 +519,42 @@ def make_server(host, port, log_dir="/workspace/ledger/logs"):
             self._send_json(202, {"task_id": task.id})
 
         def _handle_exec(self):
+            """Run a command on the sync pod.
+
+            **This endpoint is for SHORT commands only.** The reply travels
+            back through RunPod's pod proxy, which sits behind Cloudflare
+            and cuts a response at roughly 100 seconds -- past that the
+            caller gets an HTML "error code: 524" no matter what
+            ``timeout_s`` said. Worse, the timeout here is enforced with
+            ``subprocess.run(timeout=)``, which SIGKILLs only the shell it
+            started: a grandchild (an installer, a big tar) survives that
+            and then dies of SIGPIPE the next time it writes to the pipe
+            this handler just closed, leaving a half-finished job that can
+            look complete on disk. ``timeout_s`` is therefore clamped to
+            :data:`EXEC_SYNC_CEILING_S`.
+
+            Pass ``detach: true`` for anything that can run for minutes
+            (Ruling R31). The command is then written to a script, started
+            in its own session with its output going to a *file*, and the
+            call returns ``202`` immediately with ``handle``/``log_path``/
+            ``rc_path``; poll ``GET /exec/<handle>`` for the exit code and
+            read the log through ``GET /files``.
+            """
             body = self._read_json_body()
             if role != "sync":
                 return self._send_json(403, {"error": "exec only on sync pod"})
             if body is None:
                 return self._send_json(400, {"error": "invalid JSON"})
             command = body.get("command", "")
-            timeout_s = body.get("timeout_s", 600)
+
+            if body.get("detach"):
+                try:
+                    started = detached.start(command, handle=body.get("handle"))
+                except OSError as e:
+                    return self._send_json(500, {"error": "could not start: {}".format(e)})
+                return self._send_json(202, started)
+
+            timeout_s = min(body.get("timeout_s", 600), EXEC_SYNC_CEILING_S)
             try:
                 result = subprocess.run(
                     ["bash", "-c", build_shell_command(command)],
@@ -419,7 +573,23 @@ def make_server(host, port, log_dir="/workspace/ledger/logs"):
                     },
                 )
             except subprocess.TimeoutExpired:
-                self._send_json(504, {"error": "timeout"})
+                self._send_json(
+                    504,
+                    {
+                        "error": "timeout",
+                        "hint": "exec is capped at {}s by the RunPod proxy; use detach:true".format(
+                            EXEC_SYNC_CEILING_S
+                        ),
+                    },
+                )
+
+        def _handle_exec_status(self, handle):
+            if role != "sync":
+                return self._send_json(403, {"error": "exec only on sync pod"})
+            status = detached.status(handle)
+            if status is None:
+                return self._send_json(404, {"error": "no such handle"})
+            self._send_json(200, status)
 
         def _handle_kill(self, task_id):
             task = registry.tasks.get(task_id)

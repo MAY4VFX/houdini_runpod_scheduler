@@ -269,14 +269,31 @@ class FakeCfg:
 
 
 class FakeSyncClient:
+    """Stands in for :class:`rpfarm.worker_client.WorkerClient`.
+
+    Implements both paths so tests can tell them apart: `exec` (short,
+    synchronous) and `exec_wait` (detached + polled, Ruling R31). Long
+    commands must take the second one -- see
+    `test_run_upload_item_runs_post_command_detached_not_synchronously`.
+    """
+
     def __init__(self, fail_commands=None):
         self.commands = []
         self.calls = []  # (command, timeout_s), in call order
+        self.detached = []  # (command, deadline_s) that went the detached way
         self.fail_commands = fail_commands or set()
 
     def exec(self, command, timeout_s=600):
         self.commands.append(command)
         self.calls.append((command, timeout_s))
+        if command in self.fail_commands:
+            return {"exit_code": 1, "stdout": "", "stderr": "boom: " + command}
+        return {"exit_code": 0, "stdout": "", "stderr": ""}
+
+    def exec_wait(self, command, deadline_s, **kw):
+        self.commands.append(command)
+        self.calls.append((command, deadline_s))
+        self.detached.append((command, deadline_s))
         if command in self.fail_commands:
             return {"exit_code": 1, "stdout": "", "stderr": "boom: " + command}
         return {"exit_code": 0, "stdout": "", "stderr": ""}
@@ -1085,3 +1102,73 @@ def test_maybe_grow_volume_short_exec_timeout(rpfarm_home):
     sync_client.exec = spying_exec
     maybe_grow_volume(api, _GrowCfg(), sync_client, needed_bytes=1 * gb)
     assert calls and calls[0] <= 30
+
+
+# -- Ruling R31: long post-commands must go the detached way -------------------
+
+
+def _fake_rclone_copy(package, target, direction, rclone_bin, local_root, remote_root, progress_cb=None):
+    from rpfarm.sync import SyncStats
+
+    return SyncStats(files=len(package), bytes=sum(e.size for e in package), seconds=0.1)
+
+
+def _upload_item(tmp_path, post_command, nbytes=10):
+    src = tmp_path / "f.txt"
+    src.write_bytes(b"x" * 10)
+    return {
+        "index": 0,
+        "local_root": str(tmp_path),
+        "remote_root": "/workspace/apps/dist",
+        "files": [[str(src), "/workspace/apps/dist/f.txt", 10]],
+        "bytes": nbytes,
+        "post_command": post_command,
+    }
+
+
+def test_run_upload_item_runs_post_command_detached_not_synchronously(tmp_path, monkeypatch):
+    """Task 14's failure, as a test.
+
+    The Houdini-install post-command used to go through the synchronous
+    `exec`, whose pod-side `subprocess.run(timeout=)` SIGKILLs the shell and
+    closes its stdout pipe. The installer is a grandchild, so it survived the
+    kill and then died of SIGPIPE at its next progress write -- leaving an
+    11GB tree with no `python/` that still passed the preset's own
+    `ls .../bin/hython` check. It must take the detached path instead.
+    """
+    monkeypatch.setattr("rpfarm.packages.rclone_copy", _fake_rclone_copy)
+    _pairs, post = houdini_install_preset("/dl/houdini-22.0.393-linux_x86_64_gcc14.2.tar.gz", "22.0.393")
+    item = _upload_item(tmp_path, post)
+    client = FakeSyncClient()
+
+    run_upload_item(item, FakeCfg(), SftpTarget(host="1.2.3.4", port=22, key_path="/k"), client, compress=False)
+
+    assert [c for c, _ in client.detached] == [post]
+    # the short bookkeeping touches stay on the synchronous path
+    assert any("sync_last_used" in c for c in client.commands)
+
+
+def test_run_upload_item_post_command_deadline_is_the_scaled_timeout(tmp_path, monkeypatch):
+    """The size-derived timeout survives, but as a *watching* deadline handed
+    to exec_wait -- never again as a pod-side kill."""
+    from rpfarm.packages import _scaled_timeout
+
+    monkeypatch.setattr("rpfarm.packages.rclone_copy", _fake_rclone_copy)
+    nbytes = 4 * 2**30
+    item = _upload_item(tmp_path, "slow-thing", nbytes=nbytes)
+    client = FakeSyncClient()
+
+    run_upload_item(item, FakeCfg(), SftpTarget(host="1.2.3.4", port=22, key_path="/k"), client, compress=False)
+
+    assert client.detached == [("slow-thing", _scaled_timeout(nbytes))]
+
+
+def test_run_upload_item_still_raises_when_a_detached_post_command_fails(tmp_path, monkeypatch):
+    """Going detached must not turn a failed remote command into a silent
+    success -- the whole reason _exec_checked exists."""
+    monkeypatch.setattr("rpfarm.packages.rclone_copy", _fake_rclone_copy)
+    item = _upload_item(tmp_path, "boom")
+    client = FakeSyncClient(fail_commands={"boom"})
+
+    with pytest.raises(RuntimeError, match="boom"):
+        run_upload_item(item, FakeCfg(), SftpTarget(host="1.2.3.4", port=22, key_path="/k"), client, compress=False)

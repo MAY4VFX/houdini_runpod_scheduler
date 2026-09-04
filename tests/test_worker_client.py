@@ -282,3 +282,73 @@ def test_default_transport_uses_a_verifying_ssl_context(monkeypatch):
     wc._urllib_transport("GET", "https://p-8000.proxy.runpod.net/health", None, {})
     assert seen["context"] is not None
     assert seen["context"].verify_mode == ssl.CERT_REQUIRED
+
+
+# -- Ruling R31: detached exec ------------------------------------------------
+
+
+def _detached_transport(states, log_body=b"installer output"):
+    """Fake pod: accepts the detached start, then walks `states` on each
+    status poll, and serves the log through /files."""
+    seq = list(states)
+    calls = []
+
+    def t(method, url, body, headers, timeout=30):
+        calls.append((method, url, body))
+        if method == "POST" and url.endswith("/exec"):
+            return 202, json.dumps(
+                {"handle": "exec-abc", "log_path": "/workspace/.rpfarm/exec/exec-abc.log",
+                 "rc_path": "/workspace/.rpfarm/exec/exec-abc.rc"}
+            ).encode()
+        if method == "GET" and "/exec/exec-abc" in url:
+            return 200, json.dumps(seq.pop(0)).encode()
+        if method == "GET" and "/files?" in url:
+            return 200, log_body
+        raise AssertionError("unexpected " + url)
+
+    return t, calls
+
+
+def test_exec_wait_polls_until_done_and_returns_the_exit_code():
+    t, calls = _detached_transport([
+        {"state": "running", "exit_code": None},
+        {"state": "running", "exit_code": None},
+        {"state": "done", "exit_code": 0},
+    ])
+    c = WorkerClient("pod1", "tok", transport=t)
+    slept = []
+
+    out = c.exec_wait("./houdini.install ...", deadline_s=600, poll_s=5, sleep=slept.append)
+
+    assert out["exit_code"] == 0
+    assert out["stdout"] == "installer output"
+    assert len(slept) == 2  # slept between the two "running" polls, not after "done"
+    assert calls[0][0] == "POST" and calls[0][2]["detach"] is True
+
+
+def test_exec_wait_reports_a_failed_command_rather_than_swallowing_it():
+    t, _calls = _detached_transport([{"state": "done", "exit_code": 3}])
+    c = WorkerClient("pod1", "tok", transport=t)
+    assert c.exec_wait("boom", deadline_s=60, sleep=lambda s: None)["exit_code"] == 3
+
+
+def test_exec_wait_deadline_does_not_kill_the_command():
+    """Hitting the deadline means "stop watching", not "kill it" -- the old
+    pod-side subprocess timeout is exactly what corrupted Task 14's install.
+    The message has to say so, and point at the log."""
+    t, calls = _detached_transport([{"state": "running", "exit_code": None}] * 50)
+    c = WorkerClient("pod1", "tok", transport=t)
+    clock = iter([0, 0, 100, 200])
+
+    out = c.exec_wait("slow", deadline_s=1, poll_s=1, sleep=lambda s: None, now=lambda: next(clock))
+
+    assert out["exit_code"] == -1
+    assert "NOT killed" in out["stderr"] and "exec-abc.log" in out["stderr"]
+    assert not any(m == "DELETE" for m, _u, _b in calls)  # nothing was cancelled
+
+
+def test_exec_detached_returns_none_when_the_pod_refuses():
+    def t(method, url, body, headers, timeout=30):
+        return 403, b'{"error":"exec only on sync pod"}'
+
+    assert WorkerClient("pod1", "tok", transport=t).exec_detached("x") is None

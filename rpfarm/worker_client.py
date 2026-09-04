@@ -23,6 +23,7 @@ other status or a transport-level failure raises :class:`WorkerError`
 from __future__ import annotations
 
 import json
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -137,6 +138,76 @@ class WorkerClient:
         if status == 504:
             return {"exit_code": -1, "stdout": "", "stderr": data.get("error", "timeout")}
         return data
+
+    # -- detached exec (Ruling R31) -----------------------------------------
+
+    EXEC_SYNC_CEILING_S = 90
+
+    def exec_detached(self, command, handle=None) -> dict | None:
+        """Start ``command`` on the sync pod without waiting for it.
+
+        Returns ``{"handle", "log_path", "rc_path"}``, or ``None`` if the
+        pod refused/could not be reached. Use this for anything that can
+        run longer than :data:`EXEC_SYNC_CEILING_S` -- :meth:`exec` cannot,
+        because RunPod's proxy cuts the response at ~100s and the pod-side
+        timeout kills the shell out from under a long-running grandchild
+        (see ``pod/worker.py::_handle_exec``).
+        """
+        body = {"command": command, "detach": True}
+        if handle:
+            body["handle"] = handle
+        status, raw = self._call("POST", "/exec", body)
+        if status != 202 or not raw:
+            return None
+        try:
+            return json.loads(raw)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return None
+
+    def exec_status(self, handle) -> dict | None:
+        """``{"state": "running"|"done", "exit_code", "log_path", ...}`` for
+        a detached run, or ``None`` if the handle is unknown."""
+        return self._json("GET", f"/exec/{handle}")
+
+    def exec_wait(self, command, deadline_s, poll_s=5.0, sleep=time.sleep, now=time.monotonic) -> dict:
+        """Run ``command`` detached and poll until it finishes.
+
+        ``deadline_s`` is a *polling* deadline: hitting it means this call
+        stops watching and reports a timeout, but -- unlike :meth:`exec`'s
+        pod-side ``subprocess.run`` timeout -- it never kills the command
+        or closes anything underneath it. That distinction is the whole
+        point of Ruling R31: the old behaviour turned an over-long install
+        into a half-written one.
+
+        Returns the same shape :meth:`exec` does, with the command's own
+        output read back from its log file.
+        """
+        started = self.exec_detached(command)
+        if started is None:
+            return {"exit_code": -1, "stdout": "", "stderr": "could not start detached command"}
+
+        t0 = now()
+        while True:
+            status = self.exec_status(started["handle"])
+            if status and status.get("state") == "done":
+                return {
+                    "exit_code": status.get("exit_code", -1),
+                    "stdout": self.read_file(started["log_path"]) or "",
+                    "stderr": "",
+                    "handle": started["handle"],
+                    "log_path": started["log_path"],
+                }
+            if now() - t0 > deadline_s:
+                return {
+                    "exit_code": -1,
+                    "stdout": self.read_file(started["log_path"]) or "",
+                    "stderr": "still running after {:.0f}s; it was NOT killed -- follow {}".format(
+                        deadline_s, started["log_path"]
+                    ),
+                    "handle": started["handle"],
+                    "log_path": started["log_path"],
+                }
+            sleep(poll_s)
 
     def read_file(self, path) -> str | None:
         q = urllib.parse.urlencode({"path": path})
