@@ -48,7 +48,6 @@ GENERATE_CODE = '''\
 # through rpfarm.package_runner (Ruling R22).
 
 import json
-import math
 import os
 import pathlib
 import shlex
@@ -68,7 +67,6 @@ if str(_RPFARM_ROOT) not in sys.path:
 from rpfarm import config as rpcfg
 from rpfarm import deps as rpdeps
 from rpfarm import packages as rppkg
-from rpfarm.runpod_api import RunPodAPI, RunPodError
 
 node = self.topNode().parent()
 
@@ -109,26 +107,16 @@ if mode == "deps":
     _, path_map = rpdeps.resolve_entries(refs, job_dir, remote_project)
     rppkg.write_pathmap(job_dir, path_map)
 
-# Volume auto-grow (design spec 4.1): grow when usage would exceed ~85%.
-# TODO(Task 12): this can only see the size of the packages THIS cook is
-# about to upload, not real used-space on the volume -- housekeeping's
-# usage index is still a stub. Until that lands this is a coarse guard
-# (grow when this cook's own upload alone would already cross 85% of
-# total capacity), not a real (used + upload) / total check. Replace the
-# body of this block with a real usage lookup once Task 12 lands.
-try:
-    upload_bytes = sum(it["bytes"] for it in items)
-    if upload_bytes and cfg.volume_id:
-        api = RunPodAPI(cfg.api_key)
-        vol = api.get_volume(cfg.volume_id) or {}
-        total_gb = float(vol.get("size") or 0)
-        upload_gb = upload_bytes / 2**30
-        if total_gb and upload_gb > 0.85 * total_gb:
-            new_gb = int(math.ceil((total_gb + upload_gb) / 10.0) * 10)
-            api.resize_volume(cfg.volume_id, new_gb)
-            node.addWarning("grew volume {} -> {} GB for this upload".format(cfg.volume_id, new_gb))
-except RunPodError as e:
-    node.addWarning("volume auto-grow check failed (continuing): {}".format(e))
+# Volume auto-grow (design spec 4.1) is NOT done here. Task 12 landed the
+# real check as rpfarm.packages.maybe_grow_volume, which package_runner
+# calls once per item with the volume's true used-space (housekeeping's
+# disk-usage against the volume's real provisioned size, Ruling R27).
+# The coarse placeholder that used to sit here -- grow when THIS cook's
+# own upload alone would cross 85% of capacity, sized
+# ceil((total+upload)/10)*10 -- ran first and over-provisioned: a 45GB
+# upload onto a 50GB volume grew it to 100GB where the real check grows
+# it to 60GB. RunPod volumes never shrink and bill on allocated size, so
+# that was money you could not get back. Do not reintroduce it.
 
 compress = rppkg.resolve_compress_flag(node.evalParm("rpfarm_compress"))
 
@@ -285,6 +273,13 @@ compress = bool(work_item.intAttribValue("compress"))
 def progress_cb(done, total, speed):
     work_item.setStringAttrib("progress", "{:.0f}/{:.0f} MB".format(done / 2**20, total / 2**20))
 
+
+# Same auto-grow check the out-of-process path runs (rpfarm/package_runner.py):
+# per item, against the volume's real used-space. This debug path must not be
+# the one that silently fills the volume.
+autogrow_note = rppkg.maybe_grow_volume(api, cfg, sync_client, item.get("bytes") or 0, log=print)
+if autogrow_note != "ok":
+    work_item.setStringAttrib("volume_autogrow", autogrow_note)
 
 t0 = time.time()
 stats = rppkg.run_upload_item(item, cfg, sftp, sync_client, compress, progress_cb)
