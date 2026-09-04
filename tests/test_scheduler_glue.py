@@ -19,6 +19,7 @@ here: rename a collaborator and this fails.
 
 import ast
 import pathlib
+import sys
 import types
 
 import pytest
@@ -604,3 +605,121 @@ def test_setup_cook_turns_a_sync_pod_shortage_into_a_cook_error():
     # and it is given the same two parms, not a second set of knobs
     assert "capacity_wait_s=self._capacityWaitSeconds()," in src
     assert "cloud_type=self._cloudType()," in src
+
+
+# ---------------------------------------------------------------------------
+# stale sys.modules guard
+#
+# The asset and the package are updated together, but Python caches modules for
+# the life of the process: a Houdini already open when the checkout updated
+# loads the NEW asset against the OLD package. In the field that surfaced on
+# scene open as
+#     ImportError: cannot import name 'CLOUD_TYPE_SECURE' from 'rpfarm.runpod_api'
+# which names a symbol the artist has never heard of and does not say that the
+# fix is to restart Houdini.
+# ---------------------------------------------------------------------------
+
+
+def _guard():
+    return load_methods(
+        ["_version_tuple", "_ondisk_rpfarm_version", "_stale_module_message"],
+        extra_globals={"ast": ast, "pathlib": pathlib},
+    )
+
+
+def test_matching_versions_say_nothing():
+    ns = _guard()
+
+    assert ns["_stale_module_message"]("2.1.0", "2.1.0", "2.1.0", "/root") is None
+
+
+def test_a_newer_package_than_the_asset_needs_is_fine():
+    """The declared version is a floor. Bumping rpfarm.VERSION on its own must
+    not make every scene shout, and a new package with an old asset never
+    broke anything -- only the other direction does."""
+    ns = _guard()
+
+    assert ns["_stale_module_message"]("2.1.0", "2.4.7", "2.4.7", "/root") is None
+
+
+def test_stale_in_memory_but_fine_on_disk_says_restart_houdini():
+    ns = _guard()
+
+    message = ns["_stale_module_message"]("2.1.0", "2.0.0", "2.1.0", "/root")
+
+    assert message is not None
+    assert "ПЕРЕЗАПУСТИТЕ HOUDINI" in message
+    assert "2.0.0" in message and "2.1.0" in message
+    # The fix must not be confused with the other cause.
+    assert "rpfarm setup" not in message
+
+
+def test_an_old_package_without_a_version_at_all_is_still_caught():
+    """The copy that broke predates VERSION being checked, so getattr gives
+    None -- which must read as stale, not as 'no information'."""
+    ns = _guard()
+
+    message = ns["_stale_module_message"]("2.1.0", None, "2.1.0", "/root")
+
+    assert message is not None
+    assert "ПЕРЕЗАПУСТИТЕ HOUDINI" in message
+
+
+def test_an_old_checkout_says_update_and_setup_not_restart():
+    """Restarting cannot fix a checkout that is behind the installed asset."""
+    ns = _guard()
+
+    message = ns["_stale_module_message"]("2.1.0", "2.0.0", "2.0.0", "/root")
+
+    assert message is not None
+    assert "rpfarm setup" in message
+    assert "ПЕРЕЗАПУСТИТЕ HOUDINI" not in message
+    assert "/root" in message
+
+
+def test_version_tuple_never_raises_on_junk():
+    ns = _guard()
+
+    assert ns["_version_tuple"]("2.1.0") == (2, 1, 0)
+    assert ns["_version_tuple"]("2.1.0rc1") == (2, 1, 1)
+    assert ns["_version_tuple"](None) == (0,)
+    assert ns["_version_tuple"]("") == (0,)
+    assert ns["_version_tuple"]("junk") == (0,)
+    assert ns["_version_tuple"]("2.1.0") > ns["_version_tuple"]("2.0.9")
+
+
+def test_the_on_disk_version_is_read_without_importing(tmp_path):
+    """Importing is what returns the cached module, so it cannot answer this."""
+    ns = _guard()
+    pkg = tmp_path / "rpfarm"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text('"""doc"""\n\nVERSION = "2.1.0"\n')
+
+    assert ns["_ondisk_rpfarm_version"](tmp_path) == "2.1.0"
+    assert "rpfarm" not in sys.modules or sys.modules["rpfarm"].VERSION != "2.1.0-marker"
+
+
+def test_an_unreadable_or_odd_init_returns_none_instead_of_exploding(tmp_path):
+    ns = _guard()
+    pkg = tmp_path / "rpfarm"
+    pkg.mkdir()
+
+    assert ns["_ondisk_rpfarm_version"](tmp_path) is None      # no __init__ at all
+
+    (pkg / "__init__.py").write_text("this is not python (((")
+    assert ns["_ondisk_rpfarm_version"](tmp_path) is None      # unparseable
+
+    (pkg / "__init__.py").write_text("OTHER = 1\n")
+    assert ns["_ondisk_rpfarm_version"](tmp_path) is None      # no VERSION
+
+
+def test_the_asset_declares_a_minimum_and_checks_it_before_importing_symbols():
+    """Order matters: the guard is useless after the import it protects."""
+    src = MODULE.read_text()
+
+    guard = src.index("_stale = _stale_module_message(")
+    first_symbol_import = src.index("from rpfarm.runpod_api import")
+    assert guard < first_symbol_import
+
+    assert '_MIN_RPFARM_VERSION = "' in src
+    assert "raise ImportError(_stale)" in src

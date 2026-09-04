@@ -1,4 +1,23 @@
 import pdg
+
+try:
+    _scheduler_class = kwargs['type'].hdaModule().RunPodFarmScheduler
+except AttributeError:
+    # The PythonModule did not finish importing, so its class never got
+    # defined. The real reason is in the error right above this one; by far
+    # the most common one is a Houdini that was started before the code
+    # updated, which re-raises here as a second, meaningless AttributeError
+    # about a name the artist has never heard of. Say the useful thing again
+    # instead of that.
+    raise ImportError(
+        "Модуль ноды фермы не загрузился — настоящая причина в сообщении "
+        "выше.\n\nЧаще всего это значит, что Houdini был запущен до "
+        "обновления кода: ПЕРЕЗАПУСТИТЕ HOUDINI."
+    # `from None`: without it Houdini prints "During handling of the above
+    # exception..." plus the AttributeError about RunPodFarmScheduler, which is
+    # the noise this whole branch exists to remove.
+    ) from None
+
 pdg.TypeRegistry.types().registerScheduler(
-    kwargs['type'].hdaModule().RunPodFarmScheduler,
+    _scheduler_class,
     label='RunPodFarm Scheduler')
