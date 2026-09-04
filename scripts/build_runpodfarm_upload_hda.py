@@ -224,17 +224,22 @@ compress = rppkg.resolve_compress_flag(node.evalParm("rpfarm_compress"))
 # package. sys.executable here is hython itself, so it is the fallback, not
 # the choice; see the resolver below.
 in_process = bool(node.evalParm("rpfarm_inprocess"))
-# The interpreter is resolved explicitly, never off PATH. A Houdini launched
-# from the macOS Dock inherits a minimal PATH where "python3" is Xcode's 3.9,
-# which has no tomllib, so every package item died on `import rpfarm.config`
-# before doing any work -- and every headless run went through a shell whose
-# PATH started with a modern python, so this passed the smoke for the wrong
-# reason. rphou.resolve_package_python prefers the plain python bundled with
-# THIS running Houdini ($HFS), which is guaranteed present and takes no
-# licence (hython would take one per package).
-python3, python3_why = rphou.resolve_package_python(
-    hfs=hou.getenv("HFS") or hou.expandString("$HFS"))
-print("[rpfarm-upload] package runner interpreter: {}  ({})".format(python3, python3_why))
+# The interpreter is resolved explicitly and then EXECUTED to read its real
+# version, never taken off PATH on faith. A Houdini launched from the macOS
+# Dock inherits a minimal PATH where "python3" is Xcode's 3.9, which has no
+# tomllib, so every package item died on `import rpfarm.config` before doing
+# any work -- while every headless run went through a shell whose PATH started
+# with a modern python and so passed for the wrong reason. The resolver
+# prefers the plain python bundled with THIS running Houdini ($HFS): always
+# present, modern, and no licence (hython would take one per package). If it
+# cannot find anything that can import rpfarm it raises rather than handing
+# the item an interpreter that will fail at the far end of a cook.
+try:
+    python3, python3_why = rphou.resolve_package_python(
+        hfs=hou.getenv("HFS") or hou.expandString("$HFS"))
+except rphou.NoUsablePythonError as e:
+    raise hou.NodeError(str(e))
+print("[rpfarm-upload] package runner interpreter: {} ({})".format(python3, python3_why))
 items_dir = tempfile.mkdtemp(prefix="rpfarm_upload_items_")
 # "python3 -m rpfarm.package_runner" has to resolve the rpfarm package
 # BEFORE any of package_runner's own code (its $RPFARM_ROOT/~/.rpfarm/src

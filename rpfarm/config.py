@@ -16,12 +16,30 @@ import json
 import os
 import platform
 import secrets
+import sys
 import tempfile
-import tomllib
 import urllib.request
 import zipfile
 from dataclasses import dataclass, field, fields
 from pathlib import Path
+
+try:
+    import tomllib
+except ImportError as exc:  # pragma: no cover - depends on the interpreter
+    # A bare "No module named 'tomllib'" is what an artist saw when a work
+    # item was launched with Xcode's python3.9 off a Dock-launched Houdini's
+    # minimal PATH. The module name alone says nothing about which of the
+    # several pythons on a Mac is running or what it should have been, so
+    # say both.
+    raise ImportError(
+        "rpfarm needs Python 3.11 or newer (tomllib), but this is "
+        "{}.{}.{} at {}. If this came from a PDG work item, the item's "
+        "command was given the wrong interpreter -- see "
+        "rpfarm.houdini_local.resolve_package_python, which is supposed to "
+        "hand it the plain python bundled inside Houdini.".format(
+            sys.version_info[0], sys.version_info[1], sys.version_info[2],
+            sys.executable)
+    ) from exc
 
 from .runpod_api import DEFAULT_DATACENTER
 
