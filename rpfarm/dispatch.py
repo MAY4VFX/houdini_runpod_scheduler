@@ -52,6 +52,15 @@ BACKPRESSURE_DEPTH = 3
 # A pod that has answered /health and then goes quiet for this long is dead.
 POD_DEAD_AFTER_SECONDS = 60
 
+# Extra grace every pod gets while EVERY pod is failing its health check at
+# once -- see OutageTracker. Long enough to ride out a proxy or uplink blip,
+# short enough that a farm that really is gone still gets cleaned up.
+OUTAGE_GRACE_SECONDS = 300
+
+# How long to wait before retrying a terminate call that failed. A pod whose
+# terminate failed is still running and still billing, so this is short.
+TERMINATE_RETRY_SECONDS = 30
+
 # How long a pod that has never answered /health gets to boot before it is
 # given up on. Deliberately generous and separate from the heartbeat above:
 # the image pulls Houdini off the network volume, which the spec measures at
@@ -307,6 +316,88 @@ class Dispatcher:
             and p.idle_since is not None
             and now - p.idle_since > idle_seconds
         ]
+
+
+class OutageTracker:
+    """Tells "these pods are dead" apart from "this uplink is down".
+
+    Every pod in a cook is reached through the same RunPod proxy over the
+    same uplink, and ``WorkerClient.health()`` returns ``None`` for any
+    transport error or proxy 5xx/524 alike. So a blip longer than
+    :data:`POD_DEAD_AFTER_SECONDS` on *this* side fails every pod in the
+    same sweep. Judging each pod on its own then tears down the whole farm
+    at once -- and the terminate calls fail for the very same reason, so
+    the pods are dropped from tracking while they are still running and
+    billing (final-review finding 6).
+
+    A sweep in which at least one pod answered is ordinary: the pods that
+    failed really are in trouble and their own clock applies unchanged. A
+    sweep in which *no* pod answered is treated as a local outage, and every
+    pod gets :data:`OUTAGE_GRACE_SECONDS` on top of its deadline before any
+    of them can be declared dead.
+
+    Only pods that have already answered once (status ``RUNNING``) count: a
+    pod still booting has not failed a heartbeat, it has not started one,
+    and a farm of nothing but booting pods is not an outage.
+    """
+
+    def __init__(self, grace_seconds: float = OUTAGE_GRACE_SECONDS):
+        self.grace_seconds = grace_seconds
+        self.since: float | None = None
+
+    def sweep(self, now: float, polled: int, healthy: int) -> bool:
+        """Record one health sweep; return True if it looks like an outage.
+
+        ``polled`` is how many RUNNING pods were asked this sweep and
+        ``healthy`` how many answered. A sweep that asked nobody neither
+        starts nor ends a streak -- it is no evidence either way.
+        """
+        if polled <= 0:
+            return self.since is not None
+        if healthy > 0:
+            self.since = None
+            return False
+        if self.since is None:
+            self.since = now
+        return True
+
+    def dead_seconds(self, base: float = POD_DEAD_AFTER_SECONDS) -> float:
+        """The heartbeat deadline to judge pods by right now."""
+        return base + self.grace_seconds if self.since is not None else base
+
+
+class TerminateRetries:
+    """Pods whose terminate call failed, and are therefore still billing.
+
+    Final-review finding 6: ``_terminate_pod`` logged "it may still be
+    running and billing" and dropped the pod, with no list to come back to
+    -- so ``onStopCook`` never tried again and nothing else ever would. A
+    failed terminate is exactly the case that must be retried, because the
+    usual reason it failed (the network) is temporary and the meter is not.
+    """
+
+    def __init__(self, interval_s: float = TERMINATE_RETRY_SECONDS):
+        self.interval_s = interval_s
+        self._next_try: dict[str, float] = {}
+
+    def add(self, pod_id: str, now: float) -> None:
+        """Record a failed terminate (or re-arm one that failed again)."""
+        self._next_try[pod_id] = now + self.interval_s
+
+    def clear(self, pod_id: str) -> None:
+        self._next_try.pop(pod_id, None)
+
+    def due(self, now: float) -> list[str]:
+        """Pod ids whose retry is due, oldest deadline first."""
+        return [pid for pid, when in sorted(self._next_try.items(), key=lambda kv: (kv[1], kv[0]))
+                if when <= now]
+
+    def pending(self) -> list[str]:
+        """Every pod still not confirmed terminated, deterministically ordered."""
+        return sorted(self._next_try)
+
+    def __len__(self) -> int:
+        return len(self._next_try)
 
 
 # -- pure decisions ----------------------------------------------------------

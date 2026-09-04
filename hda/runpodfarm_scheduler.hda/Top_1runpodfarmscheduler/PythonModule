@@ -460,6 +460,11 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         self._last_status_update = 0.0
         self._last_health_poll = {}
         self._last_task_poll = {}
+        # Tells "the pods are dead" apart from "our uplink is down", and
+        # remembers pods whose terminate call failed (they are still
+        # billing) so the tick and onStopCook can try again.
+        self._outage = rpdispatch.OutageTracker()
+        self._terminate_retries = rpdispatch.TerminateRetries()
         self._killed_over_budget = False
         self._last_pod_error = None
         self._last_scale_failure = 0.0
@@ -900,6 +905,15 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         started one yet.
         """
         now = time.time()
+
+        # Ask everyone first, decide after. Every pod is reached through the
+        # same proxy over the same uplink, so a blip on THIS side fails all
+        # of them in one sweep -- judging each pod as it is polled would
+        # terminate the whole farm for a 61-second hiccup (final-review
+        # finding 6). Only pods that have already answered once count
+        # towards that: a booting pod has not failed a heartbeat.
+        failures = []
+        polled = healthy = 0
         for pod in list(self._dispatcher.pods.values()):
             if now - self._last_health_poll.get(pod.pod_id, 0.0) < _HEALTH_POLL_INTERVAL:
                 continue
@@ -907,7 +921,12 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
 
             client = self._clients.get(pod.pod_id)
             health = client.health() if client else None
+            running = pod.status == "RUNNING"
+            if running:
+                polled += 1
             if health:
+                if running:
+                    healthy += 1
                 pod.health_fail_since = None
                 if pod.status != "RUNNING":
                     self._promote_pod(pod, health)
@@ -915,8 +934,18 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
 
             if pod.health_fail_since is None:
                 pod.health_fail_since = now
+            failures.append(pod)
 
-            reason = rpdispatch.pod_timed_out(pod, now)
+        outage = self._outage.sweep(now, polled, healthy)
+        if outage and failures:
+            self._verboseLog(
+                "no pod answered /health this sweep ({} pod(s)); treating it as a "
+                "local outage and holding off for {:.0f}s more before giving up on "
+                "any of them".format(polled, rpdispatch.OUTAGE_GRACE_SECONDS))
+        dead_seconds = self._outage.dead_seconds()
+
+        for pod in failures:
+            reason = rpdispatch.pod_timed_out(pod, now, dead_seconds=dead_seconds)
             if reason is not None:
                 self._giveUpOnPod(pod, reason)
 
@@ -1239,9 +1268,40 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
             self._api.terminate_pod(pod_id)
         except RunPodError as e:
             # Always visible: a pod that would not terminate is still being
-            # billed, and the artist has to know to go and kill it.
+            # billed, and the artist has to know to go and kill it. It also
+            # goes on the retry list -- the usual reason a terminate fails
+            # (the network) is temporary and the meter is not, and this used
+            # to be the end of the line: the pod was dropped from the pool
+            # with nothing left to try it again (final-review finding 6).
+            self._terminate_retries.add(pod_id, time.time())
             self._log("TERMINATE FAILED for pod {}: {} -- it may still be "
-                      "running and billing. Use Kill All Pods.".format(pod_id, e))
+                      "running and billing; will retry.".format(pod_id, e))
+        else:
+            self._terminate_retries.clear(pod_id)
+
+    def _retryTerminations(self, force=False):
+        """Try again on every pod whose terminate call failed.
+
+        Called each tick (only the ids whose backoff is up) and once more
+        from onStopCook with force=True, which is the last chance: after
+        _reset_cook_state nothing is left holding the ids. Goes straight to
+        the API rather than back through _terminate_pod, because the pod's
+        spend was already banked into the cook total by the first attempt
+        and re-banking it would inflate both the budget decision and the
+        ledger's cook_summary.
+        """
+        if not self._terminate_retries or self._api is None:
+            return
+        now = time.time()
+        for pod_id in (self._terminate_retries.pending() if force else self._terminate_retries.due(now)):
+            try:
+                self._api.terminate_pod(pod_id)
+            except RunPodError as e:
+                self._terminate_retries.add(pod_id, now)
+                self._verboseLog("terminate retry for pod {} failed: {}".format(pod_id, e))
+            else:
+                self._terminate_retries.clear(pod_id)
+                self._log("pod {} terminated on retry".format(pod_id))
 
     # -------------------------------------------------------------------------
     # Status tab
@@ -1828,6 +1888,7 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
             return tickResult.SchedulerCancelCook
 
         self._dispatcher.release_full()
+        self._retryTerminations()
         self._poll_pods()
         self._dispatch_pending()
         self._poll_tasks()
@@ -1915,6 +1976,16 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         for pod_id in list(self._dispatcher.pods):
             self._terminate_pod(pod_id)
             self._dispatcher.remove_pod(pod_id)
+
+        # Anything that would not terminate is still running and billing.
+        # This is the last chance to get it: after _reset_cook_state there
+        # is nothing left holding the ids.
+        self._retryTerminations(force=True)
+        if self._terminate_retries.pending():
+            self._log(
+                "STILL RUNNING AND BILLING after repeated terminate attempts: {}. "
+                "Kill them with `rpfarm farm kill --all` or the Kill All Pods "
+                "button.".format(", ".join(self._terminate_retries.pending())))
 
         if not cancel and self._sync_queue:
             self._log("finishing {} queued download(s)...".format(len(self._sync_queue)))
