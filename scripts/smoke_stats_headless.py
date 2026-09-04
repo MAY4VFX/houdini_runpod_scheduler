@@ -29,8 +29,20 @@ import time
 import hou
 
 
-def log(message):
-    print("[smoke-stats] {}".format(message), flush=True)
+def _bootstrap_rpfarm():
+    """Put ``rpfarm`` on ``sys.path`` -- ``$RPFARM_ROOT`` if set (how these
+    scripts are meant to be run), else this checkout, found from this file."""
+    root = os.environ.get("RPFARM_ROOT") or os.path.dirname(
+        os.path.dirname(os.path.abspath(__file__)))
+    if root not in sys.path:
+        sys.path.insert(0, root)
+
+
+_bootstrap_rpfarm()
+
+from rpfarm import smoke as rpsmoke  # noqa: E402  (needs the path above first)
+
+log = rpsmoke.make_log("smoke-stats")
 
 
 def write_ledger(ledger_dir):

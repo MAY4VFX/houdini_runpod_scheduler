@@ -1,4 +1,4 @@
-"""``rpfarm`` command-line interface: setup, doctor, houdini, storage, farm, costs.
+"""``rpfarm`` command-line interface: setup, doctor, houdini, storage, farm, costs, smoke.
 
 Thin wrappers over the same ``rpfarm/`` modules the HDAs use (``config``,
 ``runpod_api``, ``pods``, ``worker_client``, ``packages``, ``ledger``,
@@ -1070,6 +1070,13 @@ def build_parser():
     p_costs.add_argument("--until", metavar="YYYY-MM-DD", help="only records started on/before this date")
     p_costs.add_argument("--billing", action="store_true", help="merge in RunPod's actual billed cost (GET /billing/pods)")
 
+    # Imported here, not at module scope: rpfarm.smoke reuses this module's
+    # formatting helpers, so a top-level import either way round would be
+    # circular. By the time build_parser() runs, this module is fully loaded.
+    from . import smoke as rpsmoke
+
+    rpsmoke.build_smoke_parser(sub)
+
     return p
 
 
@@ -1102,6 +1109,10 @@ def main(argv=None):
             return _FARM_HANDLERS[args.farm_command](args)
         if args.command == "costs":
             return cmd_costs(args)
+        if args.command == "smoke":
+            from . import smoke as rpsmoke
+
+            return rpsmoke.cmd_smoke(args)
     except rpcfg.ConfigError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
