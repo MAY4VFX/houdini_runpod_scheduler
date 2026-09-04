@@ -5,9 +5,14 @@ import json
 import pytest
 
 from rpfarm.dispatch import (
+    OUTAGE_GRACE_SECONDS,
+    POD_DEAD_AFTER_SECONDS,
+    TERMINATE_RETRY_SECONDS,
     Dispatcher,
+    OutageTracker,
     PodState,
     TaskState,
+    TerminateRetries,
     append_record,
     autoscale_decision,
     budget_state,
@@ -386,3 +391,86 @@ def test_fail_pending_ignores_an_unknown_task():
     d.enqueue(T(1))
     assert d.fail_pending("nope") is None
     assert len(d.pending) == 1 and d.failed == []
+
+
+# -- outage vs. dead pods (final-review finding 6) ---------------------------
+
+
+def test_outage_tracker_needs_every_pod_to_fail():
+    t = OutageTracker()
+    assert t.sweep(now=10.0, polled=3, healthy=1) is False
+    assert t.dead_seconds() == POD_DEAD_AFTER_SECONDS
+    assert t.sweep(now=15.0, polled=3, healthy=0) is True
+    assert t.dead_seconds() == POD_DEAD_AFTER_SECONDS + OUTAGE_GRACE_SECONDS
+
+
+def test_outage_tracker_clears_as_soon_as_one_pod_answers():
+    t = OutageTracker()
+    t.sweep(now=10.0, polled=2, healthy=0)
+    assert t.since == 10.0
+    t.sweep(now=20.0, polled=2, healthy=1)
+    assert t.since is None
+    assert t.dead_seconds() == POD_DEAD_AFTER_SECONDS
+
+
+def test_outage_tracker_keeps_the_streak_start_across_sweeps():
+    """The grace is measured from when the outage started, not from the
+    latest sweep, so it cannot be extended indefinitely one sweep at a
+    time -- the caller's per-pod clock is what eventually expires."""
+    t = OutageTracker()
+    t.sweep(now=10.0, polled=2, healthy=0)
+    t.sweep(now=15.0, polled=2, healthy=0)
+    t.sweep(now=20.0, polled=2, healthy=0)
+    assert t.since == 10.0
+
+
+def test_a_sweep_that_polled_nobody_is_no_evidence_either_way():
+    t = OutageTracker()
+    assert t.sweep(now=10.0, polled=0, healthy=0) is False
+    assert t.since is None
+    t.sweep(now=11.0, polled=1, healthy=0)
+    assert t.sweep(now=12.0, polled=0, healthy=0) is True, "an ongoing outage stays ongoing"
+    assert t.since == 11.0
+
+
+def test_pod_timed_out_honours_the_widened_deadline():
+    pod = PodState(pod_id="a", status="RUNNING", health_fail_since=0.0)
+    widened = POD_DEAD_AFTER_SECONDS + OUTAGE_GRACE_SECONDS
+    assert pod_timed_out(pod, now=POD_DEAD_AFTER_SECONDS + 1, dead_seconds=widened) is None
+    assert pod_timed_out(pod, now=widened + 1, dead_seconds=widened) == "dead"
+
+
+# -- terminate retries -------------------------------------------------------
+
+
+def test_terminate_retries_are_due_only_after_the_backoff():
+    r = TerminateRetries()
+    r.add("a", now=0.0)
+    assert r.pending() == ["a"] and len(r) == 1
+    assert r.due(now=TERMINATE_RETRY_SECONDS - 1) == []
+    assert r.due(now=TERMINATE_RETRY_SECONDS) == ["a"]
+
+
+def test_terminate_retries_clear_on_success():
+    r = TerminateRetries()
+    r.add("a", now=0.0)
+    r.clear("a")
+    assert r.pending() == [] and not r
+    r.clear("a")  # clearing something unknown is not an error
+
+
+def test_terminate_retries_rearm_when_a_retry_fails_again():
+    r = TerminateRetries()
+    r.add("a", now=0.0)
+    r.add("a", now=100.0)  # the retry at t=100 failed too
+    assert r.due(now=100.0) == []
+    assert r.due(now=100.0 + TERMINATE_RETRY_SECONDS) == ["a"]
+
+
+def test_terminate_retries_are_ordered_deterministically():
+    r = TerminateRetries()
+    r.add("b", now=0.0)
+    r.add("a", now=0.0)
+    r.add("c", now=-100.0)
+    assert r.pending() == ["a", "b", "c"]
+    assert r.due(now=TERMINATE_RETRY_SECONDS) == ["c", "a", "b"]
