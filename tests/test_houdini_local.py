@@ -185,8 +185,33 @@ def test_install_node_shape_reports_a_missing_source_instead_of_raising(tmp_path
 # Dock inherits a minimal PATH where that is Xcode's python3.9, which has no
 # tomllib, so every upload item died on `import rpfarm.config`. Headless runs
 # went through a shell with a modern python first on PATH and so never saw it.
-# These tests pin the resolution order that replaced it.
+# These tests pin the resolution order that replaced it, and the rule that
+# every candidate is executed before it is trusted.
 # ---------------------------------------------------------------------------
+
+
+def _fake_run(versions):
+    """A subprocess.run stand-in reporting `versions[exe]`, or failing."""
+
+    class _Result:
+        def __init__(self, returncode, stdout):
+            self.returncode = returncode
+            self.stdout = stdout
+
+    def run(cmd, **_kwargs):
+        version = versions.get(cmd[0])
+        if version is None:
+            return _Result(1, "")
+        return _Result(0, "{} {}".format(*version))
+
+    return run
+
+
+@pytest.fixture(autouse=True)
+def _clear_version_cache():
+    hl._VERSION_CACHE.clear()
+    yield
+    hl._VERSION_CACHE.clear()
 
 
 def _mac_hfs(tmp_path, py="3.13"):
@@ -204,17 +229,34 @@ def _mac_hfs(tmp_path, py="3.13"):
 def test_bundled_python_found_beside_houdini_framework_on_macos(tmp_path):
     hfs, exe = _mac_hfs(tmp_path)
 
-    got = hl.houdini_bundled_python(str(hfs), (3, 13), platform_name="darwin")
-
-    assert got == str(exe)
+    assert hl.houdini_bundled_python(str(hfs), (3, 13), platform_name="darwin") == str(exe)
 
 
-def test_bundled_python_version_comes_from_the_caller_not_a_hardcoded_one(tmp_path):
-    # A Houdini on python3.11 must resolve python3.11, not 3.13.
+def test_bundled_python_version_is_never_hardcoded(tmp_path):
+    """The version is the install's, not a constant and not the caller's.
+
+    Houdini 22.0 ships 3.13 and older ones 3.11/3.10, so a hardcoded tag would
+    resolve nothing on half the installs. The caller's own sys.version_info is
+    the right hint only when the caller *is* Houdini (the generate script); for
+    the CLI or a test it is some other python entirely, and silently missing
+    there would fall through to PATH -- the exact failure this function exists
+    to prevent. So a missed hint falls back to what the install really has.
+    """
     hfs, exe = _mac_hfs(tmp_path, py="3.11")
 
     assert hl.houdini_bundled_python(str(hfs), (3, 11), platform_name="darwin") == str(exe)
-    assert hl.houdini_bundled_python(str(hfs), (3, 13), platform_name="darwin") is None
+    assert hl.houdini_bundled_python(str(hfs), (3, 13), platform_name="darwin") == str(exe)
+    assert hl.houdini_bundled_python(str(hfs), platform_name="darwin") == str(exe)
+
+
+def test_bundled_python_picks_the_newest_when_an_install_has_several(tmp_path):
+    hfs, exe313 = _mac_hfs(tmp_path, py="3.13")
+    versions = hfs.parents[3] / "Python.framework" / "Versions"
+    older = versions / "3.11" / "bin"
+    older.mkdir(parents=True)
+    (older / "python3.11").write_text("")
+
+    assert hl.houdini_bundled_python(str(hfs), (3, 9), platform_name="darwin") == str(exe313)
 
 
 def test_bundled_python_linux_and_windows_layouts(tmp_path):
@@ -242,43 +284,84 @@ def test_resolve_prefers_the_bundled_interpreter(tmp_path):
 
     got, why = hl.resolve_package_python(
         hfs=str(hfs), version=(3, 13), platform_name="darwin",
-        running="/usr/bin/hython", running_version=(3, 13),
-        discover=lambda: "/opt/homebrew/bin/python3.14")
+        which=lambda n: "/usr/bin/python3",
+        run=_fake_run({str(exe): (3, 13), "/usr/bin/python3": (3, 14)}))
 
     assert got == str(exe)
     assert "bundled" in why and "licence" in why
 
 
-def test_resolve_falls_back_to_the_running_interpreter_when_new_enough(tmp_path):
+def test_a_bundled_path_that_is_too_old_is_rejected_not_trusted(tmp_path):
+    """Existing at the right path under the right name is not proof."""
+    hfs, exe = _mac_hfs(tmp_path)
+
     got, why = hl.resolve_package_python(
-        hfs=str(tmp_path / "no-such-hfs"), version=(3, 13), platform_name="darwin",
-        running="/opt/hfs/bin/hython", running_version=(3, 13),
-        discover=lambda: "/opt/homebrew/bin/python3.14")
+        hfs=str(hfs), version=(3, 13), platform_name="darwin",
+        which=lambda n: "/opt/py/python3" if n == "python3" else None,
+        run=_fake_run({str(exe): (3, 9), "/opt/py/python3": (3, 12)}))
 
-    assert got == "/opt/hfs/bin/hython"
-    # The licence cost of that choice has to be visible in the log.
-    assert "hython" in why and "licence" in why
+    assert got == "/opt/py/python3"
+    assert "PATH" in why
 
 
-def test_resolve_skips_a_too_old_running_interpreter_and_searches_disk(tmp_path):
+def test_a_python3_on_path_that_is_too_old_is_skipped_for_a_named_one(tmp_path):
+    """The exact Dock case: which('python3') is Xcode's 3.9."""
+    which = {"python3": "/usr/bin/python3", "python3.13": "/opt/homebrew/bin/python3.13"}
+
     got, why = hl.resolve_package_python(
-        hfs=None, version=(3, 9), platform_name="darwin",
-        running="/usr/bin/python3", running_version=(3, 9),
-        discover=lambda: "/opt/homebrew/bin/python3.14")
+        hfs=None, version=(3, 13), platform_name="darwin",
+        which=which.get,
+        run=_fake_run({"/usr/bin/python3": (3, 9),
+                       "/opt/homebrew/bin/python3.13": (3, 13)}))
 
-    assert got == "/opt/homebrew/bin/python3.14"
-    assert "on disk" in why
+    assert got == "/opt/homebrew/bin/python3.13"
+    assert "python3.13" in why
 
 
-def test_resolve_last_resort_is_bare_python3_and_says_it_is_a_warning():
-    got, why = hl.resolve_package_python(
-        hfs=None, version=(3, 9), platform_name="darwin",
-        running="/usr/bin/python3", running_version=(3, 9),
-        discover=lambda: None)
+def test_named_pythons_are_tried_newest_first(tmp_path):
+    which = {"python3.11": "/bin/python3.11", "python3.13": "/bin/python3.13"}
 
-    assert got == "python3"
-    assert why.startswith("WARNING")
-    assert "tomllib" in why
+    got, _why = hl.resolve_package_python(
+        hfs=None, version=(3, 13), platform_name="darwin", which=which.get,
+        run=_fake_run({"/bin/python3.11": (3, 11), "/bin/python3.13": (3, 13)}))
+
+    assert got == "/bin/python3.13"
+
+
+def test_resolve_refuses_rather_than_returning_a_bare_python3(tmp_path):
+    with pytest.raises(hl.NoUsablePythonError) as excinfo:
+        hl.resolve_package_python(
+            hfs=str(tmp_path / "no-hfs"), version=(3, 13), platform_name="darwin",
+            which=lambda n: "/usr/bin/python3" if n == "python3" else None,
+            run=_fake_run({"/usr/bin/python3": (3, 9)}), search_dirs=[])
+
+    message = str(excinfo.value)
+    assert "3.11" in message
+    assert "/usr/bin/python3 -> 3.9" in message   # names what it tried, and why it failed
+    assert "$HFS" in message
+
+
+def test_python_version_runs_the_interpreter_and_caches_the_answer():
+    calls = []
+
+    def run(cmd, **_kwargs):
+        calls.append(cmd[0])
+
+        class R:
+            returncode = 0
+            stdout = "3 13"
+        return R()
+
+    assert hl.python_version("/x/python3", run=run) == (3, 13)
+    assert hl.python_version("/x/python3", run=run) == (3, 13)
+    assert calls == ["/x/python3"]
+
+
+def test_python_version_is_none_for_an_interpreter_that_will_not_run():
+    def run(cmd, **_kwargs):
+        raise OSError("no such file")
+
+    assert hl.python_version("/nope/python3", run=run) is None
 
 
 def test_discover_picks_the_newest_and_ignores_pre_3_11(tmp_path):
@@ -291,9 +374,7 @@ def test_discover_picks_the_newest_and_ignores_pre_3_11(tmp_path):
     (new / "python3.14").write_text("")
     (new / "python3.12").write_text("")
 
-    got = hl.discover_python_on_disk(search_dirs=[str(old), str(new)])
-
-    assert got == str(new / "python3.14")
+    assert hl.discover_python_on_disk(search_dirs=[str(old), str(new)]) == str(new / "python3.14")
 
 
 def test_discover_returns_none_when_nothing_is_new_enough(tmp_path):
@@ -305,42 +386,25 @@ def test_discover_returns_none_when_nothing_is_new_enough(tmp_path):
     assert hl.discover_python_on_disk(search_dirs=[str(tmp_path / "missing")]) is None
 
 
-def test_the_resolved_interpreter_can_actually_import_tomllib(tmp_path):
-    """The whole point, checked against this machine's real Houdini.
+def test_the_resolved_interpreter_really_imports_tomllib_on_this_machine():
+    """The whole point, against this machine's real Houdini.
 
-    Skipped where no Houdini is installed; where one is, a resolver that
-    returns something without tomllib has not fixed the bug it exists for.
+    A resolver that returns something without tomllib has not fixed the bug it
+    exists for, so this runs the thing it chose.
     """
     installs = hl.find_houdini_installations()
     if not installs:
         pytest.skip("no local Houdini installation")
-    hfs = str(installs[0].hfs) if hasattr(installs[0], "hfs") else None
+    hfs = str(getattr(installs[0], "hfs", "") or "")
     if not hfs:
         pytest.skip("install has no HFS path to derive from")
-    exe = hl.houdini_bundled_python(hfs, _houdini_python_version(hfs))
-    if not exe:
-        pytest.skip("no bundled python found for {}".format(hfs))
+    try:
+        exe, why = hl.resolve_package_python(hfs=hfs)
+    except hl.NoUsablePythonError:
+        pytest.skip("no usable python on this machine")
     out = subprocess.run(
         [exe, "-c", "import tomllib, sys; print(sys.version_info[0], sys.version_info[1])"],
         capture_output=True, text=True)
     assert out.returncode == 0, out.stderr
-    major, minor = (int(x) for x in out.stdout.split())
-    assert (major, minor) >= hl.PACKAGE_PYTHON_MIN
-
-
-def _houdini_python_version(hfs):
-    """(major, minor) of the Python shipped with the install at ``hfs``."""
-    import glob as _glob
-    versions = _glob.glob(os.path.join(hfs, "..", "..", "..", "..", "Python.framework", "Versions", "3.*"))
-    versions += _glob.glob(os.path.join(hfs, "python", "lib", "python3.*"))
-    best = None
-    for v in versions:
-        name = os.path.basename(v.rstrip("/"))
-        digits = name.replace("python", "")
-        try:
-            major, minor = (int(x) for x in digits.split(".")[:2])
-        except ValueError:
-            continue
-        if best is None or (major, minor) > best:
-            best = (major, minor)
-    return best or (3, 13)
+    assert tuple(int(x) for x in out.stdout.split()) >= hl.PACKAGE_PYTHON_MIN
+    assert "bundled" in why, "expected Houdini's own python, got: " + why
