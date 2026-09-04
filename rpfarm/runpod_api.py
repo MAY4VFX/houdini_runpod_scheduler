@@ -26,6 +26,12 @@ GRAPHQL_URL = "https://api.runpod.io/graphql"
 # against the live endpoint: no header -> 403, "rpfarm/2.0.0" -> 200.
 USER_AGENT = "rpfarm/{}".format(VERSION)
 
+# Fallback region for a caller that has no configured one (and the default
+# for a brand-new volume). Every real caller passes ``cfg.datacenter``: a
+# network volume exists in exactly one region, and a pod can only mount one
+# that is in its own.
+DEFAULT_DATACENTER = "EU-RO-1"
+
 _BALANCE_QUERY = "{ myself { clientBalance } }"
 
 
@@ -80,7 +86,18 @@ class RunPodAPI:
 
     # -- pods ------------------------------------------------------------
 
-    def _pod_body(self, name, template_id, volume_id, env, ports):
+    def _pod_body(self, name, template_id, volume_id, env, ports, datacenter=DEFAULT_DATACENTER):
+        """The fields every pod create shares.
+
+        ``datacenter`` used to be the hardcoded :data:`DEFAULT_DATACENTER`
+        while ``cfg.datacenter``, the scheduler's ``rpfarm_datacenter``
+        parm, ``doctor``'s stock check and ``storage recreate`` all honoured
+        the configured value (final-review finding 5). A network volume
+        exists in exactly one region and a pod can only mount one that is in
+        its own, so an artist whose account already held a volume elsewhere
+        got pods created in EU-RO-1 against a volume that was not there, and
+        every cook failed.
+        """
         return {
             "name": name,
             "templateId": template_id,
@@ -90,10 +107,11 @@ class RunPodAPI:
             "ports": list(ports),
             "cloudType": "SECURE",
             "supportPublicIp": True,
-            "dataCenterIds": ["EU-RO-1"],
+            "dataCenterIds": [datacenter or DEFAULT_DATACENTER],
         }
 
-    def create_gpu_pod(self, name, template_id, gpu_type_ids, volume_id, env, ports):
+    def create_gpu_pod(self, name, template_id, gpu_type_ids, volume_id, env, ports,
+                       datacenter=DEFAULT_DATACENTER):
         """Create a GPU pod, trying ``gpu_type_ids`` in the order given.
 
         ``gpuTypePriority`` defaults to ``"availability"``, which picks
@@ -104,7 +122,7 @@ class RunPodAPI:
         GPU types in the order specified in gpuTypeIds." The artist's
         priority list is a cost decision, so it is ``"custom"`` here.
         """
-        body = self._pod_body(name, template_id, volume_id, env, ports)
+        body = self._pod_body(name, template_id, volume_id, env, ports, datacenter)
         body.update(
             {
                 "computeType": "GPU",
@@ -115,7 +133,8 @@ class RunPodAPI:
         )
         return self._call("POST", "/pods", body)
 
-    def create_cpu_pod(self, name, template_id, volume_id, env, ports, vcpu=2, flavors=("cpu3c", "cpu5c")):
+    def create_cpu_pod(self, name, template_id, volume_id, env, ports, vcpu=2, flavors=("cpu3c", "cpu5c"),
+                       datacenter=DEFAULT_DATACENTER):
         """Create a CPU pod, trying ``flavors`` in the order given.
 
         Same reasoning as :meth:`create_gpu_pod`. The openapi spec: "set to
@@ -124,7 +143,7 @@ class RunPodAPI:
         cpuFlavorIds." The default flavours are cheapest-first ($0.06/h for
         cpu3c against $0.07/h for cpu5c), so the order is the point.
         """
-        body = self._pod_body(name, template_id, volume_id, env, ports)
+        body = self._pod_body(name, template_id, volume_id, env, ports, datacenter)
         body.update(
             {
                 "computeType": "CPU",
@@ -153,7 +172,7 @@ class RunPodAPI:
     def get_volume(self, vid):
         return self._call("GET", f"/networkvolumes/{vid}")
 
-    def create_volume(self, name, size_gb, dc="EU-RO-1"):
+    def create_volume(self, name, size_gb, dc=DEFAULT_DATACENTER):
         return self._call(
             "POST",
             "/networkvolumes",
@@ -223,7 +242,7 @@ class RunPodAPI:
         data = json.loads(raw)
         return float(data["data"]["myself"]["clientBalance"])
 
-    def gpu_types(self, dc="EU-RO-1"):
+    def gpu_types(self, dc=DEFAULT_DATACENTER):
         """Every GPU type RunPod knows about, with ``lowestPrice`` for *dc*.
 
         REST has no per-datacenter stock signal (``GET /gputypes`` lists

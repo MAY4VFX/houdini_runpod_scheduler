@@ -856,7 +856,7 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
             try:
                 pod = self._api.create_gpu_pod(
                     name, self._templateId(), self._gpu_list, self._volumeId(),
-                    env, rppods.PORTS,
+                    env, rppods.PORTS, datacenter=self._datacenterId(),
                 )
             except RunPodError as e:
                 self._log("pod create failed ({}): {}".format(", ".join(self._gpu_list), e))
@@ -879,6 +879,17 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
 
     def _volumeId(self):
         return self["rpfarm_networkvolumeid"].evaluateString() or self._cfg.volume_id
+
+    def _datacenterId(self):
+        """Region every pod of this cook is created in.
+
+        Same "parm overrides config" shape as _templateId/_volumeId above.
+        It has to be threaded into create_gpu_pod explicitly: RunPodAPI's
+        own default is a fallback for a caller with no config, and a pod
+        created in the wrong region cannot mount the network volume at all
+        (final-review finding 5 -- the region used to be hardcoded there).
+        """
+        return self["rpfarm_datacenter"].evaluateString() or self._cfg.datacenter
 
     def _poll_pods(self):
         """Track pod health: CREATED -> RUNNING on the first /health, and give

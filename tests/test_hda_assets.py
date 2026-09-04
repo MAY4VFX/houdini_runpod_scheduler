@@ -121,3 +121,36 @@ def test_no_builder_resizes_the_volume_itself():
     for builder, asset in BUILDERS.items():
         assert "resize_volume" not in (REPO / "scripts" / builder).read_text(), builder
         assert "resize_volume" not in _asset_text(asset), asset
+
+
+# -- the scheduler asset (hand-edited: no builder generates it) ---------------
+
+SCHEDULER_MODULE = REPO / "hda" / "runpodfarm_scheduler.hda" / "Top_1runpodfarmscheduler" / "PythonModule"
+
+
+def test_scheduler_python_module_is_valid_python():
+    """It is edited by hand and never imported by the suite (it needs `hou`
+    and `pdg`), so a syntax error would only show up in Houdini."""
+    ast.parse(SCHEDULER_MODULE.read_text())
+
+
+def test_scheduler_creates_pods_in_the_configured_datacenter():
+    """Finding 5: a GPU pod must be created in the region its network volume
+    lives in, and that region comes from the node's parm or the config --
+    never from RunPodAPI's own fallback."""
+    src = SCHEDULER_MODULE.read_text()
+    assert "datacenter=self._datacenterId()" in src
+    assert 'self["rpfarm_datacenter"].evaluateString() or self._cfg.datacenter' in src
+
+
+def test_datacenter_parm_defaults_to_the_config():
+    """Sibling parms (Template ID, Network Volume ID) default to empty and
+    mean "take it from config.toml". Datacenter defaulting to a hardcoded
+    EU-RO-1 instead is how a US-KS-2 volume ends up with EU-RO-1 pods."""
+    dialog = (REPO / "hda" / "runpodfarm_scheduler.hda" / "Top_1runpodfarmscheduler" / "DialogScript").read_text()
+    assert (
+        '            name    "rpfarm_datacenter"\n'
+        '            label   "Datacenter"\n'
+        '            type    string\n'
+        '            default { "" }\n'
+    ) in dialog

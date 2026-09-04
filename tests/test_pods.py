@@ -6,6 +6,7 @@ from rpfarm import pods
 class FakeAPI:
     def __init__(self):
         self.created, self.pods, self.terminated = [], {}, []
+        self.create_kwargs = []
 
     def list_pods(self, prefix=""):
         return [p for p in self.pods.values() if p["name"].startswith(prefix)]
@@ -20,6 +21,7 @@ class FakeAPI:
         }
         self.pods[p["id"]] = p
         self.created.append(env)
+        self.create_kwargs.append(kw)
         return p
 
     def get_pod(self, pid):
@@ -101,6 +103,21 @@ def test_ensure_sync_pod_does_not_adopt_prefix_match(tmp_path, monkeypatch):
     assert len(api.created) == 1
     assert "alien1" in api.pods
     assert api.terminated == []
+
+
+def test_sync_pod_is_created_in_the_configured_datacenter(tmp_path, monkeypatch):
+    """Finding 5: the sync pod mounts the network volume, and a pod can only
+    mount a volume in its own region -- so the region has to come from the
+    config, not from RunPodAPI's fallback."""
+    monkeypatch.setenv("RPFARM_HOME", str(tmp_path))
+    from rpfarm.config import Config
+
+    c = Config(api_key="k", user="may", volume_id="v", template_id="t",
+               gpu_priority=["g"], datacenter="US-KS-2")
+    api = FakeAPI()
+    pods.ensure_sync_pod(api, c, "tok", "ssh-ed25519 AAA",
+                         client_factory=lambda pid: FakeClient(), sleep=lambda s: None)
+    assert [kw.get("datacenter") for kw in api.create_kwargs] == ["US-KS-2"]
 
 
 def test_start_mq_rewrites_public_address():
