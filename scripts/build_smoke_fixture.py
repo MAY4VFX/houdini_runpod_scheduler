@@ -149,14 +149,29 @@ def build_scene():
     _set_static(karma, "f2", FRAME_END)
     _set_static(karma, "f3", 1)
     karma.parm("samplesperpixel").set(4)
-    # The Karma ROP's intermediate USD defaults to
-    # $HOUDINI_TEMP_DIR/usd_renders/$RENDERID -- a directory reference that
-    # hou.fileReferences() reports, that resolve_entries() then walks, and
-    # that on a machine which has rendered before contains other people's
-    # leftovers. Pointing it inside $HIP keeps the upload deterministic (the
-    # directory does not exist yet in a fresh run directory, so it is simply
-    # dropped) and keeps the pod's intermediate file in the project.
-    karma.parm("savetodirectory").set("$HIP/usd/$RENDERID")
+    # Karma's intermediate USD goes to POD-LOCAL scratch, never to $HIP.
+    #
+    # This used to be $HIP/usd/$RENDERID, for a good reason that turned out to
+    # have a better answer: Karma's own default,
+    # $HOUDINI_TEMP_DIR/usd_renders/$RENDERID, is a directory reference that
+    # hou.fileReferences() reports and resolve_entries() then walks, and on a
+    # machine that has rendered before it is full of unrelated leftovers, so
+    # the upload stops being deterministic.
+    #
+    # But $HIP on a pod is the shared network volume, one directory for every
+    # pod in the cook, and a scene shaped that way was observed to lose frames
+    # in silence: 6 of 8 on two pods, with all eight tasks reporting exit_code
+    # 0 and their own output paths (see the design spec, section 7 -- the
+    # mechanism is not established, the shape is). This fixture only ever runs
+    # one pod (minpods/maxpods 1), so it was never at risk, but it was the last
+    # copy of a pattern the README now tells artists not to use, and a sample
+    # file is the worst place to keep one.
+    #
+    # $HOUDINI_TEMP_DIR is inside the container, so pods cannot share it, and
+    # "rpfarm_usd" is a name nothing else writes -- so on the machine building
+    # or running this fixture the directory does not exist and the dependency
+    # walk drops it, which is exactly the determinism $HIP was chosen for.
+    karma.parm("savetodirectory").set("$HOUDINI_TEMP_DIR/rpfarm_usd/$RENDERID")
     karma.parm("denoiser").set("off")
     karma.parm("alfprogress").set(1)
 
@@ -282,6 +297,11 @@ def _verify(dest):
             if abs(float(got) - float(want)) > 1e-6:
                 print("FAIL: {}/{} = {!r}, expected {!r}".format(path, name, got, want))
                 ok = False
+    savedir = hou.node("/out/karma1").parm("savetodirectory").rawValue()
+    if not savedir.startswith("$HOUDINI_TEMP_DIR"):
+        print("FAIL: karma1/savetodirectory = {!r} -- intermediate USD must go to "
+              "pod-local scratch, never to $HIP (the shared volume)".format(savedir))
+        ok = False
     roppath = hou.node("/obj/topnet1/render").parm("roppath").eval()
     if roppath != "/out/karma1":
         print("FAIL: ropfetch roppath = {!r}".format(roppath))
