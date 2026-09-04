@@ -1755,10 +1755,21 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
 
         self._log("waiting for sync pod {}...".format(
             rppods.sync_pod_name(self._cfg.user)))
-        self._sync_pod = rppods.ensure_sync_pod(
-            self._api, self._cfg, self._token, self._pubkey,
-            log=self._log, cancel=lambda: self.context.canceling,
-        )
+        # The sync pod comes up before anything else, and without it the cook
+        # does not start at all -- so it gets the same wait-out-a-shortage rule
+        # as the GPU pods (Ruling R32), driven by the same two parms. If it
+        # still has no machine when the deadline passes there is nothing to
+        # fail item by item, so that IS a CookError -- with the human text the
+        # exception already carries.
+        try:
+            self._sync_pod = rppods.ensure_sync_pod(
+                self._api, self._cfg, self._token, self._pubkey,
+                log=self._log, cancel=lambda: self.context.canceling,
+                capacity_wait_s=self._capacityWaitSeconds(),
+                cloud_type=self._cloudType(),
+            )
+        except rppods.SyncPodCapacityError as e:
+            raise CookError(str(e))
         self._sync_client = WorkerClient(self._sync_pod["id"], self._token)
         ip, port = pod_public_endpoint(self._sync_pod, 22)
         self._sftp = rpsync.SftpTarget(
