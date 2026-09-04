@@ -737,3 +737,66 @@ def test_the_demo_scene_never_enables_both_download_paths():
     assert 'createNode("runpodfarmdownload"' not in builder
     # and _verify refuses a scene where one came back
     assert 'hou.node("/obj/topnet1/download") is None' in builder
+
+
+# ---------------------------------------------------------------------------
+# XPU preflight -- one clear refusal instead of eight identical crashes
+# ---------------------------------------------------------------------------
+
+
+class _XpuScheduler(FakeScheduler):
+    def __init__(self, supported, rops=("/out/karma_demo",)):
+        super().__init__()
+        self._cfg = types.SimpleNamespace(xpu_supported=supported)
+        self._rops = list(rops)
+
+    def _xpuRops(self):
+        return self._rops
+
+
+class _CookError(Exception):
+    pass
+
+
+def _preflight():
+    """The asset raises CookError, which is PDG's; stand one in for it."""
+    return load_methods(["_preflightXpu"],
+                        extra_globals={"CookError": _CookError})["_preflightXpu"]
+
+
+def test_no_xpu_rops_means_nothing_to_say():
+    sched = _XpuScheduler(supported=False, rops=[])
+
+    _preflight()(sched)          # must not raise
+
+    assert sched.logs == []
+
+
+def test_a_known_bad_farm_refuses_the_cook_before_paying_for_it():
+    sched = _XpuScheduler(supported=False)
+
+    with pytest.raises(_CookError) as excinfo:
+        _preflight()(sched)
+
+    message = str(excinfo.value)
+    assert "/out/karma_demo" in message
+    assert "cannot run it" in message
+    assert "rpfarm farm xpu" in message          # how to re-check
+    assert "CPU" in message                      # and the other way out
+
+
+def test_a_known_good_farm_just_says_so():
+    sched = _XpuScheduler(supported=True)
+
+    _preflight()(sched)
+
+    assert any("checked available" in m for m in sched.logs)
+
+
+def test_an_unchecked_farm_is_not_treated_as_broken():
+    """Guessing 'no' here would block a farm that works."""
+    sched = _XpuScheduler(supported=None)
+
+    _preflight()(sched)          # must not raise
+
+    assert any("never been checked" in m for m in sched.logs)

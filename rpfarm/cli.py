@@ -1170,6 +1170,69 @@ def cmd_farm_kill(args, prompt=input):
     return 0
 
 
+def _read_pubkey(cfg):
+    with open(str(cfg.ssh_key_path) + ".pub") as f:
+        return f.read().strip()
+
+
+def cmd_farm_xpu(args):
+    """Answer "does Karma XPU work on this farm?" in one command.
+
+    Before this, the only way to find out was to submit a cook and read eight
+    identical crashed tasks: "Karma XPU delegate not supported on this
+    machine". That is an expensive way to learn something a pod can say in a
+    sentence.
+
+    Raises ONE GPU pod, asks its /health, prints the answer with husk's own
+    wording, terminates the pod, and records the result in config.toml so the
+    scheduler's preflight can refuse an XPU cook without paying for a pod at
+    all.
+    """
+    cfg = rpcfg.load()
+    api = _make_api(cfg.api_key)
+    token = rpcfg.session_token()
+    pubkey = _read_pubkey(cfg)
+
+    name = "rpfarm-{}-xpucheck-0".format(cfg.user)
+    env = rppods.pod_env(cfg, "gpu", token, 1, pubkey, cook="xpucheck", project="xpucheck")
+    print("raising one GPU pod to ask ({}, {})...".format(
+        ", ".join(cfg.gpu_priority) or "config gpu_priority", cfg.datacenter))
+    pod = None
+    try:
+        pod = api.create_gpu_pod(name, cfg.template_id, cfg.gpu_priority, cfg.volume_id,
+                                 env, rppods.PORTS, datacenter=cfg.datacenter,
+                                 cloud_type=cfg.cloud_type)
+        ready = rppods.wait_ready(api, WorkerClient(pod["id"], token), pod["id"],
+                                  timeout=args.timeout)
+        health = WorkerClient(pod["id"], token).health() or {}
+        gpu = (health.get("gpus") or [{}])
+        gpu_name = gpu[0].get("name", "?") if gpu else "?"
+        xpu = health.get("xpu") or {}
+        supported = xpu.get("supported")
+        print("GPU:    {}".format(gpu_name))
+        print("husk:   {}".format(xpu.get("detail", "no answer")))
+        if supported is True:
+            print("RESULT: Karma XPU IS available on this farm")
+        elif supported is False:
+            print("RESULT: Karma XPU is NOT available on this farm")
+            print("        A cook whose ROP asks for XPU will fail on every frame.")
+        else:
+            print("RESULT: could not tell")
+        if supported is not None:
+            cfg.xpu_supported = bool(supported)
+            rpcfg.save(cfg)
+            print("recorded xpu_supported = {} in config.toml".format(cfg.xpu_supported))
+        return 0 if supported else 1
+    finally:
+        if pod:
+            try:
+                api.terminate_pod(pod["id"])
+                print("[OK] terminated {}".format(pod["id"]))
+            except RunPodError as e:
+                print("[WARN] could not terminate {}: {} -- IT MAY STILL BE "
+                      "BILLING".format(pod["id"], e), file=sys.stderr)
+
+
 # -- costs ----------------------------------------------------------------
 
 
@@ -1251,6 +1314,9 @@ def build_parser():
     p_farm = sub.add_parser("farm", help="see/kill running rpfarm pods")
     farm_sub = p_farm.add_subparsers(dest="farm_command", required=True)
     farm_sub.add_parser("status", help="list running rpfarm-* pods (all users) with rate/uptime/est cost")
+    p_xpu = farm_sub.add_parser("xpu", help="is Karma XPU available on this farm? raises one GPU pod, asks, terminates it")
+    p_xpu.add_argument("--timeout", type=int, default=420, help="seconds to wait for the pod")
+
     p_kill = farm_sub.add_parser("kill", help="terminate pod(s) -- pick exactly one of the flags below")
     p_kill.add_argument("--all", action="store_true", help="kill YOUR OWN cook pods (rpfarm-<user>-*) that are demonstrably idle -- busy ones, other users' and unreachable ones are skipped and listed")
     p_kill.add_argument("--everyone", action="store_true", help="DANGER: also consider every other user's rpfarm-* pods. Asks for confirmation")
@@ -1284,7 +1350,7 @@ _STORAGE_HANDLERS = {
     "grow": cmd_storage_grow,
     "recreate": cmd_storage_recreate,
 }
-_FARM_HANDLERS = {"status": cmd_farm_status, "kill": cmd_farm_kill}
+_FARM_HANDLERS = {"status": cmd_farm_status, "kill": cmd_farm_kill, "xpu": cmd_farm_xpu}
 
 
 def main(argv=None, prompt=input):

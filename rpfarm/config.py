@@ -88,6 +88,10 @@ class Config:
     # SECURE (vetted datacentres) or COMMUNITY (cheaper hosts, often has
     # machines when SECURE is empty). See rpfarm.runpod_api.CLOUD_TYPES.
     cloud_type: str = "SECURE"
+    # Whether Karma XPU works on this farm. None until `rpfarm farm xpu` has
+    # asked a GPU pod. The scheduler's preflight uses it to refuse an XPU cook
+    # before paying for pods, instead of letting every frame crash identically.
+    xpu_supported: bool | None = None
     gpu_priority: list[str] = field(default_factory=list)
     rclone_path: str = field(default_factory=_default_rclone_path)
     ssh_key_path: str = field(default_factory=_default_ssh_key_path)

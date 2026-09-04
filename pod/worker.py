@@ -156,6 +156,52 @@ class Task:
         self.state_lock = threading.Lock()
 
 
+class XpuSupport:
+    """Whether Karma XPU can actually run on this pod, asked once and cached.
+
+    The answer is `husk --list-renderers`: it prints
+    ``BRAY_HdKarmaXPU (Karma XPU)`` when the delegate is usable and
+    ``... - unsupported`` when it is not, which is exactly the difference
+    between a cook that renders and eight tasks dying identically with
+    "Karma XPU delegate not supported on this machine".
+
+    Reported over /health so nobody has to discover it the way we did -- by
+    paying for eight crashed tasks and then reading a log off the volume.
+    Computed lazily (husk takes a few seconds and most cooks never ask) and
+    cached for the pod's life, because the answer cannot change under it.
+    """
+
+    def __init__(self, run=None, clock=time.time):
+        self._run = run or subprocess.run
+        self._clock = clock
+        self._answer = None
+        self._lock = threading.Lock()
+
+    def supported(self):
+        with self._lock:
+            if self._answer is None:
+                self._answer = self._ask()
+            return self._answer
+
+    def _ask(self):
+        hfs = os.environ.get("HFS", "")
+        husk = os.path.join(hfs, "bin", "husk") if hfs else "husk"
+        if hfs and not os.path.exists(husk):
+            return {"supported": None, "detail": "no husk at {}".format(husk)}
+        try:
+            proc = self._run([husk, "--list-renderers"], capture_output=True,
+                             text=True, timeout=180)
+        except Exception as e:  # noqa: BLE001 - a probe must not kill /health
+            return {"supported": None, "detail": "husk failed: {}".format(e)}
+        for line in (proc.stdout or "").splitlines():
+            if "KarmaXPU" not in line:
+                continue
+            usable = "unsupported" not in line.lower()
+            return {"supported": usable, "detail": line.strip()}
+        return {"supported": None,
+                "detail": "husk did not mention KarmaXPU (rc={})".format(proc.returncode)}
+
+
 class LastRequest:
     """When this pod was last asked to do something real.
 
@@ -465,6 +511,7 @@ def make_server(host, port, log_dir="/workspace/ledger/logs"):
     slots = int(os.environ.get("RPFARM_SLOTS", "1"))
     registry = Registry(slots, log_dir)
     last_request = LastRequest()
+    xpu = XpuSupport()
     detached = DetachedRuns(os.path.join(WORKSPACE_ROOT, EXEC_DIR_REL))
 
     class Handler(BaseHTTPRequestHandler):
@@ -591,6 +638,12 @@ def make_server(host, port, log_dir="/workspace/ledger/logs"):
                     # to zero for a moment, and that moment must not read as
                     # "abandoned".
                     "idle_s": round(last_request.idle_s(), 1),
+                    # Can this pod run Karma XPU? None when we could not tell.
+                    # A GPU pod answers truthfully; the CPU sync pod says no,
+                    # which is correct for it and useless as a farm-wide
+                    # answer -- ask a GPU pod.
+                    "xpu": xpu.supported() if role == "gpu" else {
+                        "supported": False, "detail": "sync pod has no GPU"},
                 },
             )
 
