@@ -32,7 +32,7 @@ import subprocess
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
-# Houdini installation discovery (ported from infrastructure/install_hda.py)
+# Houdini installation discovery (ported from v1's infrastructure/install_hda.py)
 # ---------------------------------------------------------------------------
 
 

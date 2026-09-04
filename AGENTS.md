@@ -37,9 +37,10 @@ Houdini (PDG)
                               зоны: houdini/ apps/ projects/ ledger/
 ```
 
-Лицензии — sesinetd через Oracle (`lic.ai-vfx.com:1715` → socat `lic-proxy.service`
-→ 192.168.2.134:1715). Поду не нужен ни ключ RunPod, ни доступ к чему-либо,
-кроме тома и лицензий.
+Лицензии — sesinetd через Oracle: `lic.ai-vfx.com:1715` → socat-юнит
+`lic-proxy.service` → домашний лицензионный сервер (его адрес — в
+`departments/infra/map.md` штаба, сюда не пишем: см. правило про домашние IP ниже).
+Поду не нужен ни ключ RunPod, ни доступ к чему-либо, кроме тома и лицензий.
 
 ## Структура
 

@@ -347,6 +347,20 @@ def houdini_install_preset(tar_local_path, version):
     ``/workspace/apps/dist/`` once the install succeeds: it is dead weight
     on a 50GB volume, and a failed install deliberately keeps it so a
     retry does not have to re-upload.
+
+    **The install is accepted by running Houdini, not by looking for a
+    file.** This used to end in ``ls <install_dir>/bin/hython`` -- and that
+    check passed on Task 14's broken install: an interrupted run left an
+    11GB tree with `bin/hython` present but no `python/` directory at all,
+    so the binary existed and could not start
+    ("libpython3.13.so.1.0: cannot open shared object file"). A missing
+    system library (`libatomic.so.1`, which Houdini 22 needs and the pod
+    image lacked) fails the same silent way. The final step therefore
+    sources the new install, runs ``hython -c "import hou; ..."``, and
+    requires the reported version to equal the version just installed --
+    which exercises the interpreter, the bundled Python, the shared
+    libraries and the `hou` module in one go, and fails loudly on any of
+    them.
     """
     tar_name = os.path.basename(tar_local_path)
     pairs = [(tar_local_path, "/workspace/apps/dist/")]
@@ -362,7 +376,17 @@ def houdini_install_preset(tar_local_path, version):
         "rm -rf /tmp/hou && "
         f"rm -f /workspace/apps/dist/{tar_name} && "
         "python3 /opt/rpfarm/housekeeping.py invalidate houdini && "
-        f"ls {install_dir}/bin/hython"
+        # Acceptance is an EXECUTION check, not an existence one -- see the
+        # docstring. Sources the install we just made (not whatever HFS the
+        # pod booted with), starts hython, imports hou, and requires the
+        # version it reports to be exactly the one we installed. `tail -1`
+        # because hython prints operator warnings ("opalias: ... is not a
+        # known operator") before the value.
+        f"cd {install_dir} && source ./houdini_setup_bash >/dev/null 2>&1 && "
+        f"ver=$(./bin/hython -c 'import hou; print(hou.applicationVersionString())' 2>/dev/null | tail -1) && "
+        f'{{ [ "$ver" = "{version}" ] || '
+        f'{{ echo "install check FAILED: hython reported \'$ver\', expected \'{version}\'" >&2; exit 1; }} ; }} && '
+        f'echo "install verified: hython reports $ver"'
     )
     return pairs, post_command
 
