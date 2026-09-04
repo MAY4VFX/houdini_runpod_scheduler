@@ -343,11 +343,12 @@ class FakeSyncClient:
     `test_run_upload_item_runs_post_command_detached_not_synchronously`.
     """
 
-    def __init__(self, fail_commands=None):
+    def __init__(self, fail_commands=None, fail_output=None):
         self.commands = []
         self.calls = []  # (command, timeout_s), in call order
         self.detached = []  # (command, deadline_s) that went the detached way
         self.fail_commands = fail_commands or set()
+        self.fail_output = fail_output
 
     def exec(self, command, timeout_s=600):
         self.commands.append(command)
@@ -357,12 +358,22 @@ class FakeSyncClient:
         return {"exit_code": 0, "stdout": "", "stderr": ""}
 
     def exec_wait(self, command, deadline_s, **kw):
+        """Mirrors the real detached contract: the pod merges stdout+stderr
+        into one log file, so everything the command said comes back as
+        `stdout` and `stderr` is always empty -- which is exactly how
+        `_exec_checked` used to lose the diagnostics."""
         self.commands.append(command)
         self.calls.append((command, deadline_s))
         self.detached.append((command, deadline_s))
+        log_path = "/workspace/.rpfarm/exec/exec-abc.log"
         if command in self.fail_commands:
-            return {"exit_code": 1, "stdout": "", "stderr": "boom: " + command}
-        return {"exit_code": 0, "stdout": "", "stderr": ""}
+            return {
+                "exit_code": 1,
+                "stdout": self.fail_output if self.fail_output is not None else "boom: " + command,
+                "stderr": "",
+                "log_path": log_path,
+            }
+        return {"exit_code": 0, "stdout": "", "stderr": "", "log_path": log_path}
 
 
 def test_run_upload_item_no_compress(tmp_path, monkeypatch):
@@ -1231,10 +1242,50 @@ def test_run_upload_item_post_command_deadline_is_the_scaled_timeout(tmp_path, m
 
 def test_run_upload_item_still_raises_when_a_detached_post_command_fails(tmp_path, monkeypatch):
     """Going detached must not turn a failed remote command into a silent
-    success -- the whole reason _exec_checked exists."""
+    success -- the whole reason _exec_checked exists.
+
+    Asserts on what the command actually *said*, not on the command name
+    echoed back: a detached run merges stdout+stderr into its log, so the
+    diagnostics arrive as stdout with stderr empty. Matching the command
+    name would pass even with the output thrown away -- which is how the
+    "(no stderr)" regression slipped through the first time.
+    """
     monkeypatch.setattr("rpfarm.packages.rclone_copy", _fake_rclone_copy)
     item = _upload_item(tmp_path, "boom")
-    client = FakeSyncClient(fail_commands={"boom"})
+    client = FakeSyncClient(
+        fail_commands={"boom"},
+        fail_output="Problem encountered installing Python's library dependencies.",
+    )
 
-    with pytest.raises(RuntimeError, match="boom"):
+    with pytest.raises(RuntimeError) as excinfo:
         run_upload_item(item, FakeCfg(), SftpTarget(host="1.2.3.4", port=22, key_path="/k"), client, compress=False)
+
+    msg = str(excinfo.value)
+    assert "Problem encountered installing Python's library dependencies." in msg
+    assert "no output" not in msg and "no stderr" not in msg
+    assert "/workspace/.rpfarm/exec/exec-abc.log" in msg  # where to go read the rest
+    assert "exit 1" in msg
+
+
+def test_exec_checked_prefers_stderr_when_the_client_supplies_it(tmp_path, monkeypatch):
+    """The synchronous path still separates the streams; stderr stays the
+    first choice so nothing regresses for callers that provide it."""
+    from rpfarm.packages import _exec_checked
+
+    class SplitStreams:
+        def exec_wait(self, command, deadline_s, **kw):
+            return {"exit_code": 2, "stdout": "chatty progress", "stderr": "the real error"}
+
+    with pytest.raises(RuntimeError, match="the real error"):
+        _exec_checked(SplitStreams(), "cmd", 60)
+
+
+def test_exec_checked_says_no_output_only_when_there_really_is_none():
+    from rpfarm.packages import _exec_checked
+
+    class Silent:
+        def exec_wait(self, command, deadline_s, **kw):
+            return {"exit_code": 9, "stdout": "", "stderr": ""}
+
+    with pytest.raises(RuntimeError, match=r"\(no output\)"):
+        _exec_checked(Silent(), "cmd", 60)

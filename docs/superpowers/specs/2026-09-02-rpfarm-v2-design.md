@@ -59,7 +59,7 @@ Houdini (артист)                              RunPod (EU-RO-1)
 ```
 
 Домашняя инфраструктура участвует только лицензиями: `lic.ai-vfx.com:1715` →
-Oracle socat → sesinetd `192.168.2.134`. Tailscale не нужен: поды не могут поднять
+Oracle socat (`lic-proxy.service`) → домашний sesinetd (адрес — в `departments/infra/map.md` штаба, в отслеживаемые файлы домашние IP не пишем). Tailscale не нужен: поды не могут поднять
 TUN, а всё остальное идёт через публичный IP/прокси RunPod. Redis, B2, JuiceFS,
 сервер на Dokploy — удаляются.
 
