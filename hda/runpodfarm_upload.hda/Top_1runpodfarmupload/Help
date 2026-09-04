@@ -63,8 +63,10 @@ Mode:
 Project:
     #id: rpfarm_project
 
-    Remote project folder: `/workspace/projects/<user>/<project>`. Empty
-    means the name of the `$JOB` directory.
+    Remote project folder: `/workspace/projects/<user>/<project>`. The field
+    shows the name of the `$JOB` directory -- what this upload will really
+    use -- as a default expression (`hou.phm().project_default()`); type
+    your own and the literal replaces it and wins.
 
 Package Size (GB):
     #id: rpfarm_packagegb
@@ -126,6 +128,12 @@ Houdini Tarball:
 
 Houdini Version:
     #id: rpfarm_houver
+
+    Shows `houdini_version` from `~/.rpfarm/config.toml` -- the version the
+    farm pods run -- as a default expression (`hou.phm().cfg_default`), so
+    the field says what will be installed instead of sitting empty. Type
+    your own to install a different one. Empty means there is no config
+    yet: run `rpfarm setup`.
 
 Cook In Process (debug):
     #id: rpfarm_inprocess

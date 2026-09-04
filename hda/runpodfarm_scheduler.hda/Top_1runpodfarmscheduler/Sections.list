@@ -10,3 +10,5 @@ PythonModule	PythonModule
 SyncNodeVersion	SyncNodeVersion
 PreFirstCreate	PreFirstCreate
 ExtraFileOptions	ExtraFileOptions
+OnCreated	OnCreated
+IconSVG	IconSVG

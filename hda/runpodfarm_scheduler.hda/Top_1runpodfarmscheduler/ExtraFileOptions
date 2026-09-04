@@ -1,62 +1,87 @@
 {
-	"PreFirstCreate/Cursor":{
-		"type":"intarray",
-		"value":[4,1]
+	"OnCreated/IsExpr": {
+		"type": "bool",
+		"value": false
 	},
-	"PreFirstCreate/IsExpr":{
-		"type":"bool",
-		"value":false
+	"OnCreated/IsPython": {
+		"type": "bool",
+		"value": true
 	},
-	"PreFirstCreate/IsPython":{
-		"type":"bool",
-		"value":true
+	"OnCreated/IsScript": {
+		"type": "bool",
+		"value": true
 	},
-	"PreFirstCreate/IsScript":{
-		"type":"bool",
-		"value":true
+	"OnCreated/Source": {
+		"type": "string",
+		"value": ""
 	},
-	"PreFirstCreate/Source":{
-		"type":"string",
-		"value":""
+	"PreFirstCreate/Cursor": {
+		"type": "intarray",
+		"value": [
+			4,
+			1
+		]
 	},
-	"PythonModule/Cursor":{
-		"type":"intarray",
-		"value":[1,1]
+	"PreFirstCreate/IsExpr": {
+		"type": "bool",
+		"value": false
 	},
-	"PythonModule/IsExpr":{
-		"type":"bool",
-		"value":false
+	"PreFirstCreate/IsPython": {
+		"type": "bool",
+		"value": true
 	},
-	"PythonModule/IsPython":{
-		"type":"bool",
-		"value":false
+	"PreFirstCreate/IsScript": {
+		"type": "bool",
+		"value": true
 	},
-	"PythonModule/IsScript":{
-		"type":"bool",
-		"value":true
+	"PreFirstCreate/Source": {
+		"type": "string",
+		"value": ""
 	},
-	"PythonModule/Source":{
-		"type":"string",
-		"value":""
+	"PythonModule/Cursor": {
+		"type": "intarray",
+		"value": [
+			1,
+			1
+		]
 	},
-	"SyncNodeVersion/Cursor":{
-		"type":"intarray",
-		"value":[1,1]
+	"PythonModule/IsExpr": {
+		"type": "bool",
+		"value": false
 	},
-	"SyncNodeVersion/IsExpr":{
-		"type":"bool",
-		"value":false
+	"PythonModule/IsPython": {
+		"type": "bool",
+		"value": false
 	},
-	"SyncNodeVersion/IsPython":{
-		"type":"bool",
-		"value":false
+	"PythonModule/IsScript": {
+		"type": "bool",
+		"value": true
 	},
-	"SyncNodeVersion/IsScript":{
-		"type":"bool",
-		"value":true
+	"PythonModule/Source": {
+		"type": "string",
+		"value": ""
 	},
-	"SyncNodeVersion/Source":{
-		"type":"string",
-		"value":""
+	"SyncNodeVersion/Cursor": {
+		"type": "intarray",
+		"value": [
+			1,
+			1
+		]
+	},
+	"SyncNodeVersion/IsExpr": {
+		"type": "bool",
+		"value": false
+	},
+	"SyncNodeVersion/IsPython": {
+		"type": "bool",
+		"value": false
+	},
+	"SyncNodeVersion/IsScript": {
+		"type": "bool",
+		"value": true
+	},
+	"SyncNodeVersion/Source": {
+		"type": "string",
+		"value": ""
 	}
 }

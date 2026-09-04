@@ -66,63 +66,13 @@ On cook the scheduler will:
 
 @parameters
 
-== Farm == (runpodparam)
+== Cook == (runpodparam)
 
-Global parameters describing the RunPod configuration. Every one of these may be
-left empty to fall back to `~/.rpfarm/config.toml`.
-
-API Key:
-    #id: rpfarm_apikey
-
-    Your RunPod API key. Generated from the RunPod web console under
-    Settings > API Keys. Empty means `api_key` from `~/.rpfarm/config.toml`.
-
-Project:
-    #id: rpfarm_project
-
-    Project folder on the network volume: `/workspace/projects/<user>/<project>`.
-    Empty means the name of the `$JOB` directory.
-
-GPU Priority:
-    #id: rpfarm_gpulist
-
-    Comma-separated RunPod GPU type names, most wanted first; the first one in
-    stock is used. Example:
-    `NVIDIA RTX A4500, NVIDIA GeForce RTX 4090`. Empty means `gpu_priority` from
-    `~/.rpfarm/config.toml`.
-
-Template ID:
-    #id: rpfarm_templateid
-
-    The RunPod template defining the pod image. It must be built from
-    `pod/Dockerfile` in this repository, which carries the worker daemon.
-
-Network Volume ID:
-    #id: rpfarm_networkvolumeid
-
-    The RunPod network volume shared by every pod, mounted at `/workspace`. It
-    holds Houdini, the project files and the ledger.
-
-Datacenter:
-    #id: rpfarm_datacenter
-
-    RunPod datacenter region. The network volume only exists in one region and
-    a pod can only mount a volume in its own, so this has to match it. Empty
-    (the default) means `datacenter` from `~/.rpfarm/config.toml`, which
-    `rpfarm setup` records from the volume's own region -- set this only to
-    override that for one node.
-
-    NOTE: this parameter used to ship defaulting to `EU-RO-1`. A scene saved
-    back then keeps that literal value in the `.hip`, where it silently wins
-    over a correctly migrated `datacenter` in `config.toml` -- pods are then
-    created in a region that cannot mount the volume, every task fails with
-    RunPod's own opaque error, and `rpfarm doctor` still reports everything
-    fine because it only reads the config, never the scene. The scheduler
-    compares the two at the start of every cook and refuses to run on a
-    mismatch rather than burning pods on it. If that stops a cook, set this
-    back to `(from config.toml)` -- the empty menu entry -- and save.
-
-=== Scaling ===
+The first page is the handful of parameters an artist actually turns: how many
+pods, how hard each one works, when they go away, what the cook may cost, and
+whether the results come back. Everything about the farm's identity is on
+__Farm__ and is normally set once by `rpfarm setup`; the service and debugging
+knobs are on __Advanced__.
 
 Min Pods:
     #id: rpfarm_minpods
@@ -146,14 +96,6 @@ Idle Timeout (s):
 
     A pod with nothing to do for this long is terminated. 0 disables it.
 
-Sync Pod Idle (min):
-    #id: rpfarm_syncidle
-
-    The shared sync pod survives between cooks. When the next cook finds it
-    unused for longer than this, it is terminated first. 0 keeps it forever.
-
-=== Budget ===
-
 Max Cost ($):
     #id: rpfarm_maxcost
 
@@ -161,33 +103,112 @@ Max Cost ($):
     stops adding pods, and at 120% it terminates every pod and cancels the
     cook. 0 means no limit.
 
-Min Balance ($):
-    #id: rpfarm_minbalance
-
-    A RunPod account balance below this only produces a warning at the start of
-    the cook; the cook goes ahead either way. 0 disables the check.
-
-=== Outputs ===
-
 Download Outputs:
     #id: rpfarm_downloadoutputs
 
     When on, each work item's output files are pulled from the network volume
     back to the local paths they map to as soon as the item succeeds.
 
-=== Paths ===
+== Farm ==
+
+Who the farm is: the account, the pod image, the volume and its region.
+
+These fields SHOW the value they will use, read live from
+`~/.rpfarm/config.toml` by a default expression (`hou.phm().cfg_default(...)`).
+That is Houdini's own idiom for it: while you have not touched a field, it
+displays the configured value; the moment you type into it, your literal
+replaces the expression and wins. So a field is never ambiguous -- what you see
+is what the cook will use, and an empty one genuinely means "nothing configured
+yet, run `rpfarm setup`".
+
+API Key:
+    #id: rpfarm_apikey
+
+    The one field that deliberately does NOT show its configured value.
+    Substituting it would put a secret on screen and, the moment you
+    "overrode" the field, bake the key in cleartext into the `.hip` -- a file
+    that travels to the farm and into backups. Leave it empty: the key comes
+    from `api_key` in `~/.rpfarm/config.toml` (chmod 600, written by
+    `rpfarm setup`), and __Key In Use__ below says which key that is.
+
+    Typing a key here still works and still overrides the config, for driving
+    a second account from one node. __Key In Use__ then warns you what it
+    costs.
+
+Key In Use:
+    #id: rpfarm_apikeystatus
+
+    Read-only, and masked on purpose (`rpa_...7f3c`): enough to tell which
+    key is in play, not enough to use it. Reads
+    `NOT CONFIGURED -- run rpfarm setup` when there is no key anywhere.
+
+Project:
+    #id: rpfarm_project
+
+    Project folder on the network volume: `/workspace/projects/<user>/<project>`.
+    Shows the name of the `$JOB` directory -- what this cook will really use --
+    until you type your own.
+
+GPU Priority:
+    #id: rpfarm_gpulist
+
+    Comma-separated RunPod GPU type names, most wanted first; the first one in
+    stock is used. Example:
+    `NVIDIA RTX A4500, NVIDIA GeForce RTX 4090`. Shows `gpu_priority` from
+    `~/.rpfarm/config.toml`.
+
+Template ID:
+    #id: rpfarm_templateid
+
+    The RunPod template defining the pod image. It must be built from
+    `pod/Dockerfile` in this repository, which carries the worker daemon.
+    Shows `template_id` from `~/.rpfarm/config.toml`.
+
+Network Volume ID:
+    #id: rpfarm_networkvolumeid
+
+    The RunPod network volume shared by every pod, mounted at `/workspace`. It
+    holds Houdini, the project files and the ledger. Shows `volume_id` from
+    `~/.rpfarm/config.toml`.
+
+Datacenter:
+    #id: rpfarm_datacenter
+
+    RunPod datacenter region. The network volume only exists in one region and
+    a pod can only mount a volume in its own, so this has to match it. Shows
+    `datacenter` from `~/.rpfarm/config.toml`, which `rpfarm setup` records
+    from the volume's own region -- type over it only to override that for one
+    node.
+
+    NOTE: this parameter used to ship defaulting to `EU-RO-1`. A scene saved
+    back then keeps that literal value in the `.hip`, where it silently wins
+    over a correctly migrated `datacenter` in `config.toml` -- pods are then
+    created in a region that cannot mount the volume, every task fails with
+    RunPod's own opaque error, and `rpfarm doctor` still reports everything
+    fine because it only reads the config, never the scene. The scheduler
+    compares the two at the start of every cook and refuses to run on a
+    mismatch rather than burning pods on it. If that stops a cook, clear the
+    field (right-click > Revert to Defaults) so it goes back to reading the
+    config, and save the scene.
+
+Sync Pod Idle (min):
+    #id: rpfarm_syncidle
+
+    The shared sync pod survives between cooks. When the next cook finds it
+    unused for longer than this, it is terminated first. 0 keeps it forever.
+
+Min Balance ($):
+    #id: rpfarm_minbalance
+
+    A RunPod account balance below this only produces a warning at the start of
+    the cook; the cook goes ahead either way. 0 disables the check.
+
+== Paths ==
 
 Local Shared Path:
     #id: pdg_workingdir
 
     Specifies the root path on your local machine that points to the directory where the job generates intermediate files and output.
-
-Remote Shared Path:
-    #id: rpfarm_remoteworkingdir
-
-    When enabled, overrides the working directory on the pods. The default is
-    this cook's project directory on the network volume,
-    `/workspace/projects/<user>/<project>`.
 
 :include _scheduler_common#pdg_workitemdatasource:
 
@@ -257,7 +278,26 @@ Parameters for configuring the behavior of RPC connections from out of process j
 
 :include _scheduler_common#pdg_rpcrelease:
 
-== Job Parms ==
+== Advanced ==
+
+Service and debugging parameters. None of these need touching for a normal
+cook: the pre/post task commands, the task environment, the thread cap, the
+remote shared path override and the verbose log all live here so the first
+page can stay small.
+
+Remote Shared Path:
+    #id: rpfarm_remoteworkingdir
+
+    When enabled, overrides the working directory on the pods. The default is
+    this cook's project directory on the network volume,
+    `/workspace/projects/<user>/<project>`.
+
+Verbose Logging:
+    #id: rpfarm_verbose
+
+    When on, prints detailed output to console. Can be useful for debugging problems.
+
+=== Job Parms ===
 
 Job-specific parameters that affect all submitted jobs, but can be overridden on a node-by-node basis.
 For more information, see [Scheduler Job Parms / Properties|/tops/schedulers#jobparms].
@@ -295,13 +335,6 @@ Houdini Max Threads:
     #id: rpfarm_usehoudinimaxthreads
 
     When on, sets the `HOUDINI_MAXTHREADS` environment to the specified value.
-
-=== Advanced ===
-
-Verbose Logging:
-    #id: rpfarm_verbose
-
-    When on, prints detailed output to console. Can be useful for debugging problems.
 
 @related
 

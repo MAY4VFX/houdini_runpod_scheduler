@@ -429,7 +429,7 @@ def test_a_stale_baked_in_datacenter_fails_the_cook_with_the_fix():
 
     message = str(e.value)
     assert "EU-RO-1" in message and "US-KS-2" in message
-    assert "(from config.toml)" in message, "the fix has to name the menu entry"
+    assert "Revert to Defaults" in message, "the fix has to name the actual gesture"
     assert "cannot mount" in message
 
 

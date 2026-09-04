@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!-- RunPodFarm node icon; see runpodfarm_scheduler.svg for the family
+     rules. Stats: what the farm above cost, as a rising bar chart whose
+     tallest bar carries the family's violet. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="48px" height="48px" viewBox="0 0 48 48" version="1.1">
+  <rect x="5" y="4" width="38" height="8" rx="2" fill="#eeeeec" stroke="#2e3436" stroke-width="1.5"/>
+  <rect x="7.5" y="6.5" width="33" height="3" rx="1" fill="#8b5cf6"/>
+  <rect x="6"  y="30" width="10" height="12" fill="#eeeeec" stroke="#2e3436" stroke-width="1.5"/>
+  <rect x="8.5" y="32.5" width="5" height="9" fill="#babdb6"/>
+  <rect x="19" y="23" width="10" height="19" fill="#eeeeec" stroke="#2e3436" stroke-width="1.5"/>
+  <rect x="21.5" y="25.5" width="5" height="16" fill="#babdb6"/>
+  <rect x="32" y="16" width="10" height="26" fill="#eeeeec" stroke="#2e3436" stroke-width="1.5"/>
+  <rect x="34.5" y="18.5" width="5" height="23" fill="#8b5cf6"/>
+  <rect x="4" y="42" width="40" height="2.5" rx="1" fill="#eeeeec" stroke="#2e3436" stroke-width="1"/>
+</svg>

@@ -1,7 +1,7 @@
 Operator:     runpodfarmupload
 Label:        RunPodFarm Upload
 Path:         oplib:/Top/runpodfarmupload?Top/runpodfarmupload
-Icon:         TOP_subnet
+Icon:         opdef:/Top/runpodfarmupload?IconSVG
 Table:        Top
 License:      
 Extra:        
@@ -10,5 +10,5 @@ Inputs:       0 to 1
 Subnet:       true
 Python:       false
 Empty:        false
-Modified:     Fri Sep  4 12:42:57 2026
+Modified:     Fri Sep  4 13:37:53 2026
 

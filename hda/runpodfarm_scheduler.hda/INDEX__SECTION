@@ -1,7 +1,7 @@
 Operator:     runpodfarmscheduler
 Label:        RunPodFarm Scheduler
 Path:         oplib:/Top/runpodfarmscheduler?Top/runpodfarmscheduler
-Icon:         TOP_scheduler
+Icon:         opdef:/Top/runpodfarmscheduler?IconSVG
 Table:        Top
 License:
 Extra:        pdgtype='scheduler' subtype=runpodfarmscheduler visibleoutputs=0

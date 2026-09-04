@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!-- RunPodFarm node icon; see runpodfarm_scheduler.svg for the family
+     rules. Download: results flowing back down from the farm. The exact
+     mirror of runpodfarm_upload.svg, deliberately: the pair has to read as
+     one direction and its opposite. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="48px" height="48px" viewBox="0 0 48 48" version="1.1">
+  <rect x="5" y="4" width="38" height="8" rx="2" fill="#eeeeec" stroke="#2e3436" stroke-width="1.5"/>
+  <rect x="7.5" y="6.5" width="33" height="3" rx="1" fill="#8b5cf6"/>
+  <path d="M 24 34 L 14 24 L 20 24 L 20 14 L 28 14 L 28 24 L 34 24 Z"
+        fill="#eeeeec" stroke="#2e3436" stroke-width="1.5" stroke-linejoin="round"/>
+  <rect x="11" y="36" width="26" height="8" rx="2" fill="#babdb6" stroke="#2e3436" stroke-width="1.5"/>
+</svg>

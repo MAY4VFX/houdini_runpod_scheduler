@@ -291,6 +291,47 @@ def build_and_install_hdas(install: HoudiniInstall, otls_cache_dir: Path, root: 
 
 
 # ---------------------------------------------------------------------------
+# node shape
+# ---------------------------------------------------------------------------
+
+# All four HDAs draw themselves with this custom network-editor shape (a
+# chamfered rectangle -- see hda/nodeshapes/rpfarm.json). Houdini only knows
+# a shape by name, and only finds it under ``config/NodeShapes`` somewhere on
+# HOUDINI_PATH, so the file has to be copied next to the HDAs at setup time
+# or every farm node falls back to a plain rectangle. Unlike the icons
+# (which live inside each HDA as an ``IconSVG`` section and need no
+# installing) a shape cannot travel inside an asset.
+NODE_SHAPE_NAME = "rpfarm"
+
+
+def node_shape_source(root: Path | None = None) -> Path:
+    return (root or repo_root()) / "hda" / "nodeshapes" / f"{NODE_SHAPE_NAME}.json"
+
+
+def node_shape_target(install: HoudiniInstall) -> Path:
+    return install.user_pref_dir / "config" / "NodeShapes" / f"{NODE_SHAPE_NAME}.json"
+
+
+def install_node_shape(install: HoudiniInstall, root: Path | None = None) -> dict:
+    """Copy the shape into ``<prefs>/config/NodeShapes/``.
+
+    Same never-raise contract as :func:`build_and_install_hdas`: returns
+    ``{"ok", "installed_to", "error"}`` so ``setup`` can report it beside
+    the HDAs rather than aborting the whole run over a cosmetic file.
+    """
+    source = node_shape_source(root)
+    if not source.is_file():
+        return {"ok": False, "installed_to": None, "error": f"node shape not found at {source}"}
+    try:
+        target = node_shape_target(install)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, target)
+    except OSError as e:
+        return {"ok": False, "installed_to": None, "error": str(e)}
+    return {"ok": True, "installed_to": str(target), "error": None}
+
+
+# ---------------------------------------------------------------------------
 # houdini.env
 # ---------------------------------------------------------------------------
 

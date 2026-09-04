@@ -4,5 +4,7 @@ CreateScript	CreateScript
 InternalFileOptions	InternalFileOptions
 Contents.gz	Contents.gz
 Help	Help
+PythonModule	PythonModule
+IconSVG	IconSVG
 OnCreated	OnCreated
 ExtraFileOptions	ExtraFileOptions

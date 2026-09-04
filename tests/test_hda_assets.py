@@ -143,14 +143,149 @@ def test_scheduler_creates_pods_in_the_configured_datacenter():
     assert 'self["rpfarm_datacenter"].evaluateString() or self._cfg.datacenter' in src
 
 
+SCHEDULER_DIALOG = REPO / "hda" / "runpodfarm_scheduler.hda" / "Top_1runpodfarmscheduler" / "DialogScript"
+
+
 def test_datacenter_parm_defaults_to_the_config():
-    """Sibling parms (Template ID, Network Volume ID) default to empty and
-    mean "take it from config.toml". Datacenter defaulting to a hardcoded
-    EU-RO-1 instead is how a US-KS-2 volume ends up with EU-RO-1 pods."""
-    dialog = (REPO / "hda" / "runpodfarm_scheduler.hda" / "Top_1runpodfarmscheduler" / "DialogScript").read_text()
+    """Datacenter must never carry a hardcoded region. It used to default to
+    a literal EU-RO-1, which is how a US-KS-2 volume ends up with EU-RO-1
+    pods that cannot mount it; Task 17 replaced that with an expression
+    reading the config, so the field now SHOWS the region it will use."""
+    dialog = SCHEDULER_DIALOG.read_text()
     assert (
         '            name    "rpfarm_datacenter"\n'
         '            label   "Datacenter"\n'
         '            type    string\n'
-        '            default { "" }\n'
+        '            default { [ "hou.phm().cfg_default(\\"datacenter\\")" python ] }\n'
     ) in dialog
+    assert '"EU-RO-1"   "EU Romania"' in dialog, "still offered as a choice"
+    assert 'default { "EU-RO-1" }' not in dialog, "but never as the default"
+
+
+# -- the family look and the config-backed defaults (Task 17) ----------------
+
+ASSETS = {
+    "runpodfarm_scheduler": "Top_1runpodfarmscheduler",
+    "runpodfarm_upload": "Top_1runpodfarmupload",
+    "runpodfarm_download": "Top_1runpodfarmdownload",
+    "runpodfarm_stats": "Top_1runpodfarmstats",
+}
+
+
+@pytest.mark.parametrize("asset,subdir", sorted(ASSETS.items()))
+def test_every_asset_ships_its_own_icon(asset, subdir):
+    """The icon rides inside the asset as an IconSVG section, so there is
+    nothing to install and nothing to lose when the .hda is copied. The
+    section has to be byte-identical to the source SVG, or the file in
+    hda/icons/ is decoration and the asset is the real (drifted) icon."""
+    source = (REPO / "hda" / "icons" / f"{asset}.svg").read_text()
+    shipped = (REPO / "hda" / f"{asset}.hda" / subdir / "IconSVG").read_text()
+    assert shipped == source
+    index = (REPO / "hda" / f"{asset}.hda" / "INDEX__SECTION").read_text()
+    optype = subdir.split("_1", 1)[1]
+    assert f"Icon:         opdef:/Top/{optype}?IconSVG" in index
+
+
+@pytest.mark.parametrize("asset,subdir", sorted(ASSETS.items()))
+def test_every_asset_creates_itself_violet_and_the_family_shape(asset, subdir):
+    """Colour comes from OnCreated (an HDA definition carries none) and the
+    shape from CreateScript's opuserdata (so it survives even when an event
+    script does not run). Both have to be there for all four, or the family
+    is a family of three."""
+    node_dir = REPO / "hda" / f"{asset}.hda" / subdir
+    assert "node.setColor(hou.Color((0.549, 0.361, 0.882)))" in (node_dir / "OnCreated").read_text()
+    assert "opuserdata -n 'nodeshape' -v 'rpfarm' $arg1" in (node_dir / "CreateScript").read_text()
+
+
+def test_the_node_shape_is_shipped_and_installable():
+    """Unlike the icons, a node shape cannot live inside an asset: Houdini
+    resolves it by name out of config/NodeShapes on HOUDINI_PATH. So it has
+    to be a real file that `rpfarm setup` installs."""
+    import json
+
+    shape = json.loads((REPO / "hda" / "nodeshapes" / "rpfarm.json").read_text())
+    assert shape["name"] == "rpfarm"
+    assert len(shape["outline"]) == 8, "a chamfered rectangle, not one of the stock shapes"
+    assert sorted(shape["flags"]) == ["0", "1", "2", "3"], "all four flag regions or the flags do not draw"
+    assert shape["inputs"] and shape["outputs"]
+
+    from rpfarm import houdini_local
+
+    assert houdini_local.node_shape_source().is_file()
+
+
+def test_the_api_key_is_the_one_field_that_never_shows_its_value():
+    """Substituting the key would put a secret on screen and, the moment a
+    user "overrides" the field, bake it in cleartext into the .hip that
+    travels to the farm and into backups."""
+    dialog = SCHEDULER_DIALOG.read_text()
+    block = dialog[dialog.index('name    "rpfarm_apikey"'):]
+    block = block[:block.index("        }")]
+    assert 'default { "" }' in block
+    assert "cfg_default" not in block and "python ]" not in block
+    # ...and the masked indicator is there instead.
+    assert 'default { [ "hou.phm().apiKeyStatus()" python ] }' in dialog
+
+
+@pytest.mark.parametrize("parm,field", [
+    ("rpfarm_templateid", "template_id"),
+    ("rpfarm_networkvolumeid", "volume_id"),
+    ("rpfarm_datacenter", "datacenter"),
+    ("rpfarm_gpulist", "gpu_priority"),
+])
+def test_the_farm_identity_parms_show_what_they_will_use(parm, field):
+    dialog = SCHEDULER_DIALOG.read_text()
+    assert f'default {{ [ "hou.phm().cfg_default(\\"{field}\\")" python ] }}' in dialog, parm
+
+
+def test_the_scheduler_module_defines_what_those_expressions_call():
+    """A default expression naming a function the PythonModule does not have
+    is an empty field on every node, silently."""
+    src = SCHEDULER_MODULE.read_text()
+    names = {n.name for n in ast.walk(ast.parse(src)) if isinstance(n, ast.FunctionDef)}
+    assert {"cfg_default", "project_default", "apiKeyStatus"} <= names
+
+
+def test_the_first_tab_is_the_one_an_artist_uses():
+    """33 parameters with the farm's identity first is not a first page."""
+    dialog = SCHEDULER_DIALOG.read_text()
+    first = dialog.index('label   "Cook"')
+    farm = dialog.index('label   "Farm"')
+    advanced = dialog.index('label   "Advanced"')
+    assert first < farm < advanced
+    page1 = dialog[first:farm]
+    for name in ("rpfarm_minpods", "rpfarm_maxpods", "rpfarm_slots", "rpfarm_idletimeout",
+                 "rpfarm_maxcost", "rpfarm_downloadoutputs"):
+        assert name in page1, name
+    tail = dialog[advanced:]
+    for name in ("rpfarm_pretaskcmd", "rpfarm_posttaskcmd", "rpfarm_envmulti",
+                 "rpfarm_houdinimaxthreads", "rpfarm_remoteworkingdir", "rpfarm_verbose"):
+        assert name in tail, name
+
+
+def test_no_parameter_was_lost_in_the_reshuffle():
+    """The tab pass moved parms; it must not have dropped any."""
+    import re
+
+    dialog = SCHEDULER_DIALOG.read_text()
+    names = set(re.findall(r'^\s+name\s+"([^"]+)"$', dialog, re.M))
+    expected = {
+        "rpfarm_apikey", "rpfarm_project", "rpfarm_gpulist", "rpfarm_templateid",
+        "rpfarm_networkvolumeid", "rpfarm_datacenter", "rpfarm_minpods", "rpfarm_maxpods",
+        "rpfarm_slots", "rpfarm_idletimeout", "rpfarm_syncidle", "rpfarm_maxcost",
+        "rpfarm_minbalance", "rpfarm_downloadoutputs", "rpfarm_verbose", "rpfarm_killall",
+        "rpfarm_syncledger", "rpfarm_status_text", "rpfarm_volume_refresh",
+        "rpfarm_volume_target", "rpfarm_volume_delete", "rpfarm_volume_growgb",
+        "rpfarm_volume_grow", "rpfarm_volume_text", "pdg_workingdir",
+        "rpfarm_overrideremoteworkingdir", "rpfarm_remoteworkingdir",
+        "pdg_workitemdatasource", "pdg_deletetempdir", "pdg_compressworkitemdata",
+        "pdg_validateoutputs", "pdg_checkexpectedoutputs", "pdg_mapmode", "pdg_usemapzone",
+        "pdg_mapzone", "submitjob", "usesubmitjobnode", "submitjobnode", "submitjobfile",
+        "mqusage", "mqaddr", "usetaskcallbackport", "taskcallbackport", "usemqrelayport",
+        "mqrelayport", "pdg_rpcignoreerrors", "pdg_rpcmaxerrors", "pdg_rpctimeout",
+        "pdg_rpcretries", "pdg_rpcbackoff", "pdg_rpcbatch", "pdg_rpcrelease",
+        "rpfarm_pretaskcmd", "rpfarm_posttaskcmd", "rpfarm_inheritlocalenv",
+        "rpfarm_envunset", "rpfarm_envmulti", "rpfarm_envname#", "rpfarm_envvalue#",
+        "rpfarm_usehoudinimaxthreads", "rpfarm_houdinimaxthreads",
+    }
+    assert expected <= names, sorted(expected - names)

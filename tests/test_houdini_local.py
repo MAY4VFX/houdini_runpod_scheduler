@@ -134,3 +134,44 @@ def test_build_and_install_hdas_missing_source_reports_error(tmp_path):
 
     results = hl.build_and_install_hdas(inst, tmp_path / "otls_cache", root=root, runner=lambda *a, **k: None)
     assert all(not r["ok"] and "not found" in r["error"] for r in results)
+
+
+# -- the custom node shape (Task 17) -----------------------------------------
+
+
+def test_install_node_shape_copies_it_where_houdini_looks(tmp_path):
+    """Unlike an icon, a node shape cannot ride inside the .hda: Houdini
+    resolves it by name out of config/NodeShapes on HOUDINI_PATH. Without
+    this copy the four farm nodes silently draw as plain rectangles."""
+    hfs = _make_hfs(tmp_path)
+    inst = hl.HoudiniInstall(hfs)
+    inst.user_pref_dir = tmp_path / "prefs"
+
+    result = hl.install_node_shape(inst)
+
+    assert result["ok"] and result["error"] is None
+    target = tmp_path / "prefs" / "config" / "NodeShapes" / "rpfarm.json"
+    assert target.exists()
+    assert target.read_text() == hl.node_shape_source().read_text()
+    assert hl.node_shape_target(inst) == target
+
+
+def test_install_node_shape_is_rerunnable(tmp_path):
+    hfs = _make_hfs(tmp_path)
+    inst = hl.HoudiniInstall(hfs)
+    inst.user_pref_dir = tmp_path / "prefs"
+    assert hl.install_node_shape(inst)["ok"]
+    assert hl.install_node_shape(inst)["ok"]
+
+
+def test_install_node_shape_reports_a_missing_source_instead_of_raising(tmp_path):
+    """Same contract as build_and_install_hdas: setup surfaces this per item
+    rather than aborting the whole run over a cosmetic file."""
+    hfs = _make_hfs(tmp_path)
+    inst = hl.HoudiniInstall(hfs)
+    inst.user_pref_dir = tmp_path / "prefs"
+
+    result = hl.install_node_shape(inst, root=tmp_path / "not-a-checkout")
+
+    assert result["ok"] is False
+    assert "node shape not found" in result["error"]

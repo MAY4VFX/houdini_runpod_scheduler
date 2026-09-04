@@ -1,0 +1,19 @@
+# The family look, shared by all four RunPodFarm nodes (Task 17): violet,
+# because it is RunPod's own colour and is essentially absent from stock
+# Houdini, so a farm node is recognisable at a glance in a TOP network.
+#
+# Colour has to be set here rather than baked into the definition: an HDA
+# definition carries no colour at all (verified in Houdini 22.0.368 -- a
+# node coloured before createDigitalAsset comes back grey). The shape is
+# also written by CreateScript's own opuserdata line, so it survives even
+# when this event script does not run; re-asserting it costs nothing and
+# means one mechanism failing is not the whole look failing.
+#
+# The shape itself is hda/nodeshapes/rpfarm.json, which `rpfarm setup`
+# copies into <prefs>/config/NodeShapes/ (rpfarm.houdini_local.
+# install_node_shape) and `rpfarm doctor` checks for -- Houdini resolves a
+# shape by name off HOUDINI_PATH and cannot read one out of an asset. If it
+# is missing the node just draws as a plain rectangle.
+node = kwargs["node"]
+node.setColor(hou.Color((0.549, 0.361, 0.882)))
+node.setUserData("nodeshape", "rpfarm")

@@ -28,11 +28,102 @@ directory layout -- ``-c``/``-C`` are for the other (``-x``/``-X``) expanded
 format and silently produce an interface-less asset here.
 """
 import os
+import pathlib
 import sys
 
 import hou
 
 OUT_HDA = sys.argv[1] if len(sys.argv) > 1 else "/tmp/runpodfarm_upload.hda"
+
+# -- the family look (Task 17) ------------------------------------------------
+#
+# All four RunPodFarm nodes share one colour, one node shape and one icon
+# family, so a farm node is recognisable at a glance among stock TOP nodes.
+# Violet because it is RunPod's own colour and is essentially absent from
+# stock Houdini.
+#
+# The icon travels INSIDE the asset as an ``IconSVG`` section referenced by
+# ``opdef:.?IconSVG``, so it needs no installation. The node shape cannot:
+# Houdini resolves a shape by name out of ``config/NodeShapes`` on
+# HOUDINI_PATH, so ``rpfarm setup`` copies hda/nodeshapes/rpfarm.json into
+# the user pref dir (rpfarm.houdini_local.install_node_shape) and ``rpfarm
+# doctor`` checks it is there. Without it the nodes simply draw as plain
+# rectangles -- they still work.
+REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
+NODE_COLOR = (0.549, 0.361, 0.882)
+NODE_SHAPE = "rpfarm"
+ICON_SVG = (REPO_ROOT / "hda" / "icons" / "runpodfarm_upload.svg").read_text()
+
+# Colour is applied in OnCreated because a definition carries none: a node
+# coloured before createDigitalAsset comes back grey on the next instance
+# (verified in Houdini 22.0.368). The shape does survive -- setUserData
+# below bakes an ``opuserdata`` line into the generated CreateScript -- but
+# it is re-asserted here too, so one mechanism failing is not the whole
+# look failing.
+FAMILY_ONCREATED = (
+    'node.setColor(hou.Color((0.549, 0.361, 0.882)))\n'
+    'node.setUserData("nodeshape", "rpfarm")\n'
+)
+
+PYTHON_MODULE = '''\
+"""Parameter-default helpers for runpodfarm_upload.
+
+Task 17: the fields that are read from ~/.rpfarm/config.toml now SHOW what
+they will use. They used to sit empty while the code behind them did
+`parm or config`, so an empty field read as "not configured" even though
+everything worked, and there was no way to tell a field that still needs
+filling in from one that is already answered.
+
+The mechanism is Houdini's own: the parm's DEFAULT is an expression calling
+into here. While the artist has not touched the field it evaluates live from
+the config; the moment they type something, the literal replaces the
+expression and wins -- exactly "an override overrides the config", with no
+change needed to the `parm or cfg` code that reads it.
+
+Two rules for everything in this module, because a parm default expression
+is re-evaluated on every UI refresh and runs while the parameter dialog is
+being drawn:
+  * it must be cheap -- rpfarm.config.load_cached() re-reads config.toml
+    only when its mtime/size change; and
+  * it must never raise -- no config yet (before `rpfarm setup`), no rpfarm
+    on sys.path at all, a corrupt config: every one of those has to come
+    back as an empty field, not a node that throws while drawing itself.
+"""
+
+import os
+import pathlib
+import sys
+
+_RPFARM_ROOT = pathlib.Path(os.environ.get("RPFARM_ROOT", pathlib.Path.home() / ".rpfarm" / "src"))
+if str(_RPFARM_ROOT) not in sys.path:
+    sys.path.insert(0, str(_RPFARM_ROOT))
+
+
+def cfg_default(name, fallback=""):
+    """The value ~/.rpfarm/config.toml gives *name*, or *fallback*."""
+    try:
+        from rpfarm import config as rpcfg
+
+        return rpcfg.config_value(name, fallback)
+    except Exception:
+        return fallback
+
+
+def project_default():
+    """What onGenerate would fall back to for Project: the $JOB basename.
+
+    Not a config field -- the project is per scene -- but the same problem:
+    an empty Project field never said which folder on the volume the upload
+    was actually going to.
+    """
+    try:
+        import hou
+
+        job = hou.getenv("JOB") or hou.expandString("$HIP") or ""
+        return os.path.basename(os.path.normpath(job)) if job else ""
+    except Exception:
+        return ""
+'''
 
 GENERATE_CODE = '''\
 # Called when this node should generate new work items from upstream items.
@@ -357,8 +448,10 @@ Mode:
 Project:
     #id: rpfarm_project
 
-    Remote project folder: `/workspace/projects/<user>/<project>`. Empty
-    means the name of the `$JOB` directory.
+    Remote project folder: `/workspace/projects/<user>/<project>`. The field
+    shows the name of the `$JOB` directory -- what this upload will really
+    use -- as a default expression (`hou.phm().project_default()`); type
+    your own and the literal replaces it and wins.
 
 Package Size (GB):
     #id: rpfarm_packagegb
@@ -421,6 +514,12 @@ Houdini Tarball:
 Houdini Version:
     #id: rpfarm_houver
 
+    Shows `houdini_version` from `~/.rpfarm/config.toml` -- the version the
+    farm pods run -- as a default expression (`hou.phm().cfg_default`), so
+    the field says what will be installed instead of sitting empty. Type
+    your own to install a different one. Empty means there is no config
+    yet: run `rpfarm setup`.
+
 Cook In Process (debug):
     #id: rpfarm_inprocess
 
@@ -480,8 +579,19 @@ def main():
     # Matches runpodfarm_scheduler's own rpfarm_project parm: empty string,
     # with the "basename of $JOB" fallback implemented in onGenerate
     # (Python) rather than as a live default expression here.
-    project_pt = hou.StringParmTemplate("rpfarm_project", "Project", 1, default_value=("",))
-    project_pt.setHelp("Project folder on the network volume: /workspace/projects/<user>/<project>. Empty means the name of the $JOB directory.")
+    # Task 17: the field shows the folder this upload will really go to
+    # (the $JOB basename) instead of sitting empty; typing over it wins, as
+    # a literal always beats a default expression. onGenerate's own
+    # `evalParm(...) or basename($JOB)` is unchanged and still correct.
+    project_pt = hou.StringParmTemplate(
+        "rpfarm_project", "Project", 1, default_value=("",),
+        default_expression=("hou.phm().project_default()",),
+        default_expression_language=(hou.scriptLanguage.Python,),
+    )
+    project_pt.setHelp(
+        "Project folder on the network volume: /workspace/projects/<user>/<project>. "
+        "Shows the name of the $JOB directory until you type your own."
+    )
     packagegb_pt = hou.FloatParmTemplate(
         "rpfarm_packagegb", "Package Size (GB)", 1, default_value=(1.5,), min=0.1, max=16, max_is_strict=False
     )
@@ -521,7 +631,18 @@ def main():
     )
     houtar_pt.setHelp("Local path to houdini-<version>-linux_x86_64_gcc14.2.tar.gz.")
     houtar_pt.setConditional(hou.parmCondType.HideWhen, "{ rpfarm_preset != install_houdini }")
-    houver_pt = hou.StringParmTemplate("rpfarm_houver", "Houdini Version", 1, default_value=("22.0.393",))
+    # Task 17: was a hardcoded "22.0.393" that quietly disagreed with
+    # houdini_version in config.toml -- the version every pod actually runs.
+    houver_pt = hou.StringParmTemplate(
+        "rpfarm_houver", "Houdini Version", 1, default_value=("",),
+        default_expression=('hou.phm().cfg_default("houdini_version")',),
+        default_expression_language=(hou.scriptLanguage.Python,),
+    )
+    houver_pt.setHelp(
+        "Shows houdini_version from ~/.rpfarm/config.toml -- the version the farm "
+        "pods run. Type your own to install a different one. Empty means there is "
+        "no config yet: run `rpfarm setup`."
+    )
     houver_pt.setConditional(hou.parmCondType.HideWhen, "{ rpfarm_preset != install_houdini }")
 
     # Ruling R22: out of process (this off) is the default -- uploads must
@@ -542,6 +663,10 @@ def main():
 
     sn.setParmTemplateGroup(ptg)
 
+    # Baked into the generated CreateScript as an "opuserdata" line, so
+    # every instance is the right shape from the moment it is created.
+    sn.setUserData("nodeshape", NODE_SHAPE)
+
     if os.path.exists(OUT_HDA):
         os.remove(OUT_HDA)
 
@@ -556,6 +681,12 @@ def main():
 
     definition = new_type.type().definition()
     definition.addSection("Help", HELP_TEXT)
+    definition.addSection("PythonModule", PYTHON_MODULE)
+    # The icon rides inside the asset rather than as a file on disk:
+    # nothing to install, nothing to lose, and it follows the .hda
+    # wherever it is copied.
+    definition.addSection("IconSVG", ICON_SVG)
+    definition.setIcon("opdef:.?IconSVG")
     # setParmTemplateGroup on the node (above) only affects this live
     # instance -- new instances created from the saved asset get their
     # interface from the DEFINITION's own template group, which has to be
@@ -576,6 +707,7 @@ def main():
     definition.addSection(
         "OnCreated",
         'node = kwargs["node"]\n'
+        + FAMILY_ONCREATED +
         'pp = node.node("pythonprocessor1")\n'
         'if pp is not None:\n'
         '    try:\n'
