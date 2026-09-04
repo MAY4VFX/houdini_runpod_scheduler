@@ -1898,6 +1898,8 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         # on the sync pod and points the relay at its public ports.
         self.startPollingClient()
 
+        self._preflightXpu()
+
         wanted = max(1, self["rpfarm_minpods"].evaluateInt())
         if not self._scale_up(wanted):
             # A cook with no machines yet is a QUEUE, not a failure. Our pods
@@ -2267,6 +2269,63 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         if count > 0:
             self._log("autoscale: {} pending, adding {} pod(s)".format(pending, count))
             self._scale_up(count)
+
+    def _xpuRops(self):
+        """ROPs this topnet is about to render that ask for Karma XPU.
+
+        Read off the ROP Fetch nodes rather than guessed: each one names its
+        ROP in `roppath`, and a Karma ROP carries the engine on `engine`.
+        """
+        out = []
+        try:
+            import hou
+
+            for node in self.topNode().parent().children():
+                roppath = node.parm("roppath") if node.parm("roppath") else None
+                if roppath is None:
+                    continue
+                rop = hou.node(roppath.eval() or "")
+                if rop is None:
+                    continue
+                engine = rop.parm("engine")
+                if engine is not None and str(engine.eval()).lower() == "xpu":
+                    out.append(rop.path())
+        except Exception:  # noqa: BLE001 - a preflight must not break the cook
+            return []
+        return out
+
+    def _preflightXpu(self):
+        """Refuse an XPU cook the farm cannot run -- once, in words.
+
+        The alternative is what actually happened: eight render tasks died
+        identically with "Karma XPU delegate not supported on this machine",
+        48-65 seconds each, and the reason was a missing library in the pod
+        image. Nothing said so until someone read a log off the volume.
+
+        Only refuses on a RECORDED no (`rpfarm farm xpu` asked a GPU pod and
+        wrote the answer). Unknown is not treated as no: guessing wrong here
+        would block a farm that works.
+        """
+        rops = self._xpuRops()
+        if not rops:
+            return
+        supported = getattr(self._cfg, "xpu_supported", None)
+        if supported is None:
+            self._log(
+                "{} ask for Karma XPU and this farm has never been checked for "
+                "it -- run `rpfarm farm xpu` if the frames fail".format(
+                    ", ".join(rops)))
+            return
+        if supported:
+            self._log("{} render with Karma XPU (checked available)".format(
+                ", ".join(rops)))
+            return
+        raise CookError(
+            "{} are set to render with Karma XPU, and this farm cannot run it.\n"
+            "Every frame would fail the same way, so the cook is stopped here "
+            "instead of paying for that.\n"
+            "Either set the ROP's Rendering Engine to CPU, or fix the farm and "
+            "re-check with `rpfarm farm xpu`.".format(", ".join(rops)))
 
     def _expireWaitingItems(self):
         """Fail the items that have waited too long for a machine -- only those.

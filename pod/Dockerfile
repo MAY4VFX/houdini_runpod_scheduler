@@ -19,6 +19,23 @@ LABEL description="RunPodFarm v2 pod - sshd + worker daemon, Houdini from networ
 
 ENV DEBIAN_FRONTEND=noninteractive
 
+# libegl1 is what makes Karma XPU work, and its absence is why XPU did not.
+# Eight render tasks died identically with "Karma XPU delegate not supported on
+# this machine" / "Unable to load render plugin: BRAY_HdKarmaXPU", and the
+# obvious suspect was wrong: RunPod already sets
+# NVIDIA_DRIVER_CAPABILITIES=compute,display,graphics,utility,video and
+# libnvoptix.so.1 is present in the container. Bisected on a live pod --
+# installing libegl1 alone flips `husk --list-renderers` from
+# "BRAY_HdKarmaXPU (Karma XPU) - unsupported" to supported, and an XPU render
+# then produces an image. The image had libGL (libgl1-mesa-glx) but never
+# libEGL, which on Ubuntu 22.04 is a separate package; Karma XPU's support
+# probe needs it to reach the driver's own libEGL_nvidia.
+#
+# libxcomposite1 is the same family, found in the same pass: without it
+# HOUDINI_DSO_ERROR=2 reports load failures for COP2_GPU*, OBJ_ReLight and
+# CHOP_Mouse3D on every pod. Not fatal to a render, but it is noise in every
+# log and the package is tiny.
+#
 # libatomic1 is required by Houdini 22.0 (gcc 14.2 build): its `hython-bin`
 # links libatomic.so.1 directly, and it is the ONLY unresolved `ldd` entry on
 # a stock ubuntu:22.04. Houdini 20.5 did not need it -- it used Houdini's own
@@ -30,6 +47,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libatomic1 \
     libgl1-mesa-glx libglu1-mesa libxi6 libxmu6 libxrandr2 libxcursor1 \
     libxinerama1 libxss1 libasound2 libxkbcommon0 libnss3 libdbus-1-3 \
+    libegl1 libxcomposite1 \
     && rm -rf /var/lib/apt/lists/* \
     && curl -fsSL https://rclone.org/install.sh -o /tmp/rclone-install.sh \
     && bash /tmp/rclone-install.sh \

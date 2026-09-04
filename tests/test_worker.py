@@ -286,3 +286,84 @@ def test_exec_sync_timeout_leaves_no_unreaped_child(srv):
     assert st == 504
     with pytest.raises(ChildProcessError):
         os.waitpid(-1, os.WNOHANG)
+
+
+# ---------------------------------------------------------------------------
+# XpuSupport -- so nobody has to learn this from eight crashed tasks again
+# ---------------------------------------------------------------------------
+
+
+def _husk(stdout, returncode=0):
+    class R:
+        pass
+    r = R()
+    r.stdout = stdout
+    r.returncode = returncode
+
+    def run(cmd, **_kw):
+        run.calls.append(cmd)
+        return r
+    run.calls = []
+    return run
+
+
+def test_xpu_supported_when_husk_lists_the_delegate_plainly(monkeypatch, tmp_path):
+    monkeypatch.setenv("HFS", str(tmp_path))
+    (tmp_path / "bin").mkdir()
+    (tmp_path / "bin" / "husk").write_text("")
+    run = _husk(" - BRAY_HdKarma (Karma CPU)\n - BRAY_HdKarmaXPU (Karma XPU)\n")
+
+    answer = worker.XpuSupport(run=run).supported()
+
+    assert answer["supported"] is True
+    assert "KarmaXPU" in answer["detail"]
+
+
+def test_xpu_unsupported_is_read_from_husks_own_wording(monkeypatch, tmp_path):
+    monkeypatch.setenv("HFS", str(tmp_path))
+    (tmp_path / "bin").mkdir()
+    (tmp_path / "bin" / "husk").write_text("")
+    run = _husk(" - BRAY_HdKarmaXPU (Karma XPU) - unsupported\n")
+
+    answer = worker.XpuSupport(run=run).supported()
+
+    assert answer["supported"] is False
+    assert "unsupported" in answer["detail"]
+
+
+def test_xpu_answer_is_cached(monkeypatch, tmp_path):
+    monkeypatch.setenv("HFS", str(tmp_path))
+    (tmp_path / "bin").mkdir()
+    (tmp_path / "bin" / "husk").write_text("")
+    run = _husk(" - BRAY_HdKarmaXPU (Karma XPU)\n")
+    probe = worker.XpuSupport(run=run)
+
+    probe.supported()
+    probe.supported()
+
+    assert len(run.calls) == 1
+
+
+def test_xpu_is_unknown_rather_than_false_when_it_cannot_ask(monkeypatch, tmp_path):
+    """Unknown must not read as 'no': the preflight refuses cooks on a no."""
+    monkeypatch.setenv("HFS", str(tmp_path))          # no bin/husk under it
+
+    assert worker.XpuSupport(run=_husk("")).supported()["supported"] is None
+
+    (tmp_path / "bin").mkdir()
+    (tmp_path / "bin" / "husk").write_text("")
+    assert worker.XpuSupport(run=_husk("nothing relevant\n")).supported()["supported"] is None
+
+
+def test_a_husk_that_explodes_does_not_take_health_down(monkeypatch, tmp_path):
+    monkeypatch.setenv("HFS", str(tmp_path))
+    (tmp_path / "bin").mkdir()
+    (tmp_path / "bin" / "husk").write_text("")
+
+    def boom(cmd, **_kw):
+        raise OSError("no husk for you")
+
+    answer = worker.XpuSupport(run=boom).supported()
+
+    assert answer["supported"] is None
+    assert "husk failed" in answer["detail"]
