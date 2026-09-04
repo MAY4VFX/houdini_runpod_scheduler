@@ -239,6 +239,26 @@ class Registry:
         threading.Timer(10, _force_kill).start()
 
 
+def _kill_process_group(proc):
+    """SIGKILL a timed-out `/exec` command and everything it started.
+
+    The command runs with ``start_new_session=True``, so its children share
+    its process group and one ``killpg`` takes the lot. Killing only the
+    direct child (what ``subprocess.run``'s own timeout does) leaves
+    grandchildren running against a closed stdout pipe -- how Task 14's
+    Houdini install ended up half-written -- and later reparented to the
+    worker as unreaped zombies.
+    """
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        proc.kill()
+    try:
+        proc.communicate(timeout=5)
+    except Exception:  # pragma: no cover - best effort reaping
+        pass
+
+
 def _under_workspace(path):
     root = os.path.realpath(WORKSPACE_ROOT)
     real = os.path.realpath(path)
@@ -555,24 +575,31 @@ def make_server(host, port, log_dir="/workspace/ledger/logs"):
                 return self._send_json(202, started)
 
             timeout_s = min(body.get("timeout_s", 600), EXEC_SYNC_CEILING_S)
+            # Own session, so a timeout can kill the whole process *group*.
+            # `subprocess.run`'s timeout kills only the direct child, which
+            # is what let Task 14's installer keep running as an orphan and
+            # then die of SIGPIPE half-done; verified live afterwards -- a
+            # clamped-out `sleep` was still sitting on the pod as a zombie.
+            proc = subprocess.Popen(
+                ["bash", "-c", build_shell_command(command)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=build_env({}),
+                text=True,
+                start_new_session=True,
+            )
             try:
-                result = subprocess.run(
-                    ["bash", "-c", build_shell_command(command)],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    env=build_env({}),
-                    text=True,
-                    timeout=timeout_s,
-                )
+                stdout, stderr = proc.communicate(timeout=timeout_s)
                 self._send_json(
                     200,
                     {
-                        "exit_code": result.returncode,
-                        "stdout": result.stdout[-200000:],
-                        "stderr": result.stderr[-20000:],
+                        "exit_code": proc.returncode,
+                        "stdout": stdout[-200000:],
+                        "stderr": stderr[-20000:],
                     },
                 )
             except subprocess.TimeoutExpired:
+                _kill_process_group(proc)
                 self._send_json(
                     504,
                     {
