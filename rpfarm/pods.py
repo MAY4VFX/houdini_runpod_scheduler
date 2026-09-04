@@ -193,8 +193,11 @@ def _find_or_create_sync_pod(api, cfg, token, pubkey, log):
     for p in existing:
         log(f"sync pod {p['id']} not running ({p.get('desiredStatus')}); terminating")
         api.terminate_pod(p["id"])
+    # cfg.datacenter, not the API's fallback: the sync pod has to be created
+    # in the same region as the network volume it mounts (finding 5).
     pod = api.create_cpu_pod(
-        name, cfg.template_id, cfg.volume_id, pod_env(cfg, "sync", token, SYNC_SLOTS, pubkey), PORTS
+        name, cfg.template_id, cfg.volume_id, pod_env(cfg, "sync", token, SYNC_SLOTS, pubkey), PORTS,
+        datacenter=cfg.datacenter,
     )
     log(f"sync pod created: {pod['id']}")
     return pod

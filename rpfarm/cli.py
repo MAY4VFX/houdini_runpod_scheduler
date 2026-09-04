@@ -45,7 +45,7 @@ from . import ledger as rpledger
 from . import packages as rppkg
 from . import pods as rppods
 from . import sync as rpsync
-from .runpod_api import RunPodAPI, RunPodError, pod_public_endpoint
+from .runpod_api import DEFAULT_DATACENTER, RunPodAPI, RunPodError, pod_public_endpoint
 from .worker_client import WorkerClient
 
 # None -> RunPodAPI's own default (a real urllib transport). Tests set this
@@ -313,8 +313,8 @@ def _pick_volume(api, args, user, log=print, prompt=input):
         log(f"[OK] using existing volume {v['id']} ({v.get('dataCenterId', '?')}, {v.get('size', '?')} GB)")
         return v["id"]
     if not volumes:
-        vol = api.create_volume(f"rpfarm-{user}", 50, dc="EU-RO-1")
-        log(f"[OK] created volume {vol['id']} (50 GB, EU-RO-1)")
+        vol = api.create_volume(f"rpfarm-{user}", 50, dc=DEFAULT_DATACENTER)
+        log(f"[OK] created volume {vol['id']} (50 GB, {DEFAULT_DATACENTER})")
         return vol["id"]
     if args.non_interactive:
         log("[FAIL] multiple volumes found; pass --volume <id>:")
@@ -405,13 +405,29 @@ def cmd_setup(args, prompt=input):
     except SystemExit as e:
         return e.code or 1
 
-    datacenter = (existing.datacenter if existing else None) or "EU-RO-1"
+    # The volume's own region is the authority: a pod can only mount a
+    # network volume that is in its region, and every pod this config
+    # creates mounts THIS volume (finding 5). So adopting a volume in
+    # another region is a region change for the whole config -- record it,
+    # but never silently.
+    datacenter = (existing.datacenter if existing else None) or DEFAULT_DATACENTER
     try:
         vinfo = api.get_volume(volume_id)
-        if vinfo:
-            datacenter = vinfo.get("dataCenterId", datacenter)
-    except RunPodError:
-        pass
+    except RunPodError as e:
+        vinfo = None
+        print(f"[WARN] could not read volume {volume_id}'s region ({e}); keeping {datacenter}")
+    if vinfo:
+        volume_dc = vinfo.get("dataCenterId") or datacenter
+        if volume_dc != datacenter:
+            print(
+                f"[WARN] volume {volume_id} lives in {volume_dc}, not {datacenter}. "
+                f"Every pod is created in the volume's region, so this config now "
+                f"records {volume_dc}. If that is not what you meant, rerun with "
+                f"--volume <id of a {datacenter} volume>."
+            )
+        datacenter = volume_dc
+    elif vinfo is None and volume_id:
+        print(f"[WARN] volume {volume_id} not found; keeping datacenter {datacenter}")
 
     if existing is not None:
         cfg = existing
@@ -527,7 +543,15 @@ def cmd_doctor(args):
     try:
         vol = api.get_volume(cfg.volume_id)
         if vol:
-            ok(f"volume {cfg.volume_id} exists ({vol.get('size', '?')} GB, {vol.get('dataCenterId', '?')})")
+            volume_dc = vol.get("dataCenterId", "?")
+            ok(f"volume {cfg.volume_id} exists ({vol.get('size', '?')} GB, {volume_dc})")
+            # Pods are created in cfg.datacenter and mount this volume; a
+            # volume in another region cannot be mounted at all, so every
+            # cook would fail with nothing here to explain why.
+            if volume_dc != "?" and volume_dc != cfg.datacenter:
+                fail(f"volume {cfg.volume_id} is in {volume_dc} but pods are created in "
+                     f"{cfg.datacenter} -- no pod can mount it. Rerun `rpfarm setup` "
+                     f"(it records the volume's region) or fix datacenter in config.toml")
         else:
             fail(f"volume {cfg.volume_id} not found -- `rpfarm storage recreate` or fix config.toml")
     except RunPodError as e:

@@ -52,15 +52,16 @@
             name    "rpfarm_datacenter"
             label   "Datacenter"
             type    string
-            default { "EU-RO-1" }
+            default { "" }
             menu {
+                ""          "(from config.toml)"
                 "EU-RO-1"   "EU Romania"
                 "EU-CZ-1"   "EU Czech Republic"
                 "EU-SE-1"   "EU Sweden"
                 "US-TX-3"   "US Texas"
                 "CA-MTL-1"  "CA Montreal"
             }
-            help    "Must be the datacenter the network volume lives in."
+            help    "Must be the datacenter the network volume lives in. Empty means datacenter from ~/.rpfarm/config.toml, which `rpfarm setup` fills in from the volume's own region."
         }
         parm {
             name    "sepparm_scaling"

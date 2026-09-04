@@ -23,6 +23,8 @@ import zipfile
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 
+from .runpod_api import DEFAULT_DATACENTER
+
 CONFIG_FILENAME = "config.toml"
 TOKEN_FILENAME = "token"
 
@@ -55,7 +57,7 @@ class Config:
     user: str
     volume_id: str
     template_id: str
-    datacenter: str = "EU-RO-1"
+    datacenter: str = DEFAULT_DATACENTER
     houdini_version: str = "22.0.393"
     sesinetd_host: str = "lic.ai-vfx.com"
     sesinetd_port: int = 1715

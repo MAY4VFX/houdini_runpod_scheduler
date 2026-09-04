@@ -1085,3 +1085,80 @@ def test_housekeeping_failure_message_survives_the_merged_log():
     buf = _io.StringIO()
     cli._report_housekeeping_failure({"exit_code": 1, "stdout": "outputs pending", "stderr": ""}, stream=buf)
     assert "outputs pending" in buf.getvalue()
+
+
+# -- datacenter (final-review finding 5) -------------------------------------
+#
+# `_pod_body` hardcoded EU-RO-1 while cfg.datacenter, the scheduler's
+# Datacenter parm, doctor's stock check and `storage recreate` all honoured
+# the configured value. A newcomer whose account already held a volume in
+# another region got `setup` adopting it, pods created in EU-RO-1 against a
+# volume that is not there, every cook failing, and doctor reporting GPU
+# stock for the wrong region.
+
+
+def test_setup_records_the_adopted_volumes_region(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("RPFARM_HOME", str(tmp_path))
+    volumes = [{"id": "vol123", "dataCenterId": "US-KS-2", "size": 50}]
+    monkeypatch.setattr(cli, "_transport", FakeTransport(_setup_handlers(volumes=volumes)))
+    monkeypatch.setattr(houdini_local, "find_houdini_installations", lambda: [])
+    monkeypatch.setattr(rpcfg, "rclone_bin", lambda *a, **k: str(tmp_path / "bin" / "rclone"))
+
+    assert cli.main(["setup", "--non-interactive", "--api-key", "k", "--user", "u"]) == 0
+    assert rpcfg.load().datacenter == "US-KS-2"
+
+
+def test_setup_warns_loudly_when_the_volumes_region_is_not_the_recorded_one(tmp_path, monkeypatch, capsys):
+    """Adopting a volume in another region is a region change for the whole
+    config -- every pod is created where the volume is. Record it, never
+    silently."""
+    monkeypatch.setenv("RPFARM_HOME", str(tmp_path))
+    _write_cfg(tmp_path, datacenter="EU-RO-1")
+    volumes = [{"id": "vol123", "dataCenterId": "US-KS-2", "size": 50}]
+    monkeypatch.setattr(cli, "_transport", FakeTransport(_setup_handlers(volumes=volumes)))
+    monkeypatch.setattr(houdini_local, "find_houdini_installations", lambda: [])
+    monkeypatch.setattr(rpcfg, "rclone_bin", lambda *a, **k: str(tmp_path / "bin" / "rclone"))
+
+    assert cli.main(["setup", "--non-interactive", "--volume", "vol123"]) == 0
+    out = capsys.readouterr().out
+    assert "[WARN]" in out and "US-KS-2" in out and "EU-RO-1" in out
+    assert rpcfg.load().datacenter == "US-KS-2"
+
+
+def test_doctor_fails_when_the_volume_is_in_another_region_than_the_pods(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("RPFARM_HOME", str(tmp_path))
+    _write_cfg(tmp_path, rclone_path="true", ssh_key_path=str(tmp_path / "id_ed25519"),
+               datacenter="EU-RO-1")
+    (tmp_path / "id_ed25519").write_text("x")
+    (tmp_path / "id_ed25519.pub").write_text("x")
+
+    handlers = _setup_handlers()
+    handlers[("GET", "/networkvolumes/vol123")] = (
+        200, json.dumps({"id": "vol123", "size": 50, "dataCenterId": "US-KS-2"}).encode()
+    )
+    monkeypatch.setattr(cli, "_transport", FakeTransport(handlers))
+    monkeypatch.setattr(houdini_local, "find_houdini_installations", lambda: [])
+    monkeypatch.setattr("socket.create_connection", lambda *a, **k: (_ for _ in ()).throw(OSError("blocked")))
+
+    assert cli.main(["doctor"]) == 1
+    out = capsys.readouterr().out
+    assert "no pod can mount it" in out
+
+
+def test_doctor_says_nothing_about_regions_when_they_agree(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("RPFARM_HOME", str(tmp_path))
+    _write_cfg(tmp_path, rclone_path="true", ssh_key_path=str(tmp_path / "id_ed25519"),
+               datacenter="US-KS-2")
+    (tmp_path / "id_ed25519").write_text("x")
+    (tmp_path / "id_ed25519.pub").write_text("x")
+
+    handlers = _setup_handlers()
+    handlers[("GET", "/networkvolumes/vol123")] = (
+        200, json.dumps({"id": "vol123", "size": 50, "dataCenterId": "US-KS-2"}).encode()
+    )
+    monkeypatch.setattr(cli, "_transport", FakeTransport(handlers))
+    monkeypatch.setattr(houdini_local, "find_houdini_installations", lambda: [])
+    monkeypatch.setattr("socket.create_connection", lambda *a, **k: (_ for _ in ()).throw(OSError("blocked")))
+
+    cli.main(["doctor"])
+    assert "no pod can mount it" not in capsys.readouterr().out

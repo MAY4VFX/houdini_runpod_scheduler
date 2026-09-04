@@ -50,6 +50,34 @@ def test_create_gpu_pod_builds_body():
     assert body["volumeMountPath"] == "/workspace"
 
 
+def test_pod_creates_carry_the_configured_datacenter():
+    """Finding 5: the region used to be hardcoded to EU-RO-1 in _pod_body
+    while cfg.datacenter, the scheduler's Datacenter parm, doctor's stock
+    check and `storage recreate` all honoured the configured value. A
+    network volume exists in exactly one region and a pod can only mount
+    one in its own, so an artist whose account already held a volume
+    elsewhere got pods that could not mount it and cooks that all failed.
+    """
+    t = FakeTransport([(200, {"id": "p1"}), (200, {"id": "p2"})])
+    api = ra.RunPodAPI("k", transport=t)
+
+    api.create_cpu_pod("rpfarm-sync-may", "tpl", "vol", {}, ["22/tcp"], datacenter="US-KS-2")
+    api.create_gpu_pod("rpfarm-gpu", "tpl", ["NVIDIA A40"], "vol", {}, ["22/tcp"], datacenter="US-KS-2")
+
+    assert [body["dataCenterIds"] for _m, _u, body, _h in t.calls] == [["US-KS-2"], ["US-KS-2"]]
+
+
+def test_pod_creates_fall_back_to_the_default_datacenter():
+    """A caller with nothing configured still gets a region, and it is the
+    one literal every other default uses."""
+    t = FakeTransport([(200, {"id": "p1"}), (200, {"id": "p2"})])
+    api = ra.RunPodAPI("k", transport=t)
+    api.create_cpu_pod("rpfarm-sync-may", "tpl", "vol", {}, [])
+    api.create_cpu_pod("rpfarm-sync-may", "tpl", "vol", {}, [], datacenter="")
+    for _m, _u, body, _h in t.calls:
+        assert body["dataCenterIds"] == [ra.DEFAULT_DATACENTER]
+
+
 def test_terminate_ignores_404():
     api = ra.RunPodAPI("k", transport=FakeTransport([(404, {"error": "no"})]))
     api.terminate_pod("gone")  # no raise

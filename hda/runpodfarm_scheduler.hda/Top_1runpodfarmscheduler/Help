@@ -106,8 +106,11 @@ Network Volume ID:
 Datacenter:
     #id: rpfarm_datacenter
 
-    RunPod datacenter region. The network volume only exists in one region, so
-    this has to match it.
+    RunPod datacenter region. The network volume only exists in one region and
+    a pod can only mount a volume in its own, so this has to match it. Empty
+    (the default) means `datacenter` from `~/.rpfarm/config.toml`, which
+    `rpfarm setup` records from the volume's own region -- set this only to
+    override that for one node.
 
 === Scaling ===
 
