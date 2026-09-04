@@ -210,6 +210,93 @@ class XpuSupport:
                     proc.returncode, tail[-1] if tail else "no output")}
 
 
+# TCP state 01 is ESTABLISHED in /proc/net/tcp. sshd listens on 22, and both
+# an interactive session and an rclone/sftp transfer hold one of these open.
+_TCP_ESTABLISHED = "01"
+_SSH_PORT = 22
+
+# Processes that mean a transfer is in flight. sftp-server is what sshd forks
+# for rclone's SFTP backend; rclone/rsync/scp cover the pod-side direction.
+_TRANSFER_COMMS = frozenset({"rclone", "sftp-server", "rsync", "scp"})
+
+
+class Liveness:
+    """Is anyone using this pod, by ANY channel -- not just HTTP?
+
+    ``busy``/``idle_s`` only ever saw requests to this worker, so a pod driven
+    over SSH looked abandoned while working flat out. That is not hypothetical:
+    a benchmark pod rendering 15 frames reported busy 0 with idle_s equal to
+    its whole uptime, and the kill guard called it safe to terminate. The
+    production case is worse -- rclone moves files to the sync pod over SFTP,
+    so a pod receiving a 4GB Houdini tarball, the heaviest thing this farm ever
+    does, reports itself perfectly idle.
+
+    Deliberately DISCRETE evidence -- an established connection on port 22, a
+    transfer process in the table -- and not a CPU threshold. A threshold has
+    to be calibrated against the pod's own background noise, which means it
+    cannot be chosen without a live machine to watch; presence or absence
+    needs no calibration and cannot drift. Both are read straight out of
+    /proc, because the image is deliberately thin and has neither `ss` nor
+    `lsof`.
+
+    Everything here fails toward "someone is here". A false busy costs a few
+    cents of idle pod; a false idle costs somebody's render or a transfer cut
+    in half. We have already had the second kind.
+    """
+
+    def __init__(self, proc="/proc", read=None, listdir=None):
+        self._proc = proc
+        self._read = read or self._read_file
+        self._listdir = listdir or os.listdir
+
+    @staticmethod
+    def _read_file(path):
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return f.read()
+
+    def ssh_sessions(self):
+        """Established connections to this pod's sshd, or None if unreadable."""
+        total = 0
+        seen_any = False
+        for name in ("net/tcp", "net/tcp6"):
+            try:
+                text = self._read(os.path.join(self._proc, name))
+            except Exception:  # noqa: BLE001 - one table missing is not fatal
+                continue
+            seen_any = True
+            for line in text.splitlines()[1:]:
+                parts = line.split()
+                if len(parts) < 4:
+                    continue
+                local, state = parts[1], parts[3]
+                _ip, _sep, port_hex = local.rpartition(":")
+                try:
+                    port = int(port_hex, 16)
+                except ValueError:
+                    continue
+                if port == _SSH_PORT and state == _TCP_ESTABLISHED:
+                    total += 1
+        return total if seen_any else None
+
+    def transfers(self):
+        """Transfer processes running right now, or None if /proc is unreadable."""
+        try:
+            entries = self._listdir(self._proc)
+        except Exception:  # noqa: BLE001
+            return None
+        total = 0
+        for entry in entries:
+            if not entry.isdigit():
+                continue
+            try:
+                comm = self._read(os.path.join(self._proc, entry, "comm")).strip()
+            except Exception:  # noqa: BLE001 - the process exited mid-scan
+                continue
+            if comm in _TRANSFER_COMMS:
+                total += 1
+        return total
+
+
 class LastRequest:
     """When this pod was last asked to do something real.
 
@@ -520,6 +607,7 @@ def make_server(host, port, log_dir="/workspace/ledger/logs"):
     registry = Registry(slots, log_dir)
     last_request = LastRequest()
     xpu = XpuSupport()
+    liveness = Liveness()
     detached = DetachedRuns(os.path.join(WORKSPACE_ROOT, EXEC_DIR_REL))
 
     class Handler(BaseHTTPRequestHandler):
@@ -646,6 +734,11 @@ def make_server(host, port, log_dir="/workspace/ledger/logs"):
                     # to zero for a moment, and that moment must not read as
                     # "abandoned".
                     "idle_s": round(last_request.idle_s(), 1),
+                    # Work that never touches this worker: an SSH session, or
+                    # an rclone/SFTP transfer. Without these, a pod busy over
+                    # any non-HTTP channel reports itself idle -- see Liveness.
+                    "ssh_sessions": liveness.ssh_sessions(),
+                    "transfers": liveness.transfers(),
                     # Can this pod run Karma XPU? None when we could not tell.
                     # A GPU pod answers truthfully; the CPU sync pod says no,
                     # which is correct for it and useless as a farm-wide

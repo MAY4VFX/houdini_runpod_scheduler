@@ -138,6 +138,13 @@ def classify_for_kill(pod, me, health=None, health_error=None,
     means we do not know, and not knowing resolves to leaving it alone -- the
     expensive mistake is killing something live, not paying a few cents while
     a human decides.
+
+    "Idle" needs evidence from every channel, not just HTTP. ``busy`` and
+    ``idle_s`` describe requests to the worker; ``ssh_sessions`` and
+    ``transfers`` describe everything else. A pod that reports none of the
+    latter two is ``unknown`` rather than safe -- see the tests, which are
+    written from the incident where this function cleared a pod that was
+    rendering.
     """
     owner = pod_owner(pod)
     if owner and me and owner != me:
@@ -148,12 +155,33 @@ def classify_for_kill(pod, me, health=None, health_error=None,
     busy = int(health.get("busy") or 0)
     if busy > 0:
         return "busy", "running {} task(s)".format(busy)
+
+    # Work that never reaches the worker. `busy`/`idle_s` only ever counted
+    # HTTP, so a pod driven over SSH -- or a sync pod taking a 4GB tarball over
+    # SFTP, the heaviest thing this farm does -- reported itself idle while
+    # working flat out, and this function called it safe to kill. It did that
+    # to a pod that was rendering.
+    transfers = health.get("transfers")
+    if transfers:
+        return "busy", "{} file transfer(s) in flight".format(int(transfers))
+    sessions = health.get("ssh_sessions")
+    if sessions:
+        return "busy", "{} open ssh session(s) -- something is driving it " \
+                       "outside the worker".format(int(sessions))
+
+    # A pod that cannot report those is a pod we cannot clear. Absent evidence
+    # is not evidence of absence, and the asymmetry is deliberate: a false
+    # "busy" costs a few cents of idle pod, a false "safe" costs a render.
+    if sessions is None or transfers is None:
+        return "unknown", ("it did not report ssh sessions or transfers, so "
+                           "work outside the worker cannot be ruled out")
+
     idle = health.get("idle_s")
     if idle is None:
         return "unknown", "it did not report how long it has been idle"
     if float(idle) < grace_s:
         return "busy", "a scheduler was talking to it {:.0f}s ago".format(float(idle))
-    return "safe", "idle for {:.0f}s".format(float(idle))
+    return "safe", "idle for {:.0f}s, no ssh sessions, no transfers".format(float(idle))
 
 
 # -- readiness ----------------------------------------------------------

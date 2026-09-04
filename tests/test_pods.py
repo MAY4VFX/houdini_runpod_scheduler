@@ -419,7 +419,7 @@ def test_an_idle_pod_of_mine_is_safe():
     pod = {"name": "rpfarm-may-demo-a-1", "env": {"RPFARM_USER": "may"}}
 
     verdict, reason = rppods.classify_for_kill(
-        pod, "may", {"busy": 0, "idle_s": 900})
+        pod, "may", {"busy": 0, "idle_s": 900, "ssh_sessions": 0, "transfers": 0})
 
     assert verdict == "safe"
     assert "900" in reason
@@ -441,7 +441,7 @@ def test_a_pod_spoken_to_seconds_ago_is_busy_even_with_no_task_running():
     pod = {"name": "rpfarm-may-demo-a-1", "env": {"RPFARM_USER": "may"}}
 
     verdict, reason = rppods.classify_for_kill(
-        pod, "may", {"busy": 0, "idle_s": 36})
+        pod, "may", {"busy": 0, "idle_s": 36, "ssh_sessions": 0, "transfers": 0})
 
     assert verdict == "busy"
     assert "36s ago" in reason
@@ -449,7 +449,7 @@ def test_a_pod_spoken_to_seconds_ago_is_busy_even_with_no_task_running():
 
 def test_the_grace_boundary_is_configurable_and_exclusive():
     pod = {"name": "rpfarm-may-demo-a-1", "env": {"RPFARM_USER": "may"}}
-    health = {"busy": 0, "idle_s": 100}
+    health = {"busy": 0, "idle_s": 100, "ssh_sessions": 0, "transfers": 0}
 
     assert rppods.classify_for_kill(pod, "may", health, grace_s=100)[0] == "safe"
     assert rppods.classify_for_kill(pod, "may", health, grace_s=101)[0] == "busy"
@@ -461,7 +461,7 @@ def test_someone_elses_pod_is_foreign_even_when_idle():
     pod = {"name": "rpfarm-bob-demo-a-1", "env": {"RPFARM_USER": "bob"}}
 
     verdict, reason = rppods.classify_for_kill(
-        pod, "may", {"busy": 0, "idle_s": 9999})
+        pod, "may", {"busy": 0, "idle_s": 9999, "ssh_sessions": 0, "transfers": 0})
 
     assert verdict == "foreign"
     assert "bob" in reason
@@ -472,6 +472,9 @@ def test_a_pod_that_cannot_be_reached_is_left_alone():
 
     assert rppods.classify_for_kill(pod, "may", None, "connection refused")[0] == "unknown"
     assert rppods.classify_for_kill(pod, "may", {"busy": 0})[0] == "unknown"
+    # reports the channels but not how long: still not clearable
+    assert rppods.classify_for_kill(
+        pod, "may", {"busy": 0, "ssh_sessions": 0, "transfers": 0})[0] == "unknown"
 
 
 def test_pod_env_carries_identity_readable_from_get_pods(tmp_path):
@@ -566,3 +569,58 @@ def test_a_pod_that_keeps_vanishing_past_the_deadline_gives_up_readably(tmp_path
 class _HealthyClient:
     def health(self):
         return {"busy": 0, "idle_s": 9999}
+
+
+# ---------------------------------------------------------------------------
+# liveness must not depend on which channel the work arrived by
+#
+# /health only ever counted HTTP. A pod driven over SSH -- or a sync pod
+# receiving a 4GB Houdini tarball over SFTP, which is the heaviest thing this
+# farm ever does -- reports busy 0 and a climbing idle_s while working flat
+# out. The guard below then calls it safe to kill. That is how a benchmark pod
+# rendering 15 frames read as abandoned, and it is how the idle watchdog would
+# terminate a transfer at its midpoint.
+# ---------------------------------------------------------------------------
+
+
+def test_a_pod_driven_over_ssh_is_busy_not_safe():
+    """The exact case: no HTTP for 24 minutes, and rendering the whole time."""
+    pod = {"name": "rpfarm-may-perframe-0", "env": {"RPFARM_USER": "may"}}
+    health = {"busy": 0, "idle_s": 1440, "ssh_sessions": 1, "transfers": 0}
+
+    verdict, reason = rppods.classify_for_kill(pod, "may", health)
+
+    assert verdict == "busy"
+    assert "ssh" in reason.lower()
+
+
+def test_a_sync_pod_receiving_a_tarball_is_busy():
+    """rclone arrives over SFTP; the worker never sees a request."""
+    pod = {"name": "rpfarm-sync-may", "env": {"RPFARM_USER": "may"}}
+    health = {"busy": 0, "idle_s": 3600, "ssh_sessions": 1, "transfers": 2}
+
+    verdict, reason = rppods.classify_for_kill(pod, "may", health)
+
+    assert verdict == "busy"
+    assert "transfer" in reason.lower()
+
+
+def test_a_genuinely_empty_pod_is_still_safe():
+    """Erring toward busy must not mean never killing anything."""
+    pod = {"name": "rpfarm-may-demo-a-1", "env": {"RPFARM_USER": "may"}}
+    health = {"busy": 0, "idle_s": 9999, "ssh_sessions": 0, "transfers": 0}
+
+    assert rppods.classify_for_kill(pod, "may", health)[0] == "safe"
+
+
+def test_an_old_pod_that_cannot_report_the_new_fields_is_not_assumed_idle():
+    """A pod from before this shipped answers /health without them. Absent
+    evidence is not evidence of absence, and the asymmetry is the whole point:
+    a false busy costs cents, a false idle costs someone's render."""
+    pod = {"name": "rpfarm-may-demo-a-1", "env": {"RPFARM_USER": "may"}}
+    health = {"busy": 0, "idle_s": 9999}          # no ssh_sessions, no transfers
+
+    verdict, reason = rppods.classify_for_kill(pod, "may", health)
+
+    assert verdict == "unknown"
+    assert "cannot" in reason.lower() or "did not" in reason.lower()
