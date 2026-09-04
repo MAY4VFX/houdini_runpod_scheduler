@@ -159,6 +159,7 @@ if _stale:
 from rpfarm import config as rpcfg
 from rpfarm import deps as rpdeps
 from rpfarm import dispatch as rpdispatch
+from rpfarm import gpus as rpgpus
 from rpfarm import packages as rppkg
 from rpfarm import pods as rppods
 from rpfarm import sync as rpsync
@@ -289,6 +290,54 @@ def cfg_default_int(name, fallback=0):
         return int(str(rpcfg.config_value(name, "")).strip() or fallback)
     except (TypeError, ValueError):
         return fallback
+
+
+def _gpu_catalogue(node):
+    """Catalogue rows for this node's datacenter, cached (see rpfarm.gpus)."""
+    try:
+        cfg = rpcfg.load()
+        api = RunPodAPI((node.parm("rpfarm_apikey").evalAsString() or "") or cfg.api_key)
+        dc = node.parm("rpfarm_datacenter").evalAsString() or cfg.datacenter
+        return rpgpus.catalogue(api, dc), dc
+    except Exception:
+        return [], ""
+
+
+def gpuMenu(kwargs):
+    """The Add A GPU menu, built from RunPod's live catalogue.
+
+    Flat [token, label, token, label, ...] as Houdini wants. Never raises: a
+    menu that cannot be built shows nothing rather than breaking the dialog,
+    and the set the artist already has is untouched either way.
+    """
+    try:
+        node = kwargs["node"]
+        rows, _dc = _gpu_catalogue(node)
+        selected = rpgpus.parse_selection(node.parm("rpfarm_gpulist").evalAsString())
+        consumer_only = bool(node.parm("rpfarm_gpuconsumer").evalAsInt())
+        out = []
+        for row in rpgpus.menu_rows(rows, consumer_only=consumer_only, selected=selected):
+            out.extend([row["id"], rpgpus.menu_label(row, selected=selected)])
+        return out
+    except Exception:
+        return []
+
+
+def onAddGpu(kwargs):
+    """Append the picked card to the set, then empty this menu again."""
+    node = kwargs["node"]
+    add = node.parm("rpfarm_gpuadd")
+    chosen = add.evalAsString()
+    if not chosen:
+        return
+    listparm = node.parm("rpfarm_gpulist")
+    # A parm still holding its config-default expression has to become a
+    # literal before it can be edited, or the append is silently discarded --
+    # the same keyframe/expression trap the frame ranges hit.
+    current = listparm.evalAsString()
+    listparm.deleteAllKeyframes()
+    listparm.set(rpgpus.add_to_selection(current, chosen))
+    add.set("")
 
 
 def project_default():
@@ -693,6 +742,8 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
                 {"name": "rpfarm_apikey", "type": "String", "tag": ["pdg::scheduler"]},
                 {"name": "rpfarm_project", "type": "String"},
                 {"name": "rpfarm_gpulist", "type": "String"},
+                {"name": "rpfarm_gpuadd", "type": "String"},
+                {"name": "rpfarm_gpuconsumer", "type": "Integer"},
                 {"name": "rpfarm_templateid", "type": "String"},
                 {"name": "rpfarm_networkvolumeid", "type": "String"},
                 {"name": "rpfarm_datacenter", "type": "String"},
@@ -1677,14 +1728,34 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         self._remote_project = "/workspace/projects/{}/{}".format(
             self._cfg.user, self._project)
 
-        gpus = self["rpfarm_gpulist"].evaluateString()
-        self._gpu_list = [g.strip() for g in gpus.split(",") if g.strip()]
-        if not self._gpu_list:
-            self._gpu_list = list(self._cfg.gpu_priority)
-        if not self._gpu_list:
+        chosen = rpgpus.parse_selection(self["rpfarm_gpulist"].evaluateString())
+        if not chosen:
+            chosen = list(self._cfg.gpu_priority)
+        if not chosen:
             raise CookError(
-                "No GPU types listed. Fill in GPU Priority on the Farm tab, or "
-                "set gpu_priority in ~/.rpfarm/config.toml.")
+                "No GPU types chosen. Pick some with Add A GPU on the Farm tab, "
+                "or set gpu_priority in ~/.rpfarm/config.toml.")
+
+        # The artist chooses a SET -- "any of these". Order is ours to decide,
+        # and gpuTypePriority is "custom", so RunPod walks the order we send and
+        # takes the first with capacity. Sorting cheapest-first therefore turns
+        # "any of these" into "the cheapest of these that exists", which is what
+        # he actually wants and what he should not have to hand-maintain.
+        #
+        # The catalogue price is a RELATIVE hint, not the bill: measured the
+        # same day, a 4090 listed at $0.34/h billed at $0.740/h and an RTX PRO
+        # 4000 listed at $0.50/h billed at $0.250/h. It is still the only
+        # comparable per-type number RunPod offers, so it orders the set; it is
+        # never shown as a cost.
+        try:
+            rows = rpgpus.catalogue(self._api, self._datacenterId())
+            self._gpu_list = rpgpus.order_for_request(chosen, rows)
+            if rows and self._gpu_list != chosen:
+                self._log("GPU order (cheapest first): {}".format(
+                    ", ".join(self._gpu_list)))
+        except Exception as e:  # noqa: BLE001 - ordering is an optimisation
+            self._log("could not price the GPU set ({}); using it as given".format(e))
+            self._gpu_list = chosen
 
         self._dispatcher = rpdispatch.Dispatcher(
             self["rpfarm_slots"].evaluateInt(), max_attempts=3)
