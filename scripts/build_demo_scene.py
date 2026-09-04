@@ -3,7 +3,8 @@
 This is the scene the farm's owner opens to decide whether the system works,
 so it is deliberately *not* the smoke fixture. The smoke fixture is a grey
 sphere at 320x240 that measures the farm; this one is meant to be looked at:
-a lit pig head on a studio floor, 1280x720 Karma CPU, eight frames that rotate
+a lit pig head on a studio floor, 1280x720 Karma (CPU by default, see
+``ENGINE``), eight frames that rotate
 enough to read as a sequence.
 
 Run it with Houdini's ``hython``::
@@ -43,9 +44,11 @@ that, in the order they matter:
   whatever generate script was installed the day it was built, ignoring every
   later HDA rebuild -- three live runs in Task 15 downloaded nothing for
   exactly this reason. ``_verify()`` asserts it stuck.
-- **Karma CPU.** The pod image has no CUDA; XPU is unverified. ``engine`` is
-  set explicitly rather than left to the default so a future default change
-  cannot quietly move this scene onto a renderer the farm cannot run.
+- **Karma CPU, by measurement.** The farm CAN run XPU now (the pod image was
+  missing libEGL), but on this scene at these settings XPU is 1.4x slower --
+  see ``ENGINE`` for the numbers and why. ``engine`` is set explicitly rather
+  than left to the default so a future default change cannot quietly move this
+  scene onto the other renderer.
 
 The button code lives in the scene's Python source editor (``hou.session``),
 so the ``.hip`` is genuinely self-contained -- no loose ``.py`` beside the
@@ -71,6 +74,23 @@ FRAME_END = 8
 RESX = 1280
 RESY = 720
 SAMPLES = 9
+
+# "cpu" or "xpu". Selectable, and measured rather than assumed.
+#
+# The farm can run XPU (that was a missing libEGL in the pod image, fixed), but
+# on this workload it loses: the same frame of this scene at 1280x720, spp 9,
+# on an RTX 4090 pod with 32 vCPU took 35.7s on CPU and 50.5s on XPU. Two
+# reasons, and both are structural rather than bad luck. RunPod's GPU pods come
+# with a lot of CPU, which Karma CPU uses all of; and XPU compiles OptiX
+# kernels at startup, which this farm pays on EVERY frame because it dispatches
+# one frame per task in a fresh hython -- the cost never amortizes.
+#
+# Renting a GPU and rendering on its CPU still looks wrong, and it is worth
+# revisiting: XPU wins on heavier scenes, more samples, higher resolution, or
+# with several frames per task (ROP Node Configuration instead of Frame Range)
+# so one compile serves many frames. Change ENGINE here and re-measure; do not
+# switch it on the strength of "XPU works now".
+ENGINE = "cpu"
 
 CAM_FOCAL = 75.0        # long enough not to distort a face at this distance
 CAM_AZIMUTH = 28.0      # degrees right of front -- a three-quarter view
@@ -270,7 +290,7 @@ def build_scene(ground_mat):
 def build_rop(cam):
     karma = hou.node("/out").createNode("karma", "karma_demo")
     karma.parm("camera").set(cam.path())
-    karma.parm("engine").set("cpu")
+    karma.parm("engine").set(ENGINE)
     karma.parm("picture").set(PICTURE)
     karma.parm("trange").set(1)  # Render Frame Range
     _set_static(karma, "f1", FRAME_START)
@@ -799,8 +819,11 @@ def _verify(dest, dest_dir):
     for name, want in (("f1", FRAME_START), ("f2", FRAME_END), ("f3", 1), ("trange", 1)):
         check(abs(float(karma.parm(name).eval()) - want) < 1e-6,
               "karma_demo/{} = {!r}, expected {!r}".format(name, karma.parm(name).eval(), want))
-    check(karma.parm("engine").eval() == "cpu",
-          "karma_demo/engine = {!r}, expected 'cpu'".format(karma.parm("engine").eval()))
+    check(karma.parm("engine").eval() == ENGINE,
+          "karma_demo/engine = {!r}, expected {!r}".format(
+              karma.parm("engine").eval(), ENGINE))
+    # XPU is a legitimate choice; anything else is a typo that costs a cook.
+    check(ENGINE in ("cpu", "xpu"), "ENGINE = {!r} is not a Karma engine".format(ENGINE))
     check(karma.parm("picture").rawValue() == PICTURE,
           "karma_demo/picture = {!r}".format(karma.parm("picture").rawValue()))
     # Never $HIP: that is the shared volume, and two pods collide there.
