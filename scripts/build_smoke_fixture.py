@@ -28,7 +28,18 @@ What it builds, and why each choice is the way it is:
   locally ``$HIP`` and ``$JOB`` are the same directory anyway.
 - ``/obj/topnet1`` -- the four-node production graph from the design spec:
 
-      upload (deps) -> probe (genericgenerator) -> render (ropfetch) -> download
+      upload (deps) -> gate (waitforall) -> probe -> render -> download
+
+  ``gate`` is not decoration. ``runpodfarm_upload`` emits **one work item per
+  package**, and every downstream node then generates per upstream item: with
+  two packages (this scene's own files, and the referenced HDA libraries under
+  ``_ext/``) the ROP Fetch produced 2 x 3 = 6 render items and rendered every
+  frame twice. A ``Wait For All`` collapses the packages into a single
+  partition, so the render is planned once regardless of how the upload was
+  split. Any real graph that puts ``runpodfarm_upload`` upstream of a renderer
+  needs the same thing. (Partition and merge items carry no command and are
+  resolved by PDG itself -- verified: they never reach a scheduler's
+  ``onSchedule`` -- so the gate costs nothing on the farm.)
 
   ``probe`` is one trivial shell item that writes a file under ``$PDG_DIR``
   and declares it with ``pdgcmd.addOutputFile``. It costs a second on the same
@@ -38,11 +49,6 @@ What it builds, and why each choice is the way it is:
   scheduler's own "Download Outputs" path, the three EXRs come back through
   both that and the ``runpodfarm_download`` node -- so one cook exercises both
   download routes.
-
-  The branches are chained rather than merged because a TOP ``merge``'s work
-  items carry no command, and a command-less item on this scheduler is
-  untested (``onSchedule`` has no empty-command short circuit); it is also why
-  ``runpodfarm_download`` only ever needs its single input.
 
   ``topscheduler`` is the ``runpodfarmscheduler``; ``upload``/``download``
   override their *own* internal scheduler to ``localscheduler`` in their
@@ -183,11 +189,16 @@ def build_topnet(karma):
     # to gain and one dependency to lose.
     upload.parm("rpfarm_compress").set("off")
 
+    # One partition for however many packages the upload split into -- see
+    # this module's docstring for what happens without it.
+    gate = topnet.createNode("waitforall", "gate")
+    gate.setInput(0, upload)
+
     probe = topnet.createNode("genericgenerator", "probe")
     probe.parm("itemcount").set(1)
     probe.parm("shellcommand").set(1)
     probe.parm("pdg_command").set(_probe_command())
-    probe.setInput(0, upload)
+    probe.setInput(0, gate)
 
     render = topnet.createNode("ropfetch", "render")
     render.parm("roppath").set(karma.path())

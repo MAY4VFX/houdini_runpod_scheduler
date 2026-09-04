@@ -116,6 +116,22 @@ def test_node_messages_reports_errors_and_skips_missing_nodes():
 # -- StageTimer ---------------------------------------------------------------
 
 
+def test_stage_timer_ignores_waiting():
+    """An item is Waiting from the moment the graph is planned. Counting that
+    as "running" made the farm-ready stage start before the upload it depends
+    on had even begun -- and print a negative duration in the live run."""
+    item = FakeItem("render_1", "Waiting")
+    node = FakeNode("render", [item])
+    timer = smoke.StageTimer({"render": node})
+    timer.poll()
+    assert timer.window("render") == (None, None)
+
+    item.state = "workItemState.Scheduled"
+    timer.poll()
+    first, done = timer.window("render")
+    assert first is not None and done is None
+
+
 def test_stage_timer_records_first_running_and_last_done():
     running = FakeItem("render_1", "Cooking")
     node = FakeNode("render", [running])
@@ -564,7 +580,10 @@ def test_stage_rows_renders_unmeasured_stages_as_question_marks():
     assert labels[0] == "scene load" and labels[-1] == "total"
     assert "pod rpfarm-sync-may" in labels
     by_label = {r[0]: r[2] for r in rows}
-    assert by_label["scene load"] == "3s"
+    # Sub-10s stages keep a decimal (a 0.4s scene load reading "0s" is
+    # indistinguishable from "not measured"); longer ones are whole seconds.
+    assert by_label["scene load"] == "3.0s"
+    assert by_label["upload"] == "12s"
     assert by_label["render"] == "?"  # never reached, not silently zero
 
 

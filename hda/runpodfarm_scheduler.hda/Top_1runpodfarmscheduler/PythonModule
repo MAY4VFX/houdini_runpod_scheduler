@@ -445,6 +445,9 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         self._killed_over_budget = False
         self._last_pod_error = None
         self._last_scale_failure = 0.0
+        # Signature of the local PDG script directory at the last upload; see
+        # _syncJobScripts.
+        self._script_signature = None
         # Ruling R25: set by _mirror_ledger_to_volume in onStopCook, read
         # by _update_status_text (before this reset runs -- see the call
         # order in onStopCook) to tell the artist when the journal didn't
@@ -1462,6 +1465,57 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         self._log("pdgtemp -> {}: {} file(s), {} bytes, {:.1f}s".format(
             remote, stats.files, stats.bytes, stats.seconds))
 
+    def _syncJobScripts(self):
+        """Re-upload PDG's job scripts to the farm when the local set changes.
+
+        onSetupCook's one-shot _uploadPdgTemp only ever sees the *base* job
+        scripts: PyScheduler._copyJobSupportFiles transfers exactly five files
+        (pdgjobcmd, pdgcmd, pdgjson, pdgnetrpc, pdgnetjson), and every
+        node-specific script -- rop.py for ROP Fetch, tracker.py for a
+        simulation, and so on -- is only copied into the local script
+        directory later, when that node's items are actually being scheduled.
+
+        The first live ROP cook on the farm died on exactly that: all six
+        render tasks exited 2 with
+
+            hython-bin: can't open file
+            '/workspace/projects/may/smoke/pdgtemp/8528/scripts/rop.py'
+
+        while the shell work items in the same cook, which need nothing beyond
+        pdgcmd.py, succeeded. So the script directory has to be re-synced
+        whenever PDG adds to it, not once at cook start.
+
+        Cost on the common path is a stat of a handful of files: only a
+        changed (name, mtime, size) signature triggers the rclone, and that
+        rclone is itself incremental.
+        """
+        if self._sftp is None:
+            return
+        local = self.scriptDir(True)
+        try:
+            names = sorted(os.listdir(local))
+            signature = [
+                (n, os.path.getmtime(os.path.join(local, n)),
+                 os.path.getsize(os.path.join(local, n)))
+                for n in names
+            ]
+        except OSError:
+            return
+        if signature == self._script_signature:
+            return
+        remote = self.scriptDir(False)
+        try:
+            stats = rpsync.rclone_copy_dir(
+                local, self._sftp, "up", self._cfg.rclone_path, remote_root=remote)
+        except (rpsync.SyncError, OSError) as e:
+            # Not fatal here: the task that needs the missing script will fail
+            # with the pod's own error, which says which file it wanted.
+            self._log("could not sync PDG job scripts to {}: {}".format(remote, e))
+            return
+        self._script_signature = signature
+        self._verboseLog("job scripts -> {}: {} file(s), {} bytes".format(
+            remote, stats.files, stats.bytes))
+
     def _touchSyncPod(self):
         """Record 'in use now' on the sync pod so it survives the idle check."""
         if self._sync_client is None:
@@ -1605,6 +1659,11 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
 
         # 1. Ensure directories exist and serialize the work item
         self.createJobDirsAndSerializeWorkItems(work_item)
+
+        # 1b. PDG copies a node's own job script (rop.py, tracker.py, ...)
+        #     into the local script directory around this point, long after
+        #     onSetupCook shipped the base set -- so re-sync if it changed.
+        self._syncJobScripts()
 
         # 2. Expand the special __PDG__* tokens in the work item command and
         #    pre/post task commands

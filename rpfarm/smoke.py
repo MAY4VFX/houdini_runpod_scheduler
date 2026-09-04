@@ -65,7 +65,12 @@ from .worker_client import WorkerClient
 # Work-item states that mean "finished, one way or the other".
 _TERMINAL_STATES = ("cookedsuccess", "success", "cookedfail", "failed", "cookedcancel", "canceled", "cancelled")
 _SUCCESS_STATES = ("cookedsuccess", "success")
-_RUNNING_STATES = ("cooking", "scheduled", "waiting")
+# "Waiting" is deliberately NOT here: an item sits in Waiting from the moment
+# the graph is planned, so counting it as "running" made the farm-ready stage
+# start before the upload it depends on had finished -- and print a negative
+# duration. "Scheduled" is the first state that means a pod is actually being
+# asked to take the item.
+_RUNNING_STATES = ("cooking", "scheduled")
 
 
 def make_log(prefix):
@@ -523,7 +528,13 @@ def _stage_rows(result, watcher, started):
     rows = []
 
     def add(label, detail, seconds):
-        rows.append((label, detail, "{:.0f}s".format(seconds) if seconds is not None else "?"))
+        if seconds is None:
+            text = "?"
+        elif seconds < 10:
+            text = "{:.1f}s".format(seconds)
+        else:
+            text = "{:.0f}s".format(seconds)
+        rows.append((label, detail, text))
 
     add("scene load", os.path.basename(result.get("hip") or ""), stages.get("load"))
     add("upload", "{} item(s), {}".format(
