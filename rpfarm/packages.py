@@ -708,6 +708,33 @@ def _exec_checked(sync_client, command, timeout_s):
 # -- path map --------------------------------------------------------------
 
 
+def result_data_path(entry):
+    """The farm path out of one ``pdg.WorkItem.resultData`` entry.
+
+    PDG hands these back in more than one shape depending on how the job
+    reported them -- a bare string, ``bytes`` (that is what comes over MQ),
+    a ``(path, tag, checksum)`` tuple, or an object with a ``.path``. A
+    plain ``str(entry)`` turns the ``bytes`` case into the literal text
+    ``b'/workspace/...'``, and ``entry[0]`` on ``bytes`` returns an *int* --
+    either way the result never matches a path-map prefix and the file is
+    silently skipped, which is exactly how three rendered EXRs stayed on the
+    volume with nothing logged. Returns ``""`` for anything unusable.
+    """
+    if isinstance(entry, (tuple, list)):
+        entry = entry[0] if entry else ""
+    for attr in ("path", "data"):
+        value = getattr(entry, attr, None)
+        if isinstance(value, (str, bytes)):
+            entry = value
+            break
+    if isinstance(entry, bytes):
+        entry = entry.decode("utf-8", "replace")
+    # Last resort str(): pdg.File's own __str__ *is* its path (its repr is
+    # not), so anything that gets this far and is not a path simply fails to
+    # match the path map and is dropped by the caller.
+    return entry if isinstance(entry, str) else str(entry)
+
+
 def localize_via_pathmap(remote, path_map):
     """Turn a farm path back into a local one using a ``{local prefix: farm
     prefix}`` map -- the same shape :func:`write_pathmap`/the scheduler's
@@ -735,6 +762,49 @@ def localize_via_pathmap(remote, path_map):
     local_prefix, farm_prefix = best
     rel = remote[len(farm_prefix):].lstrip("/")
     return posixpath.join(local_prefix, rel) if rel else local_prefix
+
+
+def delocalize_via_pathmap(local, path_map):
+    """The reverse of :func:`localize_via_pathmap`: local path -> farm path.
+
+    Needed because a work item's ``resultData`` can arrive already localized
+    -- PDG applies the path map for this machine's zone to what the job
+    reports -- and the download side needs *both* ends of the pair: the farm
+    path to copy from and the local path to copy to. Longest matching local
+    prefix wins, mirroring the other direction. ``None`` when nothing matches.
+    """
+    best = None
+    for local_prefix, farm in path_map.items():
+        if local == local_prefix or local.startswith(local_prefix.rstrip("/") + "/"):
+            if best is None or len(local_prefix) > len(best[0]):
+                best = (local_prefix, farm)
+    if best is None:
+        return None
+    local_prefix, farm_prefix = best
+    rel = local[len(local_prefix):].lstrip("/")
+    return posixpath.join(farm_prefix, rel) if rel else farm_prefix
+
+
+def map_output_pair(reported, path_map):
+    """``(farm, local)`` for one reported output path, whichever end it is.
+
+    A job reports the path it wrote on the pod; whether that reaches the
+    scheduler as the farm path or already translated to the artist's own path
+    depends on where PDG applied the path map, and the two are not
+    distinguishable by looking at one string in isolation. Both are useful and
+    only one of them is a farm path, so try the farm->local direction first
+    and fall back to local->farm. ``None`` when the path belongs to neither
+    side of this cook's mapping.
+    """
+    if not reported:
+        return None
+    local = localize_via_pathmap(reported, path_map)
+    if local and local != reported:
+        return reported, local
+    farm = delocalize_via_pathmap(reported, path_map)
+    if farm and farm != reported:
+        return farm, reported
+    return None
 
 
 def write_pathmap(job_dir, path_map):

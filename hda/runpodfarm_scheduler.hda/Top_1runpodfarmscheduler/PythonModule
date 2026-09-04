@@ -1078,14 +1078,24 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         """
         if not self["rpfarm_downloadoutputs"].evaluateInt():
             return
+        result_data = list(work_item.resultData)
+        self._verboseLog("outputs of item {}: {} entry(ies)".format(
+            work_item.id, len(result_data)))
         pairs = []
-        for rd in work_item.resultData:
-            remote = rd[0] if isinstance(rd, (tuple, list)) else str(rd)
-            local = self.localizePath(remote)
-            if not local or local == remote:
+        for rd in result_data:
+            reported = rppkg.result_data_path(rd)
+            # Whichever end PDG handed over -- the farm path the job wrote, or
+            # that path already translated for this machine -- map_output_pair
+            # returns both. localizePath alone cannot: given an already-local
+            # path it returns it unchanged, which is indistinguishable from
+            # "not mapped" and silently drops the file.
+            pair = rppkg.map_output_pair(reported, self._pathmap)
+            self._verboseLog("  output {!r} ({}) -> {}".format(
+                reported, type(rd).__name__, pair))
+            if pair is None:
                 # Not under any mapping we know: nothing to pull it to.
                 continue
-            pairs.append((remote, local))
+            pairs.append(pair)
         groups = rppkg.group_download_pairs(pairs)
         for local_root, remote_root, entries in groups:
             self._sync_queue.append((local_root, remote_root, entries))
