@@ -226,6 +226,13 @@ def main(argv):
     karma = build_scene()
     build_topnet(karma)
 
+    # A .hip stores its own variable table, and $JOB from it wins over the
+    # environment when the file is loaded elsewhere. Without this it would
+    # save whatever directory this build ran from. `rpfarm smoke` overrides
+    # $JOB after loading anyway (rpfarm.smoke.hython_main); this only keeps
+    # the checked-in file from carrying an accidental build path.
+    hou.putenv("JOB", os.path.dirname(dest))
+
     hou.hipFile.save(dest)
     print("wrote {} ({} bytes)".format(dest, os.path.getsize(dest)))
     return _verify(dest)

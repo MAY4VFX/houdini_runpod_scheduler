@@ -811,11 +811,18 @@ def hython_main(argv):
 
     result = {"ok": False, "hip": payload["hip"], "stages": {}, "counts": {}}
     try:
-        hou.putenv("JOB", payload["job"])
         t0 = time.time()
         hou.hipFile.load(payload["hip"], suppress_save_prompt=True, ignore_load_warnings=True)
         result["stages"]["load"] = time.time() - t0
+        # AFTER the load, never before: a .hip stores its own variable table
+        # and $JOB from it overrides both the environment and an earlier
+        # putenv. Setting it first looks like it works and silently leaves
+        # $JOB pointing at whatever machine built the fixture -- which then
+        # becomes the path map root, the PDG working directory and the place
+        # every downloaded output lands (caught in the first live run).
+        hou.putenv("JOB", payload["job"])
         log("$JOB = {}".format(hou.text.expandString("$JOB")))
+        log("$HIP = {}".format(hou.text.expandString("$HIP")))
         log("loaded {} in {:.1f}s".format(payload["hip"], result["stages"]["load"]))
 
         topnet = hou.node(payload["topnet"])
