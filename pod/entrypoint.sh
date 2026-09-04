@@ -121,6 +121,36 @@ if [ -d "$HFS" ] && [ -f "$HFS/houdini_setup_bash" ]; then
   export HOUDINI_TEMP_DIR=/tmp/houdini_temp
   mkdir -p "$HOUDINI_TEMP_DIR"
   echo "Houdini: $(hython --version 2>/dev/null || echo 'hython failed')"
+
+  # GPU rendering, in one line, at boot.
+  #
+  # Karma XPU needs three things the host's container runtime is supposed to
+  # inject (libnvoptix, libnvidia-rtcore, nvoptix.bin) plus libEGL, which is a
+  # plain package and was the piece actually missing -- eight render tasks died
+  # identically with "Karma XPU delegate not supported on this machine" and the
+  # only way to find out was reading a task log off the volume. On every pod
+  # we have measured the three injected files were present, so the download-
+  # the-driver-and-extract-them dance from v1 is deliberately NOT carried over:
+  # this line is here to tell us if a host ever turns up that needs it.
+  if [ -n "${NVIDIA_VISIBLE_DEVICES:-}" ] || command -v nvidia-smi >/dev/null 2>&1; then
+    _gpu_bits=""
+    for _f in libnvoptix.so.1 libnvidia-rtcore.so libEGL.so.1; do
+      if ldconfig -p 2>/dev/null | grep -q "$_f"; then
+        _gpu_bits="$_gpu_bits $_f=yes"
+      else
+        _gpu_bits="$_gpu_bits $_f=MISSING"
+      fi
+    done
+    # Reported, not judged: XPU has worked on every pod we measured, so
+    # whether this file is actually required here is unverified. yes/no rather
+    # than MISSING so it does not read as an alarm we cannot justify.
+    if [ -f /usr/share/nvidia/nvoptix.bin ]; then
+      _gpu_bits="$_gpu_bits nvoptix.bin=yes"
+    else
+      _gpu_bits="$_gpu_bits nvoptix.bin=no"
+    fi
+    echo "GPU:$_gpu_bits driver=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1 || echo '?') caps=${NVIDIA_DRIVER_CAPABILITIES:-unset}"
+  fi
 else
   echo "WARNING: no Houdini at $HFS (need $HFS/houdini_setup_bash; install with the runpodfarm_upload preset or 'rpfarm houdini install')"
 fi

@@ -587,17 +587,20 @@ def test_a_zero_deadline_waits_forever_and_never_reports():
     assert sched.reported == []
 
 
-def test_setup_cook_does_not_die_on_a_capacity_shortage():
-    """The actual bug: an empty farm at second zero killed the whole cook."""
+def test_setup_cook_raises_no_machines_at_all():
+    """Two defects met here. A shortage at second zero used to kill the cook
+    (R32), and scaling up at cook start paid for machines a fully cached cook
+    never used. Both are answered by not creating pods until work exists."""
     src = MODULE.read_text()
-    setup = src[src.index("wanted = max(1, self[\"rpfarm_minpods\"]"):]
-    setup = setup[:setup.index("self._update_status_text(force=True)")]
+    setup = src[src.index("def onSetupCook"):]
+    setup = setup[:setup.index("def _uploadPdgTemp")]
 
-    # fatal only when the refusal is NOT a temporary shortage
-    assert "if self._last_pod_error and not self._last_pod_error_transient:" in setup
-    assert "raise CookError" in setup
-    # and the wait is explained rather than silent
-    assert "the cook waits and keeps" in setup
+    # no CALL to _scale_up (the words still appear in the comment explaining why)
+    assert "self._scale_up(" not in setup
+    assert "self._raised_for_work = False" in setup
+    assert "pods will be raised when the first work item needs one" in setup
+    # the one thing that IS still fatal here: no sync pod means nothing can run
+    assert "except rppods.SyncPodCapacityError as e:" in setup
 
 
 def test_the_transient_flag_comes_from_is_capacity_error():
@@ -816,3 +819,112 @@ def test_an_unchecked_farm_is_not_treated_as_broken():
     _preflight()(sched)          # must not raise
 
     assert any("never been checked" in m for m in sched.logs)
+
+
+# ---------------------------------------------------------------------------
+# machines are raised when there is work, not when a cook starts
+#
+# onSetupCook used to scale up to Min Pods immediately. PDG only decides
+# whether an item needs running later, per item, in onSchedule -- a cached one
+# never reaches a scheduler at all -- so a cook whose outputs were already on
+# disk created two GPU pods, found all 8 items CookedCache, and terminated them
+# having rendered nothing (cook 42600deb: 0 tasks, ~$0.02).
+# ---------------------------------------------------------------------------
+
+
+class _ScaleScheduler(FakeScheduler):
+    def __init__(self, minpods=2, pending=0, scale_ok=True,
+                 last_error=None, transient=True):
+        super().__init__()
+        self._parms = {"rpfarm_minpods": minpods, "rpfarm_maxpods": 2}
+        self._raised_for_work = False
+        self._last_scale_failure = 0.0
+        self._render_times = []
+        self._cost_tracker = {"over_budget": False}
+        self._last_pod_error = last_error
+        self._last_pod_error_transient = transient
+        self._scale_ok = scale_ok
+        self.scaled = []
+        self.cook_errors = []
+        for i in range(pending):
+            self._dispatcher.enqueue(
+                rpdispatch.TaskState(task_id="t%d" % i, work_item_id=i,
+                                     command="c", env={}), now=0.0)
+
+    def __getitem__(self, name):
+        value = self._parms[name]
+        return types.SimpleNamespace(evaluateInt=lambda: int(value))
+
+    def _scale_up(self, count):
+        self.scaled.append(count)
+        if not self._scale_ok:
+            return 0
+        # The real one registers each pod as CREATED before returning, and
+        # _autoscale subtracts pods that exist but have not booted. Without
+        # that here the fake would invite a second raise the real code cannot.
+        for i in range(count):
+            self._dispatcher.add_pod("pod%d%d" % (len(self.scaled), i), status="CREATED")
+        return count
+
+    def cookError(self, message):
+        self.cook_errors.append(message)
+
+
+def _autoscale_fn():
+    return load_methods(
+        ["_autoscale"],
+        extra_globals={"time": types.SimpleNamespace(time=lambda: 1e6),
+                       "_SCALE_RETRY_BACKOFF": 15.0},
+    )["_autoscale"]
+
+
+def test_no_work_means_no_machines():
+    """The whole defect: a fully cached cook must not create a single pod."""
+    sched = _ScaleScheduler(minpods=2, pending=0)
+
+    _autoscale_fn()(sched)
+
+    assert sched.scaled == []
+    assert sched._raised_for_work is False
+
+
+def test_the_first_queued_item_raises_min_pods_not_one():
+    """Cold-start autoscale would add a single pod; asking for two and getting
+    one silently removes the parallelism the artist is paying for."""
+    sched = _ScaleScheduler(minpods=2, pending=1)
+
+    _autoscale_fn()(sched)
+
+    assert sched.scaled == [2]
+    assert sched._raised_for_work is True
+
+
+def test_machines_are_raised_once_not_on_every_tick():
+    sched = _ScaleScheduler(minpods=2, pending=3)
+    autoscale = _autoscale_fn()
+
+    autoscale(sched)
+    autoscale(sched)
+
+    assert sched.scaled == [2]
+
+
+def test_a_shortage_at_first_work_is_not_a_cook_error():
+    """No machines yet is a wait (R32), and the tick keeps trying."""
+    sched = _ScaleScheduler(pending=1, scale_ok=False,
+                            last_error="RunPod 500: no instances", transient=True)
+
+    _autoscale_fn()(sched)
+
+    assert sched.cook_errors == []
+
+
+def test_a_bad_key_at_first_work_fails_the_cook_there_and_then():
+    """Waiting never fixes a 401, and this is the first moment we can know."""
+    sched = _ScaleScheduler(pending=1, scale_ok=False,
+                            last_error="RunPod 401: unauthorized", transient=False)
+
+    _autoscale_fn()(sched)
+
+    assert len(sched.cook_errors) == 1
+    assert "not a temporary shortage" in sched.cook_errors[0]

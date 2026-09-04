@@ -722,6 +722,7 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         self._killed_over_budget = False
         self._last_pod_error = None
         self._last_pod_error_transient = False
+        self._raised_for_work = False
         self._capacity_give_up_reason = ""
         self._last_scale_failure = 0.0
         # Signature of the local PDG script directory at the last upload; see
@@ -1979,36 +1980,22 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
 
         self._preflightXpu()
 
-        wanted = max(1, self["rpfarm_minpods"].evaluateInt())
-        if not self._scale_up(wanted):
-            # A cook with no machines yet is a QUEUE, not a failure. Our pods
-            # are not spot instances (cloudType SECURE/COMMUNITY,
-            # `interruptible` never set), so one we already hold is never
-            # taken back; the only question is whether RunPod has a free one,
-            # and that answer changes minute to minute. Work items sit in
-            # _dispatcher.pending -- should_defer() counts an empty pool as one
-            # pod precisely so the first item is still accepted -- and the tick
-            # keeps retrying _scale_up under its existing backoff. Each item
-            # carries its own deadline (Wait For Capacity); when that runs out
-            # only that item fails, so a re-cook retries just the ones that
-            # never got a machine.
-            #
-            # Fatal is reserved for what waiting cannot fix: a bad key, a
-            # missing template, a malformed request. is_capacity_error()
-            # splits 4xx (hopeless) from 5xx/no-capacity (worth waiting).
-            if self._last_pod_error and not self._last_pod_error_transient:
-                raise CookError(
-                    "Could not create any GPU pod for this cook (asked for {}, "
-                    "GPU priority: {}), and the reason is not a temporary "
-                    "shortage of machines:\n{}".format(
-                        wanted, ", ".join(self._gpu_list), self._last_pod_error))
-            wait_min = self["rpfarm_capacitywait"].evaluateInt()
-            self._log(
-                "no free machine in {} ({}) yet -- the cook waits and keeps "
-                "asking. Each item gives up after {}. Cloud Type COMMUNITY "
-                "often has machines when SECURE does not.".format(
-                    self._datacenterId(), self._cloudType(),
-                    "{} min".format(wait_min) if wait_min > 0 else "never"))
+        # NO pods here. This used to be `_scale_up(max(1, minpods))` at cook
+        # start, before PDG had decided whether any work item actually needs
+        # running -- and PDG only decides that per item, later, when it calls
+        # onSchedule. A cook whose outputs were all already on disk therefore
+        # created two GPU pods, discovered every item was CookedCache, and
+        # terminated them having rendered nothing (cook 42600deb: 8 items
+        # cached, 0 tasks, ~$0.02 for the privilege).
+        #
+        # There is no way to ask PDG in advance -- a cached item never reaches
+        # a scheduler at all -- and no need to: the first item that DOES need
+        # running lands in _dispatcher.pending (should_defer counts an empty
+        # pool as one pod precisely so the first item is accepted), and the
+        # next tick raises the machines. That is a second of latency against
+        # never paying for an idle farm.
+        self._raised_for_work = False
+        self._log("pods will be raised when the first work item needs one")
         self._update_status_text(force=True)
 
     def _uploadPdgTemp(self):
@@ -2336,6 +2323,24 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
             # tick, and retrying every second only burns API calls.
             return
         pending = len(self._dispatcher.pending)
+
+        # First real work: raise Min Pods now, not at cook start. Doing it here
+        # rather than in onSetupCook is what stops a fully-cached cook paying
+        # for machines it never uses. It has to be Min Pods and not the
+        # autoscaler's cold-start single pod, or asking for two would silently
+        # give one -- which is the parallelism the artist is paying for.
+        if pending and not self._raised_for_work:
+            self._raised_for_work = True
+            wanted = max(1, self["rpfarm_minpods"].evaluateInt())
+            self._log("first work item queued; raising {} pod(s)".format(wanted))
+            if not self._scale_up(wanted) and self._last_pod_error \
+                    and not self._last_pod_error_transient:
+                # Not a shortage -- a bad key, a missing template. Waiting does
+                # not fix it, and this is the first point at which we know.
+                self.cookError(
+                    "Could not create a GPU pod, and the reason is not a "
+                    "temporary shortage of machines:\n{}".format(self._last_pod_error))
+            return
         count = rpdispatch.autoscale_decision(
             pending=pending,
             active_pods=self._dispatcher.active_pods(),
