@@ -1681,8 +1681,15 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         the file's content as a float, so two writers with two formats
         meant the stamp the package path left behind was unparseable and
         the sync pod could never be auto-retired (Ruling R32).
+
+        The result is checked, not discarded: WorkerClient.exec never
+        raises on a non-zero exit, so a pod running an image older than
+        the `sync-touch` subcommand used to fail argparse and leave the
+        stamp unwritten with nothing said anywhere -- silently the same
+        un-retirable pod this method exists to prevent. touch_sync_pod
+        reports that through the `log` it is given.
         """
-        rppkg.touch_sync_pod(self._sync_client)
+        rppkg.touch_sync_pod(self._sync_client, log=self._log)
 
     def _touchProjectIndex(self, event):
         """Stamp this project's entry in housekeeping's /workspace/.rpfarm/index.json.

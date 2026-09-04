@@ -1560,3 +1560,131 @@ def test_heartbeat_wraps_a_none_progress_cb():
 
     hb = _SyncTouchHeartbeat(FakeSyncClient(), progress_cb=None)
     hb(1, 2, 3)  # no raise
+
+
+# -- a failed sync-touch must not be invisible --------------------------------
+#
+# Task 17, residual A. WorkerClient.exec never raises on a non-zero exit and
+# every caller of touch_sync_pod discarded the result, so a pod whose
+# /opt/rpfarm/housekeeping.py predates the `sync-touch` subcommand failed
+# argparse ("invalid choice"), left the stamp unwritten, and silently
+# reproduced the un-retirable sync pod the command exists to prevent -- with
+# no line about it anywhere.
+
+
+class StaleImageSyncClient(FakeSyncClient):
+    """A sync pod running an image older than ``sync-touch``: argparse
+    rejects the subcommand and exits 2, exactly as the real pod would."""
+
+    def exec(self, command, timeout_s=600):
+        self.commands.append(command)
+        self.calls.append((command, timeout_s))
+        if command == SYNC_TOUCH_COMMAND:
+            return {
+                "exit_code": 2,
+                "stdout": "",
+                "stderr": "housekeeping.py: error: argument command: invalid choice: 'sync-touch'",
+            }
+        return {"exit_code": 0, "stdout": "", "stderr": ""}
+
+
+def test_a_failed_touch_is_reported_with_its_likely_cause():
+    from rpfarm.packages import touch_sync_pod
+
+    said = []
+    result = touch_sync_pod(StaleImageSyncClient(), log=said.append)
+
+    assert result["exit_code"] == 2
+    assert len(said) == 1
+    assert "invalid choice" in said[0], "the pod's own words have to survive"
+    assert "older than the `sync-touch` command" in said[0], "and the likely cause"
+    assert "rpfarm farm kill --sync" in said[0], "and the fix"
+
+
+def test_a_working_touch_says_nothing():
+    from rpfarm.packages import touch_sync_pod
+
+    said = []
+    result = touch_sync_pod(FakeSyncClient(), log=said.append)
+    assert result["exit_code"] == 0
+    assert said == []
+
+
+def test_no_client_is_not_a_failure():
+    from rpfarm.packages import touch_sync_pod
+
+    said = []
+    assert touch_sync_pod(None, log=said.append) is None
+    assert said == []
+
+
+def test_the_default_log_reaches_stderr(capsys):
+    """The upload/download call sites pass no log of their own: the warning
+    still has to land in the work item's log, which is package_runner's
+    stdout/stderr."""
+    from rpfarm.packages import touch_sync_pod
+
+    touch_sync_pod(StaleImageSyncClient())
+    assert "sync pod idle stamp NOT written" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("run", ["upload", "download"])
+def test_both_transfer_paths_report_a_failed_touch(tmp_path, monkeypatch, capsys, run):
+    monkeypatch.setattr("rpfarm.packages.rclone_copy", _fake_rclone_copy)
+    client = StaleImageSyncClient()
+    sftp = SftpTarget(host="1.2.3.4", port=22, key_path="/k")
+
+    if run == "upload":
+        run_upload_item(_touch_upload_item(tmp_path), FakeCfg(), sftp, client, compress=False)
+    else:
+        item = {
+            "index": 0,
+            "local_root": str(tmp_path / "down"),
+            "remote_root": "/workspace/projects/may/shotA/render",
+            "files": [],
+        }
+        run_download_item(item, FakeCfg(), sftp, client, "newer")
+
+    err = capsys.readouterr().err
+    # Both the pre-transfer and the post-transfer touch report: there are
+    # only two, and the first is the one that matters most (the transfer
+    # about to start is what would go unstamped).
+    assert err.count("sync pod idle stamp NOT written") == 2
+
+
+def test_the_heartbeat_reports_a_persistent_failure_once():
+    """A heartbeat still must not fail a transfer, but a beat a minute for
+    the length of a big package must not bury the log either."""
+    from rpfarm.packages import _SyncTouchHeartbeat
+
+    clock = [0.0]
+    said = []
+    hb = _SyncTouchHeartbeat(
+        StaleImageSyncClient(), progress_cb=None, interval_s=1.0, now=lambda: clock[0], log=said.append
+    )
+    for _ in range(10):
+        clock[0] += 2.0
+        hb(1, 2, 3)
+
+    assert len(said) == 1, "once, not per beat"
+    assert "invalid choice" in said[0]
+    assert "not repeated" in said[0], "the reader has to know the rest were suppressed"
+
+
+def test_the_heartbeat_reports_a_raising_client_once_too():
+    from rpfarm.packages import _SyncTouchHeartbeat
+
+    class Exploding:
+        def exec(self, command, timeout_s=600):
+            raise RuntimeError("pod gone")
+
+    clock = [0.0]
+    said = []
+    hb = _SyncTouchHeartbeat(
+        Exploding(), progress_cb=None, interval_s=1.0, now=lambda: clock[0], log=said.append
+    )
+    for _ in range(5):
+        clock[0] += 2.0
+        hb(1, 2, 3)  # no raise
+
+    assert len(said) == 1 and "pod gone" in said[0]
