@@ -205,6 +205,13 @@ def parse_args(argv):
     ap.add_argument("--frames", type=int, default=8, help="frames the scene renders")
     ap.add_argument("--keep-pods", action="store_true",
                     help="leave the farm as the cook left it (production behaviour)")
+    ap.add_argument("--dock-env", action="store_true",
+                    help="run the hython half with a Dock-like minimal environment "
+                         "(PATH=/usr/bin:/bin, cwd=/) instead of this shell's. This is "
+                         "how the artist actually launches Houdini, and it is the only "
+                         "way to catch anything that silently depends on the launching "
+                         "shell -- a bare 'python3' in a work item's command resolved to "
+                         "Xcode's 3.9 there and killed every upload item.")
     return ap.parse_args(argv)
 
 
@@ -249,7 +256,7 @@ def main(argv):
     cost = None
     remaining = []
     try:
-        rc = _run_hython(inst, payload_path, args.timeout, log)
+        rc = _run_hython(inst, payload_path, args.timeout, log, dock_env=args.dock_env)
         try:
             with open(payload["result"]) as f:
                 result = json.load(f)
@@ -320,14 +327,26 @@ def _ledger(cook_id, since, log):
     return tasks, cost
 
 
-def _run_hython(inst, payload_path, timeout, log):
+def _run_hython(inst, payload_path, timeout, log, dock_env=False):
     cmd = [str(inst.hython), os.path.abspath(__file__), "--hython", payload_path]
-    env = dict(os.environ)
-    env["RPFARM_ROOT"] = REPO
-    env.setdefault("PYTHONUNBUFFERED", "1")
+    if dock_env:
+        # Deliberately NOT inheriting this shell: PATH is exactly the thing that
+        # differed between every green headless run and the artist's first real
+        # one. RPFARM_ROOT is left out too -- a Dock-launched Houdini gets it
+        # from houdini.env, which `rpfarm setup` writes, so letting that supply
+        # it is the faithful path rather than a convenience.
+        env = {"PATH": "/usr/bin:/bin", "HOME": os.path.expanduser("~"),
+               "PYTHONUNBUFFERED": "1"}
+        cwd = "/"
+        log("--dock-env: PATH={} cwd={}".format(env["PATH"], cwd))
+    else:
+        env = dict(os.environ)
+        env["RPFARM_ROOT"] = REPO
+        env.setdefault("PYTHONUNBUFFERED", "1")
+        cwd = REPO
     log("$ " + " ".join(cmd))
     proc = subprocess.Popen(
-        cmd, cwd=REPO, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         text=True, bufsize=1, start_new_session=True)
     killer = threading.Timer(timeout, rpsmoke._kill_process, args=(proc, log))
     killer.daemon = True

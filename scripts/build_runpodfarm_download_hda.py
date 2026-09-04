@@ -268,7 +268,7 @@ in_process = bool(node.evalParm("rpfarm_inprocess"))
 # licence (hython would take one per package).
 python3, python3_why = rphou.resolve_package_python(
     hfs=hou.getenv("HFS") or hou.expandString("$HFS"))
-print("[rpfarm-download] package runner interpreter: {{}}  ({{}})".format(python3, python3_why))
+print("[rpfarm-download] package runner interpreter: {}  ({})".format(python3, python3_why))
 items_dir = tempfile.mkdtemp(prefix="rpfarm_download_items_")
 # See the upload node's onGenerate for why this has to be resolved from
 # rppkg.__file__ (already imported into THIS process) rather than trusted
