@@ -131,6 +131,24 @@ class HoudiniInstall:
     # -- user pref dir -------------------------------------------------------
 
     def _find_user_pref_dir(self) -> Path:
+        """Houdini's per-version user preference directory.
+
+        ``HOUDINI_USER_PREF_DIR`` wins when set, exactly as Houdini itself
+        treats it, including the ``__HVER__`` placeholder it documents for
+        the ``major.minor`` version. Honouring it is not just courtesy to
+        artists with a relocated pref dir: without it this function reads
+        ``Path.home()`` unconditionally, so anything constructing a
+        ``HoudiniInstall`` over a *fake* HFS -- the test suite did exactly
+        this -- resolves to the machine's REAL pref dir and
+        ``build_and_install_hdas`` overwrites the artist's installed HDAs.
+        That happened during Task 14: a plain ``pytest`` run replaced all
+        four real ``runpodfarm_*.hda`` with 17-byte fixtures and the next
+        smoke run died with "Invalid node type name".
+        """
+        override = os.environ.get("HOUDINI_USER_PREF_DIR")
+        if override:
+            return Path(override.replace("__HVER__", self.major_minor))
+
         system = platform.system()
         home = Path.home()
 

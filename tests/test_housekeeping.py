@@ -320,6 +320,41 @@ def test_houdini_rm_legacy_not_found_when_nothing_to_remove(tmp_path):
     assert result["ok"] is False
 
 
+def test_houdini_rm_legacy_invalidates_the_houdini_zone_size(tmp_path):
+    """Task 14, seen live: deleting the 10.8GB legacy install pruned only
+    the per-version `_houdini` cache, so the next `storage ls` still served
+    the pre-deletion `_sizes["houdini"]` (23.4GB = stale legacy + the new
+    install) and the volume read as half again as full as it was."""
+    root = mk(tmp_path)
+    (tmp_path / "houdini/bin").mkdir()
+    (tmp_path / "houdini/bin/hexpand").write_bytes(b"x" * 10)
+    hk.cmd_ls(root)  # populates _sizes["houdini"] with the pre-deletion figure
+    assert "houdini" in hk._load_index(root)["_sizes"]
+
+    hk.cmd_houdini_rm(root, "legacy")
+    assert "houdini" not in hk._load_index(root).get("_sizes", {})
+
+
+def test_houdini_rm_version_invalidates_the_houdini_zone_size(tmp_path):
+    root = mk(tmp_path)
+    hk.cmd_ls(root)
+    assert "houdini" in hk._load_index(root)["_sizes"]
+
+    hk.cmd_houdini_rm(root, "22.0.393")
+    assert "houdini" not in hk._load_index(root).get("_sizes", {})
+
+
+def test_houdini_rm_dry_run_leaves_the_zone_size_cache_alone(tmp_path):
+    """A dry run deletes nothing, so it must not throw away a good cached
+    measurement either."""
+    root = mk(tmp_path)
+    (tmp_path / "houdini/bin").mkdir()
+    (tmp_path / "houdini/bin/hexpand").write_bytes(b"x" * 10)
+    hk.cmd_ls(root)
+    hk.cmd_houdini_rm(root, "legacy", dry_run=True)
+    assert "houdini" in hk._load_index(root)["_sizes"]
+
+
 # -- sync-idle ----------------------------------------------------------------
 
 
