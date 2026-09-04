@@ -72,6 +72,16 @@ def hython_main(payload_path):
     with open(payload_path) as f:
         payload = json.load(f)
 
+    # Evidence, from inside Houdini, of the environment the cook is actually
+    # running in. Without this the only claim available is "I set the env in
+    # the parent", which is exactly the kind of claim that let the interpreter
+    # defect pass three verification runs.
+    import shutil as _shutil
+    log("environment inside Houdini: PATH={}".format(os.environ.get("PATH")))
+    log("environment inside Houdini: which(python3)={}".format(_shutil.which("python3")))
+    log("environment inside Houdini: sys.executable={} ({}.{}.{})".format(
+        sys.executable, *sys.version_info[:3]))
+
     result = {"ok": False}
     try:
         started = time.time()
