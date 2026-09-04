@@ -62,7 +62,14 @@ from rpfarm import dispatch as rpdispatch
 from rpfarm import packages as rppkg
 from rpfarm import pods as rppods
 from rpfarm import sync as rpsync
-from rpfarm.runpod_api import RunPodAPI, RunPodError, pod_public_endpoint
+from rpfarm.runpod_api import (
+    CLOUD_TYPE_SECURE,
+    CLOUD_TYPES,
+    RunPodAPI,
+    RunPodError,
+    is_capacity_error,
+    pod_public_endpoint,
+)
 from rpfarm.worker_client import WorkerClient, WorkerError
 
 try:
@@ -167,6 +174,20 @@ def cfg_default(name, fallback=""):
     try:
         return rpcfg.config_value(name, fallback)
     except Exception:
+        return fallback
+
+
+def cfg_default_int(name, fallback=0):
+    """Like :func:`cfg_default`, but for an integer parm.
+
+    ``config_value`` returns everything as a string, and an integer parm whose
+    Python default returns "15" evaluates to 0 -- silently, which is how a
+    15-minute wait became a 0-minute one. Coerce here rather than at each
+    call site.
+    """
+    try:
+        return int(str(rpcfg.config_value(name, "")).strip() or fallback)
+    except (TypeError, ValueError):
         return fallback
 
 
@@ -545,6 +566,8 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         self._terminate_retries = rpdispatch.TerminateRetries()
         self._killed_over_budget = False
         self._last_pod_error = None
+        self._last_pod_error_transient = False
+        self._capacity_give_up_reason = ""
         self._last_scale_failure = 0.0
         # Signature of the local PDG script directory at the last upload; see
         # _syncJobScripts.
@@ -574,6 +597,8 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
                 {"name": "rpfarm_networkvolumeid", "type": "String"},
                 {"name": "rpfarm_datacenter", "type": "String"},
                 {"name": "rpfarm_verbose", "type": "Integer"},
+                {"name": "rpfarm_capacitywait", "type": "Integer"},
+                {"name": "rpfarm_cloudtype", "type": "String"},
                 # -- Scaling --
                 {"name": "rpfarm_minpods", "type": "Integer"},
                 {"name": "rpfarm_maxpods", "type": "Integer"},
@@ -940,10 +965,17 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
                 pod = self._api.create_gpu_pod(
                     name, self._templateId(), self._gpu_list, self._volumeId(),
                     env, rppods.PORTS, datacenter=self._datacenterId(),
+                    cloud_type=self._cloudType(),
                 )
             except RunPodError as e:
-                self._log("pod create failed ({}): {}".format(", ".join(self._gpu_list), e))
                 self._last_pod_error = str(e)
+                self._last_pod_error_transient = is_capacity_error(e)
+                if self._last_pod_error_transient:
+                    self._log("no free machine yet ({}, {}): waiting".format(
+                        ", ".join(self._gpu_list), self._cloudType()))
+                else:
+                    self._log("pod create failed ({}): {}".format(
+                        ", ".join(self._gpu_list), e))
                 continue
             pod_id = pod["id"]
             self._dispatcher.add_pod(pod_id, 0.0, status="CREATED", created_at=time.time())
@@ -973,6 +1005,20 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         (final-review finding 5 -- the region used to be hardcoded there).
         """
         return self["rpfarm_datacenter"].evaluateString() or self._cfg.datacenter
+
+    def _cloudType(self):
+        """SECURE or COMMUNITY -- which RunPod capacity pool to rent from.
+
+        Same "parm overrides config" shape as _templateId/_volumeId. Anything
+        unrecognised falls back to SECURE rather than being sent to RunPod as
+        an invalid enum, which would 400 the whole create.
+        """
+        value = (self["rpfarm_cloudtype"].evaluateString() or "").strip().upper()
+        return value if value in CLOUD_TYPES else CLOUD_TYPE_SECURE
+
+    def _capacityWaitSeconds(self):
+        """How long one queued item may wait for a machine. 0 means forever."""
+        return max(0, self["rpfarm_capacitywait"].evaluateInt()) * 60
 
     def _poll_pods(self):
         """Track pod health: CREATED -> RUNNING on the first /health, and give
@@ -1170,10 +1216,22 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
             self._log("  | {}".format(line))
 
     def _reportFailures(self):
-        """Tell PDG about tasks the dispatcher has given up retrying."""
+        """Tell PDG about tasks the dispatcher has given up retrying.
+
+        `_capacity_give_up_reason` is set by :meth:`_expireWaitingItems` just
+        before it calls here, so an item that died waiting for a machine says
+        so in human words instead of leaving the artist with a bare failed
+        badge and no idea that the answer is "try again in a few minutes, or
+        switch Cloud Type to Community".
+        """
+        reason = self._capacity_give_up_reason
+        self._capacity_give_up_reason = ""
         for task in self._dispatcher.failed_since_last_call():
-            self._log("item {} failed after {} attempt(s)".format(
-                task.work_item_id, task.attempts))
+            if reason:
+                self._log("item {} failed: {}".format(task.work_item_id, reason))
+            else:
+                self._log("item {} failed after {} attempt(s)".format(
+                    task.work_item_id, task.attempts))
             self._work_items.pop(task.work_item_id, None)
             self.workItemFailed(task.work_item_id, -1)
 
@@ -1719,14 +1777,34 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
 
         wanted = max(1, self["rpfarm_minpods"].evaluateInt())
         if not self._scale_up(wanted):
-            # Nothing to run on and no reason to think the next tick will do
-            # better: fail the cook here with RunPod's own words rather than
-            # leave the artist watching an empty farm.
-            raise CookError(
-                "Could not create any GPU pod for this cook (asked for {}, "
-                "GPU priority: {}).\n{}".format(
-                    wanted, ", ".join(self._gpu_list),
-                    self._last_pod_error or "RunPod returned no pod and no error."))
+            # A cook with no machines yet is a QUEUE, not a failure. Our pods
+            # are not spot instances (cloudType SECURE/COMMUNITY,
+            # `interruptible` never set), so one we already hold is never
+            # taken back; the only question is whether RunPod has a free one,
+            # and that answer changes minute to minute. Work items sit in
+            # _dispatcher.pending -- should_defer() counts an empty pool as one
+            # pod precisely so the first item is still accepted -- and the tick
+            # keeps retrying _scale_up under its existing backoff. Each item
+            # carries its own deadline (Wait For Capacity); when that runs out
+            # only that item fails, so a re-cook retries just the ones that
+            # never got a machine.
+            #
+            # Fatal is reserved for what waiting cannot fix: a bad key, a
+            # missing template, a malformed request. is_capacity_error()
+            # splits 4xx (hopeless) from 5xx/no-capacity (worth waiting).
+            if self._last_pod_error and not self._last_pod_error_transient:
+                raise CookError(
+                    "Could not create any GPU pod for this cook (asked for {}, "
+                    "GPU priority: {}), and the reason is not a temporary "
+                    "shortage of machines:\n{}".format(
+                        wanted, ", ".join(self._gpu_list), self._last_pod_error))
+            wait_min = self["rpfarm_capacitywait"].evaluateInt()
+            self._log(
+                "no free machine in {} ({}) yet -- the cook waits and keeps "
+                "asking. Each item gives up after {}. Cloud Type COMMUNITY "
+                "often has machines when SECURE does not.".format(
+                    self._datacenterId(), self._cloudType(),
+                    "{} min".format(wait_min) if wait_min > 0 else "never"))
         self._update_status_text(force=True)
 
     def _uploadPdgTemp(self):
@@ -2041,6 +2119,7 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
             return tickResult.SchedulerCancelCook
 
         self._autoscale()
+        self._expireWaitingItems()
         self._retireIdlePods()
         self._update_status_text()
 
@@ -2065,6 +2144,35 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         if count > 0:
             self._log("autoscale: {} pending, adding {} pod(s)".format(pending, count))
             self._scale_up(count)
+
+    def _expireWaitingItems(self):
+        """Fail the items that have waited too long for a machine -- only those.
+
+        Per item, not per cook: PDG re-cooks dirty/failed items only, so
+        failing exactly the ones that never got a pod means the artist can hit
+        Submit again and retry just those, while everything already computed
+        stays computed. That is the whole reason this is not a CookError.
+        """
+        wait_seconds = self._capacityWaitSeconds()
+        if wait_seconds <= 0:
+            return
+        expired = self._dispatcher.capacity_expired(time.time(), wait_seconds)
+        for task in expired:
+            self._log(
+                "work item {} waited {} min for a free machine and gave up".format(
+                    task.work_item_id, self["rpfarm_capacitywait"].evaluateInt()))
+            self._dispatcher.fail_pending(task.task_id)
+        if expired:
+            self._capacity_give_up_reason = (
+                "Waited {} min for a free machine in {} ({}) and RunPod never "
+                "had one.\nTry again later, pick a different GPU in GPU "
+                "Priority, or set Cloud Type to Community -- it is cheaper and "
+                "often has machines when Secure is empty.\nLast word from "
+                "RunPod: {}".format(
+                    self["rpfarm_capacitywait"].evaluateInt(), self._datacenterId(),
+                    self._cloudType(),
+                    self._last_pod_error or "no error reported"))
+            self._reportFailures()
 
     def _retireIdlePods(self):
         """Terminate pods that have had nothing to do for Idle Timeout seconds.

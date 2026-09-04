@@ -465,3 +465,126 @@ def test_the_cook_runs_the_datacenter_check_before_creating_anything():
     assert "self._checkDatacenter()" in src
     start = src.index("def onStartCook")
     assert src.index("self._checkDatacenter()", start) < src.index("def onSetupCook")
+
+
+# ---------------------------------------------------------------------------
+# _expireWaitingItems / _cloudType -- Task 19
+#
+# A shortage of machines is a queue, not a dead cook: our pods are not spot
+# instances, so one we hold is never taken back and the only question is
+# whether a free one exists yet. onSetupCook used to raise CookError when the
+# first scale-up got nothing, killing the cook at second zero over a condition
+# that clears in a couple of minutes. These cover the backstop that replaced
+# it -- a per-item deadline, so a re-cook retries only the items that never
+# got a machine.
+# ---------------------------------------------------------------------------
+
+
+class _CapacityScheduler(FakeScheduler):
+    def __init__(self, wait_min=15, cloud="SECURE", now=0.0):
+        super().__init__()
+        self._parms = {"rpfarm_capacitywait": wait_min, "rpfarm_cloudtype": cloud}
+        self._now = now
+        self._last_pod_error = "RunPod 500: no longer any instances available"
+        self._capacity_give_up_reason = ""
+        self.reported = []
+
+    def __getitem__(self, name):
+        value = self._parms[name]
+        return types.SimpleNamespace(
+            evaluateInt=lambda: int(value),
+            evaluateString=lambda: str(value),
+        )
+
+    def _datacenterId(self):
+        return "EU-RO-1"
+
+    def _cloudType(self):
+        return self._parms["rpfarm_cloudtype"]
+
+    def _capacityWaitSeconds(self):
+        return max(0, int(self._parms["rpfarm_capacitywait"])) * 60
+
+    def _reportFailures(self):
+        self.reported.append(self._capacity_give_up_reason)
+
+
+def _capacity_ns(now):
+    return load_methods(
+        ["_expireWaitingItems"],
+        extra_globals={"time": types.SimpleNamespace(time=lambda: now)},
+    )
+
+
+def _queue(sched, task_id, work_item_id, queued_at):
+    task = rpdispatch.TaskState(task_id=task_id, work_item_id=work_item_id,
+                                command="c", env={})
+    sched._dispatcher.enqueue(task, now=queued_at)
+    return task
+
+
+def test_items_still_within_the_deadline_are_left_waiting():
+    sched = _CapacityScheduler(wait_min=15)
+    _queue(sched, "t1", 1, queued_at=0.0)
+
+    _capacity_ns(now=600.0)["_expireWaitingItems"](sched)
+
+    assert [t.task_id for t in sched._dispatcher.pending] == ["t1"]
+    assert sched.reported == []
+
+
+def test_an_item_past_the_deadline_fails_and_says_why():
+    sched = _CapacityScheduler(wait_min=15, cloud="SECURE")
+    _queue(sched, "t1", 1, queued_at=0.0)
+
+    _capacity_ns(now=901.0)["_expireWaitingItems"](sched)
+
+    assert sched._dispatcher.pending == []
+    assert [t.task_id for t in sched._dispatcher.failed] == ["t1"]
+    assert len(sched.reported) == 1
+    reason = sched.reported[0]
+    assert "15 min" in reason and "EU-RO-1" in reason
+    assert "Community" in reason                     # the actionable way out
+    assert "no longer any instances" in reason       # RunPod's own last word
+
+
+def test_only_the_expired_items_fail():
+    """The reason it is per item: a re-cook must retry only these."""
+    sched = _CapacityScheduler(wait_min=15)
+    _queue(sched, "old", 1, queued_at=0.0)
+    _queue(sched, "new", 2, queued_at=800.0)
+
+    _capacity_ns(now=901.0)["_expireWaitingItems"](sched)
+
+    assert [t.task_id for t in sched._dispatcher.pending] == ["new"]
+    assert [t.task_id for t in sched._dispatcher.failed] == ["old"]
+
+
+def test_a_zero_deadline_waits_forever_and_never_reports():
+    sched = _CapacityScheduler(wait_min=0)
+    _queue(sched, "t1", 1, queued_at=0.0)
+
+    _capacity_ns(now=1e9)["_expireWaitingItems"](sched)
+
+    assert [t.task_id for t in sched._dispatcher.pending] == ["t1"]
+    assert sched.reported == []
+
+
+def test_setup_cook_does_not_die_on_a_capacity_shortage():
+    """The actual bug: an empty farm at second zero killed the whole cook."""
+    src = MODULE.read_text()
+    setup = src[src.index("wanted = max(1, self[\"rpfarm_minpods\"]"):]
+    setup = setup[:setup.index("self._update_status_text(force=True)")]
+
+    # fatal only when the refusal is NOT a temporary shortage
+    assert "if self._last_pod_error and not self._last_pod_error_transient:" in setup
+    assert "raise CookError" in setup
+    # and the wait is explained rather than silent
+    assert "the cook waits and keeps" in setup
+
+
+def test_the_transient_flag_comes_from_is_capacity_error():
+    src = MODULE.read_text()
+
+    assert "self._last_pod_error_transient = is_capacity_error(e)" in src
+    assert "cloud_type=self._cloudType()" in src

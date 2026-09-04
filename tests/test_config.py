@@ -231,3 +231,12 @@ def test_api_key_status_warns_that_a_typed_key_goes_into_the_hip():
     assert "set on this node (rpa_...9999)" in text
     assert "cleartext" in text and ".hip" in text
     assert "rpa_TYPEDBYHAND9999" not in text, "never the key itself"
+
+
+def test_config_value_reports_the_new_capacity_fields():
+    """Both are read by parm defaults, so an empty config must still answer."""
+    from rpfarm.config import Config
+
+    cfg = Config(api_key="k", user="u", volume_id="v", template_id="t")
+    assert cfg.capacity_wait_min == 15
+    assert cfg.cloud_type == "SECURE"

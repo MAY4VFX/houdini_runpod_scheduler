@@ -80,6 +80,14 @@ class Config:
     sesinetd_host: str = "lic.ai-vfx.com"
     sesinetd_port: int = 1715
     sync_idle_min: int = 15
+    # How long a work item waits for a free machine before it -- and only it --
+    # is failed. RunPod pods are not spot instances, so a shortage is a queue,
+    # not an eviction: waiting is the correct response, and 15 minutes is the
+    # owner's default.
+    capacity_wait_min: int = 15
+    # SECURE (vetted datacentres) or COMMUNITY (cheaper hosts, often has
+    # machines when SECURE is empty). See rpfarm.runpod_api.CLOUD_TYPES.
+    cloud_type: str = "SECURE"
     gpu_priority: list[str] = field(default_factory=list)
     rclone_path: str = field(default_factory=_default_rclone_path)
     ssh_key_path: str = field(default_factory=_default_ssh_key_path)
