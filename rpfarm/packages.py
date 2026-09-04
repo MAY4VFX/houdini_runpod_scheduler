@@ -666,8 +666,16 @@ def _exec_checked(sync_client, command, timeout_s):
     Same contract as the scheduler's own ``_volume_exec`` (``hda/
     runpodfarm_scheduler.hda/.../PythonModule``, ``_volume_exec``): a
     failed remote command must never be swallowed as a successful work
-    item. Only the tail of stderr is kept in the message -- a failed
+    item. Only the tail of the output is kept in the message -- a failed
     Houdini install can log megabytes.
+
+    The diagnostics come from stderr *or*, when that is empty, stdout: a
+    detached run merges the two into one log file
+    (``DetachedRuns`` uses ``stderr=subprocess.STDOUT``), so on the path
+    that matters most -- a real install failure -- everything the command
+    said arrives as stdout and reporting only stderr would raise a
+    "(no stderr)" with the actual error thrown away. The message also
+    names the pod-side log so a human can go read the whole thing.
 
     Goes through ``exec_wait`` (detached + polling), not the synchronous
     ``exec`` -- Ruling R31. The commands reaching here are decompressing
@@ -683,11 +691,17 @@ def _exec_checked(sync_client, command, timeout_s):
     else:  # pragma: no cover - older client stub in a caller's test
         result = sync_client.exec(command, timeout_s=timeout_s)
     if result.get("exit_code") != 0:
-        stderr = (result.get("stderr") or "").strip()
-        tail = stderr[-2000:] if stderr else "(no stderr)"
-        raise RuntimeError(
-            "remote command failed (exit {}): {}\ncommand: {}".format(result.get("exit_code"), tail, command)
+        # stderr first, then stdout -- a detached run merges both into its
+        # log file, so its whole output arrives as stdout.
+        output = (result.get("stderr") or "").strip() or (result.get("stdout") or "").strip()
+        tail = output[-2000:] if output else "(no output)"
+        message = "remote command failed (exit {}): {}\ncommand: {}".format(
+            result.get("exit_code"), tail, command
         )
+        log_path = result.get("log_path")
+        if log_path:
+            message += "\nfull log on the sync pod: {}".format(log_path)
+        raise RuntimeError(message)
     return result
 
 

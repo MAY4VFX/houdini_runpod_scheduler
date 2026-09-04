@@ -282,9 +282,14 @@ class DetachedRuns:
       the request does can SIGPIPE it;
     - its own session (``start_new_session``), so no signal aimed at the
       request's process group reaches it;
-    - an exit code written to ``<handle>.rc`` by the wrapper itself, so the
-      result survives even a worker restart, and read back through the
-      existing ``/files`` endpoint;
+    - an exit code written to ``<handle>.rc`` by the wrapper itself, and
+      read back through the existing ``/files`` endpoint. A *completed*
+      result therefore survives a worker restart. A run still in flight
+      does not: the container restarting kills it, and since only the
+      wrapper ever writes ``.rc``, the new instance finds no exit code and
+      reports ``running`` forever. A caller that must tolerate that needs
+      its own deadline (``exec_wait`` has one) rather than waiting on this
+      endpoint indefinitely;
     - a live ``Popen`` this class reaps in :meth:`status`, so a finished
       child does not sit around as a zombie (as PID 1 in the container the
       worker inherits orphans and never reaps them; that zombie was the
@@ -302,6 +307,12 @@ class DetachedRuns:
         return {"script": base + ".sh", "log": base + ".log", "rc": base + ".rc"}
 
     def start(self, command, handle=None):
+        # NOTE: no uniqueness guard on a caller-supplied `handle`. Nothing
+        # in this repo passes one (they are all generated below), but a
+        # future caller reusing a live handle would truncate that run's log
+        # and drop its Popen from the table, orphaning it. If explicit
+        # handles ever get used, this wants a DuplicateTaskError-style
+        # refusal like Registry.submit has.
         handle = handle or "exec-{}".format(uuid.uuid4().hex[:16])
         paths = self.paths(handle)
         os.makedirs(self.exec_dir, exist_ok=True)
