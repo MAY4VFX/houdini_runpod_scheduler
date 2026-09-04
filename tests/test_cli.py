@@ -827,8 +827,13 @@ def test_farm_kill_sync_terminates_matching_pod_only(tmp_path, monkeypatch, caps
 
 
 def _idle_health(pod):
-    """Every pod answers "nobody has touched me in ages"."""
-    return {"busy": 0, "idle_s": 9999}
+    """Every pod answers "nobody has touched me in ages, by any channel".
+
+    The ssh/transfer fields are not optional: a pod that omits them is
+    classified `unknown` on purpose, because HTTP silence alone never proved
+    a pod was free -- see test_pods.py.
+    """
+    return {"busy": 0, "idle_s": 9999, "ssh_sessions": 0, "transfers": 0}
 
 
 def _farm_kill_transport(pods, terminated):
@@ -912,13 +917,13 @@ def test_farm_kill_pod_terminates_exact_id(tmp_path, monkeypatch, capsys):
 
 
 def _busy_health(pod):
-    return {"busy": 1, "idle_s": 2}
+    return {"busy": 1, "idle_s": 2, "ssh_sessions": 0, "transfers": 0}
 
 
 def _recently_used_health(pod):
     """No task running, but a scheduler spoke to it 36 seconds ago -- exactly
     the window in which a real cook was nearly destroyed."""
-    return {"busy": 0, "idle_s": 36}
+    return {"busy": 0, "idle_s": 36, "ssh_sessions": 0, "transfers": 0}
 
 
 def _kill_setup(tmp_path, monkeypatch, pods, health):

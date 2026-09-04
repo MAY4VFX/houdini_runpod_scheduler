@@ -372,3 +372,106 @@ def test_a_husk_that_explodes_does_not_take_health_down(monkeypatch, tmp_path):
 
     assert answer["supported"] is None
     assert "husk failed" in answer["detail"]
+
+
+# ---------------------------------------------------------------------------
+# Liveness: work that never touches this worker
+#
+# /health only ever counted HTTP requests, so a pod driven over SSH reported
+# busy 0 with idle_s equal to its whole uptime while rendering 15 frames, and
+# the kill guard cleared it. The production case is worse: rclone moves files
+# to the sync pod over SFTP, so a pod taking a 4GB tarball -- the heaviest
+# thing this farm does -- looked perfectly idle.
+# ---------------------------------------------------------------------------
+
+
+# Real /proc/net/tcp shape. Column 1 is local_address as HEX_IP:HEX_PORT,
+# column 3 is the state; 0016 is port 22 and 01 is ESTABLISHED.
+_NET_TCP_HEADER = ("  sl  local_address rem_address   st tx_queue rx_queue tr "
+                   "tm->when retrnsmt   uid  timeout inode\n")
+_LISTENING_SSH = "   0: 00000000:0016 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 1\n"
+_ESTABLISHED_SSH = "   1: 0100007F:0016 0100007F:C001 01 00000000:00000000 00:00000000 00000000     0        0 2\n"
+_ESTABLISHED_HTTP = "   2: 0100007F:1F40 0100007F:C002 01 00000000:00000000 00:00000000 00000000     0        0 3\n"
+
+
+def _fake_proc(net_tcp="", pids=None):
+    pids = pids or {}
+    files = {"/proc/net/tcp": _NET_TCP_HEADER + net_tcp}
+    for pid, comm in pids.items():
+        files["/proc/%s/comm" % pid] = comm + "\n"
+
+    def read(path):
+        if path not in files:
+            raise FileNotFoundError(path)
+        return files[path]
+
+    def listdir(path):
+        return list(pids) + ["net", "self", "uptime"]
+
+    return read, listdir
+
+
+def test_an_established_ssh_connection_is_seen():
+    read, listdir = _fake_proc(net_tcp=_ESTABLISHED_SSH)
+
+    assert worker.Liveness(read=read, listdir=listdir).ssh_sessions() == 1
+
+
+def test_a_listening_socket_is_not_a_session():
+    """sshd always listens; that is not somebody being there."""
+    read, listdir = _fake_proc(net_tcp=_LISTENING_SSH)
+
+    assert worker.Liveness(read=read, listdir=listdir).ssh_sessions() == 0
+
+
+def test_connections_on_other_ports_are_not_ssh_sessions():
+    """The worker's own HTTP traffic must not read as an ssh session."""
+    read, listdir = _fake_proc(net_tcp=_LISTENING_SSH + _ESTABLISHED_HTTP)
+
+    assert worker.Liveness(read=read, listdir=listdir).ssh_sessions() == 0
+
+
+def test_several_sessions_are_counted():
+    read, listdir = _fake_proc(net_tcp=_ESTABLISHED_SSH + _ESTABLISHED_SSH)
+
+    assert worker.Liveness(read=read, listdir=listdir).ssh_sessions() == 2
+
+
+def test_an_unreadable_proc_reports_unknown_not_zero():
+    """Zero would read as 'nobody here' and clear the pod for termination."""
+
+    def read(path):
+        raise PermissionError(path)
+
+    assert worker.Liveness(read=read, listdir=lambda p: []).ssh_sessions() is None
+    assert worker.Liveness(read=read, listdir=_boom).transfers() is None
+
+
+def _boom(path):
+    raise PermissionError(path)
+
+
+def test_transfer_processes_are_counted():
+    read, listdir = _fake_proc(pids={"11": "rclone", "12": "sftp-server",
+                                     "13": "bash", "14": "hython-bin"})
+
+    assert worker.Liveness(read=read, listdir=listdir).transfers() == 2
+
+
+def test_no_transfer_processes_is_zero_not_unknown():
+    read, listdir = _fake_proc(pids={"11": "bash", "12": "sshd"})
+
+    assert worker.Liveness(read=read, listdir=listdir).transfers() == 0
+
+
+def test_a_process_that_exits_mid_scan_does_not_break_the_count():
+    """/proc entries vanish under you; that must not make the pod unknown."""
+    read, listdir = _fake_proc(pids={"11": "rclone"})
+
+    def flaky(path):
+        if path.endswith("/99/comm"):
+            raise FileNotFoundError(path)
+        return read(path)
+
+    live = worker.Liveness(read=flaky, listdir=lambda p: ["11", "99"])
+    assert live.transfers() == 1
