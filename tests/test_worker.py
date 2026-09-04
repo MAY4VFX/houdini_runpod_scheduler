@@ -293,16 +293,21 @@ def test_exec_sync_timeout_leaves_no_unreaped_child(srv):
 # ---------------------------------------------------------------------------
 
 
-def _husk(stdout, returncode=0):
+def _husk(stdout, returncode=0, stderr=""):
+    """subprocess.run stand-in; the probe shells out via build_shell_command."""
+
     class R:
         pass
+
     r = R()
     r.stdout = stdout
+    r.stderr = stderr
     r.returncode = returncode
 
     def run(cmd, **_kw):
         run.calls.append(cmd)
         return r
+
     run.calls = []
     return run
 

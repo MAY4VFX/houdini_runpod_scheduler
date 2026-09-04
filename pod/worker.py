@@ -189,17 +189,25 @@ class XpuSupport:
         if hfs and not os.path.exists(husk):
             return {"supported": None, "detail": "no husk at {}".format(husk)}
         try:
-            proc = self._run([husk, "--list-renderers"], capture_output=True,
-                             text=True, timeout=180)
+            # Through the same shell wrapper tasks get: husk started but
+            # printed nothing useful when run bare, because sourcing
+            # houdini_setup_bash is what puts Houdini's own libraries and
+            # HOUDINI_PATH in place. Verified on a live pod -- bare husk gave
+            # rc=0 and no delegate list at all.
+            proc = self._run(["bash", "-c", build_shell_command("husk --list-renderers")],
+                             capture_output=True, text=True, timeout=180,
+                             env=build_env())
         except Exception as e:  # noqa: BLE001 - a probe must not kill /health
             return {"supported": None, "detail": "husk failed: {}".format(e)}
-        for line in (proc.stdout or "").splitlines():
+        for line in ((proc.stdout or "") + (proc.stderr or "")).splitlines():
             if "KarmaXPU" not in line:
                 continue
             usable = "unsupported" not in line.lower()
             return {"supported": usable, "detail": line.strip()}
+        tail = ((proc.stderr or "") or (proc.stdout or "")).strip().splitlines()
         return {"supported": None,
-                "detail": "husk did not mention KarmaXPU (rc={})".format(proc.returncode)}
+                "detail": "husk did not mention KarmaXPU (rc={}): {}".format(
+                    proc.returncode, tail[-1] if tail else "no output")}
 
 
 class LastRequest:
