@@ -50,10 +50,12 @@ DEFAULT_MAX_BYTES = int(1.5 * 2**30)
 # 2026-09-02-rpfarm-v2.md, Task 9). v1's installer script
 # (infrastructure/install-houdini-on-volume.sh:60,72) used 2024-01-01 /
 # 2025-01-01 for Houdini 20.5; this is the value the plan settled on for
-# 22.0.393. The tarball is not installed against the real volume until Task
-# 14 -- confirm this date against the actual installer's
-# ``houdini.install --help`` output before that run, since SideFX only
-# revises the EULA date when the license text itself changes.
+# 22.0.393. Verified in Task 14 against the real 22.0.393 installer:
+# ``houdini.install`` compares ``--accept-EULA`` against its own
+# ``LICENSE_DATE="2021-10-13"`` (line 1501; the previous date 2020-05-05
+# expired 2021-11-12), so this is exactly the string it accepts. SideFX
+# only revises the date when the license text itself changes, so recheck
+# it when moving to a new Houdini major.
 HOUDINI_EULA_DATE = "2021-10-13"
 
 
@@ -322,6 +324,29 @@ def houdini_install_preset(tar_local_path, version):
     figure with no signal anything was wrong. The last step now
     invalidates that zone (``housekeeping.py invalidate houdini``) right
     where the write happens, so the next `ls`/`disk-usage` remeasures it.
+
+    Task 14 (first real run of this preset) corrected the installer
+    invocation against the actual 22.0.393 ``houdini.install``:
+
+    - There is no ``--install-dir`` option. ``houdini.install``'s usage is
+      ``./houdini.install [options] [installation_directory]`` -- the
+      target is a *positional* argument, and its option loop ``break``s on
+      the first unrecognised token, so ``--install-dir /path`` was parsed
+      as the directory itself and died with "Error: --install-dir must be
+      a writeable directory". It must be the last word, with ``--make-dir``
+      so a fresh ``/workspace/houdini/<ver>`` is created rather than
+      rejected.
+    - ``--no-install-avahi`` is required: run as root (which the pod is),
+      the installer defaults ``avahi=yes`` and shells out to
+      ``apt-get install avahi-daemon`` -- a pointless network install on a
+      throwaway pod.
+    - ``--no-install-bin-symlink`` pins the already-correct default so a
+      future installer flip can't start writing into ``/usr/local/bin``.
+
+    The uploaded tarball (~4.3GB for 22.0) is deleted from
+    ``/workspace/apps/dist/`` once the install succeeds: it is dead weight
+    on a 50GB volume, and a failed install deliberately keeps it so a
+    retry does not have to re-upload.
     """
     tar_name = os.path.basename(tar_local_path)
     pairs = [(tar_local_path, "/workspace/apps/dist/")]
@@ -331,9 +356,11 @@ def houdini_install_preset(tar_local_path, version):
         f"tar xzf {tar_name} -C /tmp/hou && "
         f"cd /tmp/hou/houdini-{version}-* && "
         f"./houdini.install --auto-install --accept-EULA {HOUDINI_EULA_DATE} "
-        "--no-install-license --no-install-menus "
-        f"--install-dir {install_dir} --no-install-hfs-symlink && "
+        "--no-install-license --no-install-menus --no-install-avahi "
+        "--no-install-hfs-symlink --no-install-bin-symlink --make-dir "
+        f"{install_dir} && "
         "rm -rf /tmp/hou && "
+        f"rm -f /workspace/apps/dist/{tar_name} && "
         "python3 /opt/rpfarm/housekeeping.py invalidate houdini && "
         f"ls {install_dir}/bin/hython"
     )

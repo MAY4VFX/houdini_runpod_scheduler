@@ -621,13 +621,89 @@ def test_stage_tar_from_sftp_url_builds_rclone_copyto_command(tmp_path):
         return _sp.CompletedProcess(cmd, 0, stdout="", stderr="")
 
     local = cli._stage_tar_from_sftp_url(
-        "sftp://may@mayfx02/home/may/Downloads/houdini-22.0.393.tar.gz", "rclone", str(tmp_path), run=fake_run
+        "sftp://may@mayfx02/home/may/Downloads/houdini-22.0.393.tar.gz",
+        "rclone",
+        str(tmp_path),
+        run=fake_run,
+        key_file="/keys/id_rsa",
     )
     assert os.path.basename(local) == "houdini-22.0.393.tar.gz"
     assert open(local, "rb").read() == b"staged"
     cmd = calls[0]
     assert cmd[0] == "rclone" and cmd[1] == "copyto"
-    assert cmd[2] == ":sftp,host=mayfx02,user=may:/home/may/Downloads/houdini-22.0.393.tar.gz"
+    assert cmd[2] == (
+        ":sftp,host=mayfx02,user=may,key_file=/keys/id_rsa"
+        ":/home/may/Downloads/houdini-22.0.393.tar.gz"
+    )
+
+
+def _fake_sftp_run(calls, ok_when):
+    """rclone stub: succeeds only for the remote ``ok_when`` matches,
+    otherwise fails the way rclone does when a key is rejected."""
+    import subprocess as _sp
+
+    def run(cmd, capture_output, text):
+        calls.append(cmd)
+        if ok_when(cmd[2]):
+            with open(cmd[-1], "wb") as f:
+                f.write(b"staged")
+            return _sp.CompletedProcess(cmd, 0, stdout="", stderr="")
+        return _sp.CompletedProcess(
+            cmd, 1, stdout="", stderr="NewFs: couldn't connect SSH: ssh: handshake failed: ssh: unable to authenticate"
+        )
+
+    return run
+
+
+def test_stage_tar_from_sftp_url_walks_ssh_identities(tmp_path, monkeypatch):
+    """Task 14: rclone's sftp backend reads neither ~/.ssh/config nor the
+    stock identity files, and unlike ``ssh`` it gives up after the single
+    ``key_file`` it was given. With an empty agent (the normal state on the
+    artist's Mac) and a host that accepts id_rsa rather than id_ed25519,
+    staging has to try the identities in turn the way ssh does.
+    """
+    home = tmp_path / "home"
+    (home / ".ssh").mkdir(parents=True)
+    (home / ".ssh" / "id_ed25519").write_text("wrong key")
+    (home / ".ssh" / "id_rsa").write_text("right key")
+    monkeypatch.setattr(cli.os.path, "expanduser", lambda p: str(home) if p == "~" else p)
+
+    calls = []
+    run = _fake_sftp_run(calls, lambda remote: remote.endswith(f"key_file={home}/.ssh/id_rsa:/p/houdini.tar.gz"))
+    local = cli._stage_tar_from_sftp_url("sftp://root@host/p/houdini.tar.gz", "rclone", str(tmp_path), run=run)
+
+    assert open(local, "rb").read() == b"staged"
+    tried = [c[2] for c in calls]
+    assert tried[0] == ":sftp,host=host,user=root:/p/houdini.tar.gz"  # ssh-agent first
+    assert f"key_file={home}/.ssh/id_ed25519" in tried[1]
+    assert f"key_file={home}/.ssh/id_rsa" in tried[2]
+
+
+def test_stage_tar_from_sftp_url_does_not_retry_non_auth_failure(tmp_path, monkeypatch):
+    """A transfer that got past the handshake and then died must not be
+    restarted against the next identity -- only auth failures are retried,
+    because only those are known to have moved no bytes."""
+    home = tmp_path / "home"
+    (home / ".ssh").mkdir(parents=True)
+    (home / ".ssh" / "id_rsa").write_text("key")
+    monkeypatch.setattr(cli.os.path, "expanduser", lambda p: str(home) if p == "~" else p)
+
+    import subprocess as _sp
+
+    calls = []
+
+    def run(cmd, capture_output, text):
+        calls.append(cmd)
+        return _sp.CompletedProcess(cmd, 1, stdout="", stderr="ERROR: no space left on device")
+
+    with pytest.raises(RuntimeError, match="no space left"):
+        cli._stage_tar_from_sftp_url("sftp://root@host/p/t.tar.gz", "rclone", str(tmp_path), run=run)
+    assert len(calls) == 1
+
+
+def test_default_ssh_key_files_empty_when_no_identity(tmp_path):
+    (tmp_path / ".ssh").mkdir()
+    assert cli._default_ssh_key_files(home=str(tmp_path)) == []
 
 
 def test_stage_tar_from_sftp_url_rejects_malformed_url(tmp_path):
