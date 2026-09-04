@@ -189,14 +189,14 @@ def test_exec_sync_timeout_is_clamped_to_the_proxy_ceiling(srv, monkeypatch):
     install used); the transport cannot deliver a response that long, so the
     handler must not pretend it can."""
     seen = {}
+    real_popen = worker.subprocess.Popen
 
-    real_run = worker.subprocess.run
+    class SpyPopen(real_popen):
+        def communicate(self, *a, **kw):
+            seen["timeout"] = kw.get("timeout", a[1] if len(a) > 1 else None)
+            return super().communicate(*a, **kw)
 
-    def spy(cmd, **kw):
-        seen["timeout"] = kw.get("timeout")
-        return real_run(cmd, **kw)
-
-    monkeypatch.setattr(worker.subprocess, "run", spy)
+    monkeypatch.setattr(worker.subprocess, "Popen", SpyPopen)
     st, body = req(srv, "POST", "/exec", {"command": "true", "timeout_s": 829})
     assert st == 200 and body["exit_code"] == 0
     assert seen["timeout"] == worker.EXEC_SYNC_CEILING_S
@@ -206,3 +206,30 @@ def test_exec_sync_timeout_response_points_at_the_detached_path(srv):
     st, body = req(srv, "POST", "/exec", {"command": "sleep 5", "timeout_s": 1})
     assert st == 504
     assert "detach" in body["hint"]
+
+
+def test_exec_sync_timeout_kills_grandchildren_too(srv, tmp_path):
+    """A timed-out /exec must take its whole process group with it.
+
+    `subprocess.run`'s timeout kills only the shell it started; a grandchild
+    (an installer, a tar) survives and keeps writing to a pipe nobody is
+    reading -- the exact shape of Task 14's corrupted Houdini install, and
+    confirmed live afterwards as a leftover zombie on the pod.
+    """
+    marker = tmp_path / "grandchild-still-alive"
+    # bash spawns a *grandchild* that would touch the marker after the
+    # timeout has already fired, then waits on it.
+    cmd = "bash -c 'sleep 3; touch {}' & wait".format(marker)
+
+    st, body = req(srv, "POST", "/exec", {"command": cmd, "timeout_s": 1})
+    assert st == 504 and body["error"] == "timeout"
+
+    time.sleep(5)  # well past when the grandchild would have fired
+    assert not marker.exists(), "grandchild outlived the killed request"
+
+
+def test_exec_sync_timeout_leaves_no_unreaped_child(srv):
+    st, _body = req(srv, "POST", "/exec", {"command": "sleep 30", "timeout_s": 1})
+    assert st == 504
+    with pytest.raises(ChildProcessError):
+        os.waitpid(-1, os.WNOHANG)
