@@ -260,6 +260,38 @@ def group_download_pairs(pairs, sizes=None):
     return [(local_root, remote_root, entries) for (local_root, remote_root), entries in groups.items()]
 
 
+def parse_stat_sizes(stdout, remotes):
+    """``(sizes, missing)`` from the output of ``stat -c '%s %n' <paths...>``.
+
+    ``stat`` exits non-zero when **any** path is missing, but it still prints
+    a line for every path it did find. The download node used to check the
+    exit code first and throw the whole stdout away, so one absent frame cost
+    the sizes of every other file in the batch -- and, because the "failed"
+    branch then called ``hou.Node.addWarning`` from inside PDG generation
+    (which Houdini refuses: "Cannot set error badges on other nodes"), it cost
+    every work item on the node as well. Parsing what came back and naming
+    only what is genuinely absent is the whole fix on this side.
+
+    Sizes are used for packing files into transfer packages, so a missing
+    entry is not fatal here: it packs as 0 and the copy reports the real
+    error at cook time, against that one file.
+    """
+    sizes = {}
+    for line in (stdout or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        size_str, _sep, path = line.partition(" ")
+        if not path:
+            continue
+        try:
+            sizes[path] = int(size_str)
+        except ValueError:
+            continue
+    missing = [r for r in remotes if r not in sizes]
+    return sizes, missing
+
+
 def build_download_items(mode, pairs, package_gb, sizes=None):
     """Plan the work items for one ``runpodfarm_download`` cook.
 

@@ -14,6 +14,7 @@ from rpfarm.packages import (
     localize_via_pathmap,
     map_output_pair,
     maybe_grow_volume,
+    parse_stat_sizes,
     resolve_compress_flag,
     result_data_path,
     run_download_item,
@@ -1688,3 +1689,72 @@ def test_the_heartbeat_reports_a_raising_client_once_too():
         hb(1, 2, 3)  # no raise
 
     assert len(said) == 1 and "pod gone" in said[0]
+
+
+# ---------------------------------------------------------------------------
+# parse_stat_sizes
+#
+# The download node's generate() ran `stat -c '%s %n' <every expected output>`
+# on the sync pod and checked the exit code first. `stat` exits non-zero when
+# ANY path is missing while still printing the ones it found, so one absent
+# frame threw away the sizes of all the others -- and the "failed" branch then
+# called hou.Node.addWarning from inside PDG generation, which Houdini refuses
+# ("Cannot set error badges on other nodes"), turning the warning into a hard
+# generate() failure that left the node with ZERO work items. Observed live:
+# one of eight rendered frames was missing and the whole node reported nothing.
+# ---------------------------------------------------------------------------
+
+
+def test_parse_stat_sizes_reads_every_line_it_was_given():
+    stdout = "3626569 /w/render/f.0001.exr\n3629495 /w/render/f.0002.exr\n"
+    remotes = ["/w/render/f.0001.exr", "/w/render/f.0002.exr"]
+
+    sizes, missing = parse_stat_sizes(stdout, remotes)
+
+    assert sizes == {"/w/render/f.0001.exr": 3626569, "/w/render/f.0002.exr": 3629495}
+    assert missing == []
+
+
+def test_parse_stat_sizes_keeps_the_files_that_do_exist_when_one_is_missing():
+    """The whole point: one absent frame must not cost the other seven."""
+    remotes = ["/w/a.exr", "/w/gone.exr", "/w/c.exr"]
+    stdout = "100 /w/a.exr\n300 /w/c.exr\n"  # stat printed these, then exited 1
+
+    sizes, missing = parse_stat_sizes(stdout, remotes)
+
+    assert sizes == {"/w/a.exr": 100, "/w/c.exr": 300}
+    assert missing == ["/w/gone.exr"]
+
+
+def test_parse_stat_sizes_survives_empty_and_junk_output():
+    remotes = ["/w/a.exr"]
+
+    assert parse_stat_sizes("", remotes) == ({}, ["/w/a.exr"])
+    assert parse_stat_sizes(None, remotes) == ({}, ["/w/a.exr"])
+    assert parse_stat_sizes("\n\n", remotes) == ({}, ["/w/a.exr"])
+    # a size that is not a number, and a line with no path at all
+    assert parse_stat_sizes("? /w/a.exr\nnopath\n", remotes) == ({}, ["/w/a.exr"])
+
+
+def test_parse_stat_sizes_handles_paths_with_spaces_after_the_size():
+    remotes = ["/w/my frame.exr"]
+
+    sizes, missing = parse_stat_sizes("42 /w/my frame.exr\n", remotes)
+
+    assert sizes == {"/w/my frame.exr": 42}
+    assert missing == []
+
+
+def test_missing_sizes_pack_as_zero_rather_than_dropping_the_file():
+    """A missing size must still produce a work item -- it fails at copy time,
+    against that one file, instead of the node silently planning nothing."""
+    pairs = [("/w/a.exr", "/local/a.exr"), ("/w/gone.exr", "/local/gone.exr")]
+    sizes, _missing = parse_stat_sizes("100 /w/a.exr\n", ["/w/a.exr", "/w/gone.exr"])
+
+    items = build_download_items("outputs", pairs, 1.0, sizes)
+
+    # files are (local, remote, size) triples
+    planned = [f for it in items for f in it["files"]]
+    assert sorted(remote for _local, remote, _size in planned) == ["/w/a.exr", "/w/gone.exr"]
+    assert [size for _local, remote, size in planned if remote == "/w/gone.exr"] == [0]
+    assert [size for _local, remote, size in planned if remote == "/w/a.exr"] == [100]

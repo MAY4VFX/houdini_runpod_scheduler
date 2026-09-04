@@ -243,6 +243,25 @@ from rpfarm.worker_client import WorkerClient
 
 node = self.topNode().parent()
 
+
+def _warn(message):
+    \"\"\"Report a problem the way PDG allows from inside generate().
+
+    NOT hou.Node.addWarning: Houdini refuses to badge a node other than the
+    one being cooked and raises hou.OperationFailed(\"Cannot set error badges
+    on other nodes\"), which turned a warning into a hard generate() failure
+    and left this node with ZERO work items -- observed live when one of eight
+    rendered frames was missing from the volume. `self` here is the pdg.Node,
+    which owns the TOP-side badge and is legal to touch from generation.
+    Falls back to stdout, and never raises: a diagnostic that can kill the
+    cook is worse than no diagnostic.
+    \"\"\"
+    try:
+        self.addWarning(message)
+    except Exception:
+        pass
+    print(\"[rpfarm-download] WARNING: {}\".format(message), flush=True)
+
 mode = node.evalParm(\"rpfarm_mode\")
 package_gb = node.evalParm(\"rpfarm_packagegb\")
 overwrite = node.evalParm(\"rpfarm_overwrite\")
@@ -262,28 +281,27 @@ sync_client = WorkerClient(pod[\"id\"], token)
 
 def _stat_sizes(remotes):
     \"\"\"One exec() for every distinct remote file in this generate -- not one
-    per file (addendum: \"одним вызовом на пакет, не по файлу\").\"\"\"
-    sizes = {}
+    per file (addendum: \"одним вызовом на пакет, не по файлу\").
+
+    The exit code is deliberately not consulted: `stat` returns non-zero if
+    ANY path is missing while still printing every path it found, so trusting
+    it discarded good sizes over one absent file. See
+    rpfarm.packages.parse_stat_sizes.
+    \"\"\"
     if not remotes:
-        return sizes
+        return {}
     cmd = \"stat -c '%s %n' \" + \" \".join(shlex.quote(r) for r in remotes)
     result = sync_client.exec(cmd, timeout_s=rppkg._scaled_timeout(0))
-    if result.get(\"exit_code\") == 0:
-        for line in result.get(\"stdout\", \"\").splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            size_str, _sep, path = line.partition(\" \")
-            try:
-                sizes[path] = int(size_str)
-            except ValueError:
-                pass
-    else:
-        node.addWarning(
-            \"stat on {} remote output file(s) failed (sizes default to 0): {}\".format(
-                len(remotes), (result.get(\"stderr\") or \"\").strip()
-            )
-        )
+    sizes, missing = rppkg.parse_stat_sizes(result.get(\"stdout\"), remotes)
+    if missing:
+        shown = \", \".join(missing[:5]) + (\" ...\" if len(missing) > 5 else \"\")
+        _warn(
+            \"{} of {} expected output file(s) are not on the farm volume, so \"
+            \"they pack as 0 bytes and will report their own error when copied; \"
+            \"the other {} still download. Missing: {}{}\".format(
+                len(missing), len(remotes), len(remotes) - len(missing), shown,
+                ((\" (stat: \" + (result.get(\"stderr\") or \"\").strip() + \")\")
+                 if result.get(\"stderr\") else \"\")))
     return sizes
 
 
@@ -340,7 +358,7 @@ if mode == \"outputs\":
                 # Reported outputs that map to nothing local is a real fault
                 # (a missing or wrong rpfarm_pathmap), not \"nothing to do\" --
                 # say so instead of quietly planning zero work items.
-                node.addWarning(
+                _warn(
                     \"upstream item {} reported {} output(s), none of which mapped \"
                     \"back to a local path (rpfarm_pathmap has {} entry(ies))\".format(
                         up.name, len(result_data), len(path_map)))
@@ -350,7 +368,7 @@ if mode == \"outputs\":
             planned.append((it, up))
 
     if not upstream_items:
-        node.addWarning(\"Outputs mode with no upstream input: nothing to download\")
+        _warn(\"Outputs mode with no upstream input: nothing to download\")
 
 elif mode == \"custom\":
     pairs = []
@@ -363,7 +381,7 @@ elif mode == \"custom\":
         find_cmd = \"find {} -type f -printf '%s %p\\\\n'\".format(shlex.quote(remote_dir))
         result = sync_client.exec(find_cmd, timeout_s=rppkg._scaled_timeout(0))
         if result.get(\"exit_code\") != 0:
-            node.addWarning(
+            _warn(
                 \"listing remote dir {} failed: {}\".format(remote_dir, (result.get(\"stderr\") or \"\").strip())
             )
             continue
