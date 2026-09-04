@@ -636,15 +636,28 @@ def maybe_grow_volume(api, cfg, sync_client, needed_bytes, log=None) -> str:
 
 
 def _exec_checked(sync_client, command, timeout_s):
-    """Run one command on the sync pod; raise RuntimeError on non-zero exit.
+    """Run one long-running command on the sync pod; raise RuntimeError on
+    non-zero exit.
 
     Same contract as the scheduler's own ``_volume_exec`` (``hda/
     runpodfarm_scheduler.hda/.../PythonModule``, ``_volume_exec``): a
     failed remote command must never be swallowed as a successful work
     item. Only the tail of stderr is kept in the message -- a failed
     Houdini install can log megabytes.
+
+    Goes through ``exec_wait`` (detached + polling), not the synchronous
+    ``exec`` -- Ruling R31. The commands reaching here are decompressing
+    tens of GB or running SideFX's installer, both far past the ~100s the
+    RunPod proxy allows a response to take, and the old synchronous call
+    did not merely time out: it SIGKILLed the shell and closed its stdout
+    pipe, which let a grandchild keep running and then die of SIGPIPE
+    mid-install. ``timeout_s`` is now the deadline for *watching*, so
+    running past it is reported without touching the command itself.
     """
-    result = sync_client.exec(command, timeout_s=timeout_s)
+    if hasattr(sync_client, "exec_wait"):
+        result = sync_client.exec_wait(command, deadline_s=timeout_s)
+    else:  # pragma: no cover - older client stub in a caller's test
+        result = sync_client.exec(command, timeout_s=timeout_s)
     if result.get("exit_code") != 0:
         stderr = (result.get("stderr") or "").strip()
         tail = stderr[-2000:] if stderr else "(no stderr)"
