@@ -259,7 +259,7 @@ def compress_stage(package, staging_dir, remote_root, level=3):
     uncompressed here: batching them into a single tar archive is a
     directory-level operation this per-package helper doesn't do — known
     limitation, they always go into ``raw_package`` uncompressed
-    (``worker/compression.py``'s ``compress_directory`` handles VDB batching
+    (v1's ``worker/compression.py`` ``compress_directory`` handled VDB batching
     for the older bulk-sync path). If ``zstd`` isn't available on this
     machine (or compression otherwise fails), ``compress_file`` returns
     False and the entry likewise goes into ``raw_package`` uncompressed.

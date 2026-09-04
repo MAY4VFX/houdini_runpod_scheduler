@@ -44,7 +44,7 @@ WORKSPACE_ROOT = "/workspace"
 def get_gpu_info():
     """Query GPU information via nvidia-smi.
 
-    Adapted from worker/heartbeat.py::_get_gpu_info -- same body, same
+    Adapted from v1's worker/heartbeat.py::_get_gpu_info -- same body, same
     output shape. Returns an empty list when nvidia-smi is unavailable.
     """
     try:
@@ -81,7 +81,7 @@ def get_gpu_info():
 
 
 def build_env(task_env=None):
-    """Construct the subprocess environment (adapted from worker/executor.py::_build_env).
+    """Construct the subprocess environment (adapted from v1's worker/executor.py::_build_env).
 
     Priority (highest wins): explicit task env overrides > Houdini PATH
     prepend > inherited process environment (which already carries HFS,
@@ -162,7 +162,7 @@ class Registry:
 
     def _run(self, task):
         # Streams stdout+stderr line by line to the log file and the
-        # in-memory tail, mirroring worker/executor.py's Popen loop.
+        # in-memory tail, mirroring v1's worker/executor.py Popen loop.
         try:
             with open(task.log_path, "w") as log:
                 proc = subprocess.Popen(
