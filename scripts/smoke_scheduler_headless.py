@@ -22,20 +22,31 @@ from __future__ import annotations
 
 import argparse
 import glob
-import json
 import os
 import sys
 import tempfile
-import threading
 import time
 
 import hou
 
+
+def _bootstrap_rpfarm():
+    """Put ``rpfarm`` on ``sys.path`` -- ``$RPFARM_ROOT`` if set (how these
+    scripts are meant to be run), else this checkout, found from this file."""
+    root = os.environ.get("RPFARM_ROOT") or os.path.dirname(
+        os.path.dirname(os.path.abspath(__file__)))
+    if root not in sys.path:
+        sys.path.insert(0, root)
+
+
+_bootstrap_rpfarm()
+
+from rpfarm import smoke as rpsmoke  # noqa: E402  (needs the path above first)
+
 DEFAULT_GPUS = "NVIDIA RTX A4500, NVIDIA GeForce RTX 4090, NVIDIA RTX PRO 4000 Blackwell"
 
 
-def log(message):
-    print("[smoke] {}".format(message), flush=True)
+log = rpsmoke.make_log("smoke")
 
 
 def parse_args(argv):
@@ -160,53 +171,13 @@ def report_downloads(job, sched):
 
 def cook(topnet, gen, sched, timeout):
     """Cook to completion, cancelling if the wall-clock guard expires."""
-    ctx = topnet.getPDGGraphContext()
-    expired = threading.Event()
-
-    def guard():
-        expired.set()
-        log("TIMEOUT after {}s -- cancelling the cook".format(timeout))
-        try:
-            ctx.cancelCook()
-        except Exception as e:  # cancelCook from a timer thread is best-effort
-            log("cancelCook failed: {}".format(e))
-
-    watchdog = threading.Timer(timeout, guard)
-    watchdog.daemon = True
-    watchdog.start()
-
-    started = time.time()
-    log("cooking (guard {}s)...".format(timeout))
-    failed = False
-    try:
-        gen.cookWorkItems(block=True, save_prompt=False)
-    except hou.OperationFailed as e:
-        # PDG reports a scheduler that refused to start as a bare "Failed to
-        # start scheduler", with the actual reason only on the node. Print it,
-        # then carry on so the caller still gets its item/ledger/pod report.
-        failed = True
-        log("COOK FAILED: {}".format(e))
-        for node in (sched, gen.parent(), gen):
-            for err in node.errors():
-                log("  {} error: {}".format(node.path(), err))
-    finally:
-        watchdog.cancel()
-    elapsed = time.time() - started
-    log("cook returned after {:.0f}s".format(elapsed))
-    return elapsed, expired.is_set() or failed
+    return rpsmoke.cook_node(gen, timeout, log, extra_nodes=[sched])
 
 
 def report_items(gen):
     """Print each work item's final state. Returns (succeeded, total)."""
-    pdg_node = gen.getPDGNode()
-    items = list(pdg_node.workItems) if pdg_node else []
-    succeeded = 0
-    log("work items ({}):".format(len(items)))
-    for item in items:
-        state = str(item.state).rsplit(".", 1)[-1]
-        if state.lower() in ("cookedsuccess", "success"):
-            succeeded += 1
-        log("  {:<24} {:<16} {:.1f}s".format(item.name, state, item.cookDuration))
+    succeeded, total, items = rpsmoke.report_items(
+        gen, log, attribs=(), string_attribs=())
     if items:
         log("item command: {!r}".format(items[0].command))
         # The mapping runpodfarm_download (Task 10) reads off its upstream
@@ -216,48 +187,30 @@ def report_items(gen):
                 items[0].stringAttribValue("rpfarm_pathmap")))
         except Exception as e:
             log("item rpfarm_pathmap: MISSING ({})".format(e))
-    return succeeded, len(items)
+    return succeeded, total
 
 
 def report_ledger(since):
     """Print the ledger lines this run wrote. Returns the record count."""
-    home = os.environ.get("RPFARM_HOME") or os.path.join(os.path.expanduser("~"), ".rpfarm")
-    paths = [p for p in glob.glob(os.path.join(home, "ledger", "*.jsonl"))
-             if os.path.getmtime(p) >= since - 1]
-    if not paths:
-        log("ledger: no file written under {}".format(os.path.join(home, "ledger")))
-        return 0
-    count = 0
-    for path in sorted(paths):
-        log("ledger {}:".format(path))
-        with open(path) as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                count += 1
-                try:
-                    log("  " + json.dumps(json.loads(line), sort_keys=True))
-                except ValueError:
-                    log("  " + line)
-    return count
+    records, _paths = rpsmoke.report_ledger(since, log)
+    return len(records)
 
 
 def report_pods():
-    """List the pods still alive on the account, so nothing is left billing."""
+    """List the pods still alive on the account, so nothing is left billing.
+
+    Returns the orphan GPU pods (a non-empty list is a failure for the
+    caller); the sync pod is deliberately not an orphan -- it is shared and
+    outlives a cook.
+    """
     try:
         from rpfarm import config as rpcfg
         from rpfarm import pods as rppods
         from rpfarm.runpod_api import RunPodAPI
 
         cfg = rpcfg.load()
-        api = RunPodAPI(cfg.api_key)
-        alive = api.list_pods("rpfarm-")
-        log("pods still on the account ({}):".format(len(alive)))
-        for pod in alive:
-            log("  {:<16} {:<28} {}".format(
-                pod.get("id", "?"), pod.get("name", "?"), pod.get("desiredStatus", "?")))
-        orphans = rppods.find_orphans(api, cfg.user)
+        rpsmoke.list_farm_pods(log, cfg)
+        orphans = rppods.find_orphans(RunPodAPI(cfg.api_key), cfg.user)
         if orphans:
             log("ORPHAN GPU PODS STILL RUNNING: {}".format(
                 ", ".join(p.get("name", p["id"]) for p in orphans)))

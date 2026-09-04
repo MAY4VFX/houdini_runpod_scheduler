@@ -32,16 +32,27 @@ import os
 import shutil
 import sys
 import tempfile
-import threading
 import time
 
 import hou
 
+
+def _bootstrap_rpfarm():
+    """Put ``rpfarm`` on ``sys.path`` -- ``$RPFARM_ROOT`` if set (how these
+    scripts are meant to be run), else this checkout, found from this file."""
+    root = os.environ.get("RPFARM_ROOT") or os.path.dirname(
+        os.path.dirname(os.path.abspath(__file__)))
+    if root not in sys.path:
+        sys.path.insert(0, root)
+
+
+_bootstrap_rpfarm()
+
+from rpfarm import smoke as rpsmoke  # noqa: E402  (needs the path above first)
+
 DEFAULT_TIMEOUT = 900
 
-
-def log(message):
-    print("[smoke-upload] {}".format(message), flush=True)
+log = rpsmoke.make_log("smoke-upload")
 
 
 def parse_args(argv):
@@ -67,124 +78,22 @@ def cook(node, timeout, prove_nonblocking=False):
     direct evidence of out-of-process *parallel* dispatch, not just
     non-blocking.
     """
-    ctx = node.parent().getPDGGraphContext()
-    expired = threading.Event()
-
-    def guard():
-        expired.set()
-        log("TIMEOUT after {}s -- cancelling the cook".format(timeout))
-        try:
-            ctx.cancelCook()
-        except Exception as e:
-            log("cancelCook failed: {}".format(e))
-
-    watchdog = threading.Timer(timeout, guard)
-    watchdog.daemon = True
-    watchdog.start()
-
-    started = time.time()
-    log("cooking {} (guard {}s, {})...".format(
-        node.path(), timeout, "non-blocking poll" if prove_nonblocking else "blocking"))
-    failed = False
-    try:
-        if prove_nonblocking:
-            node.cookWorkItems(block=False, save_prompt=False)
-            last_states = {}
-            heartbeats = 0
-            while ctx.cooking:
-                heartbeats += 1
-                log("  main thread alive, still polling (t={:.1f}s, heartbeat #{})".format(
-                    time.time() - started, heartbeats))
-                pdg_node = node.getPDGNode()
-                if pdg_node:
-                    for item in pdg_node.workItems:
-                        state = str(item.state).rsplit(".", 1)[-1]
-                        if last_states.get(item.name) != state:
-                            log("    t={:.1f}s  {:<24} -> {}".format(time.time() - started, item.name, state))
-                            last_states[item.name] = state
-                if expired.is_set():
-                    break
-                time.sleep(0.5)
-        else:
-            node.cookWorkItems(block=True, save_prompt=False)
-    except hou.OperationFailed as e:
-        failed = True
-        log("COOK FAILED: {}".format(e))
-        for n in (node, node.parent()):
-            for err in n.errors():
-                log("  {} error: {}".format(n.path(), err))
-    finally:
-        watchdog.cancel()
-    elapsed = time.time() - started
-    log("cook returned after {:.0f}s".format(elapsed))
-    watch_nodes = [node, node.parent()]
-    pp = node.node("pythonprocessor1")
-    if pp is not None:
-        watch_nodes.append(pp)
-    for n in watch_nodes:
-        for err in n.errors():
-            log("  {} error: {}".format(n.path(), err))
-        for warn in n.warnings():
-            log("  {} warning: {}".format(n.path(), warn))
-    return elapsed, expired.is_set() or failed
+    return rpsmoke.cook_node(
+        node, timeout, log,
+        non_blocking=prove_nonblocking,
+        on_poll=rpsmoke.state_tracker(node, log) if prove_nonblocking else None,
+        extra_nodes=[node.node("pythonprocessor1")],
+    )
 
 
 def report_items(node):
     """Print every work item's final state + rpfarm attributes. Returns (succeeded, total)."""
-    pdg_node = node.getPDGNode()
-    items = list(pdg_node.workItems) if pdg_node else []
-    succeeded = 0
-    log("work items ({}):".format(len(items)))
-    for item in items:
-        state = str(item.state).rsplit(".", 1)[-1]
-        ok = state.lower() in ("cookedsuccess", "success")
-        succeeded += 1 if ok else 0
-        role = ""
-        bytes_ = files_ = seconds_ = mbps_ = 0
-        try:
-            role = item.stringAttribValue("rpfarm_role") or ""
-            bytes_ = item.intAttribValue("bytes") or 0
-            files_ = item.intAttribValue("files") or 0
-            seconds_ = item.floatAttribValue("seconds") or 0.0
-            mbps_ = item.floatAttribValue("mbps") or 0.0
-        except Exception as e:
-            log("    (attrib read failed for {}: {})".format(item.name, e))
-        log(
-            "  {:<16} {:<8} {:<14} bytes={:<8} files={:<3} seconds={:<7.2f} mbps={:<7.3f}".format(
-                item.name, role, state, bytes_, files_, seconds_, mbps_
-            )
-        )
-        if not ok:
-            try:
-                for line in str(item.logMessages).splitlines():
-                    log("    log: {}".format(line))
-            except Exception as e:
-                log("    (logMessages read failed: {})".format(e))
-            try:
-                uri = item.logURI
-                log("    logURI: {!r}".format(uri))
-                path = uri[len("file://"):] if uri.startswith("file://") else uri
-                if path and os.path.exists(path):
-                    with open(path) as f:
-                        for line in f.read().splitlines():
-                            log("    logfile: {}".format(line))
-            except Exception as e:
-                log("    (logURI read failed: {})".format(e))
-    return succeeded, len(items)
+    succeeded, total, _items = rpsmoke.report_items(node, log, string_attribs=("rpfarm_role",))
+    return succeeded, total
 
 
 def remote_ls(cfg, path):
-    from rpfarm import config as rpcfg
-    from rpfarm import pods as rppods
-    from rpfarm.runpod_api import RunPodAPI
-    from rpfarm.worker_client import WorkerClient
-
-    api = RunPodAPI(cfg.api_key)
-    token = rpcfg.session_token()
-    pod = rppods.ensure_sync_pod(api, cfg, token, open(cfg.ssh_key_path + ".pub").read(), timeout=180)
-    client = WorkerClient(pod["id"], token)
-    result = client.exec("ls -la {}".format(path), timeout_s=30)
-    return result
+    return rpsmoke.sync_exec(cfg, "ls -la {}".format(path), timeout_s=30)
 
 
 def make_custom_job(job_dir):
@@ -317,17 +226,7 @@ def run_deps(topnet, cfg, timeout, keep):
 
 
 def report_pods():
-    from rpfarm import config as rpcfg
-    from rpfarm import pods as rppods
-    from rpfarm.runpod_api import RunPodAPI
-
-    cfg = rpcfg.load()
-    api = RunPodAPI(cfg.api_key)
-    alive = api.list_pods("rpfarm-")
-    log("pods still on the account ({}):".format(len(alive)))
-    for pod in alive:
-        log("  {:<16} {:<28} {}".format(pod.get("id", "?"), pod.get("name", "?"), pod.get("desiredStatus", "?")))
-    return alive
+    return rpsmoke.list_farm_pods(log)
 
 
 def main(argv):
