@@ -4,7 +4,7 @@ Two things live here, deliberately in one module:
 
 1. **The shared headless-cook helpers** (:func:`make_log`, :func:`cook_node`,
    :func:`report_items`, :func:`report_ledger`, :func:`list_farm_pods`,
-   :func:`terminate_all_pods`, :func:`sync_pod_client`). Before this module
+   :func:`terminate_pods`, :func:`sync_pod_client`). Before this module
    they were copy-pasted, with small drifts, across the four
    ``scripts/smoke_*_headless.py``; those scripts now import them from here,
    so there is one wall-clock guard, one work-item report and one pod-cleanup
@@ -35,8 +35,10 @@ Usage::
     python3 -m rpfarm smoke [--gpu "NVIDIA RTX A4500"] [--keep] [--timeout 1800]
 
 Exit status is 0 only when every stage passed, every expected file came back
-newly written, the ledger recorded every task with exit code 0, and the
-account has no pods left.
+newly written, the ledger recorded every task with exit code 0, and none of
+*this user's* pods are left. The account is shared by several artists, so the
+cleanup only ever touches ``cfg.user``'s own pods unless ``--everyone`` says
+otherwise.
 """
 
 from __future__ import annotations
@@ -318,13 +320,40 @@ def list_farm_pods(log=None, cfg=None):
     return pods
 
 
-def terminate_all_pods(log, cfg=None, settle=5.0):
-    """Terminate every ``rpfarm-*`` pod, sync pod included, and report what is
-    left.
+def own_pods(pods, user):
+    """The subset of ``pods`` belonging to ``user``.
 
-    Live tests must leave the account exactly as they found it -- zero pods --
-    unlike production, where the sync pod is deliberately left idling for the
-    next cook. Returns the list of pods still there afterwards.
+    Two shapes, matching ``rpfarm.pods``' own naming: this user's cook pods
+    are ``rpfarm-<user>-*``, and the sync pod is exactly
+    ``rpfarm-sync-<user>`` -- matched by full name rather than by prefix,
+    because ``rpfarm-sync-may`` is itself a prefix of another artist's
+    ``rpfarm-sync-mayakovsky`` (the same trap ``pods.ensure_sync_pod``
+    documents).
+    """
+    sync_name = rppods.sync_pod_name(user)
+    cook_prefix = "rpfarm-{}-".format(user)
+    return [
+        p for p in pods
+        if p.get("name") == sync_name or (p.get("name") or "").startswith(cook_prefix)
+    ]
+
+
+def terminate_pods(log, cfg=None, settle=5.0, everyone=False):
+    """Terminate this user's ``rpfarm-*`` pods, sync pod included, and report
+    what is left.
+
+    Scoped to ``cfg.user`` by default and account-wide only with
+    ``everyone=True`` -- the same vocabulary ``rpfarm farm kill`` uses, and
+    for the same reason (final-review finding 4). The design is one RunPod
+    account shared by several trusted artists, so an unconditional sweep of
+    the ``rpfarm-`` prefix here means a smoke run kills a colleague's
+    in-flight render.
+
+    Live tests must leave the account exactly as *they* found it -- none of
+    their own pods running -- unlike production, where the sync pod is
+    deliberately left idling for the next cook. Returns the list of
+    **in-scope** pods still there afterwards, so another artist's pod can
+    never fail this run.
     """
     try:
         cfg, api = _api(cfg)
@@ -332,10 +361,16 @@ def terminate_all_pods(log, cfg=None, settle=5.0):
         log("CLEANUP FAILED -- could not reach RunPod ({}); check `rpfarm farm status`".format(e))
         return []
     try:
-        alive = api.list_pods("rpfarm-")
+        account = api.list_pods("rpfarm-")
     except Exception as e:  # noqa: BLE001
         log("CLEANUP FAILED -- could not list pods ({}); check `rpfarm farm status`".format(e))
         return []
+
+    alive = account if everyone else own_pods(account, cfg.user)
+    others = [p for p in account if p not in alive]
+    if others:
+        log("leaving {} pod(s) that are not {}'s alone: {}".format(
+            len(others), cfg.user, [(p.get("id"), p.get("name")) for p in others]))
 
     log("terminating {} pod(s) before exit: {}".format(
         len(alive), [(p.get("id"), p.get("name")) for p in alive]))
@@ -349,10 +384,11 @@ def terminate_all_pods(log, cfg=None, settle=5.0):
     if alive and settle:
         time.sleep(settle)
     try:
-        remaining = api.list_pods("rpfarm-")
+        account = api.list_pods("rpfarm-")
     except Exception as e:  # noqa: BLE001
         log("could not re-list pods after cleanup ({}) -- check `rpfarm farm status`".format(e))
         return []
+    remaining = account if everyone else own_pods(account, cfg.user)
     log("pods remaining after cleanup: {}".format(
         [(p.get("id"), p.get("name")) for p in remaining]))
     return remaining
@@ -731,7 +767,7 @@ def cmd_smoke(args):
             list_farm_pods(log, cfg)
             remaining = []
         else:
-            remaining = terminate_all_pods(log, cfg)
+            remaining = terminate_pods(log, cfg, everyone=args.everyone)
 
     print()
     print(_fmt_table(_stage_rows(result, watcher, started), ["stage", "detail", "time"]))
@@ -971,7 +1007,13 @@ def build_smoke_parser(sub):
                         "(default: gpu_priority from config.toml)")
     p.add_argument("--keep", action="store_true",
                    help="leave the pods running afterwards (production behaviour); "
-                        "by default every rpfarm pod is terminated, sync pod included")
+                        "by default this user's own rpfarm pods are terminated, "
+                        "sync pod included")
+    p.add_argument("--everyone", action="store_true",
+                   help="DANGER: at the end, terminate EVERY rpfarm pod on the account, "
+                        "including other artists' in-flight renders. Off by default -- "
+                        "cleanup is scoped to your own pods (rpfarm-<user>-* and "
+                        "rpfarm-sync-<user>)")
     p.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT,
                    help="wall-clock guard for the whole run, seconds (default {})".format(DEFAULT_TIMEOUT))
     p.add_argument("--workdir", default=None,

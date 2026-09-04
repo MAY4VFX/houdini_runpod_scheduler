@@ -385,7 +385,7 @@ def cleanup_all_pods():
     this smoke test must leave the account exactly as it found it: zero
     pods. Runs on every exit path (see main()'s finally).
     """
-    return rpsmoke.terminate_all_pods(log)
+    return rpsmoke.terminate_pods(log)
 
 
 def main(argv):

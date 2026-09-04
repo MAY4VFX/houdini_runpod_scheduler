@@ -433,35 +433,86 @@ def _patch_api(monkeypatch, api):
     return cfg
 
 
-def test_terminate_all_pods_kills_every_rpfarm_pod_including_sync(monkeypatch):
+def test_terminate_pods_kills_this_users_pods_including_sync(monkeypatch):
     api = FakeApi([
         {"id": "p1", "name": "rpfarm-sync-may"},
         {"id": "p2", "name": "rpfarm-may-smoke-ab12-0"},
     ])
     _patch_api(monkeypatch, api)
     lines, log = collector()
-    remaining = smoke.terminate_all_pods(log, settle=0)
+    remaining = smoke.terminate_pods(log, settle=0)
     assert sorted(api.terminated) == ["p1", "p2"]
     assert remaining == []
 
 
-def test_terminate_all_pods_reports_a_pod_it_could_not_kill(monkeypatch):
+def test_terminate_pods_leaves_other_artists_pods_alone(monkeypatch):
+    """Finding 4: the account is shared by several trusted artists, and the
+    cleanup used to sweep the whole `rpfarm-` prefix in a `finally` -- so
+    `rpfarm smoke` killed a colleague's in-flight render."""
+    api = FakeApi([
+        {"id": "p1", "name": "rpfarm-sync-may"},
+        {"id": "p2", "name": "rpfarm-may-smoke-ab12-0"},
+        {"id": "p3", "name": "rpfarm-sync-mayakovsky"},
+        {"id": "p4", "name": "rpfarm-mayakovsky-shot010-cd34-0"},
+    ])
+    _patch_api(monkeypatch, api)
+    lines, log = collector()
+    remaining = smoke.terminate_pods(log, settle=0)
+    assert sorted(api.terminated) == ["p1", "p2"]
+    assert remaining == []
+    assert any("not may's alone" in ln for ln in lines)
+
+
+def test_terminate_pods_everyone_is_the_explicit_opt_in(monkeypatch):
+    api = FakeApi([
+        {"id": "p1", "name": "rpfarm-sync-may"},
+        {"id": "p3", "name": "rpfarm-sync-mayakovsky"},
+    ])
+    _patch_api(monkeypatch, api)
+    lines, log = collector()
+    assert smoke.terminate_pods(log, settle=0, everyone=True) == []
+    assert sorted(api.terminated) == ["p1", "p3"]
+
+
+def test_terminate_pods_does_not_fail_the_run_on_someone_elses_pod(monkeypatch):
+    """A colleague's pod must not count as "pods still running" -- that is
+    what `cmd_smoke` turns into a non-zero exit."""
+    api = FakeApi([
+        {"id": "p1", "name": "rpfarm-may-smoke-ab12-0"},
+        {"id": "p3", "name": "rpfarm-mayakovsky-shot010-cd34-0"},
+    ])
+    _patch_api(monkeypatch, api)
+    lines, log = collector()
+    assert smoke.terminate_pods(log, settle=0) == []
+
+
+def test_own_pods_does_not_match_a_longer_username(monkeypatch):
+    pods = [
+        {"id": "p1", "name": "rpfarm-sync-may"},
+        {"id": "p3", "name": "rpfarm-sync-mayakovsky"},
+        {"id": "p4", "name": "rpfarm-mayakovsky-shot-1-0"},
+    ]
+    assert [p["id"] for p in smoke.own_pods(pods, "may")] == ["p1"]
+    assert [p["id"] for p in smoke.own_pods(pods, "mayakovsky")] == ["p3", "p4"]
+
+
+def test_terminate_pods_reports_a_pod_it_could_not_kill(monkeypatch):
     api = FakeApi([{"id": "p1", "name": "rpfarm-sync-may"}], fail_terminate=["p1"])
     _patch_api(monkeypatch, api)
     lines, log = collector()
-    remaining = smoke.terminate_all_pods(log, settle=0)
+    remaining = smoke.terminate_pods(log, settle=0)
     assert [p["id"] for p in remaining] == ["p1"]
     assert any("MAY STILL BE BILLING" in ln for ln in lines)
 
 
-def test_terminate_all_pods_never_raises_when_runpod_is_unreachable(monkeypatch):
+def test_terminate_pods_never_raises_when_runpod_is_unreachable(monkeypatch):
     class Dead:
         def list_pods(self, prefix=""):
             raise RuntimeError("network down")
 
     _patch_api(monkeypatch, Dead())
     lines, log = collector()
-    assert smoke.terminate_all_pods(log, settle=0) == []
+    assert smoke.terminate_pods(log, settle=0) == []
     assert any("CLEANUP FAILED" in ln for ln in lines)
 
 
