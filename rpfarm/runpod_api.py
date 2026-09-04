@@ -278,7 +278,7 @@ class RunPodAPI:
         data = json.loads(raw)
         return float(data["data"]["myself"]["clientBalance"])
 
-    def gpu_types(self, dc=DEFAULT_DATACENTER):
+    def gpu_types(self, dc=DEFAULT_DATACENTER, secure_cloud=True):
         """Every GPU type RunPod knows about, with ``lowestPrice`` for *dc*.
 
         REST has no per-datacenter stock signal (``GET /gputypes`` lists
@@ -292,11 +292,20 @@ class RunPodAPI:
         left to the caller -- this always returns the whole catalog so it
         stays useful outside ``doctor`` too (e.g. picking a first
         priority list at ``setup`` time).
+
+        ``secure_cloud`` is not optional in practice: without it RunPod
+        answers with the lowest price across ALL clouds, which is not what
+        anybody is billed. It made the catalogue look wrong -- an RTX 4090
+        priced at 0.34 while every cook was billed 0.740. Asked with
+        ``secureCloud: true`` the same card prices at 0.74 and matches the
+        ledger to the cent, as does the RTX PRO 4000 at 0.57. Pass the cloud
+        the pods will actually be created in.
         """
         query = (
             "query { gpuTypes { id displayName "
-            'lowestPrice(input: {gpuCount: 1, dataCenterId: "%s"}) '
-            "{ stockStatus minimumBidPrice uninterruptablePrice } } }" % dc
+            'lowestPrice(input: {gpuCount: 1, dataCenterId: "%s", secureCloud: %s}) '
+            "{ stockStatus minimumBidPrice uninterruptablePrice } } }"
+            % (dc, "true" if secure_cloud else "false")
         )
         status, raw = self._transport("POST", GRAPHQL_URL, {"query": query}, self._headers)
         if status >= 300:

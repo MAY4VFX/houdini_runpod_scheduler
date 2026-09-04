@@ -11,16 +11,19 @@ Everything here is pure except :func:`catalogue`, which fetches and caches, so
 the selection, filtering and ordering can be tested without a network or a
 Houdini.
 
-A caution that came out of building this, and that the price sort inherits:
-the catalogue's ``lowestPrice`` is NOT what we are billed. Measured the same
-day, EU-RO-1:
+The price IS the bill, provided you ask the right question. ``lowestPrice``
+without ``secureCloud`` is the lowest across all clouds, which nobody is
+charged; that made a 4090 look like $0.34/h while every cook was billed
+$0.740/h. Asked for the cloud the pods are actually created in, the catalogue
+matches the ledger to the cent:
 
-    RTX 4090                     catalogue 0.34   billed 0.740
-    RTX PRO 4000 Blackwell       catalogue 0.50   billed 0.250
+    RTX 4090                     SECURE catalogue 0.74   billed 0.740
+    RTX PRO 4000 Blackwell       SECURE catalogue 0.57   billed 0.570
 
-It is wrong in both directions, so it cannot be presented to anyone as "what
-this will cost". It is still the only comparable number RunPod gives per type,
-so it is what the sort uses -- as a relative hint, labelled as such.
+(The $0.250 once attributed to the PRO 4000 was the A4500's rate, misread off
+a `farm status` line.) So the price shown in the menu is a real hourly cost and
+the sort orders by real money -- as long as the catalogue is fetched for the
+same cloud type the scheduler will use.
 """
 
 from __future__ import annotations
@@ -40,7 +43,7 @@ OUT_OF_STOCK = "out of stock here now"
 # L40, L40S, A100, H100, H200, B200, B300, V100 and MI300X.
 _CONSUMER_MARKER = "geforce"
 
-_CACHE = {"at": 0.0, "dc": None, "rows": None}
+_CACHE = {"at": 0.0, "key": None, "rows": None}
 CACHE_TTL_S = 300.0
 
 
@@ -50,11 +53,15 @@ def is_consumer(gpu) -> bool:
 
 
 def price_of(gpu):
-    """On-demand price for one of these, or ``None`` when out of stock."""
+    """On-demand price for one of these, or ``None`` when out of stock.
+
+    ``uninterruptablePrice`` only -- never ``minimumBidPrice``. We do not rent
+    spot (``interruptible`` is deliberately never set, see R32), so a bid price
+    would be a number nobody will ever be charged sitting in a menu that claims
+    to show cost.
+    """
     low = gpu.get("lowestPrice") or {}
     price = low.get("uninterruptablePrice")
-    if price is None:
-        price = low.get("minimumBidPrice")
     return float(price) if price is not None else None
 
 
@@ -79,7 +86,7 @@ def normalise(raw):
     return rows
 
 
-def catalogue(api, dc, now=None, ttl=CACHE_TTL_S, force=False):
+def catalogue(api, dc, secure_cloud=True, now=None, ttl=CACHE_TTL_S, force=False):
     """Catalogue rows for ``dc``, cached for ``ttl`` seconds.
 
     A menu is built every time a parameter dialog opens, and RunPod's GraphQL
@@ -89,15 +96,42 @@ def catalogue(api, dc, now=None, ttl=CACHE_TTL_S, force=False):
     selected, not break the node.
     """
     now = time.time() if now is None else now
-    if (not force and _CACHE["rows"] is not None and _CACHE["dc"] == dc
+    # The cloud is part of the key, not a detail: the same card has different
+    # prices and different stock in each, and mixing them is exactly the bug
+    # that made the catalogue disagree with the bill.
+    key = (dc, bool(secure_cloud))
+    if (not force and _CACHE["rows"] is not None and _CACHE["key"] == key
             and now - _CACHE["at"] < ttl):
         return _CACHE["rows"]
     try:
-        rows = normalise(api.gpu_types(dc))
+        rows = normalise(api.gpu_types(dc, secure_cloud=secure_cloud))
     except Exception:  # noqa: BLE001 - a stale menu beats a broken node
-        return _CACHE["rows"] if _CACHE["dc"] == dc else []
-    _CACHE.update({"at": now, "dc": dc, "rows": rows})
+        return _CACHE["rows"] if _CACHE["key"] == key else []
+    _CACHE.update({"at": now, "key": key, "rows": rows})
     return rows
+
+
+def other_cloud_hint(api, dc, secure_cloud, now=None):
+    """"...or try Community", but only when Community actually has anything.
+
+    The advice was being handed out unconditionally, and in EU-RO-1 it is
+    false: asked with ``secureCloud: false``, **0 of 48** types have a price
+    or any stock there. Telling someone to switch clouds when the other cloud
+    is empty in their datacenter sends them to wait for a machine that cannot
+    arrive. Returns "" when there is nothing honest to say.
+    """
+    try:
+        other = catalogue(api, dc, secure_cloud=not secure_cloud, now=now)
+    except Exception:  # noqa: BLE001
+        return ""
+    available = [r for r in other if r["price"] is not None]
+    if not available:
+        return ""
+    name = "Community" if secure_cloud else "Secure"
+    cheapest = min(available, key=lambda r: r["price"])
+    return ("{} has {} type(s) available in {} right now, cheapest {} at "
+            "${:.2f}/h -- switching Cloud Type may find a machine sooner."
+            .format(name, len(available), dc, cheapest["display"], cheapest["price"]))
 
 
 def menu_rows(rows, consumer_only=True, selected=()):
@@ -120,7 +154,9 @@ def menu_label(row, selected=()):
     if row["price"] is None:
         tail = OUT_OF_STOCK
     else:
-        tail = "~${:.2f}/h, stock {}".format(row["price"], (row["stock"] or "?").lower())
+        # No "~": asked for the right cloud this is the on-demand rate we are
+        # actually charged, matched against the ledger to the cent.
+        tail = "${:.2f}/h, stock {}".format(row["price"], (row["stock"] or "?").lower())
     return "{}{} ({})".format(mark, row["display"], tail)
 
 

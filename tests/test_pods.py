@@ -315,7 +315,10 @@ def test_the_wait_gives_up_with_a_message_a_person_can_act_on(tmp_path, monkeypa
 
     message = str(excinfo.value)
     assert "EU-RO-1" in message
-    assert "Community" in message                      # the actionable way out
+    assert "try again shortly" in message              # the actionable way out
+    # No blanket "switch to Community": in EU-RO-1 that cloud has 0 of 48
+    # types priced, so the advice would send someone to wait for nothing.
+    assert "Community" not in message
     assert "no longer any instances" in message        # RunPod's own last word
     assert "1m 01s" in message or "61s" in message     # how long it actually waited
 

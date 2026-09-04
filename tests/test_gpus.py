@@ -149,14 +149,16 @@ class _CountingAPI:
     def __init__(self, rows=CATALOGUE):
         self.rows = rows
         self.calls = 0
+        self.asked = []
 
-    def gpu_types(self, dc):
+    def gpu_types(self, dc, secure_cloud=True):
         self.calls += 1
+        self.asked.append((dc, secure_cloud))
         return self.rows
 
 
 def test_the_catalogue_is_cached_so_opening_the_parms_does_not_hit_the_network():
-    gpus._CACHE.update({"at": 0.0, "dc": None, "rows": None})
+    gpus._CACHE.update({"at": 0.0, "key": None, "rows": None})
     api = _CountingAPI()
 
     gpus.catalogue(api, "EU-RO-1", now=1000.0)
@@ -166,7 +168,7 @@ def test_the_catalogue_is_cached_so_opening_the_parms_does_not_hit_the_network()
 
 
 def test_the_cache_expires_and_a_different_datacenter_is_not_reused():
-    gpus._CACHE.update({"at": 0.0, "dc": None, "rows": None})
+    gpus._CACHE.update({"at": 0.0, "key": None, "rows": None})
     api = _CountingAPI()
 
     gpus.catalogue(api, "EU-RO-1", now=1000.0)
@@ -176,12 +178,50 @@ def test_the_cache_expires_and_a_different_datacenter_is_not_reused():
     assert api.calls == 3
 
 
+def test_the_cloud_is_part_of_the_cache_key():
+    """Same card, different price and stock per cloud -- mixing them is the
+    bug that made the catalogue disagree with the bill."""
+    gpus._CACHE.update({"at": 0.0, "key": None, "rows": None})
+    api = _CountingAPI()
+
+    gpus.catalogue(api, "EU-RO-1", secure_cloud=True, now=1000.0)
+    gpus.catalogue(api, "EU-RO-1", secure_cloud=False, now=1000.0)
+
+    assert api.calls == 2
+    assert api.asked == [("EU-RO-1", True), ("EU-RO-1", False)]
+
+
+def test_only_the_on_demand_price_is_used():
+    """We never rent spot, so a bid price in a menu claiming to show cost
+    would be a number nobody is ever charged."""
+    bid_only = {"id": "NVIDIA GeForce RTX 4090", "displayName": "RTX 4090",
+                "lowestPrice": {"stockStatus": "Low", "minimumBidPrice": 0.20,
+                                "uninterruptablePrice": None}}
+
+    assert gpus.price_of(bid_only) is None
+
+
+def test_the_other_cloud_is_only_suggested_when_it_has_something():
+    """In EU-RO-1, Community has 0 of 48 types priced -- confirmed live. The
+    advice "switch to Community" sends someone to wait for a machine that
+    cannot arrive."""
+    gpus._CACHE.update({"at": 0.0, "key": None, "rows": None})
+
+    empty = _CountingAPI(rows=[_gpu("NVIDIA GeForce RTX 4090", "RTX 4090")])
+    assert gpus.other_cloud_hint(empty, "EU-RO-1", secure_cloud=True, now=1.0) == ""
+
+    gpus._CACHE.update({"at": 0.0, "key": None, "rows": None})
+    stocked = _CountingAPI(rows=[_gpu("NVIDIA GeForce RTX 4090", "RTX 4090", 0.34, "High")])
+    hint = gpus.other_cloud_hint(stocked, "EU-RO-1", secure_cloud=True, now=1.0)
+    assert "Community" in hint and "0.34" in hint
+
+
 def test_a_catalogue_fetch_that_fails_does_not_break_the_node():
     """A menu that cannot be built degrades; it does not raise into the UI."""
-    gpus._CACHE.update({"at": 0.0, "dc": None, "rows": None})
+    gpus._CACHE.update({"at": 0.0, "key": None, "rows": None})
 
     class _Broken:
-        def gpu_types(self, dc):
+        def gpu_types(self, dc, secure_cloud=True):
             raise OSError("no network in this Houdini")
 
     assert gpus.catalogue(_Broken(), "EU-RO-1", now=1000.0) == []
@@ -190,3 +230,14 @@ def test_a_catalogue_fetch_that_fails_does_not_break_the_node():
     api = _CountingAPI()
     gpus.catalogue(api, "EU-RO-1", now=2000.0)
     assert gpus.catalogue(_Broken(), "EU-RO-1", now=2000.0 + gpus.CACHE_TTL_S + 1)
+
+
+def test_the_label_shows_a_real_price_not_an_estimate():
+    """Asked for the right cloud, the catalogue matches the bill to the cent,
+    so hedging it with "~" would understate what we know."""
+    row = gpus.normalise([_gpu("NVIDIA GeForce RTX 4090", "RTX 4090", 0.74, "High")])[0]
+
+    label = gpus.menu_label(row)
+
+    assert "$0.74/h" in label
+    assert "~" not in label
