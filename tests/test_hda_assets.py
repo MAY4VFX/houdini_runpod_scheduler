@@ -323,3 +323,73 @@ def _download_generate_source():
             / "runpodfarm_download.hda" / "Top_1runpodfarmdownload"
             / "Contents.dir" / "Contents.mime")
     return path.read_text(encoding="utf-8", errors="replace")
+
+
+# ---------------------------------------------------------------------------
+# the stale-sys.modules guard is embedded, identically, in every asset that
+# loads on scene open
+# ---------------------------------------------------------------------------
+
+_GUARDED_ASSETS = [
+    ("runpodfarm_scheduler.hda", "Top_1runpodfarmscheduler"),
+    ("runpodfarm_stats.hda", "Top_1runpodfarmstats"),
+]
+
+
+def _asset_python_module(asset, typedir):
+    return (pathlib.Path(__file__).resolve().parent.parent / "hda" / asset
+            / typedir / "PythonModule").read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("asset,typedir", _GUARDED_ASSETS)
+def test_the_guard_is_embedded_verbatim(asset, typedir):
+    """One source of truth, embedded at build time.
+
+    It cannot live in `rpfarm` and be imported instead: an import is exactly
+    what returns the cached module the guard exists to notice. So it is
+    duplicated by construction, and this is what stops the copies drifting.
+    """
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "hda_guard",
+        pathlib.Path(__file__).resolve().parent.parent / "scripts" / "hda_guard.py")
+    hda_guard = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(hda_guard)
+
+    src = _asset_python_module(asset, typedir)
+    assert hda_guard.GUARD_SOURCE in src, (
+        f"{asset}'s guard has drifted from scripts/hda_guard.py")
+
+
+@pytest.mark.parametrize("asset,typedir", _GUARDED_ASSETS)
+def test_the_guard_runs_before_any_rpfarm_symbol_is_imported(asset, typedir):
+    """A guard after the import it protects is decoration."""
+    src = _asset_python_module(asset, typedir)
+
+    guard = src.index("_stale = _stale_module_message(")
+    first_from_rpfarm = src.index("\nfrom rpfarm import ")
+    assert guard < first_from_rpfarm
+
+
+@pytest.mark.parametrize("asset,typedir", _GUARDED_ASSETS)
+def test_the_embedded_guard_is_valid_python(asset, typedir):
+    """The first attempt shipped a broken copy: the guard was injected into a
+    NON-raw ''' literal in the builder, so its \\n escapes became real newlines
+    and the emitted module had unterminated strings. Parsing the emitted text
+    is what catches that class of mistake."""
+    ast.parse(_asset_python_module(asset, typedir))
+
+
+def test_prefirstcreate_explains_a_failed_module_instead_of_an_attributeerror():
+    """When the PythonModule does not import, its class never exists, and
+    registerScheduler re-raised that as an AttributeError about a name the
+    artist has never heard of -- right after the message that did explain it."""
+    src = (pathlib.Path(__file__).resolve().parent.parent / "hda"
+           / "runpodfarm_scheduler.hda" / "Top_1runpodfarmscheduler"
+           / "PreFirstCreate").read_text(encoding="utf-8")
+
+    assert "except AttributeError:" in src
+    assert "ПЕРЕЗАПУСТИТЕ HOUDINI" in src
+    assert "from None" in src          # or the AttributeError comes back as context
+    ast.parse(src)
