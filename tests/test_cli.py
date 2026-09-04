@@ -8,6 +8,7 @@ from rpfarm import cli
 from rpfarm import config as rpcfg
 from rpfarm import houdini_local
 from rpfarm import packages as rppkg
+from rpfarm.worker_client import WorkerClient
 
 
 # -- shared fakes -------------------------------------------------------------
@@ -51,19 +52,41 @@ def _setup_handlers(volumes=None, templates=None, balance=42.0):
 
 
 class FakeWorkerClient:
-    """Stand-in for WorkerClient: routes .exec() by substring of the
-    command so tests don't need a live pod."""
+    """Stand-in for WorkerClient: routes .exec()/.exec_wait() by substring
+    of the command so tests don't need a live pod.
+
+    Models the two transports as faithfully as the difference matters
+    (Ruling R31): `exec` refuses a timeout the pod would not honour, and
+    `exec_wait` merges the command's stdout and stderr the way a detached
+    run's single log file does.
+    """
 
     def __init__(self, responses):
         self._responses = responses  # list of (substring, result_dict)
         self.calls = []
+        self.detached = []  # (command, deadline_s) that took the detached path
 
-    def exec(self, command, timeout_s=600):
-        self.calls.append(command)
+    def _lookup(self, command):
         for substr, result in self._responses:
             if substr in command:
                 return result
         raise AssertionError(f"no fake response for exec({command!r})")
+
+    def exec(self, command, timeout_s=600):
+        assert timeout_s <= WorkerClient.EXEC_SYNC_CEILING_S, (
+            f"exec({command!r}) asked for {timeout_s}s over a transport that "
+            f"SIGKILLs at {WorkerClient.EXEC_SYNC_CEILING_S}s"
+        )
+        self.calls.append(command)
+        return self._lookup(command)
+
+    def exec_wait(self, command, deadline_s, poll_s=None, **kw):
+        self.calls.append(command)
+        self.detached.append((command, deadline_s))
+        result = dict(self._lookup(command))
+        merged = (result.get("stdout") or "") + (result.get("stderr") or "")
+        result["stdout"], result["stderr"] = merged, ""
+        return result
 
 
 def _write_cfg(tmp_path, **overrides):
@@ -928,3 +951,137 @@ def test_costs_by_user_and_date_filter(tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "$5.00" not in out  # the 1970 record is filtered out by --since
     assert "$0.10" in out
+
+
+# -- housekeeping transport (final-review finding 3) -------------------------
+#
+# The destructive commands used to go over the synchronous /exec path with
+# stated timeouts of 120/180s, while pod/worker.py clamps that path to
+# EXEC_SYNC_CEILING_S = 90 and SIGKILLs the whole process group when it
+# expires. `rpfarm houdini rm 20.5.684 --yes` on an ~11GB tree could
+# therefore be killed mid-shutil.rmtree, leaving a half-deleted install
+# that `houdini ls` still lists while the CLI reported a timeout.
+
+
+def _housekeeping_cli(tmp_path, monkeypatch, responses):
+    monkeypatch.setenv("RPFARM_HOME", str(tmp_path))
+    _write_cfg(tmp_path)
+    fake_pod = {"id": "sync1", "name": "rpfarm-sync-tester"}
+    fake_client = FakeWorkerClient(responses)
+    monkeypatch.setattr(cli, "_connect_sync_pod", lambda api, cfg, token, log=print: (fake_pod, fake_client))
+    return fake_client
+
+
+def test_houdini_rm_deletes_over_the_detached_transport(tmp_path, monkeypatch):
+    client = _housekeeping_cli(tmp_path, monkeypatch, [
+        ("houdini rm 20.5.684", {
+            "exit_code": 0,
+            "stdout": json.dumps({"ok": True, "path": "/workspace/houdini/20.5.684", "bytes_freed": 11 * 2**30}),
+            "stderr": "",
+        }),
+    ])
+    assert cli.main(["houdini", "rm", "20.5.684", "--yes"]) == 0
+    assert [c for c, _ in client.detached] == ["python3 /opt/rpfarm/housekeeping.py houdini rm 20.5.684"]
+
+
+def test_houdini_rm_dry_run_is_detached_too(tmp_path, monkeypatch):
+    """A dry run walks the same tree to size it; same ceiling problem."""
+    client = _housekeeping_cli(tmp_path, monkeypatch, [
+        ("houdini rm 20.5.684 --dry-run", {
+            "exit_code": 0,
+            "stdout": json.dumps({"ok": True, "path": "/workspace/houdini/20.5.684", "bytes_freed": 1}),
+            "stderr": "",
+        }),
+    ])
+    assert cli.main(["houdini", "rm", "20.5.684"]) == 0
+    assert len(client.detached) == 1
+
+
+def test_storage_rm_deletes_over_the_detached_transport(tmp_path, monkeypatch):
+    client = _housekeeping_cli(tmp_path, monkeypatch, [
+        ("rm may/shotA --force", {
+            "exit_code": 0,
+            "stdout": json.dumps({"ok": True, "path": "/workspace/projects/may/shotA", "bytes_freed": 1}),
+            "stderr": "",
+        }),
+    ])
+    assert cli.main(["storage", "rm", "may/shotA", "--force"]) == 0
+    assert [c for c, _ in client.detached] == ["python3 /opt/rpfarm/housekeeping.py rm may/shotA --force"]
+
+
+def test_storage_prune_deletes_over_the_detached_transport(tmp_path, monkeypatch):
+    client = _housekeeping_cli(tmp_path, monkeypatch, [
+        ("prune --older-days 30", {
+            "exit_code": 0,
+            "stdout": json.dumps({"candidates": [], "deleted": True, "boot_logs_rotated": []}),
+            "stderr": "",
+        }),
+    ])
+    assert cli.main(["storage", "prune", "--older-days", "30", "--yes"]) == 0
+    assert [c for c, _ in client.detached] == ["python3 /opt/rpfarm/housekeeping.py prune --older-days 30.0"]
+
+
+def test_storage_ls_walks_the_volume_over_the_detached_transport(tmp_path, monkeypatch):
+    client = _housekeeping_cli(tmp_path, monkeypatch, [
+        ("ls --volume-size-gb 50", {
+            "exit_code": 0,
+            "stdout": json.dumps({
+                "zones": {"houdini": 100}, "projects": [],
+                "volume": {"used": 100, "total": 50 * 2**30, "used_pct": 0.0}, "partial": False,
+            }),
+            "stderr": "",
+        }),
+    ])
+    monkeypatch.setattr(rppkg, "get_volume_size_gb", lambda api, cfg: 50)
+    assert cli.main(["storage", "ls"]) == 0
+    assert len(client.detached) == 1
+
+
+def test_synchronous_housekeeping_never_promises_past_the_pods_ceiling():
+    """Whatever a caller asks for, the synchronous path may only state a
+    timeout the pod will actually honour -- otherwise the CLI reports a
+    timeout that has nothing to do with what the pod did."""
+    seen = []
+
+    class Recording:
+        def exec(self, command, timeout_s=600):
+            seen.append(timeout_s)
+            return {"exit_code": 0, "stdout": "{}", "stderr": ""}
+
+    cli._housekeeping_exec(Recording(), "du /workspace/projects", timeout_s=999)
+    assert seen == [WorkerClient.EXEC_SYNC_CEILING_S]
+
+
+def test_detached_housekeeping_deadline_is_only_a_watching_deadline():
+    """The detached path may state any deadline it likes: reaching it stops
+    this CLI waiting and never kills the command on the pod."""
+    seen = []
+
+    class Recording:
+        def exec_wait(self, command, deadline_s, poll_s=None, **kw):
+            seen.append(deadline_s)
+            return {"exit_code": 0, "stdout": "{}", "stderr": ""}
+
+    cli._housekeeping_exec(Recording(), "rm x --force", timeout_s=600, detach=True)
+    assert seen == [600]
+
+
+def test_housekeeping_json_survives_a_merged_detached_log():
+    """A detached run's stdout and stderr land in one log file, so the JSON
+    result can arrive with chatter in front of it."""
+    payload = json.dumps({"ok": True, "bytes_freed": 7})
+    assert cli._parse_housekeeping_json(payload) == {"ok": True, "bytes_freed": 7}
+    assert cli._parse_housekeeping_json(f"warning: cache is cold\n{payload}\n") == {"ok": True, "bytes_freed": 7}
+    assert cli._parse_housekeeping_json("") == {}
+    assert cli._parse_housekeeping_json("not json at all") is None
+
+
+def test_housekeeping_failure_message_survives_the_merged_log():
+    """A detached run has no separate stderr -- everything the command said
+    is in the log, which arrives as stdout. The failure report must fall
+    back to it instead of printing a generic message."""
+    import io as _io
+
+    buf = _io.StringIO()
+    cli._report_housekeeping_failure({"exit_code": 1, "stdout": "outputs pending", "stderr": ""}, stream=buf)
+    assert "outputs pending" in buf.getvalue()

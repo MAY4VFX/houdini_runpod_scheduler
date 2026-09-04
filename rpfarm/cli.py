@@ -186,17 +186,72 @@ def _find_running_sync_pod(api, cfg):
     return None
 
 
-def _housekeeping_exec(client, args_str, timeout_s=120):
+# How often the detached path asks the pod whether a housekeeping command
+# has finished. Lower than exec_wait's own 5s default: these are
+# interactive CLI commands, and a `--dry-run` that finishes instantly
+# should not sit in a poll sleep.
+_HOUSEKEEPING_POLL_S = 2.0
+
+
+def _parse_housekeeping_json(stdout):
+    """``housekeeping.py``'s one JSON line, or ``None``.
+
+    The detached transport merges the command's stdout and stderr into one
+    log file, so the JSON result can arrive with unrelated chatter in
+    front of it. Whole-blob first (the synchronous path's clean stdout),
+    then the last non-empty line.
+    """
+    text = (stdout or "").strip()
+    if not text:
+        return {}
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    for line in reversed(text.splitlines()):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            return json.loads(line)
+        except json.JSONDecodeError:
+            return None
+    return None
+
+
+def _housekeeping_exec(client, args_str, timeout_s=120, detach=False):
     """Run ``python3 /opt/rpfarm/housekeeping.py <args_str>`` and parse its
-    JSON stdout. Returns ``(exit_code, data_or_None, raw_result)``."""
-    result = client.exec(f"python3 /opt/rpfarm/housekeeping.py {args_str}", timeout_s=timeout_s)
+    JSON stdout. Returns ``(exit_code, data_or_None, raw_result)``.
+
+    ``detach`` picks the transport, and the two are not interchangeable
+    (Ruling R31):
+
+    * ``False`` -- one synchronous ``/exec`` request. The pod clamps it to
+      ``pod/worker.py``'s ``EXEC_SYNC_CEILING_S`` (90s, because RunPod's
+      Cloudflare proxy cuts the response at ~100s) and **SIGKILLs the whole
+      process group** when that expires. ``timeout_s`` is clamped to the
+      same ceiling here so this side can never print a timeout the
+      transport was never going to honour.
+    * ``True`` -- detached run plus polling. ``timeout_s`` becomes a
+      *watching* deadline: reaching it stops this CLI waiting, and never
+      kills anything on the pod.
+
+    Every destructive command and every listing that walks the whole
+    volume takes the detached path. Final-review finding 3: ``rpfarm
+    houdini rm 20.5.684 --yes`` asked for 120s over a transport that kills
+    at 90 -- mid-``shutil.rmtree`` of an ~11 GB tree, leaving a
+    half-deleted install that ``houdini ls`` still lists while the CLI
+    reports a timeout.
+    """
+    command = f"python3 /opt/rpfarm/housekeeping.py {args_str}"
+    if detach:
+        result = client.exec_wait(command, deadline_s=timeout_s, poll_s=_HOUSEKEEPING_POLL_S)
+    else:
+        result = client.exec(command, timeout_s=min(timeout_s, WorkerClient.EXEC_SYNC_CEILING_S))
     exit_code = result.get("exit_code")
     if exit_code != 0:
         return exit_code, None, result
-    try:
-        return exit_code, json.loads(result.get("stdout") or "{}"), result
-    except json.JSONDecodeError:
-        return exit_code, None, result
+    return exit_code, _parse_housekeeping_json(result.get("stdout")), result
 
 
 def _report_housekeeping_failure(result, stream=sys.stderr):
@@ -718,7 +773,8 @@ def cmd_houdini_rm(args):
     cmd_str = f"houdini rm {shlex.quote(args.version)}"
     if dry_run:
         cmd_str += " --dry-run"
-    exit_code, data, result = _housekeeping_exec(client, cmd_str, timeout_s=120)
+    # Detached: a real delete here is a shutil.rmtree over tens of GB.
+    exit_code, data, result = _housekeeping_exec(client, cmd_str, timeout_s=600, detach=True)
     if exit_code != 0 or data is None:
         _report_housekeeping_failure(result)
         return 1
@@ -745,7 +801,9 @@ def cmd_storage_ls(args):
     cmd_str = "ls"
     if size_gb:
         cmd_str += f" --volume-size-gb {size_gb}"
-    exit_code, data, result = _housekeeping_exec(client, cmd_str, timeout_s=180)
+    # Detached: `ls` walks every zone on the volume and routinely runs
+    # past the synchronous ceiling on a full volume.
+    exit_code, data, result = _housekeeping_exec(client, cmd_str, timeout_s=600, detach=True)
     if exit_code != 0 or data is None:
         _report_housekeeping_failure(result)
         return 1
@@ -808,7 +866,8 @@ def cmd_storage_rm(args):
     token = rpcfg.session_token()
     _pod, client = _connect_sync_pod(api, cfg, token)
     cmd_str = f"rm {shlex.quote(args.user_project)} --force"
-    exit_code, data, result = _housekeeping_exec(client, cmd_str, timeout_s=120)
+    # Detached: deleting a project tree must never be SIGKILLed part-way.
+    exit_code, data, result = _housekeeping_exec(client, cmd_str, timeout_s=600, detach=True)
     if exit_code != 0 or data is None:
         _report_housekeeping_failure(result)
         return 1
@@ -835,7 +894,8 @@ def cmd_storage_prune(args):
     cmd_str = f"prune --older-days {args.older_days}"
     if dry_run:
         cmd_str += " --dry-run"
-    exit_code, data, result = _housekeeping_exec(client, cmd_str, timeout_s=180)
+    # Detached: bulk deletion across every project on the volume.
+    exit_code, data, result = _housekeeping_exec(client, cmd_str, timeout_s=900, detach=True)
     if exit_code != 0 or data is None:
         _report_housekeeping_failure(result)
         return 1
