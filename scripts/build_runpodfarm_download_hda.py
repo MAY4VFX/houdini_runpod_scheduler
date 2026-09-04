@@ -142,6 +142,30 @@ with open(cfg.ssh_key_path + ".pub") as f:
 pod = rppods.ensure_sync_pod(api, cfg, token, pubkey)
 sync_client = WorkerClient(pod["id"], token)
 
+def _scheduler_downloads_outputs():
+    """Is the farm scheduler already pulling every item's outputs itself?
+
+    "Download Outputs" on the scheduler fetches each work item's outputs the
+    moment it succeeds -- frames appear while the farm is still rendering.
+    This node in "outputs" mode then fetches the same files again at the end
+    of the cook. Both were on in the demo scene and nobody noticed until an
+    artist asked why the files arrived twice; the second pass re-transferred
+    every frame and re-acquired the sync pod to stat them.
+
+    Never raises: failing to answer this must not fail a generate.
+    """
+    try:
+        topnet = node.parent()
+        parm = topnet.parm("topscheduler") if topnet is not None else None
+        sched = hou.node(parm.eval()) if parm and parm.eval() else None
+        if sched is None or "runpodfarmscheduler" not in sched.type().name():
+            return False
+        flag = sched.parm("rpfarm_downloadoutputs")
+        return bool(flag and flag.eval())
+    except Exception:
+        return False
+
+
 def _stat_sizes(remotes):
     """One exec() for every distinct remote file in this generate -- not one
     per file (addendum: "одним вызовом на пакет, не по файлу").
@@ -229,6 +253,18 @@ if mode == "outputs":
         sizes = _stat_sizes(sorted({r for r, _l in item_pairs}))
         for it in rppkg.build_download_items(mode, item_pairs, package_gb, sizes):
             planned.append((it, up))
+
+    if _scheduler_downloads_outputs():
+        _warn(
+            "The scheduler's \"Download Outputs\" is ON, so every item's outputs "
+            "are already fetched the moment it succeeds -- while the farm is "
+            "still rendering. This node in Outputs mode will fetch the same "
+            "files a second time at the end of the cook, re-transferring them "
+            "and re-acquiring the sync pod to size them. Pick one: turn off "
+            "Download Outputs on the scheduler to have this node do it at the "
+            "end, or drop this node from the chain to keep the files arriving "
+            "as they are made. Outputs mode is for pulling files nothing "
+            "reported as an output; duplicating the scheduler is not its job.")
 
     if not upstream_items:
         _warn("Outputs mode with no upstream input: nothing to download")

@@ -163,12 +163,23 @@ def wait_ready(api, client, pod_id, timeout=300, cancel=lambda: False, sleep=tim
     """Poll ``get_pod`` until the pod has a public port 22 mapping *and* its
     8000/http proxy answers ``health()``. Returns the pod dict, or raises
     ``TimeoutError`` after ``timeout`` seconds / ``RuntimeError("canceled")``
-    if ``cancel()`` returns true."""
+    if ``cancel()`` returns true, / :class:`PodGoneError` if the pod is
+    deleted while we wait."""
     t0 = time.time()
     while time.time() - t0 < timeout:
         if cancel():
             raise RuntimeError("canceled")
-        pod = api.get_pod(pod_id)
+        try:
+            pod = api.get_pod(pod_id)
+        except RunPodError as e:
+            # 404 means this pod is gone, which is survivable: the caller finds
+            # or creates another. Anything else -- 401, 403, a bad request --
+            # is not about this pod and is re-raised untouched.
+            if getattr(e, "status", None) == 404:
+                raise PodGoneError(
+                    "pod {} disappeared while we were waiting for it "
+                    "(terminated elsewhere, or its host failed)".format(pod_id)) from e
+            raise
         try:
             pod_public_endpoint(pod, 22)
             has_ssh_port = True
@@ -259,6 +270,20 @@ _CAPACITY_RETRY_FIRST_S = 10.0
 _CAPACITY_RETRY_MAX_S = 60.0
 _CAPACITY_RETRY_GROWTH = 1.6
 _CAPACITY_RETRY_JITTER = 0.2
+
+
+class PodGoneError(RuntimeError):
+    """The pod we were waiting on no longer exists.
+
+    A pod can vanish legitimately: a host failure, a manual delete in the
+    RunPod panel, another user's `farm kill`. It happened for real -- a pod was
+    terminated out from under an in-flight ``ensure_sync_pod`` and the raw
+    ``RunPod 404 pod not found`` came out of ``wait_ready`` and failed the work
+    item. Same family as Ruling R32: a missing machine is a reason to get
+    another one, not a reason to fail. Distinct from :class:`RunPodError` so
+    the caller can tell "this one is gone" from "the key is wrong", which
+    waiting never fixes.
+    """
 
 
 class SyncPodCapacityError(RuntimeError):
@@ -369,12 +394,32 @@ def ensure_sync_pod(
         capacity_wait_s = max(0, int(getattr(cfg, "capacity_wait_min", 0) or 0)) * 60
     cloud_type = cloud_type or getattr(cfg, "cloud_type", None) or CLOUD_TYPE_SECURE
 
-    pod = _acquire_sync_pod(
-        api, cfg, token, pubkey, log,
-        cloud_type=cloud_type, capacity_wait_s=capacity_wait_s,
-        sleep=sleep, cancel=cancel, clock=clock, rand=rand,
-    )
-    return wait_ready(api, client_factory(pod["id"]), pod["id"], timeout=timeout, cancel=cancel, sleep=sleep, log=log)
+    # Acquiring and waiting are one loop, not two steps. A pod can be adopted
+    # and then vanish before it is ready -- terminated elsewhere, host failure
+    # -- and that used to escape as `RunPod 404 pod not found` and fail the
+    # work item. It happened for real to a download item whose sync pod was
+    # killed under it. Losing the pod puts us back at "find or create one",
+    # inside the same capacity deadline, exactly like being told there is no
+    # capacity in the first place.
+    deadline = None if capacity_wait_s <= 0 else clock() + capacity_wait_s
+    while True:
+        remaining = None if deadline is None else max(0.0, deadline - clock())
+        pod = _acquire_sync_pod(
+            api, cfg, token, pubkey, log,
+            cloud_type=cloud_type,
+            capacity_wait_s=0 if remaining is None else remaining,
+            sleep=sleep, cancel=cancel, clock=clock, rand=rand,
+        )
+        try:
+            return wait_ready(api, client_factory(pod["id"]), pod["id"],
+                              timeout=timeout, cancel=cancel, sleep=sleep, log=log)
+        except PodGoneError as e:
+            if deadline is not None and clock() >= deadline:
+                raise SyncPodCapacityError(
+                    "The sync pod kept disappearing while we waited for it, and "
+                    "the {} we were given to wait ran out.\nLast: {}".format(
+                        _fmt_wait(capacity_wait_s), e)) from e
+            log("{} -- looking for another".format(e))
 
 
 def _acquire_sync_pod(api, cfg, token, pubkey, log, cloud_type, capacity_wait_s,

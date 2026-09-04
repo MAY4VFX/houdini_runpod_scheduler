@@ -97,7 +97,8 @@ RENDER_SUBDIR = "render"
 PICTURE = "$HIP/{}/rpfarm_demo.$F4.exr".format(RENDER_SUBDIR)
 
 TOPNET = "/obj/topnet1"
-DOWNLOAD = TOPNET + "/download"
+# The downstream-most node of the chain, and so the one Submit cooks.
+COOK_TARGET = TOPNET + "/render"
 SCHEDULER = TOPNET + "/rpfarm"
 
 # Filled into the cost sticky note; kept here so one edit updates the scene.
@@ -346,11 +347,17 @@ def build_topnet(karma):
     _set_static(render, "range3", 1)
     render.setInput(0, gate)
 
-    download = topnet.createNode("runpodfarmdownload", "download")
-    download.parm("rpfarm_mode").set("outputs")
-    download.parm("rpfarm_overwrite").set("newer")
-    download.setInput(0, render)
-    download.setDisplayFlag(True)
+    # No runpodfarm_download node here, deliberately.
+    #
+    # The scheduler's "Download Outputs" already fetches each frame the moment
+    # its item succeeds, so frames land while the farm is still rendering --
+    # which is the behaviour worth showing. A download node in Outputs mode
+    # below the render would fetch the same files a SECOND time at the end of
+    # the cook: the artist watched files arrive during the cook and then saw
+    # eight more download items re-transfer them at the end. That node is for
+    # pulling folders nothing reported as an output; duplicating the scheduler
+    # is not its job. The node itself now warns when both are on.
+    render.setDisplayFlag(True)
 
     stats = topnet.createNode("runpodfarmstats", "stats")
     stats.parm("rpfarm_project").set(PROJECT)
@@ -359,11 +366,10 @@ def build_topnet(karma):
     submit = topnet.createNode("null", "SUBMIT_TO_FARM")
     _build_submit_interface(submit)
 
-    for node in (upload, download):
-        node.matchCurrentDefinition()
+    upload.matchCurrentDefinition()
 
-    topnet.layoutChildren([upload, gate, render, download])
-    _place_side_nodes(topnet, submit, stats, download)
+    topnet.layoutChildren([upload, gate, render])
+    _place_side_nodes(topnet, submit, stats)
     _add_sticky_notes(topnet, submit, stats)
     return topnet
 
@@ -385,7 +391,7 @@ def _build_submit_interface(node):
     )
     submit.setHelp(
         "Сохраняет сцену и отправляет все {} кадров на ферму одним куком "
-        "(нода download, один вызов cookWorkItems). Больше ничего нажимать "
+        "(нода render, один вызов cookWorkItems). Больше ничего нажимать "
         "не нужно.".format(FRAME_END - FRAME_START + 1)
     )
 
@@ -419,9 +425,9 @@ def _build_submit_interface(node):
     node.setParmTemplateGroup(ptg)
 
 
-def _place_side_nodes(topnet, submit, stats, download):
+def _place_side_nodes(topnet, submit, stats):
     """Submit above the chain's head, stats off to the right of its tail."""
-    chain = [topnet.node(n) for n in ("upload", "gate", "render", "download")]
+    chain = [topnet.node(n) for n in ("upload", "gate", "render")]
     left = min(n.position()[0] for n in chain)
     top = max(n.position()[1] for n in chain)
     bottom = min(n.position()[1] for n in chain)
@@ -465,7 +471,7 @@ def _add_sticky_notes(topnet, submit, stats):
         (0.16, 0.42, 0.20),
     )
 
-    chain = [topnet.node(n) for n in ("upload", "gate", "render", "download")]
+    chain = [topnet.node(n) for n in ("upload", "gate", "render")]
     cx = min(n.position()[0] for n in chain)
     cy = max(n.position()[1] for n in chain)
 
@@ -479,7 +485,11 @@ def _add_sticky_notes(topnet, submit, stats):
         "            посчитался бы дважды и стоил бы вдвое\n"
         "render    — 8 кадров Karma CPU, один work item на кадр,\n"
         "            кадры разъезжаются по разным подам\n"
-        "download  — забирает готовые EXR обратно на этот компьютер\n"
+        "\n"
+        "Готовые EXR приезжают сами, по мере готовности каждого\n"
+        "кадра — это делает планировщик (Download Outputs).\n"
+        "Отдельной ноды download здесь нет намеренно: с включённой\n"
+        "жадной докачкой она качала бы всё то же самое второй раз.\n"
         "\n"
         "stats     — справа, к графу не подключена: покажет, сколько\n"
         "            это стоило. Жми на ней Refresh после кука.",
@@ -496,7 +506,7 @@ def _add_sticky_notes(topnet, submit, stats):
         "~/Desktop/rpfarm_demo/render/\n"
         "     rpfarm_demo.0001.exr … rpfarm_demo.0008.exr\n"
         "\n"
-        "Они появляются по одному, по мере готовности —\n"
+        "Они появляются по одному, прямо во время кука, —\n"
         "не жди все восемь сразу.\n"
         "\n"
         "Рядом лежит preview_expected.png — так должен\n"
@@ -552,7 +562,7 @@ import sys
 import hou
 
 TOPNET = "{topnet}"
-DOWNLOAD = "{download}"
+COOK_TARGET = "{cook_target}"
 SCHEDULER = "{scheduler}"
 RENDER_SUBDIR = "{render_subdir}"
 
@@ -582,9 +592,10 @@ def _context():
 def rpfarm_demo_submit(kwargs):
     """Save the scene and cook the downstream-most node once, non-blocking.
 
-    One cookWorkItems call on `download` and nothing else: cooking the ROP
-    Fetch and the download separately starts two independent PDG cooks and
-    pays for a second GPU pod.
+    One cookWorkItems call on the downstream-most node and nothing else:
+    cooking two nodes in two calls starts two independent PDG cooks and pays
+    for a second GPU pod. Frames come home by themselves as each item
+    succeeds -- the scheduler's "Download Outputs" does that during the cook.
     """
     node = kwargs["node"]
     try:
@@ -602,9 +613,9 @@ def rpfarm_demo_submit(kwargs):
         _status(node, "Не смог сохранить сцену: {{}}".format(e))
         return
 
-    target = hou.node(DOWNLOAD)
+    target = hou.node(COOK_TARGET)
     if target is None:
-        _status(node, "Не нашёл ноду {{}} — граф изменён?".format(DOWNLOAD))
+        _status(node, "Не нашёл ноду {{}} — граф изменён?".format(COOK_TARGET))
         return
 
     _status(node, "Отправляю на ферму…\\n"
@@ -707,7 +718,7 @@ def rpfarm_demo_open_folder(kwargs):
 def install_session_module():
     source = SESSION_SOURCE.format(
         topnet=TOPNET,
-        download=DOWNLOAD,
+        cook_target=COOK_TARGET,
         scheduler=SCHEDULER,
         render_subdir=RENDER_SUBDIR,
         frames=FRAME_END - FRAME_START + 1,
@@ -814,21 +825,23 @@ def _verify(dest, dest_dir):
     check(hou.node(TOPNET).parm("topscheduler").eval() == SCHEDULER,
           "topnet topscheduler = {!r}".format(hou.node(TOPNET).parm("topscheduler").eval()))
 
-    download = hou.node(DOWNLOAD)
-    check(download.isDisplayFlagSet(), "download does not carry the display flag")
-    check(download.inputs() and download.inputs()[0].name() == "render",
-          "download is not wired to render")
-    check(hou.node("/obj/topnet1/render").inputs()[0].name() == "gate",
+    target = hou.node(COOK_TARGET)
+    check(target.isDisplayFlagSet(), "the cooked node does not carry the display flag")
+    check(target.inputs() and target.inputs()[0].name() == "gate",
           "render is not wired to the waitforall gate")
+    # Both download paths on at once fetches every frame twice -- the artist
+    # saw it happen. The scheduler's greedy download is the one kept.
+    check(hou.node("/obj/topnet1/download") is None,
+          "a runpodfarm_download node is back in the chain while the scheduler "
+          "is also downloading outputs: every frame would be fetched twice")
 
     # An unlocked HDA subnet that has drifted from its definition would freeze
     # a stale copy of its generate script into this .hip and ignore every
     # future HDA rebuild. Three live runs in Task 15 downloaded nothing for
     # exactly this reason.
-    for name in ("upload", "download"):
-        node = hou.node("/obj/topnet1/" + name)
-        check(node.matchesCurrentDefinition(),
-              "{} has an edited/frozen internal network".format(name))
+    node = hou.node("/obj/topnet1/upload")
+    check(node.matchesCurrentDefinition(),
+          "upload has an edited/frozen internal network")
 
     job = hou.text.expandString("$JOB")
     check(os.path.realpath(job) == os.path.realpath(dest_dir),
