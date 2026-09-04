@@ -3,7 +3,7 @@
 This is the scene the farm's owner opens to decide whether the system works,
 so it is deliberately *not* the smoke fixture. The smoke fixture is a grey
 sphere at 320x240 that measures the farm; this one is meant to be looked at:
-a lit pig head on a studio floor, 1280x720 Karma (CPU by default, see
+a lit pig head on a studio floor, 1280x720 Karma (XPU by default, see
 ``ENGINE``), eight frames that rotate
 enough to read as a sequence.
 
@@ -44,11 +44,10 @@ that, in the order they matter:
   whatever generate script was installed the day it was built, ignoring every
   later HDA rebuild -- three live runs in Task 15 downloaded nothing for
   exactly this reason. ``_verify()`` asserts it stuck.
-- **Karma CPU, by measurement.** The farm CAN run XPU now (the pod image was
-  missing libEGL), but on this scene at these settings XPU is 1.4x slower --
-  see ``ENGINE`` for the numbers and why. ``engine`` is set explicitly rather
-  than left to the default so a future default change cannot quietly move this
-  scene onto the other renderer.
+- **Karma XPU, by measurement.** The pod image was missing libEGL, which is
+  why XPU used to fail; with that fixed, XPU renders this scene 1.79x faster
+  than CPU once its OptiX cache is warm, and the cache survives every task on
+  a pod. Per-frame numbers and the cold-frame cost are on ``ENGINE``.
 
 The button code lives in the scene's Python source editor (``hou.session``),
 so the ``.hip`` is genuinely self-contained -- no loose ``.py`` beside the
@@ -75,22 +74,37 @@ RESX = 1280
 RESY = 720
 SAMPLES = 9
 
-# "cpu" or "xpu". Selectable, and measured rather than assumed.
+# "cpu" or "xpu". Measured per frame, on one pod, back to back.
 #
-# The farm can run XPU (that was a missing libEGL in the pod image, fixed), but
-# on this workload it loses: the same frame of this scene at 1280x720, spp 9,
-# on an RTX 4090 pod with 32 vCPU took 35.7s on CPU and 50.5s on XPU. Two
-# reasons, and both are structural rather than bad luck. RunPod's GPU pods come
-# with a lot of CPU, which Karma CPU uses all of; and XPU compiles OptiX
-# kernels at startup, which this farm pays on EVERY frame because it dispatches
-# one frame per task in a fresh hython -- the cost never amortizes.
+# An earlier note here said XPU was 1.4x SLOWER and I was wrong: that compared
+# a cold XPU against a warm CPU. Karma XPU compiles OptiX kernels on first use
+# and caches them in /var/tmp/OptixCache_<user>/optix7cache.db -- which lives in
+# the CONTAINER, not in the process, so it survives every task the pod runs.
+# Only the first frame on a pod pays for it.
 #
-# Renting a GPU and rendering on its CPU still looks wrong, and it is worth
-# revisiting: XPU wins on heavier scenes, more samples, higher resolution, or
-# with several frames per task (ROP Node Configuration instead of Frame Range)
-# so one compile serves many frames. Change ENGINE here and re-measure; do not
-# switch it on the strength of "XPU works now".
-ENGINE = "cpu"
+# Same scene, same pod, RTX 4090, each frame its own hython exactly as the farm
+# dispatches them:
+#
+#     frame |   XPU |   CPU
+#        1  |  89.7 |  74.8      <- XPU compiling
+#        2  |  53.2 |  75.4
+#        3  |  43.2 |  76.5
+#        4  |  42.1 |  78.3
+#        5  |  42.7 |  80.4
+#        6  |  42.4 |  79.2
+#        7  |  42.2 |  79.5
+#        8  |  47.3 |     -
+#
+# XPU warm averages 43.3s against CPU's 77.7s: 1.79x faster. Even paying one
+# cold frame per pod, eight frames over two pods is ~220s on XPU against ~311s
+# on CPU. So XPU it is -- and the more frames a pod gets, the better it looks.
+#
+# Two caveats worth keeping. CPU times swing a lot between pods (the same frame
+# measured 35.7s on one pod and ~78s on this one), so only within-pod
+# comparisons mean anything -- these numbers are one pod, back to back. And the
+# farm refuses an XPU cook it cannot run: the scheduler preflights against
+# xpu_supported, recorded by `rpfarm farm xpu`.
+ENGINE = "xpu"
 
 CAM_FOCAL = 75.0        # long enough not to distort a face at this distance
 CAM_AZIMUTH = 28.0      # degrees right of front -- a three-quarter view
