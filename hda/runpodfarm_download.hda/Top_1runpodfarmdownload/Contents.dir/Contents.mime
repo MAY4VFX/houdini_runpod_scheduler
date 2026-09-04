@@ -235,6 +235,7 @@ if str(_RPFARM_ROOT) not in sys.path:
     sys.path.insert(0, str(_RPFARM_ROOT))
 
 from rpfarm import config as rpcfg
+from rpfarm import houdini_local as rphou
 from rpfarm import packages as rppkg
 from rpfarm import pods as rppods
 from rpfarm.runpod_api import RunPodAPI, RunPodError, pod_public_endpoint
@@ -394,7 +395,17 @@ else:
 # was chosen). \"kind\": \"download\" in the payload is what routes it to
 # rpfarm.packages.run_download_item instead of run_upload_item.
 in_process = bool(node.evalParm(\"rpfarm_inprocess\"))
-python3 = shutil.which(\"python3\") or \"python3\"
+# The interpreter is resolved explicitly, never off PATH. A Houdini launched
+# from the macOS Dock inherits a minimal PATH where \"python3\" is Xcode's 3.9,
+# which has no tomllib, so every package item died on `import rpfarm.config`
+# before doing any work -- and every headless run went through a shell whose
+# PATH started with a modern python, so this passed the smoke for the wrong
+# reason. rphou.resolve_package_python prefers the plain python bundled with
+# THIS running Houdini ($HFS), which is guaranteed present and takes no
+# licence (hython would take one per package).
+python3, python3_why = rphou.resolve_package_python(
+    hfs=hou.getenv(\"HFS\") or hou.expandString(\"$HFS\"))
+print(\"[rpfarm-download] package runner interpreter: {{}}  ({{}})\".format(python3, python3_why))
 items_dir = tempfile.mkdtemp(prefix=\"rpfarm_download_items_\")
 # See the upload node's onGenerate for why this has to be resolved from
 # rppkg.__file__ (already imported into THIS process) rather than trusted

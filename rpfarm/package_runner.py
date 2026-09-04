@@ -47,10 +47,13 @@ Runs under a plain system ``python3``, not ``hython``: every module this
 touches (``rpfarm.packages``, ``.sync``, ``.pods``, ``.config``,
 ``.worker_client``, ``.runpod_api``) is stdlib-only by design (see their
 own module docstrings), so there is no reason to pay ``hython``'s startup
-cost per package. ``sys.executable`` from the generating side would be
-wrong here -- that process is ``hython`` -- so each node resolves a plain
-``python3`` explicitly at generate time instead (see the upload node's
-``onGenerate``/Help for exactly how and why).
+cost per package. ``sys.executable`` from the generating side is
+``hython``, which works but takes a licence per package, so each node
+resolves an interpreter explicitly at generate time via
+``rpfarm.houdini_local.resolve_package_python`` -- preferring the plain
+Python bundled inside the running Houdini. It must not be left to ``PATH``:
+a Dock-launched Houdini has a minimal one where ``python3`` is Xcode's 3.9,
+which has no ``tomllib`` and cannot import ``rpfarm.config`` at all.
 """
 
 from __future__ import annotations
@@ -109,7 +112,13 @@ def main(argv):
     # PID in every line is the cheapest possible evidence, in the log,
     # that two packages ran as separate out-of-process work items rather
     # than sequentially in one process.
-    print("[{}] pid={} starting {}".format(tag, os.getpid(), argv[0]), flush=True)
+    # The interpreter goes in the item's own log on purpose: when this died
+    # on `import tomllib` under Xcode's python3.9, the only way to see which
+    # interpreter had been picked was the traceback's file paths.
+    print("[{}] pid={} python={} ({}.{}.{}) starting {}".format(
+        tag, os.getpid(), sys.executable,
+        sys.version_info[0], sys.version_info[1], sys.version_info[2],
+        argv[0]), flush=True)
 
     _bootstrap_rpfarm()
 

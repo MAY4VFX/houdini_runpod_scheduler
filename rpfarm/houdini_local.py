@@ -29,6 +29,7 @@ import platform
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -376,3 +377,161 @@ def write_rpfarm_root_env(install: HoudiniInstall, root: Path | None = None) -> 
     install.user_pref_dir.mkdir(parents=True, exist_ok=True)
     env_file.write_text("\n".join(out) + "\n", encoding="utf-8")
     return env_file
+
+
+# ---------------------------------------------------------------------------
+# interpreter for out-of-process package work items
+# ---------------------------------------------------------------------------
+
+# `rpfarm.config` reads config.toml with `tomllib`, which is 3.11+. Anything
+# older cannot import `rpfarm` at all.
+PACKAGE_PYTHON_MIN = (3, 11)
+
+
+def houdini_bundled_python(hfs, version, platform_name=None, exists=None):
+    """Absolute path to the **plain** Python that ships inside a Houdini install.
+
+    ``hfs`` is ``$HFS`` (Houdini's own resources root, what ``hou.getenv("HFS")``
+    returns) and ``version`` is the ``(major, minor)`` of the Python that
+    Houdini is running -- taken from the caller's own ``sys.version_info``
+    rather than hardcoded, because it moves with the Houdini version
+    (22.0 ships 3.13, older ones 3.11/3.10).
+
+    Deliberately **not** ``hython``: ``hython`` initialises the Houdini
+    environment and checks out a licence, and an upload that splits into
+    eight packages would try to take eight of them. The plain interpreter
+    beside it takes none, and everything ``rpfarm.package_runner`` touches is
+    stdlib-only by design.
+
+    Layouts, one per platform:
+
+    - macOS: the Python framework is a *sibling* of ``Houdini.framework``, so
+      the path is found by walking up from ``$HFS``
+      (``.../Frameworks/Houdini.framework/Versions/<ver>/Resources``) until a
+      directory with a ``Python.framework`` in it appears -- four levels, but
+      searched rather than counted, so a relocated or differently nested
+      install still resolves.
+    - Linux: ``$HFS/python/bin/python3``.
+    - Windows: ``$HFS/python/python.exe``.
+
+    Returns the path only if it actually exists, else ``None`` -- the caller
+    falls back rather than putting a guess in a work item's command.
+    """
+    if not hfs:
+        return None
+    platform_name = platform_name or sys.platform
+    exists = exists or os.path.exists
+    root = Path(hfs)
+    tag = "{}.{}".format(version[0], version[1])
+
+    if platform_name == "darwin":
+        # Walk up rather than counting "..": the nesting depth is an Apple
+        # framework detail, not a promise.
+        for parent in [root] + list(root.parents):
+            candidate = parent / "Python.framework" / "Versions" / tag / "bin" / ("python" + tag)
+            if exists(str(candidate)):
+                return str(candidate)
+        return None
+
+    if platform_name.startswith("win"):
+        candidate = root / "python" / "python.exe"
+    else:
+        candidate = root / "python" / "bin" / "python3"
+    return str(candidate) if exists(str(candidate)) else None
+
+
+def discover_python_on_disk(search_dirs=None, exists=None, listdir=None):
+    """Newest ``python3.<minor>`` on disk that is at least PACKAGE_PYTHON_MIN.
+
+    A last resort before giving up and writing a bare ``python3`` into a work
+    item's command. Scans explicit directories rather than ``PATH``, because
+    ``PATH`` is exactly what cannot be trusted here: a Houdini launched from
+    the macOS Dock inherits a minimal one where ``python3`` is Xcode's 3.9.
+    """
+    exists = exists or os.path.exists
+    listdir = listdir or _safe_listdir
+    if search_dirs is None:
+        search_dirs = [
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+            "/opt/local/bin",
+            "/usr/bin",
+        ]
+    best = None
+    for directory in search_dirs:
+        for name in listdir(directory):
+            match = re.fullmatch(r"python3\.(\d+)", name)
+            if not match:
+                continue
+            minor = int(match.group(1))
+            if (3, minor) < PACKAGE_PYTHON_MIN:
+                continue
+            path = os.path.join(directory, name)
+            if not exists(path):
+                continue
+            if best is None or minor > best[0]:
+                best = (minor, path)
+    return best[1] if best else None
+
+
+def _safe_listdir(directory):
+    try:
+        return sorted(os.listdir(directory))
+    except OSError:
+        return []
+
+
+def resolve_package_python(
+    hfs=None,
+    version=None,
+    running=None,
+    running_version=None,
+    platform_name=None,
+    exists=None,
+    discover=None,
+):
+    """``(interpreter, reason)`` for the out-of-process package runner.
+
+    The command written into a work item must name an **absolute** interpreter.
+    It used to be ``shutil.which("python3") or "python3"``, and that shipped a
+    real defect: ``PATH`` inside a Dock-launched Houdini is minimal, so
+    ``python3`` resolved to Xcode's 3.9, which has no ``tomllib``, so every
+    upload item died on ``import rpfarm.config`` before doing any work. Every
+    headless run went through a shell whose ``PATH`` started with Homebrew, so
+    the smoke passed for the wrong reason.
+
+    Order, each step verified before it is accepted:
+
+    1. Houdini's own bundled plain Python. Guaranteed present wherever this
+       tool can run at all -- the product needs Houdini anyway -- and modern.
+    2. The interpreter running this generator, if new enough. Inside Houdini
+       that is ``hython``, which works but takes a licence per package; the
+       reason string says so, because it is a cost worth seeing in a log.
+    3. The newest ``python3.x`` found on disk.
+    4. Bare ``python3``, which is what used to happen unconditionally. The
+       reason string is a warning: this is the case that breaks.
+    """
+    version = version or sys.version_info[:2]
+    running = running if running is not None else sys.executable
+    running_version = running_version or sys.version_info[:2]
+
+    bundled = houdini_bundled_python(hfs, version, platform_name=platform_name, exists=exists)
+    if bundled:
+        return bundled, "Houdini's own bundled python{}.{} (no licence taken)".format(*version)
+
+    if running and tuple(running_version) >= PACKAGE_PYTHON_MIN:
+        return running, (
+            "no bundled python under $HFS={!r}; falling back to the interpreter "
+            "running this generator ({}.{}) -- note that inside Houdini this is "
+            "hython and takes a licence per package".format(hfs, *running_version)
+        )
+
+    discover = discover or discover_python_on_disk
+    found = discover()
+    if found:
+        return found, "no bundled or usable running interpreter; found {} on disk".format(found)
+
+    return "python3", (
+        "WARNING: falling back to a bare 'python3' off PATH -- if that is older "
+        "than {}.{} every package item will die on 'import tomllib'".format(*PACKAGE_PYTHON_MIN)
+    )
