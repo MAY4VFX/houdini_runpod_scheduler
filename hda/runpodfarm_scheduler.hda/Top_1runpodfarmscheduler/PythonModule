@@ -1422,6 +1422,8 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
                 "No RunPod template id. Set the Template ID parameter, or run "
                 "`rpfarm setup`.")
 
+        self._checkDatacenter()
+
         self._token = rpcfg.session_token()
         self._pubkey = _read_pubkey(self._cfg)
 
@@ -1474,6 +1476,49 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
             self._cook_id, self._project, self._remote_project,
             ", ".join(self._gpu_list)))
         return True
+
+    def _checkDatacenter(self):
+        """Fail the cook when this node's Datacenter contradicts the config.
+
+        `rpfarm doctor` and `rpfarm setup` compare config.toml against the
+        volume's real region and are the only checks that existed -- but
+        neither can see a .hip file. This node's Datacenter parm used to
+        ship with a hardcoded "EU-RO-1" default, and a scene saved before
+        that default became empty keeps the old value baked in: it wins
+        over a correctly migrated cfg.datacenter (see _datacenterId), so
+        every pod is created in a region that cannot mount the network
+        volume, every task fails with RunPod's own opaque error, and
+        `doctor` reports a clean bill of health because it only ever
+        inspects the config. The scheduler is the only place that sees
+        both halves, so the comparison has to live here.
+
+        A hand-picked Network Volume ID is the one case where the config's
+        region is not the authority (the artist is pointing at some other
+        volume, whose region we have no way to know here): say so and let
+        the cook run.
+        """
+        node_dc = self["rpfarm_datacenter"].evaluateString().strip()
+        if not node_dc or not self._cfg.datacenter or node_dc == self._cfg.datacenter:
+            return
+        if self._volumeId() != self._cfg.volume_id:
+            self._log(
+                "Datacenter is set to {} on this node while config.toml says {}; "
+                "Network Volume ID is overridden too, so this is being taken as "
+                "deliberate. The pod's region must match that volume's region or "
+                "nothing will mount.".format(node_dc, self._cfg.datacenter))
+            return
+        raise CookError(
+            "Datacenter mismatch: this node says {node}, but network volume {vol} "
+            "lives in {cfg} (~/.rpfarm/config.toml, filled in by `rpfarm setup` "
+            "from the volume's own region). A pod created outside its volume's "
+            "region cannot mount /workspace at all, so every task of this cook "
+            "would fail.\n"
+            "This is almost always a scene saved before the Datacenter parameter's "
+            "default changed from EU-RO-1 to empty: the old default is baked into "
+            "the .hip and silently overrides the config.\n"
+            "Fix: on the Farm tab set Datacenter back to '(from config.toml)' -- "
+            "the empty menu entry -- or to {cfg}, then save the scene.".format(
+                node=node_dc, vol=self._cfg.volume_id, cfg=self._cfg.datacenter))
 
     def _checkBalance(self):
         """Warn, but do not block, when the RunPod balance is low."""

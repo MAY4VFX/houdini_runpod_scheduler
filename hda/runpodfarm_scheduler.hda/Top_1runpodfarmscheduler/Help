@@ -112,6 +112,16 @@ Datacenter:
     `rpfarm setup` records from the volume's own region -- set this only to
     override that for one node.
 
+    NOTE: this parameter used to ship defaulting to `EU-RO-1`. A scene saved
+    back then keeps that literal value in the `.hip`, where it silently wins
+    over a correctly migrated `datacenter` in `config.toml` -- pods are then
+    created in a region that cannot mount the volume, every task fails with
+    RunPod's own opaque error, and `rpfarm doctor` still reports everything
+    fine because it only reads the config, never the scene. The scheduler
+    compares the two at the start of every cook and refuses to run on a
+    mismatch rather than burning pods on it. If that stops a cook, set this
+    back to `(from config.toml)` -- the empty menu entry -- and save.
+
 === Scaling ===
 
 Min Pods:

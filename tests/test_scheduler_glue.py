@@ -378,3 +378,90 @@ def test_a_working_sync_touch_stays_quiet():
     sched._sync_client = Ok()
     ns["_touchSyncPod"](sched)
     assert sched.logs == []
+
+
+# -- the Datacenter parm baked into an old scene (Task 17, residual B) --------
+
+
+class _CookError(Exception):
+    """Stands in for pdg.CookError, which needs PDG to import."""
+
+
+class _Parm:
+    def __init__(self, value):
+        self.value = value
+
+    def evaluateString(self):
+        return self.value
+
+
+class _DatacenterScheduler(FakeScheduler):
+    """A scheduler whose parms and config can disagree, as they do in a
+    .hip saved before the Datacenter default became empty."""
+
+    def __init__(self, node_dc, cfg_dc="US-KS-2", node_volume="", cfg_volume="vol-real"):
+        super().__init__()
+        self._cfg = types.SimpleNamespace(datacenter=cfg_dc, volume_id=cfg_volume)
+        self._parms = {
+            "rpfarm_datacenter": _Parm(node_dc),
+            "rpfarm_networkvolumeid": _Parm(node_volume),
+        }
+
+    def __getitem__(self, name):
+        return self._parms[name]
+
+    def _volumeId(self):
+        return self._parms["rpfarm_networkvolumeid"].evaluateString() or self._cfg.volume_id
+
+
+def _datacenter_check():
+    return load_methods(["_checkDatacenter"], {"CookError": _CookError})["_checkDatacenter"]
+
+
+def test_a_stale_baked_in_datacenter_fails_the_cook_with_the_fix():
+    """The trap: the parm shipped defaulting to EU-RO-1, a scene saved then
+    keeps that literal, and _datacenterId's `parm or config` hands it to
+    every create_gpu_pod -- so pods land where the volume is not and cannot
+    mount /workspace, while `doctor` (config only) says everything is
+    fine."""
+    with pytest.raises(_CookError) as e:
+        _datacenter_check()(_DatacenterScheduler("EU-RO-1", cfg_dc="US-KS-2"))
+
+    message = str(e.value)
+    assert "EU-RO-1" in message and "US-KS-2" in message
+    assert "(from config.toml)" in message, "the fix has to name the menu entry"
+    assert "cannot mount" in message
+
+
+def test_the_empty_parm_means_the_config_and_is_never_a_mismatch():
+    _datacenter_check()(_DatacenterScheduler("", cfg_dc="US-KS-2"))  # no raise
+
+
+def test_a_matching_parm_is_fine():
+    _datacenter_check()(_DatacenterScheduler("US-KS-2", cfg_dc="US-KS-2"))  # no raise
+
+
+def test_whitespace_is_not_a_mismatch():
+    _datacenter_check()(_DatacenterScheduler("  US-KS-2 ", cfg_dc="US-KS-2"))  # no raise
+
+
+def test_an_overridden_volume_is_taken_as_deliberate_and_only_warned_about():
+    """The config's region is the *configured* volume's region. Point the
+    node at another volume and we have no way to know where that one lives,
+    so this must not be the thing that fails the cook."""
+    sched = _DatacenterScheduler("EU-RO-1", cfg_dc="US-KS-2", node_volume="vol-other")
+    _datacenter_check()(sched)  # no raise
+    assert any("deliberate" in m for m in sched.logs)
+
+
+def test_no_configured_region_is_nothing_to_compare_against():
+    _datacenter_check()(_DatacenterScheduler("EU-RO-1", cfg_dc=""))  # no raise
+
+
+def test_the_cook_runs_the_datacenter_check_before_creating_anything():
+    """A check nobody calls is not a check. It has to happen in
+    onStartCook, which is the only callback that sees the node."""
+    src = MODULE.read_text()
+    assert "self._checkDatacenter()" in src
+    start = src.index("def onStartCook")
+    assert src.index("self._checkDatacenter()", start) < src.index("def onSetupCook")
