@@ -1038,41 +1038,135 @@ def cmd_farm_status(args):
     return 0
 
 
-def cmd_farm_kill(args):
-    """Terminate rpfarm pod(s). Scope is opt-in and explicit, because the
-    account-wide ``rpfarm-`` prefix used by ``farm status`` covers every
-    user's pods, not just the caller's: ``--pod ID`` one specific pod;
-    ``--sync`` this user's own sync pod only (``rpfarm-sync-<user>``);
-    ``--all`` this user's own cook pods only (``rpfarm-<user>-*`` --
-    never the sync pod, never another user's pods); ``--everyone`` is the
-    one flag that reaches outside ``cfg.user`` at all, killing every
-    ``rpfarm-*`` pod on the whole shared account.
+# Test seam, same shape as _transport above: tests answer /health without a pod.
+_health_probe = None
+
+
+def _probe_pod(cfg, pod):
+    """``(health, error)`` for one pod, asked over its own ``/health``.
+
+    Never raises: a pod we cannot reach is a pod we do not understand, and
+    :func:`rpfarm.pods.classify_for_kill` turns that into "leave it alone".
+    """
+    try:
+        if _health_probe is not None:
+            return _health_probe(pod), None
+        return WorkerClient(pod["id"], rpcfg.session_token()).health(), None
+    except Exception as e:  # noqa: BLE001 - a probe failure is an answer, not a crash
+        return None, str(e)
+
+
+def cmd_farm_kill(args, prompt=input):
+    """Terminate rpfarm pod(s), refusing by default to touch anything that is
+    not both ours and idle.
+
+    This used to kill every pod matching a prefix. The account is shared, and
+    an agent that assumed every running pod was its own leftover terminated a
+    colleague's -- 36 seconds after their cook happened to finish. One minute
+    earlier it would have destroyed a live render with eight GPU-minutes in it.
+    Discipline was the only thing standing between that and a bad day, so the
+    default is now incapable of it:
+
+    * ``--all`` kills this user's pods that are demonstrably idle. Anything
+      busy, anyone else's, or anything that cannot be reached to ask is
+      skipped and reported.
+    * ``--even-if-running`` lifts the busy guard, ``--everyone`` lifts the
+      ownership guard. Both are spelled out and both ask for confirmation;
+      neither is implied by anything else.
+    * ``--pod ID`` gets the same treatment: a busy pod is refused unless the
+      override is given.
     """
     cfg = rpcfg.load()
     api = _make_api(cfg.api_key)
 
+    def confirm(what):
+        if args.yes:
+            return True
+        answer = prompt("About to {}. Type 'yes' to continue: ".format(what)).strip()
+        if answer.lower() != "yes":
+            print("cancelled -- nothing was terminated")
+            return False
+        return True
+
     if args.pod:
+        pods = [p for p in api.list_pods("rpfarm-") if p.get("id") == args.pod]
+        if not pods:
+            print(f"[WARN] no rpfarm pod with id {args.pod}; terminating it anyway")
+            api.terminate_pod(args.pod)
+            print(f"[OK] terminated {args.pod}")
+            return 0
+        pod = pods[0]
+        health, error = _probe_pod(cfg, pod)
+        verdict, reason = rppods.classify_for_kill(pod, cfg.user, health, error)
+        if verdict != "safe" and not args.even_if_running:
+            print(
+                f"refusing to terminate {pod.get('name', args.pod)} ({args.pod}): "
+                f"{reason}.\n"
+                f"If you are sure, rerun with --even-if-running.",
+                file=sys.stderr,
+            )
+            return 2
+        if verdict != "safe" and not confirm(
+                f"terminate {pod.get('name', args.pod)}, which {reason}"):
+            return 1
         api.terminate_pod(args.pod)
         print(f"[OK] terminated {args.pod}")
         return 0
 
     if args.sync:
         name = rppods.sync_pod_name(cfg.user)
-        pods = [p for p in api.list_pods(name) if p.get("name") == name]
+        candidates = [p for p in api.list_pods(name) if p.get("name") == name]
     elif args.everyone:
-        pods = api.list_pods("rpfarm-")
+        candidates = api.list_pods("rpfarm-")
     elif args.all:
-        pods = api.list_pods(f"rpfarm-{cfg.user}-")
+        candidates = api.list_pods(f"rpfarm-{cfg.user}-")
     else:
-        print("error: pass --all (your own pods), --everyone (DANGER: every user's pods), --pod <id>, or --sync", file=sys.stderr)
+        print("error: pass --all (your own idle pods), --sync, --pod <id>, or "
+              "--everyone (every user's pods -- asks first)", file=sys.stderr)
         return 1
 
-    if not pods:
+    if not candidates:
         print("nothing to terminate")
         return 0
-    for p in pods:
-        api.terminate_pod(p["id"])
-        print(f"[OK] terminated {p.get('name', '?')} ({p['id']})")
+
+    kill, skipped = [], []
+    for pod in candidates:
+        health, error = _probe_pod(cfg, pod)
+        verdict, reason = rppods.classify_for_kill(pod, cfg.user, health, error)
+        if verdict == "safe":
+            kill.append((pod, reason))
+        elif verdict == "foreign" and args.everyone:
+            kill.append((pod, reason + " -- included by --everyone"))
+        elif verdict in ("busy", "unknown") and args.even_if_running:
+            kill.append((pod, reason + " -- included by --even-if-running"))
+        else:
+            skipped.append((pod, verdict, reason))
+
+    for pod, verdict, reason in skipped:
+        print("[SKIP] {} ({}): {}".format(pod.get("name", "?"), pod["id"], reason))
+    if skipped:
+        needs_running = any(v in ("busy", "unknown") for _p, v, _r in skipped)
+        needs_everyone = any(v == "foreign" for _p, v, _r in skipped)
+        hint = " and ".join(
+            f for f, want in (("--even-if-running", needs_running),
+                              ("--everyone", needs_everyone)) if want)
+        print("{} pod(s) left alone. If you really mean to take them, rerun "
+              "with {}.".format(len(skipped), hint))
+
+    if not kill:
+        print("nothing terminated")
+        return 0
+
+    risky = [(p, r) for p, r in kill if "included by" in r]
+    if risky and not confirm(
+            "terminate {} pod(s) that are running or not yours: {}".format(
+                len(risky), ", ".join(p.get("name", p["id"]) for p, _r in risky))):
+        return 1
+
+    for pod, reason in kill:
+        api.terminate_pod(pod["id"])
+        print("[OK] terminated {} ({}) -- {}".format(
+            pod.get("name", "?"), pod["id"], reason))
     return 0
 
 
@@ -1158,10 +1252,12 @@ def build_parser():
     farm_sub = p_farm.add_subparsers(dest="farm_command", required=True)
     farm_sub.add_parser("status", help="list running rpfarm-* pods (all users) with rate/uptime/est cost")
     p_kill = farm_sub.add_parser("kill", help="terminate pod(s) -- pick exactly one of the flags below")
-    p_kill.add_argument("--all", action="store_true", help="kill all of YOUR OWN cook pods (rpfarm-<user>-*) -- not the sync pod, not other users' pods")
-    p_kill.add_argument("--everyone", action="store_true", help="DANGER: kill every rpfarm-* pod on the whole account, including other users' pods and every sync pod")
-    p_kill.add_argument("--pod", metavar="ID", help="kill one specific pod by id")
+    p_kill.add_argument("--all", action="store_true", help="kill YOUR OWN cook pods (rpfarm-<user>-*) that are demonstrably idle -- busy ones, other users' and unreachable ones are skipped and listed")
+    p_kill.add_argument("--everyone", action="store_true", help="DANGER: also consider every other user's rpfarm-* pods. Asks for confirmation")
+    p_kill.add_argument("--even-if-running", dest="even_if_running", action="store_true", help="DANGER: also kill pods with a live cook, or ones that could not be reached to ask. Asks for confirmation")
+    p_kill.add_argument("--pod", metavar="ID", help="kill one specific pod by id -- refused if it is busy unless --even-if-running")
     p_kill.add_argument("--sync", action="store_true", help="kill YOUR OWN sync pod (rpfarm-sync-<user>) only")
+    p_kill.add_argument("--yes", action="store_true", help="skip the confirmation prompt (for scripts)")
 
     p_costs = sub.add_parser("costs", help="ledger + billing cost summary")
     p_costs.add_argument("--by", choices=["project", "user", "cook"], default="project", help="group totals by (default: project)")
@@ -1191,7 +1287,7 @@ _STORAGE_HANDLERS = {
 _FARM_HANDLERS = {"status": cmd_farm_status, "kill": cmd_farm_kill}
 
 
-def main(argv=None):
+def main(argv=None, prompt=input):
     parser = build_parser()
     args = parser.parse_args(argv)
 
@@ -1205,6 +1301,8 @@ def main(argv=None):
         if args.command == "storage":
             return _STORAGE_HANDLERS[args.storage_command](args)
         if args.command == "farm":
+            if args.farm_command == "kill":
+                return cmd_farm_kill(args, prompt=prompt)
             return _FARM_HANDLERS[args.farm_command](args)
         if args.command == "costs":
             return cmd_costs(args)

@@ -144,6 +144,10 @@ def test_pod_env_contents():
         "RPFARM_TOKEN": "tok123",
         "RPFARM_ROLE": "gpu",
         "RPFARM_SLOTS": "2",
+        # identity, readable back out of GET /pods -- see classify_for_kill
+        "RPFARM_USER": c.user,
+        "RPFARM_COOK": "",
+        "RPFARM_PROJECT": "",
         "PUBLIC_KEY": "ssh-ed25519 AAA",
         "HOUDINI_VERSION": c.houdini_version,
         "SESINETD_HOST": c.sesinetd_host,
@@ -160,6 +164,9 @@ def test_pod_env_without_extra():
         "RPFARM_TOKEN",
         "RPFARM_ROLE",
         "RPFARM_SLOTS",
+        "RPFARM_USER",
+        "RPFARM_COOK",
+        "RPFARM_PROJECT",
         "PUBLIC_KEY",
         "HOUDINI_VERSION",
         "SESINETD_HOST",
@@ -372,3 +379,108 @@ def test_backoff_never_overshoots_the_remaining_deadline():
 @contextlib.contextmanager
 def _nolock(*_args, **_kwargs):
     yield
+
+
+# ---------------------------------------------------------------------------
+# who owns a pod, and is its cook alive
+#
+# The account is shared. An agent that could only see its own state assumed
+# every running pod was its own leftover and terminated a colleague's -- 36
+# seconds after their cook happened to finish. A minute earlier and it would
+# have destroyed a live render. These pin the classification that makes the
+# default incapable of it.
+# ---------------------------------------------------------------------------
+
+
+def test_pod_owner_prefers_the_env_it_was_created_with():
+    pod = {"name": "rpfarm-may-demo-abc12345-1",
+           "env": {"RPFARM_USER": "bob", "RPFARM_COOK": "abc12345"}}
+
+    assert rppods.pod_owner(pod) == "bob"
+    assert rppods.pod_cook(pod) == "abc12345"
+
+
+def test_pod_owner_falls_back_to_the_name_for_pods_created_before_the_env():
+    assert rppods.pod_owner({"name": "rpfarm-may-demo-abc-1"}) == "may"
+    assert rppods.pod_owner({"name": "rpfarm-sync-may"}) == "may"
+    assert rppods.pod_owner({"name": "something-else"}) == ""
+
+
+def test_an_unknown_owner_is_not_silently_mine():
+    """'I cannot tell' must never resolve to 'mine' -- that is the whole bug."""
+    pod = {"name": "something-else"}
+
+    # No owner and no health: unreachable wins, and it is still not killed.
+    verdict, _reason = rppods.classify_for_kill(pod, "may", None, "timeout")
+    assert verdict == "unknown"
+
+
+def test_an_idle_pod_of_mine_is_safe():
+    pod = {"name": "rpfarm-may-demo-a-1", "env": {"RPFARM_USER": "may"}}
+
+    verdict, reason = rppods.classify_for_kill(
+        pod, "may", {"busy": 0, "idle_s": 900})
+
+    assert verdict == "safe"
+    assert "900" in reason
+
+
+def test_a_pod_running_a_task_is_busy():
+    pod = {"name": "rpfarm-may-demo-a-1", "env": {"RPFARM_USER": "may"}}
+
+    verdict, reason = rppods.classify_for_kill(
+        pod, "may", {"busy": 2, "idle_s": 5000})
+
+    assert verdict == "busy"
+    assert "2 task(s)" in reason
+
+
+def test_a_pod_spoken_to_seconds_ago_is_busy_even_with_no_task_running():
+    """The exact 36-second window that made the real incident survivable by
+    luck: between two tasks of a live cook `busy` dips to zero."""
+    pod = {"name": "rpfarm-may-demo-a-1", "env": {"RPFARM_USER": "may"}}
+
+    verdict, reason = rppods.classify_for_kill(
+        pod, "may", {"busy": 0, "idle_s": 36})
+
+    assert verdict == "busy"
+    assert "36s ago" in reason
+
+
+def test_the_grace_boundary_is_configurable_and_exclusive():
+    pod = {"name": "rpfarm-may-demo-a-1", "env": {"RPFARM_USER": "may"}}
+    health = {"busy": 0, "idle_s": 100}
+
+    assert rppods.classify_for_kill(pod, "may", health, grace_s=100)[0] == "safe"
+    assert rppods.classify_for_kill(pod, "may", health, grace_s=101)[0] == "busy"
+
+
+def test_someone_elses_pod_is_foreign_even_when_idle():
+    """Ownership is checked before liveness: another artist's idle pod is
+    still not ours to take."""
+    pod = {"name": "rpfarm-bob-demo-a-1", "env": {"RPFARM_USER": "bob"}}
+
+    verdict, reason = rppods.classify_for_kill(
+        pod, "may", {"busy": 0, "idle_s": 9999})
+
+    assert verdict == "foreign"
+    assert "bob" in reason
+
+
+def test_a_pod_that_cannot_be_reached_is_left_alone():
+    pod = {"name": "rpfarm-may-demo-a-1", "env": {"RPFARM_USER": "may"}}
+
+    assert rppods.classify_for_kill(pod, "may", None, "connection refused")[0] == "unknown"
+    assert rppods.classify_for_kill(pod, "may", {"busy": 0})[0] == "unknown"
+
+
+def test_pod_env_carries_identity_readable_from_get_pods(tmp_path):
+    cfg = rpcfg.Config(api_key="k", user="may", volume_id="v", template_id="t")
+    cfg.ssh_key_path = str(tmp_path / "id")
+
+    env = rppods.pod_env(cfg, "gpu", "tok", 1, "ssh-ed25519 AAA",
+                         cook="abc12345", project="demo")
+
+    assert env["RPFARM_USER"] == "may"
+    assert env["RPFARM_COOK"] == "abc12345"
+    assert env["RPFARM_PROJECT"] == "demo"

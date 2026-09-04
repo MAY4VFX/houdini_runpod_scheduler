@@ -57,11 +57,28 @@ def sync_pod_name(user):
     return f"rpfarm-sync-{user}"
 
 
-def pod_env(cfg, role, token, slots, pubkey, extra=None):
+def pod_env(cfg, role, token, slots, pubkey, extra=None, cook="", project=""):
+    """Environment a pod is created with.
+
+    ``RPFARM_USER``/``RPFARM_COOK``/``RPFARM_PROJECT`` are identity, not
+    configuration. RunPod returns a pod's ``env`` from ``GET /pods``, so they
+    let anyone holding the account key answer "whose pod is this, and which
+    cook does it belong to?" from the outside, without the local state of the
+    machine that created it. That matters because the account is shared: an
+    agent that could only see its own state killed a colleague's pods, having
+    no way to tell them apart from its own leftovers.
+
+    The name carries the same facts, but parsing it is guesswork -- a user or
+    project containing "-" makes ``rpfarm-<user>-<project>-<cook>-<n>``
+    ambiguous. These are unambiguous; the name stays for humans.
+    """
     env = {
         "RPFARM_TOKEN": token,
         "RPFARM_ROLE": role,
         "RPFARM_SLOTS": str(slots),
+        "RPFARM_USER": cfg.user,
+        "RPFARM_COOK": cook,
+        "RPFARM_PROJECT": project,
         "PUBLIC_KEY": pubkey,
         "HOUDINI_VERSION": cfg.houdini_version,
         "SESINETD_HOST": cfg.sesinetd_host,
@@ -70,6 +87,73 @@ def pod_env(cfg, role, token, slots, pubkey, extra=None):
     if extra:
         env.update(extra)
     return env
+
+
+# -- who owns a pod, and is its cook alive -----------------------------------
+
+# How long after a scheduler last spoke to a pod we still treat it as driven.
+# A live cook's gap between two tasks is seconds; this is generous on purpose,
+# because the cost of waiting is a few cents and the cost of being wrong is
+# somebody's render.
+COOK_ALIVE_GRACE_S = 180.0
+
+
+def pod_owner(pod):
+    """The user a pod belongs to: its env first, its name second.
+
+    Falls back to the name because pods created before RPFARM_USER existed are
+    still on the account, and "I cannot tell" must never silently become "mine".
+    """
+    env = pod.get("env") or {}
+    owner = (env.get("RPFARM_USER") or "").strip()
+    if owner:
+        return owner
+    name = pod.get("name") or ""
+    if name.startswith("rpfarm-sync-"):
+        return name[len("rpfarm-sync-"):]
+    if name.startswith("rpfarm-"):
+        rest = name[len("rpfarm-"):]
+        return rest.split("-", 1)[0] if rest else ""
+    return ""
+
+
+def pod_cook(pod):
+    env = pod.get("env") or {}
+    return (env.get("RPFARM_COOK") or "").strip()
+
+
+def classify_for_kill(pod, me, health=None, health_error=None,
+                      grace_s=COOK_ALIVE_GRACE_S):
+    """``(verdict, reason)`` -- may this pod be terminated without being asked?
+
+    ``verdict`` is one of ``"safe"``, ``"busy"``, ``"foreign"``, ``"unknown"``.
+    Only ``"safe"`` is killed by a plain ``farm kill --all``; the rest need a
+    flag that says out loud what it is overriding.
+
+    Ownership is checked before liveness on purpose: another artist's *idle*
+    pod is still not ours to take, and reporting it as "foreign" says something
+    the caller can act on, where "safe" would be a lie with a price.
+
+    ``health`` is the pod's own ``/health``. Unreachable (``health_error``)
+    means we do not know, and not knowing resolves to leaving it alone -- the
+    expensive mistake is killing something live, not paying a few cents while
+    a human decides.
+    """
+    owner = pod_owner(pod)
+    if owner and me and owner != me:
+        return "foreign", "belongs to {}".format(owner)
+    if health_error is not None or health is None:
+        return "unknown", "could not reach it to ask ({})".format(
+            health_error or "no answer")
+    busy = int(health.get("busy") or 0)
+    if busy > 0:
+        return "busy", "running {} task(s)".format(busy)
+    idle = health.get("idle_s")
+    if idle is None:
+        return "unknown", "it did not report how long it has been idle"
+    if float(idle) < grace_s:
+        return "busy", "a scheduler was talking to it {:.0f}s ago".format(float(idle))
+    return "safe", "idle for {:.0f}s".format(float(idle))
 
 
 # -- readiness ----------------------------------------------------------

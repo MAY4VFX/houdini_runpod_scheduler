@@ -1060,7 +1060,10 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
                 self._cfg.user, self._project, self._cook_id,
                 len(self._dispatcher.pods) + 1,
             )
-            env = rppods.pod_env(self._cfg, "gpu", self._token, slots, self._pubkey)
+            # cook + project on the pod itself, so `farm kill` can tell whose
+            # this is and which cook it serves without any local state.
+            env = rppods.pod_env(self._cfg, "gpu", self._token, slots, self._pubkey,
+                                 cook=self._cook_id, project=self._project)
             try:
                 pod = self._api.create_gpu_pod(
                     name, self._templateId(), self._gpu_list, self._volumeId(),

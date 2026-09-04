@@ -156,6 +156,41 @@ class Task:
         self.state_lock = threading.Lock()
 
 
+class LastRequest:
+    """When this pod was last asked to do something real.
+
+    Together with ``Registry.busy()`` this is the pod's whole liveness story,
+    and both readers want the same two numbers:
+
+    * ``rpfarm farm kill`` asks over ``/health`` before terminating anything --
+      a pod that is running a task, or that a scheduler was talking to seconds
+      ago, belongs to a live cook and is not safe to kill (an agent killed a
+      colleague's pods 36 seconds after their cook finished; had it looked one
+      minute earlier it would have destroyed a live render);
+    * the idle watchdog in task-18 will ask the same two locally, to decide
+      whether the pod should terminate itself.
+
+    ``/health`` deliberately does NOT count as a request. It is what the
+    killer polls, so counting it would let the act of asking "is this idle?"
+    make the answer "no" -- and it is also what a watchdog would poll, which
+    would keep an abandoned pod alive forever. Every other authorized route
+    means a scheduler is actually driving this pod.
+    """
+
+    def __init__(self, clock=time.time):
+        self._clock = clock
+        self._at = clock()
+        self._lock = threading.Lock()
+
+    def touch(self):
+        with self._lock:
+            self._at = self._clock()
+
+    def idle_s(self):
+        with self._lock:
+            return max(0.0, self._clock() - self._at)
+
+
 class Registry:
     """Tracks tasks and enforces the pod's slot limit."""
 
@@ -429,6 +464,7 @@ def make_server(host, port, log_dir="/workspace/ledger/logs"):
     role = os.environ.get("RPFARM_ROLE", "gpu")
     slots = int(os.environ.get("RPFARM_SLOTS", "1"))
     registry = Registry(slots, log_dir)
+    last_request = LastRequest()
     detached = DetachedRuns(os.path.join(WORKSPACE_ROOT, EXEC_DIR_REL))
 
     class Handler(BaseHTTPRequestHandler):
@@ -482,6 +518,11 @@ def make_server(host, port, log_dir="/workspace/ledger/logs"):
                 self._drain_body()
                 self._send_json(401, {"error": "unauthorized"})
                 return False
+            # /health is excluded on purpose: it is what `farm kill` and the
+            # idle watchdog poll, so counting it would make the act of asking
+            # "has anyone touched this pod?" the reason the answer is yes.
+            if urlparse(self.path).path != "/health":
+                last_request.touch()
             return True
 
         # -- routing -----------------------------------------------------
@@ -538,6 +579,18 @@ def make_server(host, port, log_dir="/workspace/ledger/logs"):
                     "uptime_s": int(time.time() - START),
                     "hfs": hfs,
                     "houdini_ok": houdini_ok,
+                    # Who this pod belongs to and what it is working on, read
+                    # from the environment it was created with, so a caller can
+                    # answer "whose is this, and is its cook alive?" without any
+                    # local state -- see rpfarm.pods.classify_for_kill.
+                    "user": os.environ.get("RPFARM_USER", ""),
+                    "cook": os.environ.get("RPFARM_COOK", ""),
+                    "project": os.environ.get("RPFARM_PROJECT", ""),
+                    # Seconds since the last non-/health request. `busy` alone
+                    # is not enough: between two tasks of a live cook it dips
+                    # to zero for a moment, and that moment must not read as
+                    # "abandoned".
+                    "idle_s": round(last_request.idle_s(), 1),
                 },
             )
 
