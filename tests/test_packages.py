@@ -4,6 +4,7 @@ import os
 import pytest
 
 from rpfarm.packages import (
+    SYNC_TOUCH_COMMAND,
     build_download_items,
     build_upload_items,
     delocalize_via_pathmap,
@@ -412,7 +413,7 @@ def test_run_upload_item_no_compress(tmp_path, monkeypatch):
     )
     assert stats["files"] == 1 and stats["bytes"] == 10 and stats["seconds"] == pytest.approx(0.1)
     assert calls == [("up", str(tmp_path), "/workspace/apps/plug", 1)]
-    assert any("sync_last_used" in c for c in sync_client.commands)
+    assert SYNC_TOUCH_COMMAND in sync_client.commands
 
 
 def test_run_upload_item_runs_post_command(tmp_path, monkeypatch):
@@ -878,7 +879,7 @@ def test_run_download_item_no_files(tmp_path, monkeypatch):
         item, FakeCfg(), SftpTarget(host="1.2.3.4", port=22, key_path="/k"), sync_client, "newer", progress_cb=None
     )
     assert stats == {"files": 0, "bytes": 0, "seconds": 0.0}
-    assert any("sync_last_used" in c for c in sync_client.commands)
+    assert SYNC_TOUCH_COMMAND in sync_client.commands
 
 
 def test_run_download_item_newer_uses_update_flag(tmp_path, monkeypatch):
@@ -1320,7 +1321,7 @@ def test_run_upload_item_runs_post_command_detached_not_synchronously(tmp_path, 
 
     assert [c for c, _ in client.detached] == [post]
     # the short bookkeeping touches stay on the synchronous path
-    assert any("sync_last_used" in c for c in client.commands)
+    assert SYNC_TOUCH_COMMAND in client.commands
 
 
 def test_run_upload_item_post_command_deadline_is_the_scaled_timeout(tmp_path, monkeypatch):
@@ -1387,3 +1388,175 @@ def test_exec_checked_says_no_output_only_when_there_really_is_none():
 
     with pytest.raises(RuntimeError, match=r"\(no output\)"):
         _exec_checked(Silent(), "cmd", 60)
+
+
+# -- sync-pod idle stamp (final-review finding 1) ----------------------------
+
+
+def _housekeeping():
+    """The pod-side module, imported the same way tests/test_housekeeping.py
+    imports it (pod/ is not a package)."""
+    import sys
+
+    pod_dir = os.path.join(os.path.dirname(__file__), "..", "pod")
+    if pod_dir not in sys.path:
+        sys.path.insert(0, pod_dir)
+    import housekeeping
+
+    return housekeeping
+
+
+class RealTouchSyncClient(FakeSyncClient):
+    """FakeSyncClient whose ``sync-touch`` really runs pod/housekeeping.py.
+
+    Closes the loop the two-writers bug slipped through: the command the
+    upload/download path actually sends is executed by the same code the
+    pod would run, and the file it leaves behind is then handed to both
+    readers.
+    """
+
+    def __init__(self, root, **kw):
+        super().__init__(**kw)
+        self.root = str(root)
+
+    def exec(self, command, timeout_s=600):
+        result = super().exec(command, timeout_s=timeout_s)
+        if command == SYNC_TOUCH_COMMAND:
+            _housekeeping().cmd_sync_touch(self.root)
+        return result
+
+
+def _stamp_readers(volume_root):
+    """``(hda_reader_value, housekeeping_idle_seconds)`` for the stamp on
+    ``volume_root``. The first is exactly what the scheduler HDA's
+    ``_retireStaleSyncPod`` does: ``float(read_file(path).strip())``."""
+    hk = _housekeeping()
+    raw = open(os.path.join(volume_root, ".rpfarm", "sync_last_used")).read()
+    return float(raw.strip()), hk.cmd_sync_idle(volume_root)["idle_seconds"]
+
+
+def _touch_upload_item(tmp_path):
+    src = tmp_path / "f.txt"
+    src.write_bytes(b"x" * 10)
+    return {
+        "index": 0,
+        "local_root": str(tmp_path),
+        "remote_root": "/workspace/projects/may/shotA",
+        "files": [[str(src), "/workspace/projects/may/shotA/f.txt", 10]],
+        "bytes": 10,
+        "post_command": "",
+    }
+
+
+def test_upload_stamp_is_parseable_by_both_readers(tmp_path, monkeypatch):
+    """Finding 1: run_upload_item used to write the stamp with a bare
+    ``touch``, which creates an EMPTY file -- unparseable by the scheduler
+    HDA's reader and by housekeeping's ``sync-idle`` alike, so the sync pod
+    could never be auto-retired."""
+    monkeypatch.setattr("rpfarm.packages.rclone_copy", _fake_rclone_copy)
+    volume = tmp_path / "workspace"
+    client = RealTouchSyncClient(volume)
+
+    run_upload_item(
+        _touch_upload_item(tmp_path), FakeCfg(),
+        SftpTarget(host="1.2.3.4", port=22, key_path="/k"), client, compress=False,
+    )
+
+    hda_value, idle_seconds = _stamp_readers(str(volume))
+    assert hda_value > 0
+    assert idle_seconds is not None and idle_seconds < 60
+
+
+def test_download_stamp_is_parseable_by_both_readers(tmp_path, monkeypatch):
+    monkeypatch.setattr("rpfarm.packages.rclone_copy", _fake_rclone_copy)
+    volume = tmp_path / "workspace"
+    client = RealTouchSyncClient(volume)
+    item = {
+        "index": 0,
+        "local_root": str(tmp_path / "down"),
+        "remote_root": "/workspace/projects/may/shotA/render",
+        "files": [],
+    }
+
+    run_download_item(
+        item, FakeCfg(), SftpTarget(host="1.2.3.4", port=22, key_path="/k"), client, "newer",
+    )
+
+    hda_value, idle_seconds = _stamp_readers(str(volume))
+    assert hda_value > 0
+    assert idle_seconds is not None and idle_seconds < 60
+
+
+def test_upload_touches_the_stamp_before_the_transfer_too(tmp_path, monkeypatch):
+    """A transfer that fails part-way must still have refreshed the stamp,
+    and the stamp must not go stale for the whole length of a package."""
+    order = []
+
+    def spy_rclone_copy(package, target, direction, rclone_bin, local_root, remote_root, **kw):
+        order.append("rclone")
+        return _fake_rclone_copy(package, target, direction, rclone_bin, local_root, remote_root, **kw)
+
+    monkeypatch.setattr("rpfarm.packages.rclone_copy", spy_rclone_copy)
+
+    class OrderedClient(FakeSyncClient):
+        def exec(self, command, timeout_s=600):
+            if command == SYNC_TOUCH_COMMAND:
+                order.append("touch")
+            return super().exec(command, timeout_s=timeout_s)
+
+    client = OrderedClient()
+    run_upload_item(
+        _touch_upload_item(tmp_path), FakeCfg(),
+        SftpTarget(host="1.2.3.4", port=22, key_path="/k"), client, compress=False,
+    )
+    assert order[0] == "touch" and order[-1] == "touch"
+
+
+def test_heartbeat_refreshes_the_stamp_during_a_long_transfer():
+    """A package can transfer for longer than Sync Pod Idle; the stamp has
+    to keep moving while it does, or a concurrent cook retires a sync pod
+    that is in use."""
+    from rpfarm.packages import _SyncTouchHeartbeat
+
+    clock = [0.0]
+    client = FakeSyncClient()
+    forwarded = []
+    hb = _SyncTouchHeartbeat(
+        client, progress_cb=lambda *a: forwarded.append(a), interval_s=60.0, now=lambda: clock[0]
+    )
+
+    for _ in range(30):  # 30 stats lines, one per second
+        clock[0] += 1.0
+        hb(1, 2, 3)
+    assert client.commands == [], "no touch yet -- under the interval"
+
+    clock[0] += 31.0
+    hb(1, 2, 3)
+    assert client.commands == [SYNC_TOUCH_COMMAND]
+
+    clock[0] += 61.0
+    hb(1, 2, 3)
+    assert client.commands == [SYNC_TOUCH_COMMAND, SYNC_TOUCH_COMMAND]
+    assert len(forwarded) == 32, "every call still reaches the wrapped progress_cb"
+
+
+def test_heartbeat_never_fails_a_transfer():
+    """A touch is bookkeeping. If the sync pod refuses it, the transfer that
+    is otherwise succeeding must not die with it."""
+    from rpfarm.packages import _SyncTouchHeartbeat
+
+    class Exploding:
+        def exec(self, command, timeout_s=600):
+            raise RuntimeError("pod gone")
+
+    clock = [0.0]
+    hb = _SyncTouchHeartbeat(Exploding(), progress_cb=None, interval_s=1.0, now=lambda: clock[0])
+    clock[0] = 100.0
+    hb(1, 2, 3)  # no raise
+
+
+def test_heartbeat_wraps_a_none_progress_cb():
+    from rpfarm.packages import _SyncTouchHeartbeat
+
+    hb = _SyncTouchHeartbeat(FakeSyncClient(), progress_cb=None)
+    hb(1, 2, 3)  # no raise

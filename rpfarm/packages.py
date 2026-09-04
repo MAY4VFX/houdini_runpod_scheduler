@@ -462,6 +462,70 @@ def _touch_project_index(sync_client, remote_root, event):
     )
 
 
+# The one command that writes the sync pod's idle stamp. Both readers --
+# ``pod/housekeeping.py``'s ``sync-idle`` and the scheduler HDA's
+# ``_retireStaleSyncPod`` -- parse the file's *content* as a float, so the
+# format has to live in exactly one place. It lives in housekeeping's
+# ``sync-touch`` (the pod side), and every caller goes through this.
+#
+# Final-review fix: this module used to run a bare
+# ``touch /workspace/.rpfarm/sync_last_used``, which creates an EMPTY file
+# and never rewrites an existing one -- unparseable by either reader, so
+# the sync pod could never be auto-retired (Ruling R32's ~8h idle pod) and
+# ``rpfarm farm status`` silently dropped its idle line.
+SYNC_TOUCH_COMMAND = "python3 /opt/rpfarm/housekeeping.py sync-touch"
+
+# How often a long transfer refreshes the stamp while it is still running.
+_SYNC_TOUCH_INTERVAL_S = 60.0
+
+
+def touch_sync_pod(sync_client, timeout_s=30):
+    """Record "in use now" on the sync pod so it survives the idle check.
+
+    Best-effort like :func:`_touch_project_index` beside it: keeping the
+    pod alive is bookkeeping around a transfer, never the transfer itself.
+    """
+    if sync_client is None:
+        return
+    sync_client.exec(SYNC_TOUCH_COMMAND, timeout_s=timeout_s)
+
+
+class _SyncTouchHeartbeat:
+    """``progress_cb`` wrapper that also refreshes the sync pod's stamp.
+
+    Final-review fix, second half: the stamp used to be written only once
+    a package had finished transferring. One package can easily run longer
+    than Sync Pod Idle (15 min by default), so another artist's cook could
+    call ``_retireStaleSyncPod`` and terminate a sync pod mid-transfer.
+    rclone emits a stats line every second (``--stats 1s``, see
+    ``rpfarm.sync._COMMON_RCLONE_FLAGS``), so wrapping the progress
+    callback is clock enough -- no thread, and nothing extra to shut down.
+
+    Forwards every call to the wrapped callback (which may be ``None``)
+    and swallows any touch failure: a heartbeat must never fail a transfer
+    that is otherwise succeeding.
+    """
+
+    def __init__(self, sync_client, progress_cb=None, interval_s=_SYNC_TOUCH_INTERVAL_S, now=time.monotonic):
+        self._sync_client = sync_client
+        self._progress_cb = progress_cb
+        self._interval_s = interval_s
+        self._now = now
+        self._last_touch = now()
+
+    def __call__(self, done, total, speed):
+        if self._progress_cb is not None:
+            self._progress_cb(done, total, speed)
+        now = self._now()
+        if now - self._last_touch < self._interval_s:
+            return
+        self._last_touch = now
+        try:
+            touch_sync_pod(self._sync_client)
+        except Exception:  # noqa: BLE001 - see the class docstring
+            pass
+
+
 # Spec 4.1: "Ресайз вверх автоматический: при заполнении > 85% перед
 # заливкой шедулер/upload увеличивает volume на нужный объём (с
 # округлением до 10 ГБ) и пишет об этом в лог ноды." RunPod volumes only
@@ -849,6 +913,11 @@ def run_upload_item(item, cfg, sftp, sync_client, compress, progress_cb=None):
     local_root = item["local_root"]
     remote_root = item["remote_root"]
 
+    # Stamp before the transfer as well as after it, and keep stamping
+    # while it runs -- see _SyncTouchHeartbeat.
+    touch_sync_pod(sync_client)
+    progress_cb = _SyncTouchHeartbeat(sync_client, progress_cb)
+
     total_files = 0
     total_bytes = 0
     total_seconds = 0.0
@@ -886,7 +955,7 @@ def run_upload_item(item, cfg, sftp, sync_client, compress, progress_cb=None):
     if post_command:
         _exec_checked(sync_client, post_command, timeout_s)
 
-    sync_client.exec("mkdir -p /workspace/.rpfarm && touch /workspace/.rpfarm/sync_last_used")
+    touch_sync_pod(sync_client)
     _touch_project_index(sync_client, remote_root, "upload")
 
     return {"files": total_files, "bytes": total_bytes, "seconds": total_seconds}
@@ -927,6 +996,9 @@ def run_download_item(item, cfg, sftp, sync_client, overwrite, progress_cb=None)
     local_root = item["local_root"]
     remote_root = item["remote_root"]
 
+    touch_sync_pod(sync_client)
+    progress_cb = _SyncTouchHeartbeat(sync_client, progress_cb)
+
     if entries:
         os.makedirs(local_root, exist_ok=True)
         stats = rclone_copy(
@@ -942,7 +1014,7 @@ def run_download_item(item, cfg, sftp, sync_client, overwrite, progress_cb=None)
     else:
         stats = SyncStats(files=0, bytes=0, seconds=0.0)
 
-    sync_client.exec("mkdir -p /workspace/.rpfarm && touch /workspace/.rpfarm/sync_last_used")
+    touch_sync_pod(sync_client)
     _touch_project_index(sync_client, remote_root, "download")
 
     return {"files": stats.files, "bytes": stats.bytes, "seconds": stats.seconds}

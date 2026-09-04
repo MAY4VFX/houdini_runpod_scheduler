@@ -1599,14 +1599,19 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
             remote, stats.files, stats.bytes))
 
     def _touchSyncPod(self):
-        """Record 'in use now' on the sync pod so it survives the idle check."""
-        if self._sync_client is None:
-            return
-        self._sync_client.exec(
-            "mkdir -p {} && echo {} > {}".format(
-                posixpath.dirname(_SYNC_LAST_USED), int(time.time()), _SYNC_LAST_USED),
-            timeout_s=30,
-        )
+        """Record 'in use now' on the sync pod so it survives the idle check.
+
+        Goes through rpfarm.packages.touch_sync_pod -- which runs
+        housekeeping's own ``sync-touch`` -- rather than formatting the
+        stamp here. Final-review fix: this method used to write the epoch
+        with `echo`, while rpfarm/packages.py's upload/download items ran a
+        bare `touch` that leaves an EMPTY file. Both readers
+        (_retireStaleSyncPod below and housekeeping's `sync-idle`) parse
+        the file's content as a float, so two writers with two formats
+        meant the stamp the package path left behind was unparseable and
+        the sync pod could never be auto-retired (Ruling R32).
+        """
+        rppkg.touch_sync_pod(self._sync_client)
 
     def _touchProjectIndex(self, event):
         """Stamp this project's entry in housekeeping's /workspace/.rpfarm/index.json.
