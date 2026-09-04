@@ -331,3 +331,50 @@ def test_the_tick_drains_the_retry_list():
     tick = src[src.index("def onTick("):]
     tick = tick[:tick.index("\n    def ", 1)]
     assert "self._retryTerminations()" in tick
+
+
+# -- the sync-touch the scheduler sends (Task 17, residual A) -----------------
+
+
+class _StaleImageSyncClient:
+    """A sync pod whose /opt/rpfarm/housekeeping.py predates ``sync-touch``."""
+
+    def exec(self, command, timeout_s=600):
+        return {
+            "exit_code": 2,
+            "stdout": "",
+            "stderr": "housekeeping.py: error: argument command: invalid choice: 'sync-touch'",
+        }
+
+
+def test_the_scheduler_says_so_when_its_sync_touch_fails():
+    """`WorkerClient.exec` never raises on a non-zero exit, and this method
+    used to throw the result away -- so a stale pod image left the idle
+    stamp unwritten (the pod then never auto-retires and keeps billing)
+    with no line anywhere. The real rpfarm.packages is used here, not a
+    stand-in: rename touch_sync_pod and this fails."""
+    from rpfarm import packages as rppkg
+
+    ns = load_methods(["_touchSyncPod"], {"rppkg": rppkg})
+    sched = FakeScheduler()
+    sched._sync_client = _StaleImageSyncClient()
+
+    ns["_touchSyncPod"](sched)
+
+    assert len(sched.logs) == 1
+    assert "sync pod idle stamp NOT written" in sched.logs[0]
+    assert "invalid choice" in sched.logs[0]
+
+
+def test_a_working_sync_touch_stays_quiet():
+    from rpfarm import packages as rppkg
+
+    class Ok:
+        def exec(self, command, timeout_s=600):
+            return {"exit_code": 0, "stdout": "", "stderr": ""}
+
+    ns = load_methods(["_touchSyncPod"], {"rppkg": rppkg})
+    sched = FakeScheduler()
+    sched._sync_client = Ok()
+    ns["_touchSyncPod"](sched)
+    assert sched.logs == []

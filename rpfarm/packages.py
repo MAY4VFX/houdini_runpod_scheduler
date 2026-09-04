@@ -37,6 +37,7 @@ import json
 import math
 import os
 import posixpath
+import sys
 import tempfile
 import time
 
@@ -479,15 +480,70 @@ SYNC_TOUCH_COMMAND = "python3 /opt/rpfarm/housekeeping.py sync-touch"
 _SYNC_TOUCH_INTERVAL_S = 60.0
 
 
-def touch_sync_pod(sync_client, timeout_s=30):
+# What a failed ``sync-touch`` means, in the words the artist needs. The
+# overwhelmingly likely cause is a pod whose ``/opt/rpfarm/housekeeping.py``
+# predates the ``sync-touch`` subcommand (a merge that bypassed the CI image
+# publish, or simply a sync pod that has not been recreated since): argparse
+# then answers ``invalid choice: 'sync-touch'`` and exits 2. Any other
+# non-zero exit is just as fatal to the stamp, so the same line covers both
+# -- it names the likely cause and the fix rather than guessing.
+_SYNC_TOUCH_FAILED = (
+    "sync pod idle stamp NOT written: `{command}` exited {code}{detail}. "
+    "Most likely the sync pod runs an image older than the `sync-touch` "
+    "command. Terminate it (`rpfarm farm kill --sync`) so the next cook "
+    "recreates it from the current image -- until then the stamp never moves "
+    "and the pod can never be auto-retired, so it keeps billing."
+)
+
+
+def _stderr_log(message):
+    """Default sink for the warnings below.
+
+    stderr rather than a ``logging`` logger: every caller of this module is
+    either ``rpfarm.package_runner`` (whose stdout/stderr *is* the work
+    item's log) or the scheduler HDA (which passes its own ``_log``), and
+    neither configures logging.
+    """
+    print("[rpfarm] " + message, file=sys.stderr, flush=True)
+
+
+def _sync_touch_failure(result):
+    """The warning line for a non-zero ``sync-touch``, or ``None`` if it
+    actually worked."""
+    code = (result or {}).get("exit_code")
+    if code == 0:
+        return None
+    detail = (result or {}).get("stderr") or (result or {}).get("stdout") or ""
+    return _SYNC_TOUCH_FAILED.format(
+        command=SYNC_TOUCH_COMMAND,
+        code=code,
+        detail=(": " + detail.strip()[-400:]) if detail.strip() else "",
+    )
+
+
+def touch_sync_pod(sync_client, timeout_s=30, log=_stderr_log):
     """Record "in use now" on the sync pod so it survives the idle check.
 
     Best-effort like :func:`_touch_project_index` beside it: keeping the
-    pod alive is bookkeeping around a transfer, never the transfer itself.
+    pod alive is bookkeeping around a transfer, never the transfer itself,
+    so a failure is reported and not raised.
+
+    Reported, though -- :meth:`rpfarm.worker_client.WorkerClient.exec` never
+    raises on a non-zero exit and every caller used to throw the result
+    away, so a pod that cannot run ``sync-touch`` at all silently
+    reproduced the un-retirable sync pod this command exists to prevent,
+    with no line about it anywhere. ``log(message)`` is called instead;
+    pass ``log=None`` to stay silent.
+
+    Returns the raw ``exec`` result (``None`` when there is no client).
     """
     if sync_client is None:
-        return
-    sync_client.exec(SYNC_TOUCH_COMMAND, timeout_s=timeout_s)
+        return None
+    result = sync_client.exec(SYNC_TOUCH_COMMAND, timeout_s=timeout_s) or {}
+    message = _sync_touch_failure(result)
+    if message and log is not None:
+        log(message)
+    return result
 
 
 class _SyncTouchHeartbeat:
@@ -504,14 +560,30 @@ class _SyncTouchHeartbeat:
     Forwards every call to the wrapped callback (which may be ``None``)
     and swallows any touch failure: a heartbeat must never fail a transfer
     that is otherwise succeeding.
+
+    It does say so once, though. A heartbeat that keeps failing is the same
+    un-retirable sync pod :func:`touch_sync_pod` warns about, and a beat a
+    minute for the length of a big package would bury the log in identical
+    lines -- so the first failure is reported and the rest are silent. The
+    pre- and post-transfer touches around this heartbeat report every time
+    (there are only two of them).
     """
 
-    def __init__(self, sync_client, progress_cb=None, interval_s=_SYNC_TOUCH_INTERVAL_S, now=time.monotonic):
+    def __init__(self, sync_client, progress_cb=None, interval_s=_SYNC_TOUCH_INTERVAL_S,
+                 now=time.monotonic, log=_stderr_log):
         self._sync_client = sync_client
         self._progress_cb = progress_cb
         self._interval_s = interval_s
         self._now = now
+        self._log = log
+        self._warned = False
         self._last_touch = now()
+
+    def _warn_once(self, message):
+        if self._warned or self._log is None:
+            return
+        self._warned = True
+        self._log(message + " (further heartbeat failures in this transfer are not repeated)")
 
     def __call__(self, done, total, speed):
         if self._progress_cb is not None:
@@ -521,9 +593,9 @@ class _SyncTouchHeartbeat:
             return
         self._last_touch = now
         try:
-            touch_sync_pod(self._sync_client)
-        except Exception:  # noqa: BLE001 - see the class docstring
-            pass
+            touch_sync_pod(self._sync_client, log=self._warn_once)
+        except Exception as e:  # noqa: BLE001 - see the class docstring
+            self._warn_once("sync pod idle-stamp heartbeat failed: {}".format(e))
 
 
 # Spec 4.1: "Ресайз вверх автоматический: при заполнении > 85% перед
