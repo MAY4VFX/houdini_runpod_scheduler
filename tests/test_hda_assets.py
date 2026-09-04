@@ -413,3 +413,32 @@ def test_download_node_warns_when_the_scheduler_already_downloads_outputs():
     # and it is checked in the outputs branch, before anything is planned
     assert generate.index("_scheduler_downloads_outputs()") < generate.index(
         "Outputs mode with no upstream input")
+
+
+def test_the_gpu_set_is_a_menu_not_a_string_to_type_from_memory():
+    """`gpu_priority` was a comma-separated string whose semantics were "first
+    of these that exists". The owner asked for a set -- "any of these" -- built
+    from the live catalogue."""
+    dialog = (pathlib.Path(__file__).resolve().parent.parent / "hda"
+              / "runpodfarm_scheduler.hda" / "Top_1runpodfarmscheduler"
+              / "DialogScript").read_text(encoding="utf-8")
+
+    assert 'name    "rpfarm_gpuadd"' in dialog
+    assert 'name    "rpfarm_gpuconsumer"' in dialog
+    assert "hou.phm().gpuMenu(kwargs)" in dialog
+    assert "hou.phm().onAddGpu(kwargs)" in dialog
+    # A Houdini python menu script is an expression, not a function body:
+    # a leading `return` is a SyntaxError and the menu silently comes back empty.
+    assert "return hou.phm().gpuMenu" not in dialog
+
+
+def test_the_scheduler_sorts_the_gpu_set_by_price_before_sending_it():
+    """gpuTypePriority is custom, so RunPod walks our order -- which is what
+    makes "any of these" mean "the cheapest of these that exists"."""
+    src = (pathlib.Path(__file__).resolve().parent.parent / "hda"
+           / "runpodfarm_scheduler.hda" / "Top_1runpodfarmscheduler"
+           / "PythonModule").read_text(encoding="utf-8")
+
+    assert "rpgpus.order_for_request(chosen, rows)" in src
+    # and a catalogue it cannot fetch must not stop the cook
+    assert "using it as given" in src

@@ -102,10 +102,30 @@
         }
         parm {
             name    "rpfarm_gpulist"
-            label   "GPU Priority"
+            label   "GPUs To Use"
             type    string
             default { [ "hou.phm().cfg_default(\"gpu_priority\")" python ] }
-            help    "Comma-separated RunPod GPU type names, most wanted first; the first one in stock is used. Shows gpu_priority from ~/.rpfarm/config.toml, which is what this node will actually use; type your own and the literal replaces the expression and wins. Empty means there is no config yet -- run `rpfarm setup`."
+            help    "The set of GPU types this cook may rent -- ANY of them, not a ranking. Add with the menu below; edit or clear the text directly to remove one. On submit the set is sorted cheapest-first and sent that way, so RunPod takes the cheapest of your choices that has capacity. Shows gpu_priority from ~/.rpfarm/config.toml, which is what this node will actually use; type your own and the literal replaces the expression and wins."
+        }
+        parm {
+            name    "rpfarm_gpuadd"
+            label   "Add A GPU"
+            type    string
+            default { "" }
+            menu {
+                [ "hou.phm().gpuMenu(kwargs)" ]
+                language python
+            }
+            parmtag { "script_callback" "hou.phm().onAddGpu(kwargs)" }
+            parmtag { "script_callback_language" "python" }
+            help    "Pick a card to add to the set above. Houdini has no multi-select parameter, so this menu appends to that list and empties itself. A * marks one already in the set. Prices come from RunPod's live catalogue for your datacenter and are a RELATIVE hint only -- measured the same day, a 4090 the catalogue priced at $0.34/h billed at $0.740/h while an RTX PRO 4000 at $0.50/h billed at $0.250/h. Cards with no price have no capacity in your datacenter at this moment; they stay pickable because stock returns, and they are tried last."
+        }
+        parm {
+            name    "rpfarm_gpuconsumer"
+            label   "Only Gaming Cards In The Menu"
+            type    toggle
+            default { "1" }
+            help    "Gaming cards (GeForce) tend to be the better value for rendering, so the menu shows only those by default. Turn this off to see the professional and datacenter cards too. It filters the MENU, never the set: anything already chosen stays visible and stays used."
         }
         parm {
             name    "rpfarm_templateid"
