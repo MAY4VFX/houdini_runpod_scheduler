@@ -12,3 +12,6 @@ build/
 
 # `rpfarm smoke` run directories
 tmp/
+
+# PDG scratch, if a local scheduler ever cooks with the checkout as $JOB
+pdgtemp/
