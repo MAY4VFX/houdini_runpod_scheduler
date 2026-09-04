@@ -65,12 +65,11 @@ from .worker_client import WorkerClient
 # Work-item states that mean "finished, one way or the other".
 _TERMINAL_STATES = ("cookedsuccess", "success", "cookedfail", "failed", "cookedcancel", "canceled", "cancelled")
 _SUCCESS_STATES = ("cookedsuccess", "success")
-# "Waiting" is deliberately NOT here: an item sits in Waiting from the moment
-# the graph is planned, so counting it as "running" made the farm-ready stage
-# start before the upload it depends on had finished -- and print a negative
-# duration. "Scheduled" is the first state that means a pod is actually being
-# asked to take the item.
-_RUNNING_STATES = ("cooking", "scheduled")
+# Only "Cooking". An item is "Waiting" from the moment the graph is planned and
+# "Scheduled" as soon as its dependencies are met -- neither means a pod has it,
+# and counting them made the farm-ready stage read as a negative duration in one
+# live run and 0.0s in the next. "Cooking" is set when a pod accepted the task.
+_RUNNING_STATES = ("cooking",)
 
 
 def make_log(prefix):
@@ -511,7 +510,8 @@ class PodWatcher(threading.Thread):
             "first_ip": None,
         })
         entry["rate"] = float(p.get("costPerHr") or entry["rate"])
-        gpu = p.get("machine", {}).get("gpuTypeId") or p.get("gpuTypeId") or ""
+        # `or {}`, not a default: RunPod sends machine: null for a CPU pod.
+        gpu = (p.get("machine") or {}).get("gpuTypeId") or p.get("gpuTypeId") or ""
         if gpu:
             entry["gpu"] = gpu
         if entry["first_ip"] is None and p.get("publicIp"):
@@ -522,7 +522,16 @@ class PodWatcher(threading.Thread):
 
 
 def _stage_rows(result, watcher, started):
-    """The stage table: label, detail, seconds."""
+    """The stage table: label, detail, seconds.
+
+    Two kinds of row. The named stages come from the cook's own work-item
+    timeline (:class:`StageTimer`). The ``pod ...`` rows come from
+    :class:`PodWatcher` and read differently: their detail is the hourly rate
+    and GPU the scheduler actually got, and their time is how long after the
+    pod first appeared in ``GET /pods`` it had a public IP -- RunPod's side of
+    "the pod is up", which is not the same as the worker answering ``/health``
+    (that gap is inside the "farm ready" stage above).
+    """
     stages = result.get("stages") or {}
     counts = result.get("counts") or {}
     rows = []
@@ -695,8 +704,15 @@ def cmd_smoke(args):
     watcher = PodWatcher(cfg)
     watcher.start()
 
+    # Set before the try so the report below is printable on every path,
+    # including one where _run_hython itself blows up -- the pod cleanup in
+    # the finally is the whole reason this function has a try at all, and it
+    # must not be followed by a NameError instead of a summary.
     rc = 1
     result = {}
+    outputs_ok = ledger_ok = False
+    frames = probes = tasks = []
+    cost = None
     try:
         rc = _run_hython(inst, repo, run_dir, payload_path, args.timeout, log)
         try:

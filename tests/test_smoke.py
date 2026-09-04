@@ -116,17 +116,18 @@ def test_node_messages_reports_errors_and_skips_missing_nodes():
 # -- StageTimer ---------------------------------------------------------------
 
 
-def test_stage_timer_ignores_waiting():
-    """An item is Waiting from the moment the graph is planned. Counting that
-    as "running" made the farm-ready stage start before the upload it depends
-    on had even begun -- and print a negative duration in the live run."""
-    item = FakeItem("render_1", "Waiting")
+@pytest.mark.parametrize("state", ["Waiting", "Scheduled"])
+def test_stage_timer_ignores_states_before_a_pod_has_the_item(state):
+    """An item is Waiting from the moment the graph is planned and Scheduled
+    as soon as its dependencies are met. Counting either as "running" made the
+    farm-ready stage read as -14s in one live run and 0.0s in the next."""
+    item = FakeItem("render_1", state)
     node = FakeNode("render", [item])
     timer = smoke.StageTimer({"render": node})
     timer.poll()
     assert timer.window("render") == (None, None)
 
-    item.state = "workItemState.Scheduled"
+    item.state = "workItemState.Cooking"
     timer.poll()
     first, done = timer.window("render")
     assert first is not None and done is None
@@ -395,6 +396,16 @@ def test_pod_watcher_records_rate_gpu_and_first_public_ip():
     assert watcher.pods["p1"]["first_ip"] == first_ip  # first, not latest
     # A later payload without costPerHr must not zero the rate we already saw.
     assert watcher.pods["p1"]["rate"] == pytest.approx(0.25)
+
+
+def test_pod_watcher_handles_a_cpu_pod_with_no_machine():
+    """RunPod sends machine: null for a CPU pod -- a plain .get("machine", {})
+    would raise on None and lose that poll."""
+    cfg = rpcfg.Config(api_key="k", user="may", volume_id="v", template_id="t")
+    watcher = smoke.PodWatcher(cfg)
+    watcher._record({"id": "s1", "name": "rpfarm-sync-may", "costPerHr": 0.06,
+                     "machine": None})
+    assert watcher.pods["s1"]["gpu"] == ""
 
 
 # -- pod cleanup ---------------------------------------------------------------
