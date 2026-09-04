@@ -762,8 +762,8 @@ def cmd_smoke(args):
         return 1
     print("\nOK: {} frame(s) rendered on the farm and downloaded to the ROP's own "
           "paths in {}".format(len(frames), _fmt_duration(time.time() - started)))
-    if not args.keep:
-        print("Run directory kept for inspection: {}".format(run_dir))
+    # Kept either way -- --keep is about the farm, not about this directory.
+    print("Run directory kept for inspection: {}".format(run_dir))
     return 0
 
 

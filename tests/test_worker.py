@@ -156,20 +156,73 @@ def test_exec_detached_leaves_no_zombie(srv):
     installer as `[houdini.install] <defunct>` with PPID 1, which is how the
     cause was identified in the first place.
 
-    Checked by asking the OS: once the run reports done, this process must
-    have no unreaped children left, i.e. `waitpid(-1, WNOHANG)` raises
-    ChildProcessError rather than handing back a corpse.
+    Checked by asking the OS about *this run's* child specifically, by pid:
+    `waitpid(pid, WNOHANG)` raises ChildProcessError once it has been reaped,
+    returns `(pid, status)` while it is a corpse, and `(0, 0)` while it is
+    still alive. Only the first is acceptable. Asking about every child
+    instead (`waitpid(-1, ...)`) made this test answer for whatever other
+    tests in this file happened to still be running, which is what made it
+    fail about one run in three.
     """
     st, body = req(srv, "POST", "/exec", {"command": "true", "detach": True})
     assert st == 202
-    _wait_done(srv, body["handle"])
+    done = _wait_done(srv, body["handle"])
+    assert done["pid"], "status did not report the wrapper's pid"
 
     with pytest.raises(ChildProcessError):
-        os.waitpid(-1, os.WNOHANG)
+        os.waitpid(done["pid"], os.WNOHANG)
 
     # and the exit code survives being reaped
     _st, again = req(srv, "GET", "/exec/" + body["handle"])
     assert again["state"] == "done" and again["exit_code"] == 0
+
+
+def test_exec_status_does_not_call_a_run_done_while_its_wrapper_still_lives(tmp_path, monkeypatch):
+    """The wrapper writes .rc and only *then* runs `exit $rc`, so there is a
+    window where the file says "finished" while the bash that wrote it is
+    still alive -- and therefore not reaped. status() must not report `done`
+    from inside that window: doing so hands the caller a result and leaves a
+    zombie behind, which is the exact fingerprint Task 14 chased.
+
+    Provoked deterministically by writing .rc by hand under a run that is
+    still sleeping, rather than by racing the real wrapper.
+    """
+    monkeypatch.setattr(worker, "DETACHED_REAP_GRACE_S", 0.2)
+    runs = worker.DetachedRuns(str(tmp_path / "exec"))
+    started = runs.start("sleep 30")
+    handle = started["handle"]
+    try:
+        assert runs.status(handle)["state"] == "running"
+
+        # The file appears; the child has not gone anywhere.
+        with open(runs.paths(handle)["rc"], "w") as f:
+            f.write("0")
+
+        st = runs.status(handle)
+        assert st["state"] == "running", "reported done while its child was still alive"
+        assert st["exit_code"] is None
+        assert runs._procs[handle].poll() is None, "the child really was still running"
+    finally:
+        runs._procs[handle].kill()
+        runs._procs[handle].wait()
+
+
+def test_exec_status_reaps_the_child_before_reporting_done(tmp_path):
+    """The positive half: once status() does say `done`, the child must
+    already be reaped -- asserted on the Popen itself rather than by racing
+    waitpid() from the outside."""
+    runs = worker.DetachedRuns(str(tmp_path / "exec"))
+    started = runs.start("exit 5")
+    handle = started["handle"]
+
+    deadline = time.time() + 20
+    while time.time() < deadline:
+        st = runs.status(handle)
+        if st["state"] == "done":
+            break
+        time.sleep(0.05)
+    assert st["state"] == "done" and st["exit_code"] == 5
+    assert runs._procs[handle].returncode is not None, "said done without reaping"
 
 
 def test_exec_detached_writes_its_output_to_a_file_not_the_http_pipe(srv):
