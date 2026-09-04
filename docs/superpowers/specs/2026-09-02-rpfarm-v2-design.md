@@ -302,8 +302,11 @@ staging, на sync-поде post-шаг распаковывает. Уже сж�
 Compression (auto/on/off); Custom: multiparm (local → remote), Post-command (на
 sync-поде после пакета). Пресеты: «Install Houdini from tarball» (источник —
 локальный файл или `sftp://host/path`, назначение `/workspace/apps/dist/`, post:
-распаковать и `houdini.install --auto-install --accept-EULA <дата> --install-dir
-/workspace/houdini/<ver>`). Атрибуты item: files, bytes, seconds, MB/s.
+распаковать и `houdini.install --auto-install --accept-EULA 2021-10-13
+--no-install-license --no-install-menus --no-install-avahi --no-install-hfs-symlink
+--no-install-bin-symlink --make-dir /workspace/houdini/<ver>` — каталог установки у
+`houdini.install` позиционный, флага `--install-dir` нет; проверено на 22.0.393
+в Task 14). Атрибуты item: files, bytes, seconds, MB/s.
 
 **rpfarm_scheduler** — вкладки: *Farm* (GPU priority list, Min/Max pods, Tasks per pod,
 Idle timeout, Budget limit $ на кук, Sync-pod idle); *Paths* (project name = имя папки

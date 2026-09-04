@@ -181,9 +181,40 @@ def test_build_upload_items_rejects_unknown_mode(tmp_path):
 def test_houdini_preset():
     pairs, post = houdini_install_preset("/dl/houdini-22.0.393-linux_x86_64_gcc14.2.tar.gz", "22.0.393")
     assert pairs == [("/dl/houdini-22.0.393-linux_x86_64_gcc14.2.tar.gz", "/workspace/apps/dist/")]
-    assert "--install-dir /workspace/houdini/22.0.393" in post and "tar xzf" in post
+    assert "tar xzf" in post
     assert "houdini-22.0.393-linux_x86_64_gcc14.2.tar.gz" in post
-    assert "--accept-EULA" in post
+    assert "--accept-EULA 2021-10-13" in post
+
+
+def test_houdini_preset_install_dir_is_positional_and_last():
+    """Task 14, against the real 22.0.393 installer: ``houdini.install``
+    has no ``--install-dir`` flag (usage is ``[options] [directory]``) and
+    its option loop breaks on the first unknown token, so the target must
+    be the final word of the invocation, with ``--make-dir`` to create it.
+    """
+    _pairs, post = houdini_install_preset("/dl/houdini-22.0.393-linux_x86_64_gcc14.2.tar.gz", "22.0.393")
+    assert "--install-dir" not in post
+    install = post.split("./houdini.install ", 1)[1].split(" && ", 1)[0]
+    assert install.split()[-1] == "/workspace/houdini/22.0.393"
+    assert "--make-dir /workspace/houdini/22.0.393" in install
+
+
+def test_houdini_preset_disables_avahi_and_bin_symlink():
+    """As root the installer defaults to installing Avahi via apt-get, and
+    a bin symlink into /usr/local/bin; neither belongs on a farm pod."""
+    _pairs, post = houdini_install_preset("/dl/houdini-22.0.393-linux_x86_64_gcc14.2.tar.gz", "22.0.393")
+    assert "--no-install-avahi" in post
+    assert "--no-install-bin-symlink" in post
+
+
+def test_houdini_preset_removes_uploaded_tarball_after_success():
+    """The ~4.3GB tarball is dead weight on the volume once installed, but
+    only removed on success (an && chain) so a failed install can be
+    retried without re-uploading it."""
+    _pairs, post = houdini_install_preset("/dl/houdini-22.0.393-linux_x86_64_gcc14.2.tar.gz", "22.0.393")
+    rm = "rm -f /workspace/apps/dist/houdini-22.0.393-linux_x86_64_gcc14.2.tar.gz"
+    assert rm in post
+    assert post.index("./houdini.install") < post.index(rm)
 
 
 def test_houdini_preset_invalidates_houdini_zone_cache(tmp_path):

@@ -19,8 +19,15 @@ LABEL description="RunPodFarm v2 pod - sshd + worker daemon, Houdini from networ
 
 ENV DEBIAN_FRONTEND=noninteractive
 
+# libatomic1 is required by Houdini 22.0 (gcc 14.2 build): its `hython-bin`
+# links libatomic.so.1 directly, and it is the ONLY unresolved `ldd` entry on
+# a stock ubuntu:22.04. Houdini 20.5 did not need it -- it used Houdini's own
+# bundled `libhboost_atomic` -- so this gap only appeared with the 22.0
+# migration (Task 14), where hython died on every pod with
+# "libatomic.so.1: cannot open shared object file".
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 openssh-server rsync curl ca-certificates zstd unzip \
+    libatomic1 \
     libgl1-mesa-glx libglu1-mesa libxi6 libxmu6 libxrandr2 libxcursor1 \
     libxinerama1 libxss1 libasound2 libxkbcommon0 libnss3 libdbus-1-3 \
     && rm -rf /var/lib/apt/lists/* \

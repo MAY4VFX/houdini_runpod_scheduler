@@ -572,25 +572,71 @@ def cmd_doctor(args):
 # -- houdini ----------------------------------------------------------------
 
 
-def _stage_tar_from_sftp_url(url, rclone_bin, tmp_dir, run=subprocess.run):
+# Identity files an ``ssh``/``scp`` to the same host would try on its own,
+# in ssh's own preference order. rclone's sftp backend does *not* read
+# these (or ``~/.ssh/config``): with no ``key_file`` it offers only what an
+# ssh-agent holds, so on a Mac with an empty agent -- the normal state --
+# staging died with "unable to authenticate, attempted methods [none
+# publickey]" even though plain ``scp`` from that host worked. Task 14, the
+# first live run of this path, hit exactly that.
+_SSH_DEFAULT_IDENTITIES = ("id_ed25519", "id_rsa", "id_ecdsa", "id_dsa")
+
+
+def _default_ssh_key_files(home=None):
+    """Existing stock ssh identities, in ssh's own preference order."""
+    home = home or os.path.expanduser("~")
+    paths = [os.path.join(home, ".ssh", name) for name in _SSH_DEFAULT_IDENTITIES]
+    return [p for p in paths if os.path.isfile(p)]
+
+
+def _sftp_remotes_to_try(host, user, key_file=None):
+    """rclone ``:sftp,...:`` remote strings to attempt, in order.
+
+    An explicit ``key_file`` is the only candidate. Otherwise: the bare
+    remote first (an ssh-agent identity, if the agent holds one), then one
+    candidate per stock identity file. rclone takes a single ``key_file``
+    and gives up if it is rejected, whereas ``ssh`` walks its identities
+    until one is accepted -- so the walking has to happen here, or the
+    host's key simply has to be the first one alphabetically. Every
+    candidate fails (or succeeds) at connection setup, before any bytes
+    move, so retrying costs a handshake and never a partial transfer.
+    """
+    base = f":sftp,host={host},user={user}"
+    if key_file:
+        return [f"{base},key_file={key_file}"]
+    return [base] + [f"{base},key_file={p}" for p in _default_ssh_key_files()]
+
+
+def _is_sftp_auth_failure(stderr):
+    return "unable to authenticate" in (stderr or "") or "couldn't connect SSH" in (stderr or "")
+
+
+def _stage_tar_from_sftp_url(url, rclone_bin, tmp_dir, run=subprocess.run, key_file=None):
     """Stage a tarball that lives on an external SFTP host (not the rpfarm
     sync pod) into a local temp file via rclone's on-the-fly ``:sftp,...:``
     remote syntax, so ``cmd_houdini_install`` only ever has to deal with a
-    local path from here on. Auth is whatever rclone's sftp backend picks
-    up by default (ssh-agent / the caller's own ``~/.ssh`` keys) -- the
-    same as a manual ``scp`` from that host would use; this repo's own
-    ``rpfarm`` SSH key is for the farm's pods, not arbitrary hosts.
+    local path from here on. Auth is meant to match what a manual ``scp``
+    from that host would use -- an ssh-agent identity, else whichever of
+    the caller's stock ``~/.ssh`` keys the host accepts
+    (:func:`_sftp_remotes_to_try`, since rclone looks at neither on its
+    own). This repo's own ``rpfarm`` SSH key is for the farm's pods, not
+    arbitrary hosts.
     """
     m = re.match(r"^sftp://(?:([^@/]+)@)?([^/]+)(/.+)$", url)
     if not m:
         raise ValueError(f"invalid sftp url: {url!r} (expected sftp://[user@]host/path)")
     user, host, path = m.group(1) or "root", m.group(2), m.group(3)
     local = os.path.join(tmp_dir, os.path.basename(path))
-    args = [rclone_bin, "copyto", f":sftp,host={host},user={user}:{path}", local]
-    proc = run(args, capture_output=True, text=True)
-    if proc.returncode != 0:
-        raise RuntimeError(f"rclone copyto from {url} failed: {proc.stderr}")
-    return local
+    last_err = ""
+    for remote in _sftp_remotes_to_try(host, user, key_file):
+        args = [rclone_bin, "copyto", f"{remote}:{path}", local]
+        proc = run(args, capture_output=True, text=True)
+        if proc.returncode == 0:
+            return local
+        last_err = proc.stderr
+        if not _is_sftp_auth_failure(last_err):
+            break
+    raise RuntimeError(f"rclone copyto from {url} failed: {last_err}")
 
 
 def cmd_houdini_install(args):
