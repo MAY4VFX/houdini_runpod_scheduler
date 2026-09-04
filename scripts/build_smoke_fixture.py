@@ -223,6 +223,20 @@ def build_topnet(karma):
     download.setInput(0, render)
     download.setDisplayFlag(True)
 
+    # runpodfarm_upload and runpodfarm_download are subnets whose OnCreated
+    # unlocks their contents (Ruling R22 needs to point their internal
+    # scheduler at the topnet's localscheduler). An unlocked HDA instance
+    # saves its *whole internal network* into the .hip, so the fixture would
+    # otherwise carry a frozen copy of whatever generate script was installed
+    # the day it was built -- and go on using it no matter how many times the
+    # HDA is rebuilt. That is not hypothetical: three live runs downloaded
+    # nothing because the fixture was still running Task 10's original
+    # generate. Re-syncing to the current definition here (the definition
+    # already carries the scheduler override, see the builder scripts) keeps
+    # the checked-in scene honest; _verify() asserts it stuck.
+    for node in (upload, download):
+        node.matchCurrentDefinition()
+
     topnet.layoutChildren()
     return topnet
 
@@ -272,6 +286,12 @@ def _verify(dest):
     if roppath != "/out/karma1":
         print("FAIL: ropfetch roppath = {!r}".format(roppath))
         ok = False
+    for name in ("upload", "download"):
+        node = hou.node("/obj/topnet1/" + name)
+        if not node.matchesCurrentDefinition():
+            print("FAIL: {} has an edited/frozen internal network -- it would "
+                  "keep using it and ignore every future HDA rebuild".format(name))
+            ok = False
     print("verify: {}".format("OK" if ok else "FAILED"))
     return 0 if ok else 1
 

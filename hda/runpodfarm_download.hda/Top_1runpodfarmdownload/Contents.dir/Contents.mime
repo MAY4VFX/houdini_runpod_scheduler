@@ -309,6 +309,15 @@ if mode == \"outputs\":
     # outputs as their own build_download_items() call, rather than
     # flattening every upstream item's pairs into one list first, is what
     # makes a single, correct parent available for each resulting item.
+    # One line, every generate pass. An upstream item with no output files is
+    # the single most common reason this node plans nothing, and without this
+    # the symptom is a silent zero -- which is how three rendered frames went
+    # undownloaded for three live runs.
+    _missing = [u.name for u in upstream_items if not list(u.resultData)]
+    print(\"[rpfarm-download] generate: {} upstream item(s), {} without output \"
+          \"files{}\".format(len(upstream_items), len(_missing),
+                           \" ({})\".format(\", \".join(_missing[:5])) if _missing else \"\"),
+          flush=True)
     for up in upstream_items:
         raw_map = up.stringAttribValue(\"rpfarm_pathmap\") or \"\"
         try:
