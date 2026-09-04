@@ -104,6 +104,24 @@ _STATUS_REFRESH_SECONDS = 5.0
 # Cap on how long onStopCook will keep draining queued output downloads.
 _STOP_DRAIN_MAX_SECONDS = 600
 
+# How long a finished work item is held back from workItemSucceeded while its
+# output files catch up. A task's completion arrives out of band, over HTTP
+# from the pod's worker, while the files it produced arrive over PDG's MQ --
+# so completion can, and does, overtake the result data. When it does, every
+# consumer of work_item.resultData sees an empty list: the scheduler's own
+# output downloader queues nothing, and any downstream node generating on
+# "All Upstream Items Cooked" (runpodfarm_download in Upstream Outputs mode,
+# for one) plans nothing. Measured live: three Karma frames whose tasks were
+# seen to exit ~3s before their addOutputFile messages landed produced three
+# EXRs on the volume, zero downloads and zero download work items.
+#
+# Holding the item back costs nothing in pod time -- the slot is released as
+# soon as the task exits, only the report to PDG waits.
+_RESULT_SETTLE_SECONDS = 5.0
+# Longer when the item declared expected outputs (ROP Fetch does): there is
+# something definite to wait for, so wait properly for it.
+_RESULT_SETTLE_EXPECTED_SECONDS = 30.0
+
 # Where the sync pod records the last time a cook used it, so the next cook can
 # retire it once it has been idle past rpfarm_syncidle. Keeping the decision on
 # the artist's side means the pod never needs a RunPod API key of its own.
@@ -448,6 +466,8 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         # Signature of the local PDG script directory at the last upload; see
         # _syncJobScripts.
         self._script_signature = None
+        # Finished-but-not-yet-reported work items; see _settleResults.
+        self._settling = []
         # Ruling R25: set by _mirror_ledger_to_volume in onStopCook, read
         # by _update_status_text (before this reset runs -- see the call
         # order in onStopCook) to tell the artist when the journal didn't
@@ -1006,11 +1026,12 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
 
             work_item = self._work_items.pop(task.work_item_id, None)
             if ok:
-                self.workItemSucceeded(task.work_item_id, -1, duration)
                 self._render_times = (
                     self._render_times + [duration])[-_AUTOSCALE_HISTORY_SIZE:]
-                if work_item is not None:
-                    self._download_outputs(work_item)
+                # Not reported to PDG yet -- see _settleResults and
+                # _RESULT_SETTLE_SECONDS. The pod slot is already free
+                # (dispatcher.complete above), so this costs no farm time.
+                self._queueSettle(task.work_item_id, work_item, duration)
             else:
                 # complete(ok=False) has already put the task on
                 # dispatcher.failed; _reportFailures is the single place that
@@ -1071,6 +1092,57 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         if groups:
             self._verboseLog("queued {} output(s) of item {} for download".format(
                 sum(len(entries) for _, _, entries in groups), work_item.id))
+
+    def _queueSettle(self, work_item_id, work_item, duration):
+        """Hold a finished item until its MQ result data has landed."""
+        expected = 0
+        if work_item is not None:
+            try:
+                expected = len(work_item.expectedResultData)
+            except Exception:  # older PDG, or an item type without it
+                expected = 0
+        grace = _RESULT_SETTLE_EXPECTED_SECONDS if expected else _RESULT_SETTLE_SECONDS
+        self._settling.append({
+            "id": work_item_id,
+            "item": work_item,
+            "duration": duration,
+            "expected": expected,
+            "deadline": time.time() + grace,
+        })
+
+    def _settleResults(self, force=False):
+        """Report held-back items to PDG once their outputs have arrived.
+
+        An item is released as soon as it has at least as many result data
+        entries as it declared expected (and at least one either way), or when
+        its grace period runs out -- whichever comes first. ``force`` releases
+        everything immediately and is used on the way out of a cook, so a
+        cancel can never leave PDG waiting on an item this scheduler is
+        holding.
+        """
+        if not self._settling:
+            return
+        now = time.time()
+        still = []
+        for entry in self._settling:
+            item = entry["item"]
+            try:
+                have = len(item.resultData) if item is not None else 0
+            except Exception:
+                have = 0
+            ready = have > 0 and have >= entry["expected"]
+            if not (ready or force or now >= entry["deadline"]):
+                still.append(entry)
+                continue
+            if not ready:
+                self._verboseLog(
+                    "item {} finished with {} of {} expected output file(s) after "
+                    "waiting for MQ; reporting it anyway".format(
+                        entry["id"], have, entry["expected"]))
+            self.workItemSucceeded(entry["id"], -1, entry["duration"])
+            if item is not None:
+                self._download_outputs(item)
+        self._settling = still
 
     def _drain_sync_queue(self, block=False, deadline=None):
         """Run queued downloads. Failures go back on the queue and are retried
@@ -1733,6 +1805,7 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         self._poll_pods()
         self._dispatch_pending()
         self._poll_tasks()
+        self._settleResults()
         self._reportFailures()
         self._drain_sync_queue()
 
@@ -1802,6 +1875,10 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         self._log("cook {} stopping (cancel={}), {} pod(s), {} task(s) in flight".format(
             self._cook_id, cancel, len(self._dispatcher.pods),
             len(self._dispatcher.running_tasks())))
+
+        # Anything still waiting for its output files has to be reported now:
+        # PDG must never be left waiting on an item this scheduler is holding.
+        self._settleResults(force=True)
 
         if cancel:
             for task in self._dispatcher.running_tasks():
