@@ -15,3 +15,7 @@ tmp/
 
 # PDG scratch, if a local scheduler ever cooks with the checkout as $JOB
 pdgtemp/
+
+# Houdini chat-panel drops these into a scene folder; they are not ours
+tests/fixtures/smoke/AGENTS.md
+tests/fixtures/smoke/CLAUDE.md
