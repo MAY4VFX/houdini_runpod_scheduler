@@ -645,7 +645,7 @@ def _guard():
 
     return load_methods(
         ["_version_tuple", "_ondisk_rpfarm_version", "_stale_module_message",
-         "_ondisk_fingerprint", "_changed_module_files"],
+         "_ondisk_fingerprint", "_asset_mismatch"],
         extra_globals={"ast": ast, "pathlib": pathlib, "hashlib": hashlib, "os": os},
     )
 
@@ -663,41 +663,6 @@ def test_a_newer_package_than_the_asset_needs_is_fine():
     ns = _guard()
 
     assert ns["_stale_module_message"]("2.1.0", "2.4.7", "2.4.7", "/root") is None
-
-
-def test_stale_in_memory_but_fine_on_disk_says_restart_houdini():
-    ns = _guard()
-
-    message = ns["_stale_module_message"]("2.1.0", "2.0.0", "2.1.0", "/root")
-
-    assert message is not None
-    assert "ПЕРЕЗАПУСТИТЕ HOUDINI" in message
-    assert "2.0.0" in message and "2.1.0" in message
-    # The fix must not be confused with the other cause.
-    assert "rpfarm setup" not in message
-
-
-def test_an_old_package_without_a_version_at_all_is_still_caught():
-    """The copy that broke predates VERSION being checked, so getattr gives
-    None -- which must read as stale, not as 'no information'."""
-    ns = _guard()
-
-    message = ns["_stale_module_message"]("2.1.0", None, "2.1.0", "/root")
-
-    assert message is not None
-    assert "ПЕРЕЗАПУСТИТЕ HOUDINI" in message
-
-
-def test_an_old_checkout_says_update_and_setup_not_restart():
-    """Restarting cannot fix a checkout that is behind the installed asset."""
-    ns = _guard()
-
-    message = ns["_stale_module_message"]("2.1.0", "2.0.0", "2.0.0", "/root")
-
-    assert message is not None
-    assert "rpfarm setup" in message
-    assert "ПЕРЕЗАПУСТИТЕ HOUDINI" not in message
-    assert "/root" in message
 
 
 def test_version_tuple_never_raises_on_junk():
@@ -1055,82 +1020,92 @@ def test_the_houdini_only_limit_is_stated_where_it_is_configured():
 
 
 # ---------------------------------------------------------------------------
-# The guard that slept through seven commits (2026-09-05)
+# What the guard is allowed to decide on (2026-09-05, corrected the same day)
 #
-# rpfarm.VERSION sat at 2.2.0 while deps.py, preflight.py and usddeps.py
-# changed under it, so "loaded >= minimum" was true the whole time the loaded
-# code was a week old -- and the owner's cook failed with two CookedFail items
-# and nothing pointing at the cause. A guard that depends on someone
-# remembering to bump a number is off whenever they forget. These tests are
-# about the replacement: compare the FILES.
+# First version: a version floor. It slept through seven commits because
+# rpfarm.VERSION was never bumped -- a guard that depends on someone
+# remembering a number is off whenever they forget.
+#
+# Second version: the package's files against the DISK. That answered the
+# wrong question. Every push while an artist had Houdini open blocked their
+# next cook, and a genuinely broken session -- an asset reinstalled under a
+# running Houdini, which reloads definitions without reopening the scene --
+# could still look fine.
+#
+# This version: what the asset was BUILT AGAINST against what this process
+# LOADED. Both live inside the artist's Houdini, so nothing anyone does in a
+# checkout can move either of them, and a mismatch means exactly one thing:
+# this node was built against different code than the one in memory.
 # ---------------------------------------------------------------------------
 
 
 class _FakePackage:
-    def __init__(self, path, fingerprint):
-        self.__file__ = str(path)
+    def __init__(self, fingerprint, version="2.3.0"):
         self.FINGERPRINT = fingerprint
-        self.VERSION = "2.3.0"
+        self.VERSION = version
 
 
-def test_a_changed_file_is_stale_even_when_the_versions_agree(tmp_path):
-    """The exact hole: same version in memory and on disk, different code."""
-    pkg = tmp_path / "rpfarm"
-    pkg.mkdir()
-    (pkg / "deps.py").write_text("first")
+def test_an_asset_built_against_the_loaded_code_says_nothing():
     ns = _guard()
-    loaded = ns["_ondisk_fingerprint"](str(pkg))
+    baked = {"deps.py": (100, "aaaa"), "preflight.py": (50, "bbbb")}
 
-    (pkg / "deps.py").write_text("second, longer")
-    changed = ns["_changed_module_files"](_FakePackage(pkg / "__init__.py", loaded))
+    assert ns["_asset_mismatch"](_FakePackage(dict(baked)), baked) == []
+    assert ns["_stale_module_message"]("2.3.0", "2.3.0", "2.3.0", "/root", [], True) is None
+
+
+def test_an_asset_built_against_other_code_is_a_hard_stop():
+    ns = _guard()
+    baked = {"deps.py": (100, "aaaa"), "preflight.py": (50, "bbbb")}
+    loaded = {"deps.py": (140, "cccc"), "preflight.py": (50, "bbbb")}
+
+    changed = ns["_asset_mismatch"](_FakePackage(loaded), baked)
 
     assert changed == ["deps.py"]
-    message = ns["_stale_module_message"]("2.3.0", "2.3.0", "2.3.0", str(tmp_path), changed)
-    assert message is not None, "versions matched, the code did not"
+    message = ns["_stale_module_message"]("2.3.0", "2.2.0", "2.3.0", "/root", changed, True)
     assert "ПЕРЕЗАПУСТИТЕ HOUDINI" in message
-    assert "deps.py" in message, "and it names what changed"
+    assert "deps.py" in message
 
 
-def test_an_untouched_package_says_nothing(tmp_path):
-    pkg = tmp_path / "rpfarm"
-    pkg.mkdir()
-    (pkg / "deps.py").write_text("first")
+def test_the_disk_takes_no_part_in_the_decision(tmp_path):
+    """The correction, as a test: a checkout that moves while an artist has
+    Houdini open must not block their cook. Both sides of the comparison are
+    inside the session; nothing here reads a file."""
     ns = _guard()
-    loaded = ns["_ondisk_fingerprint"](str(pkg))
+    baked = {"deps.py": (100, "aaaa")}
+    package = _FakePackage(dict(baked))
 
-    assert ns["_changed_module_files"](_FakePackage(pkg / "__init__.py", loaded)) == []
-    assert ns["_stale_module_message"]("2.3.0", "2.3.0", "2.3.0", str(tmp_path), []) is None
+    pkg_dir = tmp_path / "rpfarm"
+    pkg_dir.mkdir()
+    (pkg_dir / "deps.py").write_text("a checkout that has moved on")
+
+    assert ns["_asset_mismatch"](package, baked) == [], "the disk is not consulted"
 
 
-def test_a_file_restored_to_identical_content_is_not_stale(tmp_path):
-    """Content, not mtime: a git checkout that puts the same bytes back must
-    not send the artist to restart Houdini for nothing."""
-    pkg = tmp_path / "rpfarm"
-    pkg.mkdir()
-    (pkg / "deps.py").write_text("same bytes")
+def test_an_asset_with_no_baked_fingerprint_warns_but_does_not_stop():
+    """An old node cannot be judged. Refusing to cook on "I cannot tell" is
+    how a guard gets switched off for good."""
     ns = _guard()
-    loaded = ns["_ondisk_fingerprint"](str(pkg))
 
-    (pkg / "deps.py").write_text("same bytes")  # rewritten, new mtime
+    assert ns["_asset_mismatch"](_FakePackage({"deps.py": (1, "a")}), {}) == []
+    message = ns["_stale_module_message"]("2.3.0", "2.3.0", "0", "/root", ["<no fingerprint>"], False)
+    assert message is not None
+    assert "ПЕРЕЗАПУСТИТЕ" not in message
+    assert "ВНИМАНИЕ" in message
 
-    assert ns["_changed_module_files"](_FakePackage(pkg / "__init__.py", loaded)) == []
 
-
-def test_a_package_too_old_to_carry_a_fingerprint_is_stale_by_definition(tmp_path):
-    pkg = tmp_path / "rpfarm"
-    pkg.mkdir()
+def test_a_package_too_old_to_carry_a_fingerprint_is_reported_the_same_way():
     ns = _guard()
 
     class _Ancient:
-        __file__ = str(pkg / "__init__.py")
         VERSION = "2.2.0"
 
-    changed = ns["_changed_module_files"](_Ancient())
+    changed = ns["_asset_mismatch"](_Ancient(), {"deps.py": (1, "a")})
 
     assert changed and "fingerprint" in changed[0]
+    assert "ВНИМАНИЕ" in ns["_stale_module_message"]("2.3.0", None, "2.3.0", "/root", changed, True)
 
 
-def test_the_guard_and_the_package_measure_the_same_thing(tmp_path):
+def test_the_guard_and_the_package_measure_the_same_thing():
     """Two implementations on purpose -- the package's own copy may be the
     stale one -- so something has to hold them to the same answer."""
     import rpfarm
@@ -1144,7 +1119,9 @@ def test_the_guard_and_the_package_measure_the_same_thing(tmp_path):
 
 def test_the_scheduler_checks_before_it_rents_anything():
     """The owner was bitten at COOK time, in a session that was fine when the
-    scene opened. A guard that only runs on scene load misses that."""
+    scene opened. A guard that only runs on scene load misses that -- and so
+    does one that only runs on scene load when Houdini reloads a reinstalled
+    asset without reopening the scene."""
     src = MODULE.read_text()
     setup = src.index("def onSetupCook(self):")
     guard = src.index("_stale_module_message(", setup)

@@ -510,3 +510,49 @@ def test_the_upload_guard_does_not_raise_while_the_ui_draws():
     toplevel_raises = [n for n in tree.body if isinstance(n, ast.Raise)]
     assert not toplevel_raises
     assert "raise ImportError(_stale)" not in module
+
+
+def _bake_script():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "bake_asset_fingerprint", REPO / "scripts" / "bake_asset_fingerprint.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_every_shipped_asset_was_built_against_this_package():
+    """The discipline the version number failed at, enforced instead of
+    remembered: if rpfarm changed and the assets were not rebaked, this
+    fails. Without it the guard would be comparing against history and the
+    artist would get "restart Houdini" for a node that is perfectly fine.
+
+        python3 scripts/bake_asset_fingerprint.py
+        # then rebuild upload + stats and reinstall all three
+
+    """
+    bake = _bake_script()
+    guard = bake._hda_guard()
+    block = bake.current_block(guard)
+    stale = [p.relative_to(REPO).as_posix()
+             for p in bake.TARGETS if bake.rewrite(p, guard, block, check=True)]
+
+    assert not stale, f"baked fingerprints are out of date in: {stale}"
+
+
+@pytest.mark.parametrize("asset,typedir", _GUARDED_ASSETS + [
+    ("runpodfarm_upload.hda", "Top_1runpodfarmupload")])
+def test_the_shipped_asset_carries_what_it_was_built_against(asset, typedir):
+    """The comparison the guard makes lives inside the artist's Houdini: the
+    fingerprint baked into the node against the modules this process loaded.
+    Neither side moves when someone pushes to the checkout, which is exactly
+    why the disk-based version of this check had to go."""
+    import rpfarm
+
+    src = _asset_python_module(asset, typedir)
+    assert "_ASSET_FINGERPRINT = {" in src, f"{asset} carries no baked fingerprint"
+    assert f"_ASSET_BUILT_AGAINST_VERSION = {rpfarm.VERSION!r}" in src
+    for name in ("deps.py", "preflight.py", "__init__.py"):
+        size, digest = rpfarm.FINGERPRINT[name]
+        assert f"{name!r}: ({size}, {digest!r})" in src, f"{asset} is stale for {name}"
