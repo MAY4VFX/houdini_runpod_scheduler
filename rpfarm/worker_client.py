@@ -113,8 +113,29 @@ class WorkerClient:
             return "duplicate"
         raise WorkerError(status, raw)
 
+    #: The worker answered, and has never heard of this task. Distinct from
+    #: None, which means we could not ask at all.
+    UNKNOWN_TASK = {"state": "unknown"}
+
     def status(self, task_id) -> dict | None:
-        return self._json("GET", f"/tasks/{task_id}")
+        """A task's status, ``UNKNOWN_TASK``, or None if the pod is unreachable.
+
+        The three answers used to collapse into two: any non-200 became None,
+        so "this worker has no record of your task" was indistinguishable from
+        "I could not reach the worker". The scheduler treats None as "ask
+        again later", which for a task the worker will never report is
+        forever -- the item sat in Cooking while the pod idled and billed
+        (2026-09-05, 21 minutes of an RTX PRO 4000 doing nothing).
+        """
+        status, raw = self._call("GET", f"/tasks/{task_id}")
+        if status == 404:
+            return dict(self.UNKNOWN_TASK)
+        if status != 200 or not raw:
+            return None
+        try:
+            return json.loads(raw)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return None
 
     def log(self, task_id) -> str:
         status, raw = self._call("GET", f"/tasks/{task_id}/log")

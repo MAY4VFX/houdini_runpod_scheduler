@@ -260,7 +260,7 @@ _ASSET_FINGERPRINT = {
     'tls.py': (3642, 'f3e50ea6ebd0308f'),
     'tools.py': (4290, 'c5d3b026f125578f'),
     'usddeps.py': (9631, '3c7192d3bd94d07f'),
-    'worker_client.py': (8816, 'c1cd036661f82a96'),
+    'worker_client.py': (9791, 'cf6b40b1e879c658'),
 }
 # END baked
 
