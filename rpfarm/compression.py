@@ -12,6 +12,9 @@ import struct
 import subprocess
 from enum import Enum
 from pathlib import Path
+from types import SimpleNamespace
+
+from . import tools as _tools
 
 log = logging.getLogger(__name__)
 
@@ -148,8 +151,11 @@ def _probe_compressibility(path: str, sample_size: int = 65536) -> CompressionSt
             ratio = len(compressed) / len(sample)
         else:
             # Fallback to subprocess
+            binary = archiver("zstd")
+            if binary is None:
+                return CompressionStrategy.SKIP
             result = subprocess.run(
-                ["zstd", "-1", "-c"],
+                [binary, "-1", "-c"],
                 input=sample,
                 capture_output=True,
                 timeout=5,
@@ -170,6 +176,28 @@ def _probe_compressibility(path: str, sample_size: int = 65536) -> CompressionSt
         return CompressionStrategy.SKIP
 
 
+_MISSING_WARNED = set()
+
+
+def archiver(name: str = "zstd"):
+    """The absolute path to *name*, or None on a machine that has none.
+
+    Never a bare ``"zstd"``: Houdini launched from the Dock has a PATH
+    without ``/opt/homebrew/bin``, so the name alone raised FileNotFoundError
+    on a machine where zstd was installed the whole time (2026-09-05, an
+    upload item died on it). :mod:`rpfarm.tools` resolves and verifies it by
+    absolute path instead.
+    """
+    found = _tools.resolve_tool(name)
+    if found is None and name not in _MISSING_WARNED:
+        _MISSING_WARNED.add(name)
+        log.warning(
+            "%s not found on this machine -- uploads will not be compressed "
+            "(slower, not broken). Install it (macOS: brew install %s) and "
+            "restart Houdini to get compression back.", name, name)
+    return found.path if found else None
+
+
 def compress_file(src: str, dst: str, strategy: CompressionStrategy, level: int = 3) -> bool:
     """
     Compress a single file according to strategy.
@@ -182,9 +210,14 @@ def compress_file(src: str, dst: str, strategy: CompressionStrategy, level: int 
         raise ValueError("TAR_ZSTD should not be used on single files; use compress_directory for batching")
 
     if strategy == CompressionStrategy.ZSTD:
+        binary = archiver("zstd")
+        if binary is None:
+            # Not an error: the file uploads uncompressed. Losing compression
+            # is slower; failing the work item is a dead cook.
+            return False
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         result = subprocess.run(
-            ["zstd", "-T0", f"-{level}", "-f", src, "-o", dst],
+            [binary, "-T0", f"-{level}", "-f", src, "-o", dst],
             capture_output=True,
             text=True,
         )
@@ -208,8 +241,12 @@ def decompress_file(src: str, dst: str, strategy: CompressionStrategy) -> bool:
     os.makedirs(os.path.dirname(dst), exist_ok=True)
 
     if strategy == CompressionStrategy.ZSTD:
+        binary = archiver("zstd")
+        if binary is None:
+            log.error("cannot decompress %s: no zstd on this machine", src)
+            return False
         result = subprocess.run(
-            ["zstd", "-d", "-f", src, "-o", dst],
+            [binary, "-d", "-f", src, "-o", dst],
             capture_output=True,
             text=True,
         )
@@ -221,8 +258,12 @@ def decompress_file(src: str, dst: str, strategy: CompressionStrategy) -> bool:
     if strategy == CompressionStrategy.TAR_ZSTD:
         dst_dir = os.path.dirname(dst)
         os.makedirs(dst_dir, exist_ok=True)
+        binary = archiver("tar")
+        if binary is None:
+            log.error("cannot unpack %s: no tar on this machine", src)
+            return False
         result = subprocess.run(
-            ["tar", "--zstd", "-xf", src, "-C", dst_dir],
+            [binary, "--zstd", "-xf", src, "-C", dst_dir],
             capture_output=True,
             text=True,
         )
@@ -304,11 +345,17 @@ def compress_directory(src_dir: str, staging_dir: str, enabled: bool = True) -> 
         file_args = [rel for rel, _, _ in vdb_files]
         total_original = sum(sz for _, _, sz in vdb_files)
 
-        result = subprocess.run(
-            ["tar", "--zstd", "-cf", archive_path, "-C", src_dir] + file_args,
-            capture_output=True,
-            text=True,
-        )
+        binary = archiver("tar")
+        if binary is None:
+            # Same outcome as a failed tar: the files below are copied
+            # individually. No archiver is slower, never broken.
+            result = SimpleNamespace(returncode=1, stderr="no tar on this machine")
+        else:
+            result = subprocess.run(
+                [binary, "--zstd", "-cf", archive_path, "-C", src_dir] + file_args,
+                capture_output=True,
+                text=True,
+            )
 
         if result.returncode != 0:
             log.error("VDB batch tar failed for %s: %s", parent_dir, result.stderr)
