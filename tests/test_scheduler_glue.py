@@ -1476,7 +1476,11 @@ def test_nothing_is_said_when_nothing_was_skipped():
 
     load_methods(["_announceCachedItems"], {})["_announceCachedItems"](sched)
 
-    assert sched.logs == []
+    assert not any("skipped" in m for m in sched.logs), sched.logs
+    assert any("0 cached" in m for m in sched.logs), (
+        "the count itself is still reported: a check that says nothing is "
+        "indistinguishable from a check that did not run, which is exactly "
+        "how the first version of this hid a bug in itself")
 
 
 def test_a_rop_that_reports_only_its_intermediate_still_brings_the_frame_home():
