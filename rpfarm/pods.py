@@ -205,7 +205,16 @@ def classify_for_kill(pod, me, health=None, health_error=None,
         return "busy", "{} open ssh session(s) -- something is driving it " \
                        "outside the worker".format(int(sessions))
 
-    # A pod that cannot report those is a pod we cannot clear. Absent evidence
+    # Neither of the two above can be trusted on its own: rclone opens and
+    # closes a connection per file, so mid-upload there are instants with no
+    # socket and no live child. Verified on a live pod. busy_idle_s comes from
+    # the pod's own sampler and is what survives that churn.
+    busy_idle = health.get("busy_idle_s")
+    if busy_idle is not None and float(busy_idle) < grace_s:
+        return "busy", ("something was transferring or connected {:.0f}s ago"
+                        .format(float(busy_idle)))
+
+    # A pod that cannot report these is a pod we cannot clear. Absent evidence
     # is not evidence of absence, and the asymmetry is deliberate: a false
     # "busy" costs a few cents of idle pod, a false "safe" costs a render.
     if sessions is None or transfers is None:

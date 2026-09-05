@@ -219,35 +219,44 @@ _SSH_PORT = 22
 # for rclone's SFTP backend; rclone/rsync/scp cover the pod-side direction.
 _TRANSFER_COMMS = frozenset({"rclone", "sftp-server", "rsync", "scp"})
 
+# How often the background sampler looks. Well under the grace window a
+# caller judges on, so a transfer between files is never missed.
+_LIVENESS_SAMPLE_S = 2.0
+
 
 class Liveness:
     """Is anyone using this pod, by ANY channel -- not just HTTP?
 
     ``busy``/``idle_s`` only ever saw requests to this worker, so a pod driven
-    over SSH looked abandoned while working flat out. That is not hypothetical:
-    a benchmark pod rendering 15 frames reported busy 0 with idle_s equal to
-    its whole uptime, and the kill guard called it safe to terminate. The
-    production case is worse -- rclone moves files to the sync pod over SFTP,
-    so a pod receiving a 4GB Houdini tarball, the heaviest thing this farm ever
-    does, reports itself perfectly idle.
+    over SSH looked abandoned while working flat out, and a sync pod taking a
+    4GB tarball over SFTP -- the heaviest thing this farm does -- reported
+    itself perfectly idle.
 
-    Deliberately DISCRETE evidence -- an established connection on port 22, a
-    transfer process in the table -- and not a CPU threshold. A threshold has
-    to be calibrated against the pod's own background noise, which means it
-    cannot be chosen without a live machine to watch; presence or absence
-    needs no calibration and cannot drift. Both are read straight out of
-    /proc, because the image is deliberately thin and has neither `ss` nor
-    `lsof`.
+    Two things this got wrong on the first attempt, both found by reading a
+    live pod instead of trusting the code:
 
-    Everything here fails toward "someone is here". A false busy costs a few
-    cents of idle pod; a false idle costs somebody's render or a transfer cut
-    in half. We have already had the second kind.
+    * **Zombies are not work.** Counting every process named ``sftp-server``
+      counted ELEVEN of them on a pod whose upload had already finished: all
+      ``<defunct>``, reparented to PID 1, never reaped. That is worse than the
+      bug it replaced -- a pod stuck at "busy" forever is a pod `farm kill`
+      can never clear. Only live processes count now.
+    * **A single sample flickers.** rclone opens and closes a connection per
+      file, so mid-upload there are instants with no established socket and no
+      live child at all. Sampling once and calling that idle would cut a
+      transfer in half. A background sampler remembers when anything last
+      looked alive, and callers read the age of that instead.
+
+    Everything fails toward "someone is here": a false busy costs a few cents,
+    a false idle costs a render or half a transfer. We have had both.
     """
 
-    def __init__(self, proc="/proc", read=None, listdir=None):
+    def __init__(self, proc="/proc", read=None, listdir=None, clock=time.time):
         self._proc = proc
         self._read = read or self._read_file
         self._listdir = listdir or os.listdir
+        self._clock = clock
+        self._last_busy = None
+        self._lock = threading.Lock()
 
     @staticmethod
     def _read_file(path):
@@ -255,7 +264,13 @@ class Liveness:
             return f.read()
 
     def ssh_sessions(self):
-        """Established connections to this pod's sshd, or None if unreadable."""
+        """Established connections to this pod's sshd, or None if unreadable.
+
+        Correct, and on its own not enough: verified on a live pod mid-upload,
+        /proc/net/tcp held only a LISTEN row for :0016 while eleven finished
+        SFTP sessions sat around as zombies. Between files there is genuinely
+        nothing established.
+        """
         total = 0
         seen_any = False
         for name in ("net/tcp", "net/tcp6"):
@@ -279,7 +294,12 @@ class Liveness:
         return total if seen_any else None
 
     def transfers(self):
-        """Transfer processes running right now, or None if /proc is unreadable."""
+        """LIVE transfer processes, or None if /proc is unreadable.
+
+        Zombies are excluded deliberately -- see the class docstring. A
+        ``<defunct>`` sftp-server is a transfer that has ALREADY FINISHED, and
+        counting it pins the pod at "busy" until the container restarts.
+        """
         try:
             entries = self._listdir(self._proc)
         except Exception:  # noqa: BLE001
@@ -292,9 +312,45 @@ class Liveness:
                 comm = self._read(os.path.join(self._proc, entry, "comm")).strip()
             except Exception:  # noqa: BLE001 - the process exited mid-scan
                 continue
-            if comm in _TRANSFER_COMMS:
-                total += 1
+            if comm not in _TRANSFER_COMMS:
+                continue
+            if self._is_zombie(entry):
+                continue
+            total += 1
         return total
+
+    def _is_zombie(self, pid):
+        """True when this pid is a reaped-pending corpse.
+
+        /proc/<pid>/stat is "pid (comm) state ...", and comm can itself contain
+        spaces or brackets, so the state is taken after the LAST ')'.
+        """
+        try:
+            stat = self._read(os.path.join(self._proc, str(pid), "stat"))
+        except Exception:  # noqa: BLE001 - gone already: not our problem
+            return True
+        _before, _sep, after = stat.rpartition(")")
+        fields = after.split()
+        return bool(fields) and fields[0] == "Z"
+
+    def sample(self):
+        """Note whether anything looks alive right now. Cheap; call often."""
+        sessions = self.ssh_sessions()
+        transfers = self.transfers()
+        if (sessions or 0) > 0 or (transfers or 0) > 0:
+            with self._lock:
+                self._last_busy = self._clock()
+
+    def busy_idle_s(self):
+        """Seconds since anything last looked alive, or None if never seen.
+
+        This, not a single sample, is what a caller should judge on: it is what
+        survives rclone's per-file connection churn.
+        """
+        with self._lock:
+            if self._last_busy is None:
+                return None
+            return max(0.0, self._clock() - self._last_busy)
 
 
 class LastRequest:
@@ -608,6 +664,20 @@ def make_server(host, port, log_dir="/workspace/ledger/logs"):
     last_request = LastRequest()
     xpu = XpuSupport()
     liveness = Liveness()
+
+    def _sample_liveness():
+        # Every couple of seconds, because rclone's connection churn means a
+        # single sample taken at the wrong instant sees nothing at all during
+        # an active upload. Daemon: it must never hold the pod open.
+        while True:
+            try:
+                liveness.sample()
+            except Exception:  # noqa: BLE001 - a sampler must not kill the worker
+                pass
+            time.sleep(_LIVENESS_SAMPLE_S)
+
+    threading.Thread(target=_sample_liveness, name="rpfarm-liveness",
+                     daemon=True).start()
     detached = DetachedRuns(os.path.join(WORKSPACE_ROOT, EXEC_DIR_REL))
 
     class Handler(BaseHTTPRequestHandler):
@@ -739,6 +809,10 @@ def make_server(host, port, log_dir="/workspace/ledger/logs"):
                     # any non-HTTP channel reports itself idle -- see Liveness.
                     "ssh_sessions": liveness.ssh_sessions(),
                     "transfers": liveness.transfers(),
+                    # Seconds since ANY channel last looked alive. This is the
+                    # field to judge on: the two above are instantaneous and
+                    # legitimately read zero between files of a live upload.
+                    "busy_idle_s": liveness.busy_idle_s(),
                     # Can this pod run Karma XPU? None when we could not tell.
                     # A GPU pod answers truthfully; the CPU sync pod says no,
                     # which is correct for it and useless as a farm-wide

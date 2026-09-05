@@ -395,10 +395,13 @@ _ESTABLISHED_HTTP = "   2: 0100007F:1F40 0100007F:C002 01 00000000:00000000 00:0
 
 
 def _fake_proc(net_tcp="", pids=None):
+    """pids: {pid: comm}. All alive -- zombies have their own fixture below,
+    because a process with no readable stat is treated as already gone."""
     pids = pids or {}
     files = {"/proc/net/tcp": _NET_TCP_HEADER + net_tcp}
     for pid, comm in pids.items():
         files["/proc/%s/comm" % pid] = comm + "\n"
+        files["/proc/%s/stat" % pid] = "%s (%s) S 1 1 0\n" % (pid, comm)
 
     def read(path):
         if path not in files:
@@ -475,3 +478,112 @@ def test_a_process_that_exits_mid_scan_does_not_break_the_count():
 
     live = worker.Liveness(read=flaky, listdir=lambda p: ["11", "99"])
     assert live.transfers() == 1
+
+
+# ---------------------------------------------------------------------------
+# zombies are not work, and one sample is not evidence
+#
+# Read off a live sync pod: eleven processes named sftp-server, every one
+# <defunct> and reparented to PID 1 -- an upload that had already finished.
+# Counting them reported "transfers: 11" and looked like a successful field
+# validation. It was the opposite: a pod pinned at busy forever, which
+# `farm kill` could never clear. /proc/net/tcp on the same pod held only a
+# LISTEN row for :0016, because rclone opens and closes a connection per file.
+# ---------------------------------------------------------------------------
+
+
+def _proc_with(pids):
+    """pids: {pid: (comm, state)} -- state 'Z' is a zombie."""
+    files = {"/proc/net/tcp": _NET_TCP_HEADER}
+    for pid, (comm, state) in pids.items():
+        files["/proc/%s/comm" % pid] = comm + "\n"
+        files["/proc/%s/stat" % pid] = "%s (%s) %s 1 1 0 0 -1 0 0 0\n" % (pid, comm, state)
+
+    def read(path):
+        if path not in files:
+            raise FileNotFoundError(path)
+        return files[path]
+
+    return read, lambda p: list(pids)
+
+
+def test_a_defunct_transfer_is_not_counted():
+    """The exact live reading: 11 sftp-server zombies, upload long finished."""
+    read, listdir = _proc_with({str(p): ("sftp-server", "Z") for p in range(11)})
+
+    assert worker.Liveness(read=read, listdir=listdir).transfers() == 0
+
+
+def test_live_and_dead_transfers_are_told_apart():
+    read, listdir = _proc_with({"1": ("rclone", "R"), "2": ("sftp-server", "Z"),
+                                "3": ("sftp-server", "S"), "4": ("bash", "S")})
+
+    assert worker.Liveness(read=read, listdir=listdir).transfers() == 2
+
+
+def test_a_process_name_with_spaces_does_not_break_zombie_detection():
+    """/proc/<pid>/stat is "pid (comm) state" and comm can contain anything."""
+    files = {"/proc/7/comm": "rclone\n",
+             "/proc/7/stat": "7 (rclone (odd) name) Z 1 1 0\n"}
+
+    def read(path):
+        if path in files:
+            return files[path]
+        raise FileNotFoundError(path)
+
+    assert worker.Liveness(read=read, listdir=lambda p: ["7"]).transfers() == 0
+
+
+def test_the_sampler_remembers_when_anything_last_looked_alive():
+    """One sample is not evidence: mid-upload there are instants with no
+    socket and no live child, and calling that idle cuts a transfer in half."""
+    clock = [1000.0]
+    state = {"comm": "rclone", "st": "R"}
+
+    def read(path):
+        if path == "/proc/net/tcp":
+            return _NET_TCP_HEADER
+        if path.endswith("/comm"):
+            return state["comm"] + "\n"
+        if path.endswith("/stat"):
+            return "9 (%s) %s 1 1 0\n" % (state["comm"], state["st"])
+        raise FileNotFoundError(path)
+
+    live = worker.Liveness(read=read, listdir=lambda p: ["9"],
+                           clock=lambda: clock[0])
+
+    assert live.busy_idle_s() is None          # nothing seen yet
+    live.sample()
+    assert live.busy_idle_s() == 0.0
+
+    # the transfer finishes; the age grows from the last time it was alive
+    state["st"] = "Z"
+    clock[0] += 30
+    live.sample()
+    assert live.busy_idle_s() == 30.0
+
+
+def test_a_gap_between_files_does_not_read_as_idle():
+    clock = [0.0]
+    alive = {"now": True}
+
+    def read(path):
+        if path == "/proc/net/tcp":
+            return _NET_TCP_HEADER
+        if path.endswith("/comm"):
+            return "sftp-server\n"
+        if path.endswith("/stat"):
+            return "9 (sftp-server) %s 1 1 0\n" % ("R" if alive["now"] else "Z")
+        raise FileNotFoundError(path)
+
+    live = worker.Liveness(read=read, listdir=lambda p: ["9"], clock=lambda: clock[0])
+    live.sample()                       # file 1 transferring
+    alive["now"] = False
+    clock[0] += 2
+    live.sample()                       # between files: nothing alive
+    alive["now"] = True
+    clock[0] += 2
+    live.sample()                       # file 2 transferring
+
+    # never looked idle for more than the gap
+    assert live.busy_idle_s() == 0.0
