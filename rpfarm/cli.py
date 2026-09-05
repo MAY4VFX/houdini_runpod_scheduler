@@ -518,29 +518,39 @@ def _measure_uplink(cfg, pod, client, rclone_bin, size_mb=20, copy_fn=rpsync.rcl
     return (stats.bytes * 8) / 1e6 / max(stats.seconds, 1e-3)
 
 
-def _check_archiver(ok, warn, resolve=None):
-    """Is there a zstd, and would a COOK find it?
+def _check_compression(ok, resolve=None):
+    """What will compress this artist's uploads, and where it came from.
 
-    Two different questions, and the doctor used to answer neither. It
-    reported "rclone v1.75.0" from a shell whose PATH had Homebrew in it,
-    while inside Houdini that PATH does not exist -- which is exactly how an
-    upload item came to die on `FileNotFoundError: 'zstd'` with zstd sitting
-    in /opt/homebrew/bin the whole time. So this checks with the PATH a
-    Dock-launched Houdini actually has, and reports the absolute path that
-    makes the answer the same either way.
+    Not a pass/fail: compression is stdlib now (lzma, in every Python this
+    runs on including the pod's 3.10.12), so there is nothing here that can
+    be missing. zstd is an optional accelerator, reported when a real binary
+    is found by ABSOLUTE path -- never by bare name, which is what died on
+    2026-09-05 with zstd installed the whole time at /opt/homebrew/bin.
     """
-    resolve = resolve or rptools.resolve_tool
-    found = resolve("zstd", path=rptools.HOUDINI_LIKE_PATH)
-    if found is None:
-        warn("zstd not found -- uploads will not be compressed (slower, not "
-             "broken). macOS: brew install zstd, then restart Houdini")
-        return None
-    where = "on Houdini's own PATH" if found.how == "on PATH" else f"by absolute path ({found.how})"
-    ok(f"zstd: {found.version or 'ok'} -- {found.path}, found {where}")
-    return found
+    from . import compression as rpcompression
+
+    resolve = resolve or (lambda name, **kw: rptools.resolve_tool(
+        name, path=rptools.HOUDINI_LIKE_PATH, **kw))
+    codec = rpcompression.select_codec(resolve=resolve)
+    if codec.binary:
+        found = resolve("zstd")
+        where = "on Houdini's PATH" if found and found.how == "on PATH" else f"at {codec.binary}"
+        ok(f"compression: zstd {found.version if found else ''} ({where})")
+    else:
+        ok(f"compression: {codec.name} from the standard library "
+           f"(no external program needed; zstd not found, which is fine)")
+    return codec
 
 
 def cmd_doctor(args):
+    if getattr(args, "dock_env", False):
+        # Check what a COOK sees. Running doctor from a shell whose PATH has
+        # Homebrew in it is how a report stays green while an upload item
+        # dies on a program it cannot find.
+        os.environ["PATH"] = rptools.HOUDINI_LIKE_PATH
+        rptools.clear_cache()
+        print(f"[..]   --dock-env: PATH is now {rptools.HOUDINI_LIKE_PATH}")
+
     try:
         cfg = rpcfg.load()
     except rpcfg.ConfigError as e:
@@ -614,7 +624,7 @@ def cmd_doctor(args):
     except (OSError, subprocess.TimeoutExpired) as e:
         fail(f"rclone not runnable at {cfg.rclone_path} ({e}) -- rerun `rpfarm setup`")
 
-    _check_archiver(ok, warn)
+    _check_compression(ok)
 
     if os.path.exists(cfg.ssh_key_path) and os.path.exists(cfg.ssh_key_path + ".pub"):
         ok(f"SSH key present ({cfg.ssh_key_path})")
@@ -1302,7 +1312,13 @@ def build_parser():
     p_setup.add_argument("--template", help="use this pod template id instead of discovering/keeping one")
     p_setup.add_argument("--non-interactive", action="store_true", help="never prompt; fail instead of asking")
 
-    sub.add_parser("doctor", help="check the whole setup end to end (key, volume, template, HDAs, GPU stock, ...)")
+    p_doctor = sub.add_parser(
+        "doctor", help="check the whole setup end to end (key, volume, template, HDAs, GPU stock, ...)")
+    p_doctor.add_argument(
+        "--dock-env", action="store_true",
+        help="check with the PATH a Dock-launched Houdini has, not this shell's -- "
+             "a green report from a shell that has Homebrew on PATH says nothing "
+             "about what a cook can find")
 
     p_houdini = sub.add_parser("houdini", help="manage Houdini installs on the shared farm volume")
     houdini_sub = p_houdini.add_subparsers(dest="houdini_command", required=True)

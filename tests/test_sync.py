@@ -2,6 +2,8 @@ import os
 
 import pytest
 
+import rpfarm.sync as rpsync
+
 from rpfarm.sync import (
     FileEntry,
     SftpTarget,
@@ -253,54 +255,94 @@ def test_compress_stage_empty_post_command_when_nothing_compressed(tmp_path):
     assert raw[0].local == str(bgeo)
 
 
-# -- no archiver is slower, not broken (field failure, 2026-09-05) --------------
+# -- compression is the standard library (owner's requirement, 2026-09-05) -----
+#
+# "нам надо как-то это всё внутри нашего пакета держать, и нам же надо чтобы
+# это работало мультиплатформенно" -- a repository someone clones, types
+# their RunPod keys into, and uses. facebook/zstd ships binaries for Windows
+# only, so a downloaded-binary approach like rclone's does not port; lzma is
+# in the standard library everywhere, including Houdini's Python and the
+# pod's (3.10.12, verified on the live sync pod).
 
 
-def test_an_upload_without_zstd_goes_up_uncompressed(tmp_path, monkeypatch, caplog):
-    """The item that died read `FileNotFoundError: 'zstd'` and took the cook
-    with it. zstd was installed the whole time -- at /opt/homebrew/bin, which
-    a Dock-launched Houdini does not have on PATH. Whatever the reason, a
-    missing archiver must cost speed, not the job."""
-    from rpfarm import compression, tools
+def test_compression_needs_no_external_program_at_all(tmp_path, monkeypatch):
+    from rpfarm import compression
 
-    tools.clear_cache()
-    compression._MISSING_WARNED.clear()
-    monkeypatch.setattr(tools, "resolve_tool", lambda *a, **k: None)
+    def no_subprocesses(*a, **k):
+        raise AssertionError("compression must not shell out")
+
+    monkeypatch.setattr(compression.subprocess, "run", no_subprocesses)
+    # sync.py imported the name, so that is the reference that matters
+    monkeypatch.setattr(rpsync, "select_codec", lambda **k: compression.CODEC_XZ)
+
+    src = tmp_path / "scene.usdc"
+    src.write_bytes(b"usd data " * 20000)
+    package = [FileEntry(local=str(src), remote="/remote/root/scene.usdc", size=src.stat().st_size)]
+
+    raw, staged, post = compress_stage(package, tmp_path / "staging", "/remote/root")
+
+    assert raw == [] and len(staged) == 1
+    assert staged[0].remote.endswith(".xz"), "the format travels with the file"
+    assert staged[0].size < src.stat().st_size
+    assert "python3 -c" in post, "the pod has lzma but no xz binary -- checked on the pod"
+
+
+def test_the_package_says_which_format_it_is_in(tmp_path):
+    """The pod cannot guess. The extension names the codec and the post
+    command matches it -- both come from the same choice, made once."""
+    from rpfarm import compression
+
+    zstd = compression.Codec("zstd", ".zst", "/opt/homebrew/bin/zstd")
+
+    assert compression.decompress_command("/root", ["a.zst"], zstd) == (
+        "cd /root && zstd -d --rm a.zst")
+    xz = compression.decompress_command("/root", ["a.xz", "b.xz"], compression.CODEC_XZ)
+    assert xz.startswith("cd /root && python3 -c ")
+    assert xz.endswith(" a.xz b.xz")
+    assert compression.decompress_command("/root", [], compression.CODEC_XZ) == ""
+
+
+def test_a_round_trip_through_the_standard_library(tmp_path):
+    from rpfarm import compression
 
     src = tmp_path / "geo.bgeo"
-    src.write_bytes(b"g" * 4096)
-    package = [FileEntry(local=str(src), remote="/remote/root/geo.bgeo", size=4096)]
+    payload = b"geometry" * 5000
+    src.write_bytes(payload)
+    staged = tmp_path / "staged" / "geo.bgeo.xz"
+    back = tmp_path / "back" / "geo.bgeo"
 
-    with caplog.at_level("WARNING"):
-        raw, staged, post = compress_stage(package, tmp_path / "staging", "/remote/root")
+    assert compression.compress_file(str(src), str(staged),
+                                     compression.CompressionStrategy.COMPRESS,
+                                     codec=compression.CODEC_XZ)
+    assert staged.stat().st_size < len(payload)
+    assert compression.decompress_file(str(staged), str(back),
+                                       compression.CompressionStrategy.COMPRESS)
+    assert back.read_bytes() == payload
+
+
+def test_a_zstd_that_is_not_really_there_does_not_break_the_upload(tmp_path, monkeypatch):
+    """The field failure, as a test: something claims a zstd binary, the
+    binary is not there. The upload must still happen."""
+    from rpfarm import compression
+
+    ghost = compression.Codec("zstd", ".zst", str(tmp_path / "nowhere" / "zstd"))
+    monkeypatch.setattr(rpsync, "select_codec", lambda **k: ghost)
+
+    src = tmp_path / "cache.bgeo"
+    src.write_bytes(b"g" * 8192)
+    package = [FileEntry(local=str(src), remote="/remote/root/cache.bgeo", size=8192)]
+
+    raw, staged, post = compress_stage(package, tmp_path / "staging", "/remote/root")
 
     assert raw == package, "every file still uploads"
     assert staged == [] and post == ""
-    assert any("not be compressed" in r.getMessage() for r in caplog.records), caplog.text
-    compression._MISSING_WARNED.clear()
-    tools.clear_cache()
 
 
-def test_compression_uses_an_absolute_binary_never_a_bare_name(tmp_path, monkeypatch):
-    """PATH is not to be trusted for external programs -- the same lesson as
-    resolve_package_python, which this reuses the shape of."""
+def test_the_codec_is_the_standard_library_unless_a_real_binary_is_found():
     from rpfarm import compression, tools
 
-    tools.clear_cache()
-    seen = []
-    monkeypatch.setattr(tools, "resolve_tool",
-                        lambda name, **k: tools.Tool("/opt/homebrew/bin/" + name, "/opt/homebrew/bin", "1.5.6"))
-
-    def fake_run(argv, **kwargs):
-        seen.append(argv[0])
-        raise AssertionError("stop here; the argv is the point")
-
-    monkeypatch.setattr(compression.subprocess, "run", fake_run)
-    src = tmp_path / "a.exr"
-    src.write_bytes(b"x" * 100)
-    with pytest.raises(AssertionError):
-        compression.compress_file(str(src), str(tmp_path / "a.exr.zst"),
-                                  compression.CompressionStrategy.ZSTD)
-
-    assert seen == ["/opt/homebrew/bin/zstd"]
-    tools.clear_cache()
+    assert compression.select_codec(resolve=lambda name, **k: None) is compression.CODEC_XZ
+    assert compression.select_codec(allow_external=False) is compression.CODEC_XZ
+    found = tools.Tool("/opt/homebrew/bin/zstd", "/opt/homebrew/bin", "1.5.7")
+    picked = compression.select_codec(resolve=lambda name, **k: found)
+    assert picked.name == "zstd" and picked.binary == found.path
