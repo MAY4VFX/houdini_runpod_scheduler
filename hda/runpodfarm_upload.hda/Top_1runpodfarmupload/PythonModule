@@ -68,11 +68,9 @@ def _say(message):
 def previewUpload(kwargs):
     """Show the upload plan without cooking anything.
 
-    The same two windows the cook shows -- Houdini's own file dependency
-    dialog, then this package's window for the USD files Houdini's dialog
-    has no row for -- forced on regardless of the Confirm toggle. Any
-    choice made here is kept, so previewing IS how you set the selection
-    for a batch cook that will never open a window.
+    The same single window the cook shows, forced on regardless of the
+    Confirm toggle. Any choice made here is kept, so previewing IS how you
+    set the selection for a batch cook that will never open a window.
     """
     node = kwargs["node"]
     from rpfarm import deps as rpdeps
@@ -85,8 +83,7 @@ def previewUpload(kwargs):
     usd = rpusd.collect_usd_refs(
         rops, log=_say, deep=bool(node.evalParm("rpfarm_usddeep"))) if rops else []
     try:
-        paths = rppf.choose_uploads(
-            node, scan, usd, ask=True, log=_say, rop=rops[0] if rops else None)
+        paths = rppf.choose_uploads(node, scan, usd, ask=True, log=_say)
     except rppf.UploadCancelled:
         _say("preview closed with Cancel -- nothing changed")
         return
@@ -94,11 +91,7 @@ def previewUpload(kwargs):
 
 
 def clearExclusions(kwargs):
-    """Re-check every USD file this node was told to skip.
-
-    Only the USD half: Houdini keeps its own selection state for parameter
-    references, and this button has no business pretending to reset that.
-    """
+    """Forget every answer given in the window -- back to the defaults."""
     node = kwargs["node"]
     node.parm("rpfarm_exclude").set("")
-    _say("all USD files re-checked")
+    _say("window answers cleared: everything checked again except outputs")

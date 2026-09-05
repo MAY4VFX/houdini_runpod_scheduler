@@ -288,34 +288,33 @@ if preset == \"install_houdini\":
     custom, post_command = rppkg.houdini_install_preset(tar, ver)
     mode = \"custom\"
 
-# What this cook uploads, in two halves that no single Houdini API covers.
+# What this cook uploads, from two places no single Houdini API covers,
+# shown in ONE window.
 #
 # 1. Parameter references -- hou.fileReferences(), narrowed to this cook's
-#    branch, with output parameters handed to Houdini's own dependency
-#    dialog as forced-unchecked rows rather than dropped out of sight.
-# 2. USD references -- everything a stage reads that no parameter points
-#    at. On airship_v013.hip that is 77 files the parameter scan cannot
-#    see, including both .usdc layers the render is made of. A farm render
-#    without them produces nothing.
+#    branch. Output parameters (pdg_workingdir, outputimage) come back on
+#    their own list and appear unchecked rather than dropped out of sight.
+# 2. USD references -- what a stage reads that no parameter names. On
+#    airship_v013.hip that is 77 files, including both .usdc layers the
+#    render is made of; a farm render without them produces nothing.
 #
-# Whether to ask is decided BEFORE the scan, because it changes what is
-# scanned: with a window, Houdini's dialog is asked; without one, the
-# selection Houdini already remembers is read instead (selected_only) --
-# the same call SideFX make when their own dialog is skipped.
+# Houdini's own dependency dialog cannot carry (2): it is fed entirely by
+# hou.fileReferences(), its rows ARE (hou.Parm, pattern) pairs, and its
+# five arguments offer no way to add a row that is not one. So the window
+# is ours, and it is the only one -- two windows for one question was
+# rejected, correctly.
 #
 # Custom mode skips all of it: there the artist typed the paths.
 refs = []
 if mode == \"deps\":
     ask = rppf.wants_window(node, log=_say)
     scan = rpdeps.scan_refs(
-        scope=node.evalParm(\"rpfarm_scope\") or rpdeps.SCOPE_BRANCH,
-        node=node, log=_say, selected_only=not ask)
+        scope=node.evalParm(\"rpfarm_scope\") or rpdeps.SCOPE_BRANCH, node=node, log=_say)
     rops = rpdeps.cook_rops(node, log=_say)
     usd = rpusd.collect_usd_refs(
         rops, log=_say, deep=bool(node.evalParm(\"rpfarm_usddeep\"))) if rops else []
     try:
-        refs = rppf.choose_uploads(
-            node, scan, usd, ask=ask, log=_say, rop=rops[0] if rops else None)
+        refs = rppf.choose_uploads(node, scan, usd, ask=ask, log=_say)
     except rppf.UploadCancelled as e:
         # A deliberate no, not a failure -- but generation has to stop, and
         # a NodeError is the only way to stop it that PDG reports plainly.
