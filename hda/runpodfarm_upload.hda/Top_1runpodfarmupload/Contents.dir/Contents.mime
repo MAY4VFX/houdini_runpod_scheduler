@@ -235,27 +235,25 @@ _RPFARM_ROOT = pathlib.Path(os.environ.get(\"RPFARM_ROOT\", pathlib.Path.home() 
 if str(_RPFARM_ROOT) not in sys.path:
     sys.path.insert(0, str(_RPFARM_ROOT))
 
+# BEFORE anything is imported from rpfarm, and before a single machine is
+# rented: is the code in this process the code on disk? A Houdini that was
+# open when the checkout updated runs this NEW asset against the OLD
+# package, and on 2026-09-05 that cost the owner a cook -- two work items,
+# both CookedFail, with nothing in the message about the real cause.
+#
+# The check is the package's own content fingerprint against the files
+# (hou.phm() -> farmCodeMessage above), NOT a version number. The version
+# check that used to be here slept through seven commits because nobody
+# remembered to bump rpfarm.VERSION, which is exactly what a guard that
+# depends on discipline does.
+_stale = self.topNode().parent().hdaModule().farmCodeMessage()
+if _stale:
+    raise hou.NodeError(_stale)
+
 from rpfarm import config as rpcfg
 from rpfarm import deps as rpdeps
 from rpfarm import houdini_local as rphou
 from rpfarm import packages as rppkg
-
-# The asset and the package are updated together, but Python caches modules
-# for the life of the process: a Houdini that reloads this asset without
-# restarting runs the NEW generate against the OLD rpfarm, and the artist
-# gets \"unexpected keyword argument 'scope'\" instead of the one instruction
-# that helps. Checked before the newer modules are imported, so the message
-# is this one rather than a ModuleNotFoundError. The full version-floor
-# guard (scripts/hda_guard.py) lives in the assets that import rpfarm while
-# the scene is loading; here a single capability check is enough, because
-# nothing in this node runs until a cook.
-if not hasattr(rpdeps, \"scan_refs\"):
-    raise hou.NodeError(
-        \"Код фермы обновился, а Houdini держит в памяти старую версию.\\n\"
-        \"\\n\"
-        \"ПЕРЕЗАПУСТИТЕ HOUDINI. Больше ничего делать не нужно --\\n\"
-        \"на диске всё правильно, чинить нечего.\")
-
 from rpfarm import preflight as rppf
 from rpfarm import usddeps as rpusd
 

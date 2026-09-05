@@ -640,9 +640,13 @@ def test_setup_cook_turns_a_sync_pod_shortage_into_a_cook_error():
 
 
 def _guard():
+    import hashlib
+    import os
+
     return load_methods(
-        ["_version_tuple", "_ondisk_rpfarm_version", "_stale_module_message"],
-        extra_globals={"ast": ast, "pathlib": pathlib},
+        ["_version_tuple", "_ondisk_rpfarm_version", "_stale_module_message",
+         "_ondisk_fingerprint", "_changed_module_files"],
+        extra_globals={"ast": ast, "pathlib": pathlib, "hashlib": hashlib, "os": os},
     )
 
 
@@ -1048,3 +1052,103 @@ def test_the_houdini_only_limit_is_stated_where_it_is_configured():
     assert "only while Houdini is open" in dialog
     # and there is finally a way to finish for the day from the interface
     assert 'name    "rpfarm_killsync"' in dialog
+
+
+# ---------------------------------------------------------------------------
+# The guard that slept through seven commits (2026-09-05)
+#
+# rpfarm.VERSION sat at 2.2.0 while deps.py, preflight.py and usddeps.py
+# changed under it, so "loaded >= minimum" was true the whole time the loaded
+# code was a week old -- and the owner's cook failed with two CookedFail items
+# and nothing pointing at the cause. A guard that depends on someone
+# remembering to bump a number is off whenever they forget. These tests are
+# about the replacement: compare the FILES.
+# ---------------------------------------------------------------------------
+
+
+class _FakePackage:
+    def __init__(self, path, fingerprint):
+        self.__file__ = str(path)
+        self.FINGERPRINT = fingerprint
+        self.VERSION = "2.3.0"
+
+
+def test_a_changed_file_is_stale_even_when_the_versions_agree(tmp_path):
+    """The exact hole: same version in memory and on disk, different code."""
+    pkg = tmp_path / "rpfarm"
+    pkg.mkdir()
+    (pkg / "deps.py").write_text("first")
+    ns = _guard()
+    loaded = ns["_ondisk_fingerprint"](str(pkg))
+
+    (pkg / "deps.py").write_text("second, longer")
+    changed = ns["_changed_module_files"](_FakePackage(pkg / "__init__.py", loaded))
+
+    assert changed == ["deps.py"]
+    message = ns["_stale_module_message"]("2.3.0", "2.3.0", "2.3.0", str(tmp_path), changed)
+    assert message is not None, "versions matched, the code did not"
+    assert "ПЕРЕЗАПУСТИТЕ HOUDINI" in message
+    assert "deps.py" in message, "and it names what changed"
+
+
+def test_an_untouched_package_says_nothing(tmp_path):
+    pkg = tmp_path / "rpfarm"
+    pkg.mkdir()
+    (pkg / "deps.py").write_text("first")
+    ns = _guard()
+    loaded = ns["_ondisk_fingerprint"](str(pkg))
+
+    assert ns["_changed_module_files"](_FakePackage(pkg / "__init__.py", loaded)) == []
+    assert ns["_stale_module_message"]("2.3.0", "2.3.0", "2.3.0", str(tmp_path), []) is None
+
+
+def test_a_file_restored_to_identical_content_is_not_stale(tmp_path):
+    """Content, not mtime: a git checkout that puts the same bytes back must
+    not send the artist to restart Houdini for nothing."""
+    pkg = tmp_path / "rpfarm"
+    pkg.mkdir()
+    (pkg / "deps.py").write_text("same bytes")
+    ns = _guard()
+    loaded = ns["_ondisk_fingerprint"](str(pkg))
+
+    (pkg / "deps.py").write_text("same bytes")  # rewritten, new mtime
+
+    assert ns["_changed_module_files"](_FakePackage(pkg / "__init__.py", loaded)) == []
+
+
+def test_a_package_too_old_to_carry_a_fingerprint_is_stale_by_definition(tmp_path):
+    pkg = tmp_path / "rpfarm"
+    pkg.mkdir()
+    ns = _guard()
+
+    class _Ancient:
+        __file__ = str(pkg / "__init__.py")
+        VERSION = "2.2.0"
+
+    changed = ns["_changed_module_files"](_Ancient())
+
+    assert changed and "fingerprint" in changed[0]
+
+
+def test_the_guard_and_the_package_measure_the_same_thing(tmp_path):
+    """Two implementations on purpose -- the package's own copy may be the
+    stale one -- so something has to hold them to the same answer."""
+    import rpfarm
+
+    ns = _guard()
+    package_dir = pathlib.Path(rpfarm.__file__).parent
+
+    assert ns["_ondisk_fingerprint"](str(package_dir)) == rpfarm.fingerprint(str(package_dir))
+    assert rpfarm.FINGERPRINT == rpfarm.fingerprint(), "taken at import, over the same files"
+
+
+def test_the_scheduler_checks_before_it_rents_anything():
+    """The owner was bitten at COOK time, in a session that was fine when the
+    scene opened. A guard that only runs on scene load misses that."""
+    src = MODULE.read_text()
+    setup = src.index("def onSetupCook(self):")
+    guard = src.index("_stale_module_message(", setup)
+    first_pod = src.index("ensure_sync_pod", setup)
+
+    assert guard < first_pod, "the check must come before a machine is rented"
+    assert "raise CookError(_stale)" in src[setup:first_pod]

@@ -305,15 +305,55 @@ def leaves(roots):
     return out
 
 
-def header_text(roots, checked, missing=()):
+def eta_text(size_bytes, mbps):
+    """How long that many bytes take at a measured uplink, in words.
+
+    Empty when nothing has measured the connection (``rpfarm doctor`` is
+    what writes ``measured_mbps``), because a made-up number here would be
+    worse than none. The owner's machine measures 4.7 Mbps, which turns his
+    2.8 GB upload into about 80 minutes -- a fact worth knowing BEFORE the
+    upload starts rather than after.
+    """
+    try:
+        rate = float(mbps or 0)
+    except (TypeError, ValueError):
+        return ""
+    if rate <= 0 or size_bytes <= 0:
+        return ""
+    seconds = size_bytes * 8.0 / (rate * 1e6)
+    # Rounded UP to the whole minute: an estimate that reads shorter than
+    # the wait is the one that annoys.
+    minutes = max(1, int(seconds // 60 + (1 if seconds % 60 else 0)))
+    if minutes < 60:
+        spell = "{} min".format(minutes)
+    else:
+        spell = "{} h {:02d} min".format(minutes // 60, minutes % 60)
+    return "~{} at {:.1f} Mbps".format(spell, rate)
+
+
+def measured_uplink():
+    """The uplink ``rpfarm doctor`` last measured, or None. Never raises."""
+    try:
+        from . import config as _config
+
+        cfg = _config.load_cached() or _config.load()
+        return getattr(cfg, "measured_mbps", None)
+    except Exception:
+        return None
+
+
+def header_text(roots, checked, missing=(), mbps=None):
     """The one line that has to be true before anyone reads the tree."""
     all_leaves = leaves(roots)
     picked = [n for n in all_leaves if normalise(n.path) in {normalise(p) for p in checked}]
+    picked_bytes = sum(n.bytes for n in picked)
     text = "{} of {} files -- {} of {}".format(
-        len(picked), len(all_leaves),
-        human_bytes(sum(n.bytes for n in picked)),
+        len(picked), len(all_leaves), human_bytes(picked_bytes),
         human_bytes(sum(n.bytes for n in all_leaves)),
     )
+    eta = eta_text(picked_bytes, mbps)
+    if eta:
+        text += "  ({})".format(eta)
     by_source = []
     for source in ("scene", "usd", "output"):
         count = len([n for n in all_leaves if n.source == source])
@@ -393,7 +433,7 @@ def houdini_qt():
         return None
 
 
-def build_dialog(roots, missing, checked, title="RunPodFarm", parent=None):
+def build_dialog(roots, missing, checked, title="RunPodFarm", parent=None, mbps=None):
     """Construct (but do not run) the confirmation window.
 
     Built out of Houdini's own widgets where they exist: ``hou.qt.Dialog``
@@ -424,7 +464,7 @@ def build_dialog(roots, missing, checked, title="RunPodFarm", parent=None):
     dialog.setMinimumSize(980, 620)
 
     layout = QtWidgets.QVBoxLayout(dialog)
-    head = QtWidgets.QLabel(header_text(roots, checked, missing))
+    head = QtWidgets.QLabel(header_text(roots, checked, missing, mbps))
     head.setWordWrap(True)
     layout.addWidget(head)
 
@@ -525,7 +565,7 @@ def build_dialog(roots, missing, checked, title="RunPodFarm", parent=None):
 
     def _refresh(*_args):
         chosen = _checked()
-        head.setText(header_text(roots, chosen, missing))
+        head.setText(header_text(roots, chosen, missing, mbps))
         upload.setEnabled(bool(chosen))
 
     def _set_all(state):
@@ -586,7 +626,7 @@ def build_dialog(roots, missing, checked, title="RunPodFarm", parent=None):
     return dialog
 
 
-def confirm(roots, missing, checked, title="RunPodFarm", parent=None):
+def confirm(roots, missing, checked, title="RunPodFarm", parent=None, mbps=None):
     """Show the plan. Returns the checked paths, or None if cancelled.
 
     None means the artist said no -- the caller must stop the cook, and must
@@ -602,7 +642,7 @@ def confirm(roots, missing, checked, title="RunPodFarm", parent=None):
             parent = None
     if QtWidgets.QApplication.instance() is None:  # pragma: no cover - Houdini always has one
         QtWidgets.QApplication([])
-    dialog = build_dialog(roots, missing, checked, title=title, parent=parent)
+    dialog = build_dialog(roots, missing, checked, title=title, parent=parent, mbps=mbps)
     if not dialog.exec():
         return None
     return dialog.rpfarm_checked()
@@ -678,6 +718,7 @@ def choose_uploads(node, scan, usd_paths=(), ask=False, log=None, window=None):
         missing.extend(gone)
 
     roots = build_tree(rows)
+    mbps = measured_uplink()
     off, on = load_choices(node.evalParm("rpfarm_exclude"))
 
     def default_off(leaf):
@@ -689,7 +730,8 @@ def choose_uploads(node, scan, usd_paths=(), ask=False, log=None, window=None):
     if ask:
         asker = window or confirm
         try:
-            chosen = asker(roots, missing, checked, title="RunPodFarm -- what will upload")
+            chosen = asker(roots, missing, checked, title="RunPodFarm -- what will upload",
+                           mbps=mbps)
         except Exception as exc:
             say("confirmation window unavailable ({}) -- using the remembered answer".format(exc))
             chosen = checked
@@ -708,5 +750,5 @@ def choose_uploads(node, scan, usd_paths=(), ask=False, log=None, window=None):
                 say("directory reference {} -> {}, {}".format(
                     row_label(row), row_detail(row), human_bytes(row.bytes)))
 
-    say(header_text(roots, checked, missing))
+    say(header_text(roots, checked, missing, mbps))
     return selected_paths(rows, checked)

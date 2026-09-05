@@ -22,6 +22,8 @@ being drawn:
     back as an empty field, not a node that throws while drawing itself.
 """
 
+import ast
+import hashlib
 import os
 import pathlib
 import sys
@@ -29,6 +31,172 @@ import sys
 _RPFARM_ROOT = pathlib.Path(os.environ.get("RPFARM_ROOT", pathlib.Path.home() / ".rpfarm" / "src"))
 if str(_RPFARM_ROOT) not in sys.path:
     sys.path.insert(0, str(_RPFARM_ROOT))
+
+
+# -- stale-module guard ------------------------------------------------------
+#
+# The asset and the package ship together and are updated together, but Python
+# caches modules in sys.modules for the life of the process. A Houdini that was
+# already open when the checkout updated runs the NEW asset against the OLD
+# package, and the artist sees either an ImportError naming a symbol they have
+# never heard of, or -- worse, and this is what happened on 2026-09-05 -- a
+# cook whose work items simply fail.
+#
+# THE CHECK IS A FACT, NOT A NUMBER. It compares the package's own
+# FINGERPRINT (size + content digest of every module file, taken when this
+# process imported it) against those files as they are now. If anything
+# differs, the code in memory is not the code on disk, and no version needs
+# to have been bumped for us to know it.
+#
+# That matters because the version check that used to be the whole guard
+# failed exactly where it was needed: rpfarm.VERSION sat at 2.2.0 through
+# seven commits that changed deps.py, preflight.py and usddeps.py, so
+# "loaded >= minimum" was true while the loaded code was a week behind. A
+# guard that depends on someone remembering to bump a number is a guard that
+# is off whenever they forget. The version is still read -- but only to make
+# the message concrete.
+_MIN_RPFARM_VERSION = "2.3.0"
+
+
+def _version_tuple(text):
+    """("2.1.0") -> (2, 1, 0). Unparseable parts sort as 0, never raises."""
+    parts = []
+    for chunk in str(text or "").split("."):
+        digits = "".join(c for c in chunk if c.isdigit())
+        parts.append(int(digits) if digits else 0)
+    return tuple(parts) or (0,)
+
+
+def _ondisk_rpfarm_version(root):
+    """rpfarm's VERSION as it is ON DISK, read without importing it.
+
+    Importing is precisely what cannot answer this question: the import is
+    what hands back the cached module. Parsed with ast, so a half-written or
+    unexpected __init__ cannot execute anything or raise here.
+    """
+    try:
+        source = (pathlib.Path(root) / "rpfarm" / "__init__.py").read_text(encoding="utf-8")
+        for node in ast.parse(source).body:
+            if isinstance(node, ast.Assign) and any(
+                    isinstance(t, ast.Name) and t.id == "VERSION" for t in node.targets):
+                return ast.literal_eval(node.value)
+    except Exception:  # noqa: BLE001 - a diagnostic must not become the failure
+        return None
+    return None
+
+
+def _ondisk_fingerprint(package_dir):
+    """The same measurement rpfarm takes of itself, computed here.
+
+    Deliberately a second implementation: the first one lives in the module
+    that may be stale, and asking a stale module to measure staleness is how
+    you get a guard that agrees with itself and nothing else.
+    tests/test_scheduler_glue.py holds the two to the same answer.
+    """
+    out = {}
+    try:
+        names = sorted(os.listdir(package_dir))
+    except Exception:
+        return out
+    for name in names:
+        if not name.endswith(".py"):
+            continue
+        try:
+            with open(os.path.join(package_dir, name), "rb") as handle:
+                data = handle.read()
+        except Exception:
+            continue
+        out[name] = (len(data), hashlib.sha256(data).hexdigest()[:16])
+    return out
+
+
+def _changed_module_files(package):
+    """Module files that differ from what this process imported, by content.
+
+    A package too old to carry a FINGERPRINT at all is itself the answer:
+    it predates this check, so it cannot be the code we just shipped.
+    """
+    loaded = getattr(package, "FINGERPRINT", None)
+    if not isinstance(loaded, dict):
+        return ["<no fingerprint: this rpfarm predates the check>"]
+    try:
+        package_dir = os.path.dirname(os.path.abspath(package.__file__))
+    except Exception:
+        return []
+    current = _ondisk_fingerprint(package_dir)
+    if not current:
+        return []  # cannot read the files: say nothing rather than cry wolf
+    return sorted(name for name in set(current) | set(loaded)
+                  if current.get(name) != loaded.get(name))
+
+
+def _stale_module_message(minimum, loaded, on_disk, root, changed=()):
+    """The sentence to show the artist, or None when nothing is wrong.
+
+    Two different causes, two different fixes, and telling them apart is the
+    whole point of reading the on-disk version as well as the loaded one:
+
+    * the files changed since this process imported them, or the loaded
+      version is below the floor -> a running Houdini is holding the old
+      package. Restart it.
+    * on disk it is old too -> the checkout itself is behind the asset, and
+      restarting will change nothing. Update it and rerun `rpfarm setup`.
+    """
+    changed = list(changed)
+    behind = _version_tuple(loaded) < _version_tuple(minimum)
+    if not changed and not behind:
+        return None
+    seen = loaded or "неизвестна (старая копия без VERSION)"
+    if changed or _version_tuple(on_disk) >= _version_tuple(minimum):
+        detail = ""
+        if changed:
+            shown = ", ".join(changed[:4])
+            more = " и ещё {}".format(len(changed) - 4) if len(changed) > 4 else ""
+            detail = ("\n\nИзменились с момента загрузки: {}{}.".format(shown, more))
+        return (
+            "Код фермы обновился, а Houdini держит в памяти старую версию.\n"
+            "\n"
+            "ПЕРЕЗАПУСТИТЕ HOUDINI. Больше ничего делать не нужно —\n"
+            "на диске всё правильно, чинить нечего.\n"
+            "\n"
+            "Подробности: в памяти rpfarm {seen}, на диске {disk}.{detail}".format(
+                seen=seen, disk=on_disk or "не найдена", detail=detail)
+        )
+    return (
+        "Код фермы на диске старее, чем установленная нода.\n"
+        "\n"
+        "Перезапуск здесь не поможет. Обновите репозиторий и выполните\n"
+        "    python3 -m rpfarm setup\n"
+        "чтобы нода и пакет снова совпали.\n"
+        "\n"
+        "Подробности: нода требует rpfarm {min}, на диске {disk} ({root}),\n"
+        "в памяти {seen}.".format(min=minimum, disk=on_disk or "не найдена",
+                                  root=root, seen=seen)
+    )
+
+
+def farmCodeMessage():
+    """Why this session cannot cook, or None. Never raises.
+
+    The guard functions above are embedded rather than run at module scope
+    on purpose: this module also backs the parameter DEFAULT expressions,
+    which are evaluated while Houdini draws the parameter dialog, and a
+    module that raises there turns every redraw into an error. So the check
+    is a call, made where it matters -- at the start of a cook, and by the
+    Preview button -- rather than an import-time explosion.
+    """
+    try:
+        import rpfarm as _pkg
+
+        return _stale_module_message(
+            _MIN_RPFARM_VERSION,
+            getattr(_pkg, "VERSION", None),
+            _ondisk_rpfarm_version(_RPFARM_ROOT),
+            _RPFARM_ROOT,
+            _changed_module_files(_pkg),
+        )
+    except Exception:
+        return None  # a diagnostic must never become the failure
 
 
 def cfg_default(name, fallback=""):
