@@ -803,6 +803,12 @@ def test_an_unchecked_farm_is_not_treated_as_broken():
 # ---------------------------------------------------------------------------
 
 
+class _StubPdgNode:
+    def __init__(self, name, items):
+        self.name = name
+        self.workItems = list(range(items))
+
+
 class _ScaleScheduler(FakeScheduler):
     def __init__(self, minpods=2, pending=0, scale_ok=True,
                  last_error=None, transient=True):
@@ -817,6 +823,9 @@ class _ScaleScheduler(FakeScheduler):
         self._scale_ok = scale_ok
         self.scaled = []
         self.cook_errors = []
+        # No PDG here, so the ceiling comes from the queue alone -- which is
+        # the real code path when nothing has been scheduled from a node yet.
+        self._work_items = {}
         for i in range(pending):
             self._dispatcher.enqueue(
                 rpdispatch.TaskState(task_id="t%d" % i, work_item_id=i,
@@ -825,6 +834,10 @@ class _ScaleScheduler(FakeScheduler):
     def __getitem__(self, name):
         value = self._parms[name]
         return types.SimpleNamespace(evaluateInt=lambda: int(value))
+
+    def _workCeiling(self):
+        # the REAL one, so these tests exercise the counting they depend on
+        return load_methods(["_workCeiling"], {})["_workCeiling"](self)
 
     def _scale_up(self, count):
         self.scaled.append(count)
@@ -859,15 +872,30 @@ def test_no_work_means_no_machines():
     assert sched._raised_for_work is False
 
 
-def test_the_first_queued_item_raises_min_pods_not_one():
-    """Cold-start autoscale would add a single pod; asking for two and getting
-    one silently removes the parallelism the artist is paying for."""
+def test_one_item_raises_one_machine_whatever_min_pods_says():
+    """Min Pods is a floor, not a quantity. Applied blind it put two RTX PRO
+    4000s on a one-item cook, one at 99% and one at exactly 0%, both billed
+    for the whole render."""
     sched = _ScaleScheduler(minpods=2, pending=1)
 
     _autoscale_fn()(sched)
 
-    assert sched.scaled == [2]
+    assert sched.scaled == [1]
     assert sched._raised_for_work is True
+
+
+def test_min_pods_is_still_honoured_when_the_work_is_there():
+    """The guarantee the previous version of this test was protecting, kept:
+    cold-start autoscale would add a single pod, and asking for two and
+    getting one does remove parallelism the artist is paying for -- WHEN
+    there are two things to run. PDG has generated six items here while only
+    one has reached the queue."""
+    sched = _ScaleScheduler(minpods=2, pending=1)
+    sched._work_items = {0: types.SimpleNamespace(node=_StubPdgNode("fetch", 6))}
+
+    _autoscale_fn()(sched)
+
+    assert sched.scaled == [2]
 
 
 def test_machines_are_raised_once_not_on_every_tick():
@@ -1258,3 +1286,63 @@ def test_a_nested_root_is_not_pruned_from_houdinis_map():
         "/Users/may/color/ocio/aces_2.0":
             "/workspace/projects/may/airship/_ext/Users/may/color/ocio/aces_2.0",
     }
+
+
+# ---------------------------------------------------------------------------
+# Never more machines than there is work (2026-09-05)
+#
+# The owner's RunPod panel: two RTX PRO 4000 at $0.57/hr on a ONE-task cook,
+# one pod at 99% and the other at exactly 0% for the whole render, because
+# Min Pods was applied without looking at how much there was to do.
+# ---------------------------------------------------------------------------
+
+
+def _ceiling(pending=0, running=0, nodes=()):
+    ns = load_methods(["_workCeiling"], {})
+    work_items = []
+    for node in nodes:
+        for _ in range(1):
+            work_items.append(types.SimpleNamespace(node=node))
+    self = types.SimpleNamespace(
+        _dispatcher=types.SimpleNamespace(
+            pending=[None] * pending,
+            running_tasks=lambda: [None] * running),
+        _work_items={i: wi for i, wi in enumerate(work_items)})
+    return ns["_workCeiling"](self)
+
+
+def test_the_ceiling_counts_what_pdg_generated_not_just_the_queue():
+    """On the first tick the queue can hold one item while the graph has six.
+    Counting the queue alone would turn Min Pods into 1 and take away the
+    parallelism the artist is paying for."""
+    assert _ceiling(pending=1, nodes=[_StubPdgNode("fetch", 6)]) == 6
+
+
+def test_the_ceiling_adds_up_distinct_nodes():
+    assert _ceiling(pending=1, nodes=[_StubPdgNode("a", 4), _StubPdgNode("b", 4)]) == 8
+
+
+def test_the_ceiling_falls_back_to_the_queue_when_pdg_says_nothing():
+    """A node that cannot be read must not shrink the answer to zero."""
+    class _Broken:
+        @property
+        def name(self):
+            raise RuntimeError("gone")
+
+    assert _ceiling(pending=3, running=2, nodes=[_Broken()]) == 5
+    assert _ceiling() == 1, "never zero -- there is work, something must run it"
+
+
+def test_one_task_and_min_pods_two_raises_one_machine():
+    """The owner's case, end to end through the two pieces that decide it."""
+    ceiling = _ceiling(pending=1, nodes=[_StubPdgNode("fetch_shot0012", 1)])
+
+    assert ceiling == 1
+    assert rpdispatch.initial_pods(2, ceiling) == 1
+
+
+def test_three_tasks_and_min_pods_two_raises_two_machines():
+    ceiling = _ceiling(pending=3, nodes=[_StubPdgNode("fetch_shot0012", 3)])
+
+    assert ceiling == 3
+    assert rpdispatch.initial_pods(2, ceiling) == 2

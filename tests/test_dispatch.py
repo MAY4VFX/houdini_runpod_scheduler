@@ -2,6 +2,8 @@
 
 import json
 
+import rpfarm.dispatch as rpdispatch
+
 import pytest
 
 from rpfarm.dispatch import (
@@ -563,3 +565,44 @@ def test_a_requeued_task_restarts_its_capacity_clock():
 
     assert t.queued_at == 5000.0
     assert d.capacity_expired(5100.0, 900) == []
+
+
+# -- never more machines than there is work (2026-09-05) -----------------------
+#
+# The owner's RunPod panel: two RTX PRO 4000 at $0.57/hr for a cook with ONE
+# task -- one pod at 99%, the other at exactly 0% for the whole render. Min
+# Pods was applied without looking at how much work there was.
+
+
+def test_one_item_raises_one_pod_even_with_min_pods_two():
+    assert rpdispatch.initial_pods(min_pods=2, work_items=1) == 1
+
+
+def test_three_items_raise_min_pods():
+    assert rpdispatch.initial_pods(min_pods=2, work_items=3) == 2
+
+
+def test_min_pods_is_a_floor_not_a_ceiling():
+    """Two items and Min Pods 1 still raises one here -- the autoscaler adds
+    more when it sees the work is worth it. This decision is only about not
+    starting more machines than there are items."""
+    assert rpdispatch.initial_pods(min_pods=1, work_items=5) == 1
+    assert rpdispatch.initial_pods(min_pods=4, work_items=4) == 4
+    assert rpdispatch.initial_pods(min_pods=0, work_items=3) == 1
+    assert rpdispatch.initial_pods(min_pods=2, work_items=0) == 1
+
+
+def test_the_autoscaler_does_not_outnumber_the_work_either():
+    """Same defect, milder: the batch is sized by predicted TIME, which says
+    nothing about how many items are left to spread across it. One slow item
+    on one pod predicted a long cook and asked for four more machines."""
+    added = rpdispatch.autoscale_decision(
+        pending=1, active_pods=1, max_pods=8,
+        render_times=[2400.0], threshold_min=10.0)
+
+    assert added == 1, "one item cannot use more than one more machine"
+
+    many = rpdispatch.autoscale_decision(
+        pending=6, active_pods=1, max_pods=8,
+        render_times=[2400.0], threshold_min=10.0)
+    assert many > 1, "and real work still scales up"

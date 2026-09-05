@@ -245,7 +245,7 @@ _ASSET_FINGERPRINT = {
     'compression.py': (23234, 'bef2f19daebbc929'),
     'config.py': (12718, 'c81813f3ccec7011'),
     'deps.py': (38546, 'a2cc13cc1eecb505'),
-    'dispatch.py': (21295, '9c0aa38ea12b3720'),
+    'dispatch.py': (22191, '1121a6505c88adb3'),
     'gpus.py': (8311, '7a28d5c2692b776e'),
     'houdini_local.py': (25206, 'a5ec6729405ccb1a'),
     'ledger.py': (17327, '70425e75fb216f01'),
