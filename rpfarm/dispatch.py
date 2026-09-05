@@ -438,6 +438,20 @@ class TerminateRetries:
 # -- pure decisions ----------------------------------------------------------
 
 
+def initial_pods(min_pods: int, work_items: int) -> int:
+    """How many pods to raise when a cook's first work appears.
+
+    ``Min Pods`` is a FLOOR, not a quantity: "at least this many, if there is
+    that much to do". It used to be applied blind -- the owner watched two
+    RTX PRO 4000s at $0.57/hr each for a single-item cook, one at 99% and one
+    at exactly 0%, for the whole render.
+
+    Always at least one (there is work, so something must run it), never more
+    than there are items to run.
+    """
+    return max(1, min(max(1, int(min_pods)), max(1, int(work_items))))
+
+
 def autoscale_decision(
     pending: int,
     active_pods: int,
@@ -476,7 +490,11 @@ def autoscale_decision(
 
     ratio = remaining_min / threshold_min
     batch = min(AUTOSCALE_BATCH_MAX, max(AUTOSCALE_BATCH_MIN, int(ratio)))
-    return min(batch, headroom)
+    # Never more machines than there is work. The batch is sized by predicted
+    # TIME, which says nothing about how many items are left to spread across
+    # it: one slow item on one pod predicts a long cook and used to ask for
+    # four more machines, three of which would have nothing to run.
+    return min(batch, headroom, pending)
 
 
 def should_defer(pending: int, pods: int, depth_per_pod: int = BACKPRESSURE_DEPTH) -> bool:

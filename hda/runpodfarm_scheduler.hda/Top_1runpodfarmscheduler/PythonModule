@@ -203,7 +203,7 @@ _ASSET_FINGERPRINT = {
     'compression.py': (23234, 'bef2f19daebbc929'),
     'config.py': (12718, 'c81813f3ccec7011'),
     'deps.py': (38546, 'a2cc13cc1eecb505'),
-    'dispatch.py': (21295, '9c0aa38ea12b3720'),
+    'dispatch.py': (22191, '1121a6505c88adb3'),
     'gpus.py': (8311, '7a28d5c2692b776e'),
     'houdini_local.py': (25206, 'a5ec6729405ccb1a'),
     'ledger.py': (17327, '70425e75fb216f01'),
@@ -2716,6 +2716,40 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         time.sleep(1)
         return tickResult.SchedulerReady
 
+    def _workCeiling(self):
+        """How many machines this cook could possibly keep busy.
+
+        Min Pods is a floor, not a quantity, and applying it blind is what put
+        two GPUs on a one-item cook -- one at 99%, one at exactly 0%, both
+        billed. The ceiling is the work, so the question is how to count it
+        when PDG hands items over as they become ready.
+
+        Two sources, whichever is larger, because neither alone is right:
+
+        * what this scheduler is holding -- queued plus running. Exact, but on
+          the very first tick it can be a single item even when the graph has
+          plenty, which would quietly turn Min Pods into 1 and take away the
+          parallelism the artist asked for.
+        * what PDG has GENERATED on the nodes that have scheduled to us
+          (`pdg.Node.workItems`), summed over distinct nodes. That counts
+          items whose dependencies have not cleared yet -- work that is coming
+          -- and it is what makes the answer stable no matter which tick this
+          runs on.
+
+        Deliberately not clever about items already finished: over-counting
+        only ever lets Min Pods be honoured in full, which is what the artist
+        asked for; under-counting would silently take machines away.
+        """
+        queued = len(self._dispatcher.pending) + len(self._dispatcher.running_tasks())
+        by_node = {}
+        for work_item in list(self._work_items.values()):
+            try:
+                node = work_item.node
+                by_node[node.name] = len(node.workItems)
+            except Exception:
+                continue  # a diagnostic must never break a cook
+        return max(queued, sum(by_node.values()), 1)
+
     def _autoscale(self):
         if time.time() - self._last_scale_failure < _SCALE_RETRY_BACKOFF:
             # RunPod just refused; out-of-stock GPUs do not come back within a
@@ -2730,8 +2764,14 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         # give one -- which is the parallelism the artist is paying for.
         if pending and not self._raised_for_work:
             self._raised_for_work = True
-            wanted = max(1, self["rpfarm_minpods"].evaluateInt())
-            self._log("first work item queued; raising {} pod(s)".format(wanted))
+            min_pods = self["rpfarm_minpods"].evaluateInt()
+            work = self._workCeiling()
+            wanted = rpdispatch.initial_pods(min_pods, work)
+            if wanted < max(1, min_pods):
+                self._log("Min Pods is {} but this cook has {} work item(s) -- "
+                          "raising {}".format(min_pods, work, wanted))
+            else:
+                self._log("first work item queued; raising {} pod(s)".format(wanted))
             if not self._scale_up(wanted) and self._last_pod_error \
                     and not self._last_pod_error_transient:
                 # Not a shortage -- a bad key, a missing template. Waiting does
