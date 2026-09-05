@@ -106,12 +106,32 @@ def test_status_url_and_method():
     assert calls[0] == ("GET", "https://pod1-8000.proxy.runpod.net/tasks/t1")
 
 
-def test_status_none_on_404():
+def test_a_404_says_unknown_task_not_nothing():
+    """The three answers must stay three. "This worker has no record of your
+    task" collapsed into the same None as "I could not reach the worker", and
+    the scheduler reads None as "ask again later" -- which for a task nobody
+    will ever report is forever. That is how an item sat in Cooking for 21
+    minutes while its pod idled and billed."""
     def t(method, url, body, headers, timeout=30):
         return 404, b'{"error":"unknown task"}'
 
     c = WorkerClient("pod1", "tok", transport=t)
-    assert c.status("nope") is None
+    assert c.status("nope") == {"state": "unknown"}
+
+
+def test_an_unreachable_pod_is_still_none():
+    def t(method, url, body, headers, timeout=30):
+        raise OSError("connection refused")
+
+    c = WorkerClient("pod1", "tok", transport=t)
+    assert c.status("t1") is None, "cannot ask is not the same as no such task"
+
+
+def test_a_broken_body_is_none_not_a_status():
+    def t(method, url, body, headers, timeout=30):
+        return 200, b"not json"
+
+    assert WorkerClient("pod1", "tok", transport=t).status("t1") is None
 
 
 def test_log_returns_text():

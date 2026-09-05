@@ -21,6 +21,7 @@ import ast
 import json
 import pathlib
 import sys
+import time
 import types
 
 import pytest
@@ -1346,3 +1347,79 @@ def test_three_tasks_and_min_pods_two_raises_two_machines():
 
     assert ceiling == 3
     assert rpdispatch.initial_pods(2, ceiling) == 2
+
+
+# ---------------------------------------------------------------------------
+# A task that dies before it can report (2026-09-05)
+#
+# Cook 21bf1949: the task crashed on startup -- its RPC for the work item JSON
+# answered in 192 ms with None, so pdgjson.fromString got None and raised. The
+# worker never got a result to report, its /tasks/<id> answered 404, the client
+# turned that into None, and the scheduler reads None as "still running". 21
+# minutes later: item Cooking, pod idle at 0%, nothing in the ledger, $0.57/hr
+# still running.
+# ---------------------------------------------------------------------------
+
+
+class _UnknownTaskClient:
+    def status(self, task_id):
+        return {"state": "unknown"}
+
+
+def _poll_scheduler(started_ago, ledger_path):
+    sched = FakeScheduler()
+    sched._last_task_poll = {}
+    sched._work_items = {}
+    sched._cook_id = "21bf1949"
+    sched._project = "airship"
+    sched._cfg = types.SimpleNamespace(user="may")
+    sched._ledger_path = str(ledger_path)
+    sched._dispatcher.add_pod("pod1", cost_per_hr=0.57, status="RUNNING", gpu="RTX PRO 4000")
+    task = rpdispatch.TaskState(task_id="t1", work_item_id=7, command="c", env={},
+                                log_path="/workspace/ledger/logs/21bf1949/fetch_shot0018_6.log")
+    sched._dispatcher.enqueue(task, now=0.0)
+    sched._dispatcher.assign("t1", "pod1")
+    sched._dispatcher.running_tasks()[0].started = time.time() - started_ago
+    sched._clients["pod1"] = _UnknownTaskClient()
+    return sched
+
+
+def test_a_task_the_worker_never_heard_of_fails_the_item(tmp_path):
+    ledger = tmp_path / "ledger.jsonl"
+    sched = _poll_scheduler(started_ago=600, ledger_path=ledger)
+    ns = load_methods(["_poll_tasks", "_failUnaccountedTask", "_itemName"],
+                      {"time": time, "_ledger_append": _capture_ledger(ledger),
+                       "_TASK_POLL_INTERVAL": 2.0, "_TASK_UNKNOWN_GRACE": 60.0})
+    sched._failUnaccountedTask = lambda task: ns["_failUnaccountedTask"](sched, task)
+    sched._itemName = lambda wid: str(wid)
+
+    ns["_poll_tasks"](sched)
+
+    assert sched._dispatcher.running_tasks() == [], "the machine is free again"
+    assert [t.work_item_id for t in sched._dispatcher.failed_since_last_call()] == [7]
+    assert any("has no record of task" in m for m in sched.logs), sched.logs
+    assert ledger.read_text().strip(), "a cook that ends this way must leave a record"
+
+
+def test_a_task_that_just_started_is_given_a_moment(tmp_path):
+    """There is a real gap between dispatch and the worker registering the
+    task; failing inside it would kill healthy items."""
+    ledger = tmp_path / "ledger.jsonl"
+    sched = _poll_scheduler(started_ago=5, ledger_path=ledger)
+    ns = load_methods(["_poll_tasks", "_failUnaccountedTask", "_itemName"],
+                      {"time": time, "_ledger_append": _capture_ledger(ledger),
+                       "_TASK_POLL_INTERVAL": 2.0, "_TASK_UNKNOWN_GRACE": 60.0})
+    sched._failUnaccountedTask = lambda task: ns["_failUnaccountedTask"](sched, task)
+    sched._itemName = lambda wid: str(wid)
+
+    ns["_poll_tasks"](sched)
+
+    assert len(sched._dispatcher.running_tasks()) == 1, "still running, not yet judged"
+    assert not ledger.exists() or not ledger.read_text().strip()
+
+
+def _capture_ledger(path):
+    def append(ledger_path, **row):
+        with open(path, "a") as f:
+            f.write(json.dumps(row, default=str) + "\n")
+    return append

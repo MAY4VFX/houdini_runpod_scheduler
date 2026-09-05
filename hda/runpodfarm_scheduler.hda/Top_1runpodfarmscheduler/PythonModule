@@ -217,7 +217,7 @@ _ASSET_FINGERPRINT = {
     'tls.py': (3642, 'f3e50ea6ebd0308f'),
     'tools.py': (4290, 'c5d3b026f125578f'),
     'usddeps.py': (9631, '3c7192d3bd94d07f'),
-    'worker_client.py': (8816, 'c1cd036661f82a96'),
+    'worker_client.py': (9791, 'cf6b40b1e879c658'),
 }
 # END baked
 
@@ -283,6 +283,15 @@ _HEALTH_POLL_INTERVAL = 5.0
 # partition turns each one into a 30s timeout and the tick stops doing
 # anything else for minutes.
 _TASK_POLL_INTERVAL = 2.0
+
+# How long a task may be unaccounted for by the worker that is supposed to be
+# running it before the scheduler calls it dead. There is a real window right
+# after dispatch where the worker has not registered the task yet, so this is
+# not zero -- but it is not "forever" either, which is what it used to be:
+# a 404 from the worker became None in the client and None read as "still
+# running", so a task that died before it could report left its item in
+# Cooking and its pod idling and billing (2026-09-05, 21 minutes).
+_TASK_UNKNOWN_GRACE = 60.0
 
 # After a failed pod create, wait this long before asking RunPod again --
 # out-of-stock GPUs stay out of stock for more than a tick.
@@ -1712,6 +1721,15 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
 
             client = self._clients.get(task.pod_id)
             status = client.status(task.task_id) if client else None
+            if status and status.get("state") == "unknown":
+                # The worker answered and has no record of this task. It will
+                # never report one, so waiting is waiting forever. Give it a
+                # grace period for the gap between dispatch and registration,
+                # then fail the item and free the machine.
+                if now - (task.started or now) < _TASK_UNKNOWN_GRACE:
+                    continue
+                self._failUnaccountedTask(task)
+                continue
             if not status or status.get("state") == "running":
                 continue
             self._last_task_poll.pop(task.task_id, None)
@@ -1753,6 +1771,42 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
                 # tells PDG. Reporting it here as well made every pod-side
                 # failure arrive at workItemFailed twice.
                 self._logTaskFailure(task, status)
+
+    def _failUnaccountedTask(self, task):
+        """Fail an item whose task the worker cannot account for.
+
+        Everything a normal failure does -- free the slot, write the ledger
+        row, let _reportFailures tell PDG -- because the artist is owed the
+        same outcome whether the task reported its death or simply vanished.
+        The ledger row is the part that was missing entirely: a cook that
+        ends this way used to leave no record at all, so there was nothing to
+        find afterwards except an idle pod.
+        """
+        self._last_task_poll.pop(task.task_id, None)
+        pod = self._dispatcher.pods.get(task.pod_id)
+        duration = round(max(0.0, time.time() - (task.started or time.time())), 3)
+        self._dispatcher.complete(task.task_id, False)
+        _ledger_append(
+            self._ledger_path,
+            cook_id=self._cook_id,
+            user=self._cfg.user,
+            project=self._project,
+            work_item=task.work_item_id,
+            work_item_name=self._itemName(task.work_item_id),
+            pod=task.pod_id,
+            gpu=pod.gpu if pod else "",
+            started=task.started,
+            ended=time.time(),
+            duration_s=duration,
+            exit_code=None,
+            cost_est=(pod.cost_per_hr if pod else 0.0) * duration / 3600.0,
+        )
+        self._log(
+            "item {} vanished: pod {} has no record of task {} after {:.0f}s. "
+            "The task died before it could report -- most often a cook that was "
+            "cancelled and restarted while this one was starting. Log, if the "
+            "task got far enough to write one: {}".format(
+                task.work_item_id, task.pod_id, task.task_id, duration, task.log_path))
 
     def _itemName(self, work_item_id):
         item = self._work_items.get(work_item_id)
