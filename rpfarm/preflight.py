@@ -376,23 +376,50 @@ def ui_available():
     return ui_unavailable_reason() is None
 
 
+def houdini_qt():
+    """Houdini's own widget module, or None outside a Houdini UI.
+
+    ``hou.qt`` does not exist under hython -- verified, it is not even an
+    importable submodule -- so every use of it here is optional and the
+    plain Qt class stands in. That is also why the widget test can run at
+    all: the model, the checkboxes and the tri-state logic are the same
+    objects either way, and only the two container classes swap.
+    """
+    try:
+        import hou
+
+        return hou.qt
+    except Exception:
+        return None
+
+
 def build_dialog(roots, missing, checked, title="RunPodFarm", parent=None):
     """Construct (but do not run) the confirmation window.
 
+    Built out of Houdini's own widgets where they exist: ``hou.qt.Dialog``
+    (which applies ``hou.qt.styleSheet()`` itself -- the style lives on the
+    application, not on anything we could set) and ``hou.qt.TreeView``,
+    which is ``_houqt.QT_HighlightTreeView``, a QTreeView subclass. That is
+    why the rows live in a ``QStandardItemModel`` rather than a
+    QTreeWidget: a QTreeWidget cannot be shown by Houdini's view class, and
+    keeping two different row implementations -- one tested, one shipped --
+    is worse than the small amount of model code.
+
     Split out from :func:`confirm` so the whole widget tree can be built
-    and inspected head-less -- ``QT_QPA_PLATFORM=offscreen`` -- which is the
+    and inspected head-less (``QT_QPA_PLATFORM=offscreen``), which is the
     only way any of this gets tested without a human at a screen.
-
-    A folder is checkable like anything else, and Qt's ``ItemIsAutoTristate``
-    does the rest: toggling a folder sets everything under it, and a folder
-    with a mix shows the partially-checked box, which is the only way to see
-    from a collapsed row that something inside was dropped.
     """
-    from PySide6 import QtCore, QtWidgets
+    from PySide6 import QtCore, QtGui, QtWidgets
 
+    hqt = houdini_qt()
     picked = {normalise(p) for p in checked}
 
-    dialog = QtWidgets.QDialog(parent)
+    if hqt is not None and hasattr(hqt, "Dialog"):
+        dialog = hqt.Dialog()          # takes no arguments; styles itself
+        if parent is not None:
+            dialog.setParent(parent, QtCore.Qt.Window)
+    else:
+        dialog = QtWidgets.QDialog(parent)
     dialog.setWindowTitle(title)
     dialog.setMinimumSize(980, 620)
 
@@ -401,58 +428,84 @@ def build_dialog(roots, missing, checked, title="RunPodFarm", parent=None):
     head.setWordWrap(True)
     layout.addWidget(head)
 
-    tree = QtWidgets.QTreeWidget()
-    tree.setColumnCount(4)
-    tree.setHeaderLabels(["Reference", "Size", "Contains", "Found by"])
-    tree.setUniformRowHeights(True)
-    tree.setAlternatingRowColors(True)
-    tree.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
-
+    model = QtGui.QStandardItemModel()
+    model.setHorizontalHeaderLabels(["Reference", "Size", "Contains", "Found by"])
     leaf_items = []
 
     def add(node, parent_item):
+        label = node.name if node.is_leaf else node.name.rstrip(os.sep) + os.sep
         detail = "1 file" if node.files == 1 else "{} files".format(node.files)
-        item = QtWidgets.QTreeWidgetItem([
-            node.name if node.is_leaf else node.name.rstrip(os.sep) + os.sep,
-            human_bytes(node.bytes), detail, SOURCE_LABELS.get(node.source, "")])
-        item.setData(0, QtCore.Qt.UserRole, node.path)
-        item.setTextAlignment(1, QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
-        flags = item.flags() | QtCore.Qt.ItemIsUserCheckable
+        first = QtGui.QStandardItem(label)
+        first.setData(node.path, QtCore.Qt.UserRole + 1)
+        first.setCheckable(True)
+        first.setEditable(False)
         if not node.is_leaf:
-            flags |= QtCore.Qt.ItemIsAutoTristate
-        item.setFlags(flags)
-        if parent_item is None:
-            tree.addTopLevelItem(item)
-        else:
-            parent_item.addChild(item)
+            first.setAutoTristate(True)
+        size = QtGui.QStandardItem(human_bytes(node.bytes))
+        size.setTextAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        row = [first, size, QtGui.QStandardItem(detail),
+               QtGui.QStandardItem(SOURCE_LABELS.get(node.source, ""))]
+        for cell in row[1:]:
+            cell.setEditable(False)
+        parent_item.appendRow(row)
         if node.is_leaf:
-            leaf_items.append((item, node))
+            leaf_items.append((first, node))
         for child in node.children:
-            add(child, item)
-        return item
+            add(child, first)
+        return first
 
-    for root in roots:
-        add(root, None).setExpanded(True)  # only the top level opens by default
+    root_items = [add(root, model.invisibleRootItem()) for root in roots]
+
+    def _refold(item):
+        """Recompute a folder's box from its children.
+
+        Qt derives it automatically only while signals flow; every bulk
+        change here blocks them (300 dataChanged signals per Check All is
+        not a refresh, it is a freeze), so the folds are recomputed once at
+        the end instead.
+        """
+        if not item.hasChildren():
+            return item.checkState()
+        states = {_refold(item.child(row)) for row in range(item.rowCount())}
+        state = states.pop() if len(states) == 1 else QtCore.Qt.PartiallyChecked
+        item.setCheckState(state)
+        return state
 
     # States go on AFTER the tree is assembled: auto-tristate derives every
     # folder from its children, so a folder set before its children exist
     # would be overwritten by them.
-    tree.blockSignals(True)
+    model.blockSignals(True)
     for item, node in leaf_items:
-        item.setCheckState(0, QtCore.Qt.Checked
+        item.setCheckState(QtCore.Qt.Checked
                            if normalise(node.path) in picked else QtCore.Qt.Unchecked)
-    tree.blockSignals(False)
+    for item in root_items:
+        _refold(item)
+    model.blockSignals(False)
 
-    tree.setColumnWidth(0, 560)
-    tree.setColumnWidth(1, 100)
-    tree.setColumnWidth(2, 90)
-    layout.addWidget(tree, 1)
+    view = hqt.TreeView() if hqt is not None and hasattr(hqt, "TreeView") else QtWidgets.QTreeView()
+    view.setModel(model)
+    view.setUniformRowHeights(True)
+    # Off deliberately: with Houdini's style the stripes carry on past the
+    # last row and fill the empty viewport, which is exactly the "not a
+    # Houdini window" look. Its own trees do not do that.
+    view.setAlternatingRowColors(False)
+    view.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
+    view.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+    for item in root_items:
+        view.expand(model.indexFromItem(item))  # only the top level opens
+    view.setColumnWidth(0, 560)
+    view.setColumnWidth(1, 100)
+    view.setColumnWidth(2, 90)
+    layout.addWidget(view, 1)
 
     if missing:
         note = QtWidgets.QLabel("Not on disk, skipped:  " + "   ".join(missing[:3])
                                 + ("   ..." if len(missing) > 3 else ""))
         note.setWordWrap(True)
         layout.addWidget(note)
+
+    if hqt is not None and hasattr(hqt, "Separator"):
+        layout.addWidget(hqt.Separator())
 
     buttons = QtWidgets.QHBoxLayout()
     check_all = QtWidgets.QPushButton("Check All")
@@ -468,21 +521,56 @@ def build_dialog(roots, missing, checked, title="RunPodFarm", parent=None):
 
     def _checked():
         return {node.path for item, node in leaf_items
-                if item.checkState(0) == QtCore.Qt.Checked}
+                if item.checkState() == QtCore.Qt.Checked}
 
-    def _refresh():
+    def _refresh(*_args):
         chosen = _checked()
         head.setText(header_text(roots, chosen, missing))
         upload.setEnabled(bool(chosen))
 
     def _set_all(state):
-        tree.blockSignals(True)
+        model.blockSignals(True)
         for item, _node in leaf_items:
-            item.setCheckState(0, state)
-        tree.blockSignals(False)
+            item.setCheckState(state)
+        for item in root_items:  # blocked signals mean nothing folded itself
+            _refold(item)
+        model.blockSignals(False)
         _refresh()
 
-    tree.itemChanged.connect(lambda *_: _refresh())
+    def _cascade(item, state):
+        for row in range(item.rowCount()):
+            child = item.child(row)
+            child.setCheckState(state)
+            _cascade(child, state)
+
+    busy = {"in_update": False}
+
+    def _on_item_changed(item):
+        """Both directions of the folder checkbox, by hand.
+
+        ``QStandardItem.setAutoTristate`` is not ``ItemIsAutoTristate``:
+        the auto-tristate logic lives in QTreeWidgetItem, which this model
+        is not (Houdini's TreeView is a QTreeView, so a QTreeWidget cannot
+        be used at all). Verified head-less: with the flag set and nothing
+        else, unchecking a child left the folder fully checked -- a
+        collapsed row that lies about what is under it.
+        """
+        if busy["in_update"] or item.column() != 0:
+            return
+        busy["in_update"] = True
+        model.blockSignals(True)
+        try:
+            state = item.checkState()
+            if item.hasChildren() and state != QtCore.Qt.PartiallyChecked:
+                _cascade(item, state)
+            for root in root_items:
+                _refold(root)
+        finally:
+            model.blockSignals(False)
+            busy["in_update"] = False
+        _refresh()
+
+    model.itemChanged.connect(_on_item_changed)
     check_all.clicked.connect(lambda: _set_all(QtCore.Qt.Checked))
     check_none.clicked.connect(lambda: _set_all(QtCore.Qt.Unchecked))
     box.accepted.connect(dialog.accept)
@@ -493,6 +581,8 @@ def build_dialog(roots, missing, checked, title="RunPodFarm", parent=None):
     # returned through a signal: the dialog is modal, so the caller reads
     # the answer straight off the object after exec().
     dialog.rpfarm_checked = _checked
+    dialog.rpfarm_view = view
+    dialog.rpfarm_model = model
     return dialog
 
 
@@ -505,10 +595,9 @@ def confirm(roots, missing, checked, title="RunPodFarm", parent=None):
     from PySide6 import QtWidgets
 
     if parent is None:
+        hqt = houdini_qt()
         try:
-            import hou
-
-            parent = hou.qt.mainWindow()
+            parent = hqt.mainWindow() if hqt is not None else None
         except Exception:
             parent = None
     if QtWidgets.QApplication.instance() is None:  # pragma: no cover - Houdini always has one
