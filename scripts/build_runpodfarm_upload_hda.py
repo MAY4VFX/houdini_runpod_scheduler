@@ -123,6 +123,41 @@ def project_default():
         return os.path.basename(os.path.normpath(job)) if job else ""
     except Exception:
         return ""
+
+
+# -- buttons (these may raise: unlike the default expressions above, they run
+#    on a click, not while the parameter dialog is being drawn) ---------------
+
+
+def _say(message):
+    print("[rpfarm-upload] {}".format(message))
+
+
+def previewUpload(kwargs):
+    """Show the upload plan without cooking anything.
+
+    The same window the cook shows, forced on (ask=True) regardless of the
+    Confirm toggle -- that is what the button is for. Any choice made here
+    is written back to the node, so previewing IS the way to set the
+    selection for a batch cook that will never open a window.
+    """
+    node = kwargs["node"]
+    from rpfarm import deps as rpdeps
+    from rpfarm import preflight as rppf
+
+    scope = node.evalParm("rpfarm_scope") or rpdeps.SCOPE_BRANCH
+    refs = rpdeps.collect_refs(scope=scope, node=node, log=_say)
+    try:
+        rppf.resolve_upload_set(node, refs, ask=True, log=_say)
+    except rppf.UploadCancelled:
+        _say("preview closed with Cancel -- nothing changed")
+
+
+def clearExclusions(kwargs):
+    """Re-check every reference this node was told to skip."""
+    node = kwargs["node"]
+    node.parm("rpfarm_exclude").set("")
+    _say("all references re-checked")
 '''
 
 GENERATE_CODE = '''\
@@ -159,6 +194,25 @@ from rpfarm import config as rpcfg
 from rpfarm import deps as rpdeps
 from rpfarm import houdini_local as rphou
 from rpfarm import packages as rppkg
+from rpfarm import preflight as rppf
+
+# The asset and the package are updated together, but Python caches modules
+# for the life of the process: a Houdini that reloads this asset without
+# restarting runs the NEW generate against the OLD rpfarm, and the artist
+# gets "unexpected keyword argument 'scope'" instead of the one instruction
+# that helps. The full version-floor guard (scripts/hda_guard.py) lives in
+# the assets that import rpfarm while the scene is loading; here a single
+# capability check is enough, because nothing in this node runs until a cook.
+if not hasattr(rpdeps, "SCOPE_BRANCH"):
+    raise hou.NodeError(
+        "Код фермы обновился, а Houdini держит в памяти старую версию.\\n"
+        "\\n"
+        "ПЕРЕЗАПУСТИТЕ HOUDINI. Больше ничего делать не нужно --\\n"
+        "на диске всё правильно, чинить нечего.")
+
+
+def _say(message):
+    print("[rpfarm-upload] {}".format(message))
 
 node = self.topNode().parent()
 
@@ -185,7 +239,26 @@ if preset == "install_houdini":
     custom, post_command = rppkg.houdini_install_preset(tar, ver)
     mode = "custom"
 
-refs = rpdeps.collect_refs() if mode == "deps" else []
+# Two separate questions, and until 2026-09-05 this node asked neither.
+# Which references belong to THIS cook (Dependencies: branch vs whole
+# scene), and which of them does the artist actually want moved (the
+# confirmation window, remembered on the node). Field case: the node
+# planned 794 files / 9.97 GB for a scene that reads 113 files / 1.32 GB,
+# because one unrelated TOP scheduler's pdg_workingdir named the project
+# folder and a directory reference is walked recursively. Custom mode
+# skips both -- there the artist typed the paths, so there is nothing to
+# narrow and nothing to confirm.
+refs = []
+if mode == "deps":
+    refs = rpdeps.collect_refs(
+        scope=node.evalParm("rpfarm_scope") or rpdeps.SCOPE_BRANCH, node=node, log=_say)
+    try:
+        refs, _plan_rows, _plan_missing, _plan_excluded = rppf.resolve_upload_set(
+            node, refs, log=_say)
+    except rppf.UploadCancelled as e:
+        # A deliberate no, not a failure -- but generation has to stop, and
+        # a NodeError is the only way to stop it that PDG reports plainly.
+        raise hou.NodeError(str(e))
 
 items = rppkg.build_upload_items(mode, job_dir, user, project, custom, refs, package_gb)
 
@@ -462,6 +535,70 @@ Mode:
     plus everything it references, expanded and de-duplicated. `Custom
     paths` uploads exactly the local -> remote pairs below.
 
+Dependencies:
+    #id: rpfarm_scope
+
+    Which references count. `This cook's branch` starts at every ROP Fetch
+    in this TOP network, resolves each `roppath`, and walks upstream from
+    there -- input ancestors, node-reference parameters (a LOP reaching a
+    SOP through `soppath`), and the contents of every node it reaches.
+    `Whole scene` is every file reference in the hip file, which is what
+    this node did unconditionally before 2026-09-05.
+
+    Why branch is the default: on a real scene the difference was 794 files
+    / 9.97 GB against 113 files / 1.32 GB, and everything extra is uplink
+    time paid before a rented GPU starts rendering. When the branch cannot
+    be resolved (nothing in the network fetches a ROP), `collect_refs`
+    falls back to the whole scene and says so in the log -- narrowing never
+    silently ships less than it can prove.
+
+    What NEITHER scope can see: assets a USD layer references from inside
+    itself. Those are resolved by USD at render time and never appear in
+    `hou.fileReferences()`, so they are missing from `Whole scene` too --
+    narrowing does not lose them, it was never able to find them. Add them
+    by hand in `Custom paths` (or upload the folder they live in once).
+
+    Output parameters are dropped in BOTH scopes: `pdg_workingdir`,
+    `outputimage`, `savetodirectory_directory`, cryptomatte side-cars and
+    the rest of `rpfarm.deps._NON_DEPENDENCY_PARMS`. A scheduler's working
+    directory is not a dependency of anything, and it is what turned one
+    parameter into 11.54 GB (ten .hip versions, 467 finished EXRs and a
+    1.47 GB export zip) the day this was found.
+
+Confirm Before Upload:
+    #id: rpfarm_confirm
+
+    Shows the plan before anything moves: every reference with its size,
+    heaviest first, with a checkbox. A directory reference is ONE line
+    carrying its whole recursive weight -- that is deliberate, it is how a
+    single parameter turns into gigabytes and it has to be visible as one
+    line you can uncheck, not 827 you scroll past.
+
+    Unchecking is remembered on the node (`rpfarm_exclude`, hidden), so the
+    window is not a tax on every cook: answer it once, and it comes back
+    the way you left it. Cancel stops the cook -- it does not fall through
+    to uploading what was there before.
+
+    Turn it off for batch/headless work. A cook without a UI never shows it
+    anyway (`hou.isUIAvailable()`), and a cook whose generation runs off the
+    main thread does not either -- Qt from another thread is not a raised
+    exception, it is a lost session. With no window, every directory
+    reference is still logged with its full weight, so nothing is expanded
+    silently either way. If the window itself fails to open, the upload
+    proceeds with the remembered selection and the reason is logged: a
+    confirmation dialog must never be the reason a farm submission dies.
+
+Preview Upload...:
+    #id: rpfarm_preview
+
+    Open that window now, without cooking -- and the way to set the
+    selection for a batch cook that will never open it.
+
+Re-check Everything:
+    #id: rpfarm_clearexclude
+
+    Forget every reference unchecked in the window.
+
 Project:
     #id: rpfarm_project
 
@@ -593,6 +730,56 @@ def main():
         menu_items=("deps", "custom"), menu_labels=("Project Dependencies", "Custom Paths"),
     )
     mode_pt.setHelp("Project dependencies: hou.fileReferences() plus the hip file itself. Custom paths: exactly the local -> remote pairs below.")
+
+    # Default: the branch. The whole scene is a superset that in the field
+    # was 9x too big (794 files / 9.97 GB against 113 / 1.32 GB), and every
+    # extra byte is uplink time before a rented GPU starts. When the branch
+    # cannot be worked out at all, collect_refs falls back to the whole
+    # scene and says so in the log -- so the safe direction is still the
+    # automatic one.
+    scope_pt = hou.StringParmTemplate(
+        "rpfarm_scope", "Dependencies", 1, default_value=("branch",),
+        menu_items=("branch", "scene"),
+        menu_labels=("This cook's branch", "Whole scene"),
+    )
+    scope_pt.setHelp(
+        "Branch: only what the ROPs this TOP network fetches actually read. "
+        "Whole scene: every file reference in the hip file. Neither can see "
+        "assets a USD layer references from inside itself -- those never "
+        "appear in hou.fileReferences() in the first place."
+    )
+    scope_pt.setConditional(hou.parmCondType.HideWhen, "{ rpfarm_mode != deps }")
+
+    confirm_pt = hou.ToggleParmTemplate("rpfarm_confirm", "Confirm Before Upload", default_value=True)
+    confirm_pt.setHelp(
+        "Show the plan -- every reference with its size, heaviest first -- and "
+        "upload only what stays checked. Off for batch/headless cooks, which "
+        "then use the selection this node already remembers. A cook with no UI "
+        "(hython) never shows the window regardless."
+    )
+    confirm_pt.setConditional(hou.parmCondType.HideWhen, "{ rpfarm_mode != deps }")
+
+    preview_pt = hou.ButtonParmTemplate("rpfarm_preview", "Preview Upload...")
+    preview_pt.setHelp(
+        "Open that window now, without cooking. This is how you set the "
+        "selection for a batch cook that will never open it."
+    )
+    preview_pt.setScriptCallback("hou.phm().previewUpload(kwargs)")
+    preview_pt.setScriptCallbackLanguage(hou.scriptLanguage.Python)
+    preview_pt.setConditional(hou.parmCondType.HideWhen, "{ rpfarm_mode != deps }")
+
+    clearexclude_pt = hou.ButtonParmTemplate("rpfarm_clearexclude", "Re-check Everything")
+    clearexclude_pt.setHelp("Forget every reference unchecked in the window.")
+    clearexclude_pt.setScriptCallback("hou.phm().clearExclusions(kwargs)")
+    clearexclude_pt.setScriptCallbackLanguage(hou.scriptLanguage.Python)
+    clearexclude_pt.setConditional(hou.parmCondType.HideWhen, "{ rpfarm_mode != deps }")
+
+    # Hidden, but a real parameter and not user data: it has to travel with
+    # the scene, survive save/load, and be diffable when someone asks why a
+    # file did not upload.
+    exclude_pt = hou.StringParmTemplate("rpfarm_exclude", "Unchecked References", 1, default_value=("",))
+    exclude_pt.setHelp("JSON list of references the artist unchecked. Cleared by Re-check Everything.")
+    exclude_pt.hide(True)
     # Matches runpodfarm_scheduler's own rpfarm_project parm: empty string,
     # with the "basename of $JOB" fallback implemented in onGenerate
     # (Python) rather than as a live default expression here.
@@ -673,8 +860,9 @@ def main():
     )
 
     for pt in (
-        mode_pt, project_pt, packagegb_pt, compress_pt, custom_pt, postcmd_pt,
-        preset_pt, houtar_pt, houver_pt, inprocess_pt,
+        mode_pt, scope_pt, project_pt, packagegb_pt, compress_pt,
+        confirm_pt, preview_pt, clearexclude_pt, exclude_pt,
+        custom_pt, postcmd_pt, preset_pt, houtar_pt, houver_pt, inprocess_pt,
     ):
         ptg.append(pt)
 

@@ -13,4 +13,4 @@ name, a changed signature) and raise the matching
 harmless: the check is a floor, not an equality.
 """
 
-VERSION = "2.1.0"
+VERSION = "2.2.0"
