@@ -194,12 +194,12 @@ def test_collect_refs_import_guard(monkeypatch):
     ]
     stub = SimpleNamespace(
         hipFile=SimpleNamespace(path=lambda: "/job/hip/scene.hip"),
-        fileReferences=lambda: refs,
+        fileReferences=lambda *a, **k: refs,
         text=_StubText(),
     )
     monkeypatch.setitem(sys.modules, "hou", stub)
 
-    result = collect_refs()
+    result = collect_refs(**_ANY_PATH)
 
     assert result[0] == "/job/hip/scene.hip"
     assert "/job/tex/a.rat" in result
@@ -304,10 +304,17 @@ class _StubNode:
         return out
 
 
+# The stub scenes below name paths that are not on this machine, so the
+# existence check every reference now goes through is stubbed out too --
+# these tests are about which references survive the filters, not about
+# what is on disk (that is expand_reference's own tests, above).
+_ANY_PATH = {"exists": lambda _p: True, "isdir": lambda _p: True}
+
+
 def _stub_hou(scene, refs):
     return SimpleNamespace(
         hipFile=SimpleNamespace(path=lambda: "/job/hip/scene.hip"),
-        fileReferences=lambda: refs,
+        fileReferences=lambda *a, **k: refs,
         text=_StubText(),
         node=scene.get,
         stringParmType=SimpleNamespace(NodeReference="noderef", NodeReferenceList="noderefs"),
@@ -352,7 +359,7 @@ def test_a_schedulers_working_directory_is_not_a_dependency(monkeypatch):
     ]
     monkeypatch.setitem(sys.modules, "hou", _stub_hou(scene, refs))
 
-    result = collect_refs()  # whole scene -- the filter is not the scope
+    result = collect_refs(**_ANY_PATH)  # whole scene -- the filter is not the scope
 
     assert "/job/tex/a.rat" in result
     assert "/job" not in result
@@ -371,7 +378,7 @@ def test_an_output_path_is_not_a_dependency(monkeypatch):
     ]
     monkeypatch.setitem(sys.modules, "hou", _stub_hou(scene, refs))
 
-    result = collect_refs()
+    result = collect_refs(**_ANY_PATH)
 
     assert result == ["/job/hip/scene.hip", "/job/tex/a.rat"]
 
@@ -385,8 +392,8 @@ def test_branch_scope_keeps_only_what_this_cook_reads(monkeypatch):
     ]
     monkeypatch.setitem(sys.modules, "hou", _stub_hou(scene, refs))
 
-    scoped = collect_refs(scope="branch", node=upload)
-    whole = collect_refs(scope="scene", node=upload)
+    scoped = collect_refs(scope="branch", node=upload, **_ANY_PATH)
+    whole = collect_refs(scope="scene", node=upload, **_ANY_PATH)
 
     assert "/job/tex/airship.rat" in scoped
     assert "/job/tex/probe.rat" not in scoped, "another network's lookdev is not this cook"
@@ -404,7 +411,7 @@ def test_branch_scope_follows_node_references_not_just_inputs(monkeypatch):
     refs = [(_StubParm("file", sop), "/job/geo/airship.bgeo.sc")]
     monkeypatch.setitem(sys.modules, "hou", _stub_hou(scene, refs))
 
-    assert "/job/geo/airship.bgeo.sc" in collect_refs(scope="branch", node=upload)
+    assert "/job/geo/airship.bgeo.sc" in collect_refs(scope="branch", node=upload, **_ANY_PATH)
 
 
 def test_branch_scope_falls_back_to_the_whole_scene_when_it_finds_no_rop(monkeypatch):
@@ -419,7 +426,7 @@ def test_branch_scope_falls_back_to_the_whole_scene_when_it_finds_no_rop(monkeyp
     monkeypatch.setitem(sys.modules, "hou", _stub_hou(scene, refs))
     said = []
 
-    result = collect_refs(scope="branch", node=upload, log=said.append)
+    result = collect_refs(scope="branch", node=upload, log=said.append, **_ANY_PATH)
 
     assert "/job/tex/a.rat" in result
     assert any("whole scene" in m for m in said), said
@@ -456,3 +463,128 @@ def test_plan_refs_dedups_and_honours_the_skip_rules(tmp_path):
 
     assert len(rows) == 1
     assert rows[0].path == str(job) and rows[0].files == 1  # backup/ and ~ pruned
+
+
+# -- resolving one reference to real paths (field measurement, 2026-09-05) -------
+#
+# On airship_v013.hip, of 115 references: 38 resolve ONLY through
+# hou.text.expandString, 0 only through parm.evalAsString(), 26 through both
+# identically, 0 through both differently. The 38 are FBX: evaluating the
+# parameter returns "/Users/may/Downloads/airship_v06.fbx#Airship_...,convertoff",
+# an address INTO the file, which does not exist on disk. SideFX's own advice
+# in the displayFileDependencyDialog docs -- "evaluate the parameter instead of
+# calling hou.expandString" -- would have dropped all 38. The rule is to try
+# both and keep what exists.
+
+
+class _EvalParm:
+    def __init__(self, value):
+        self._value = value
+
+    def evalAsString(self):
+        return self._value
+
+
+def _expand_env(text):
+    return text.replace("$HIP", "/job").replace("$JOB", "/job")
+
+
+def test_an_fbx_fragment_resolves_through_the_pattern(tmp_path):
+    fbx = tmp_path / "airship.fbx"
+    fbx.write_bytes(b"f")
+    parm = _EvalParm(str(fbx) + "#Airship_fullBindings,convertoff")
+
+    got = deps.expand_reference(parm, str(fbx), expand=lambda s: s)
+
+    assert got == [str(fbx)]
+
+
+def test_a_parameter_that_only_evaluates_is_not_lost(tmp_path):
+    """The mirror case: $OS, channel references and other things only the
+    parameter knows how to expand."""
+    real = tmp_path / "geo.bgeo"
+    real.write_bytes(b"g")
+
+    got = deps.expand_reference(_EvalParm(str(real)), "$HIP/`chs('x')`.bgeo", expand=_expand_env)
+
+    assert got == [str(real)]
+
+
+def test_two_different_real_paths_are_both_kept(tmp_path):
+    a = tmp_path / "a.rat"
+    a.write_bytes(b"a")
+    b = tmp_path / "b.rat"
+    b.write_bytes(b"b")
+
+    got = deps.expand_reference(_EvalParm(str(a)), str(b), expand=lambda s: s)
+
+    assert sorted(got) == sorted([str(a), str(b)])
+
+
+def test_the_same_path_twice_is_one_path(tmp_path):
+    a = tmp_path / "a.rat"
+    a.write_bytes(b"a")
+
+    assert deps.expand_reference(_EvalParm(str(a)), str(a), expand=lambda s: s) == [str(a)]
+
+
+def test_a_sequence_becomes_its_directory_only_if_that_exists(tmp_path):
+    seq = tmp_path / "cache"
+    seq.mkdir()
+    (seq / "c.0001.bgeo").write_bytes(b"c")
+
+    assert deps.expand_reference(None, str(seq / "c.$F4.bgeo"), expand=lambda s: s) == [str(seq)]
+    assert deps.expand_reference(None, str(tmp_path / "gone" / "c.$F4.bgeo"), expand=lambda s: s) == []
+
+
+def test_a_reference_that_resolves_to_nothing_yields_nothing(tmp_path):
+    assert deps.expand_reference(None, str(tmp_path / "missing.exr"), expand=lambda s: s) == []
+
+
+# -- what the built-in dependency dialog needs from us ---------------------------
+
+
+def test_output_patterns_come_back_for_the_dialog_to_show_unchecked(monkeypatch):
+    """Houdini's own dialog takes forced_unselected_patterns. Handing it the
+    output references is honester than dropping them behind the artist's
+    back: they see the decision and can undo it."""
+    scene, upload, geo, _lookdev, sched = _airship_like_scene()
+    refs = [
+        (_StubParm("file", geo), "$JOB/tex/a.rat"),
+        (_StubParm("pdg_workingdir", sched), "$JOB"),
+    ]
+    monkeypatch.setitem(sys.modules, "hou", _stub_hou(scene, refs))
+
+    got = deps.scan_refs(**_ANY_PATH)
+
+    assert got.output_patterns == ("$JOB",)
+    assert "/job/tex/a.rat" in got.paths
+
+
+def test_after_the_artist_answers_the_dialog_we_do_not_second_guess_them(monkeypatch):
+    scene, upload, geo, _lookdev, sched = _airship_like_scene()
+    refs = [(_StubParm("pdg_workingdir", sched), "$JOB")]
+    monkeypatch.setitem(sys.modules, "hou", _stub_hou(scene, refs))
+
+    got = deps.scan_refs(drop_outputs=False, **_ANY_PATH)
+
+    assert "/job" in got.paths
+    assert got.output_patterns == ()
+
+
+def test_selected_only_asks_houdini_for_its_own_selection(monkeypatch):
+    scene, upload, geo, _lookdev, _sched = _airship_like_scene()
+    seen = {}
+
+    def _refs(project_dir_variable="HIP", include_all_refs=True):
+        seen["all"] = include_all_refs
+        seen["var"] = project_dir_variable
+        return [(_StubParm("file", geo), "$JOB/tex/a.rat")]
+
+    stub = _stub_hou(scene, [])
+    stub.fileReferences = _refs
+    monkeypatch.setitem(sys.modules, "hou", stub)
+
+    deps.scan_refs(selected_only=True, project_dir_variable="JOB", **_ANY_PATH)
+
+    assert seen == {"all": False, "var": "JOB"}

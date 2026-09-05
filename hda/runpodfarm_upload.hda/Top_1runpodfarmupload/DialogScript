@@ -72,6 +72,14 @@
         hidewhen "{ rpfarm_mode != deps }"
     }
     parm {
+        name    "rpfarm_usddeep"
+        label   "Scan USD Layer Files Too"
+        type    toggle
+        default { "1" }
+        help    "On: also run UsdUtils.ComputeAllDependencies on every USD layer on disk, which finds what the layer file references even when this session never composed it -- and expands <UDIM> itself. Off: only what the live stage reads. 0.02s per layer on a 1.6 GB layer, but reported slow on very large scenes; the cook logs the time it took."
+        hidewhen "{ rpfarm_mode != deps }"
+    }
+    parm {
         name    "rpfarm_preview"
         label   "Preview Upload..."
         type    button
@@ -93,11 +101,11 @@
     }
     parm {
         name    "rpfarm_exclude"
-        label   "Unchecked References"
+        label   "Unchecked USD Files"
         type    string
         invisible
         default { "" }
-        help    "JSON list of references the artist unchecked. Cleared by Re-check Everything."
+        help    "JSON list of USD files the artist unchecked. Cleared by Re-check Everything."
     }
     multiparm {
         name    "rpfarm_custom"

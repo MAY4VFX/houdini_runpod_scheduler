@@ -11,6 +11,7 @@ import os
 
 import pytest
 
+from rpfarm import deps
 from rpfarm import preflight as pf
 from rpfarm.deps import PlanRow
 
@@ -131,7 +132,7 @@ class _FakeParm:
 
 
 class _FakeNode:
-    """The three parameters resolve_upload_set touches, and nothing else."""
+    """The two parameters choose_uploads touches, and nothing else."""
 
     def __init__(self, confirm=1, exclude=""):
         self._parms = {"rpfarm_confirm": _FakeParm(confirm), "rpfarm_exclude": _FakeParm(exclude)}
@@ -143,93 +144,117 @@ class _FakeNode:
         return self._parms[name].value
 
 
-def _scene(tmp_path):
-    """A hip, a texture and one heavy directory reference."""
-    (tmp_path / "export").mkdir()
-    (tmp_path / "export" / "lookdev.zip").write_bytes(b"z" * 4096)
-    (tmp_path / "scene.hip").write_bytes(b"h")
-    (tmp_path / "tex.rat").write_bytes(b"t" * 10)
-    return [str(tmp_path / "scene.hip"), str(tmp_path / "export"), str(tmp_path / "tex.rat")]
+def _scan(paths, output_patterns=()):
+    return deps.RefScan(paths=list(paths), output_patterns=tuple(output_patterns), unresolved=())
 
 
-def test_batch_mode_uploads_the_remembered_selection_without_asking(tmp_path, monkeypatch):
-    refs = _scene(tmp_path)
-    node = _FakeNode(confirm=0, exclude=pf.dump_exclusions({str(tmp_path / "export")}))
-    monkeypatch.setattr(pf, "confirm", lambda *a, **k: pytest.fail("must not ask"))
-
-    kept, rows, missing, excluded = pf.resolve_upload_set(node, refs)
-
-    assert kept == [str(tmp_path / "scene.hip"), str(tmp_path / "tex.rat")]
-    assert len(rows) == 3 and missing == []
-
-
-def test_a_directory_is_never_expanded_silently(tmp_path):
-    """No window means no one saw the plan, so the log has to name the
-    directory and its full weight -- that is the parameter that turned into
-    11.54 GB in the field."""
-    refs = _scene(tmp_path)
-    said = []
-
-    pf.resolve_upload_set(_FakeNode(confirm=0), refs, log=said.append)
-
-    line = [m for m in said if str(tmp_path / "export") in m]
-    assert line, said
-    assert "1 file" in line[0] and "4.0 KB" in line[0]
+def _files(tmp_path):
+    hip = tmp_path / "scene.hip"
+    hip.write_bytes(b"h")
+    tex = tmp_path / "tex.rat"
+    tex.write_bytes(b"t" * 10)
+    out = tmp_path / "render"
+    out.mkdir()
+    (out / "f.0001.exr").write_bytes(b"e" * 100)
+    return str(hip), str(tex), str(out)
 
 
-def test_the_window_choice_is_written_back_to_the_node(tmp_path, monkeypatch):
-    refs = _scene(tmp_path)
-    node = _FakeNode(confirm=1)
-    monkeypatch.setattr(pf, "confirm", lambda rows, missing, excluded, **k: {str(tmp_path / "export")})
+def test_the_dialogs_answer_is_taken_as_given(tmp_path):
+    """Houdini's window is where the decision is made. If the artist
+    re-checks a row we had forced unchecked -- an output path -- that is
+    their call, and second-guessing it would make the checkbox a lie."""
+    hip, tex, out = _files(tmp_path)
+    node = _FakeNode()
+    selection = [(None, tex), (None, out + "/f.$F4.exr")]
 
-    kept, _rows, _missing, excluded = pf.resolve_upload_set(node, refs, ask=True)
+    got = pf.choose_uploads(
+        node, _scan([hip], output_patterns=(out + "/f.$F4.exr",)), ask=True,
+        dialog=lambda *a: (True, selection), expand=lambda s: s, hip_path=hip)
 
-    assert str(tmp_path / "export") not in kept
-    assert pf.load_exclusions(node.evalParm("rpfarm_exclude")) == {str(tmp_path / "export")}
+    assert got == [hip, tex, out]
 
 
-def test_cancel_stops_the_cook(tmp_path, monkeypatch):
-    """Cancel must not fall through to "upload what you had" -- the artist
-    said no to this upload, not to this row."""
-    monkeypatch.setattr(pf, "confirm", lambda *a, **k: None)
+def test_cancel_in_the_file_dialog_stops_the_cook(tmp_path):
+    hip, tex, _out = _files(tmp_path)
 
     with pytest.raises(pf.UploadCancelled):
-        pf.resolve_upload_set(_FakeNode(), _scene(tmp_path), ask=True)
+        pf.choose_uploads(_FakeNode(), _scan([hip, tex]), ask=True,
+                          dialog=lambda *a: (False, ()), expand=lambda s: s, hip_path=hip)
 
 
-def test_a_broken_window_never_stalls_the_cook(tmp_path, monkeypatch):
-    """Qt failing is not a reason to refuse to upload: fall back to the
-    remembered selection and say so."""
-    refs = _scene(tmp_path)
+def test_a_broken_file_dialog_falls_back_to_the_scan(tmp_path):
+    """Qt failing is not a reason to refuse to upload."""
+    hip, tex, _out = _files(tmp_path)
 
-    def _boom(*a, **k):
+    def _boom(*a):
         raise RuntimeError("no QApplication")
 
-    monkeypatch.setattr(pf, "confirm", _boom)
     said = []
+    got = pf.choose_uploads(_FakeNode(), _scan([hip, tex]), ask=True, dialog=_boom,
+                            log=said.append, expand=lambda s: s, hip_path=hip)
 
-    kept, _rows, _missing, _excluded = pf.resolve_upload_set(_FakeNode(), refs, ask=True, log=said.append)
-
-    assert kept == refs
+    assert got == [hip, tex]
     assert any("no QApplication" in m for m in said), said
 
 
-def test_a_skipped_window_says_which_condition_refused(tmp_path, monkeypatch):
-    """Silence here reads as "the window is broken". The artist has a
-    working alternative when it is the thread check that refused, and the
-    log is where they find out."""
+def test_usd_files_get_our_own_window_because_houdini_has_no_row_for_them(tmp_path):
+    """hou.fileReferences() has no entry for a texture a USD layer names
+    from inside itself, so displayFileDependencyDialog cannot show one --
+    there is no API to add a row that is not a (Parm, pattern) pair."""
+    hip, tex, _out = _files(tmp_path)
+    usd = tmp_path / "Zeppelin.usdc"
+    usd.write_bytes(b"u" * 50)
+    png = tmp_path / "Balon_1001.png"
+    png.write_bytes(b"p" * 5000)
+    node = _FakeNode()
+    asked = {}
+
+    def _usd_window(rows, missing, excluded, **kw):
+        asked["paths"] = [r.path for r in rows]
+        return {str(png)}  # the artist unchecks the heavy source texture
+
+    got = pf.choose_uploads(node, _scan([hip]), usd_paths=[str(usd), str(png)], ask=True,
+                            dialog=lambda *a: (True, [(None, tex)]),
+                            confirm_usd=_usd_window, expand=lambda s: s, hip_path=hip)
+
+    assert asked["paths"] == [str(usd), str(png)]
+    assert got == [hip, tex, str(usd)]
+    assert pf.load_exclusions(node.evalParm("rpfarm_exclude")) == {str(png)}
+
+
+def test_an_unchecked_usd_file_stays_unchecked_next_cook(tmp_path):
+    hip, _tex, _out = _files(tmp_path)
+    usd = tmp_path / "Zeppelin.usdc"
+    usd.write_bytes(b"u")
+    png = tmp_path / "Balon_1001.png"
+    png.write_bytes(b"p")
+    node = _FakeNode(confirm=0, exclude=pf.dump_exclusions({str(png)}))
+
+    got = pf.choose_uploads(node, _scan([hip]), usd_paths=[str(usd), str(png)], ask=False)
+
+    assert got == [hip, str(usd)]
+
+
+def test_batch_mode_asks_nothing(tmp_path):
+    hip, tex, _out = _files(tmp_path)
+
+    got = pf.choose_uploads(_FakeNode(confirm=0), _scan([hip, tex]), ask=False,
+                            dialog=lambda *a: pytest.fail("must not ask"))
+
+    assert got == [hip, tex]
+
+
+def test_wants_window_says_which_condition_refused(monkeypatch):
     monkeypatch.setattr(pf, "ui_unavailable_reason", lambda: "no UI (headless cook)")
     said = []
 
-    pf.resolve_upload_set(_FakeNode(confirm=1), _scene(tmp_path), log=said.append)
+    assert pf.wants_window(_FakeNode(confirm=1), log=said.append) is False
+    assert any("no UI (headless cook)" in m for m in said), said
 
-    assert any("confirmation window not shown: no UI (headless cook)" in m for m in said), said
+    said.clear()
+    assert pf.wants_window(_FakeNode(confirm=0), log=said.append) is False
+    assert not said, "nothing to explain when nobody asked for a window"
 
-
-def test_no_reason_is_logged_when_the_window_was_not_wanted(tmp_path, monkeypatch):
-    monkeypatch.setattr(pf, "ui_unavailable_reason", lambda: "no UI (headless cook)")
-    said = []
-
-    pf.resolve_upload_set(_FakeNode(confirm=0), _scene(tmp_path), log=said.append)
-
-    assert not any("not shown" in m for m in said), said
+    monkeypatch.setattr(pf, "ui_unavailable_reason", lambda: None)
+    assert pf.wants_window(_FakeNode(confirm=1)) is True
+    assert pf.wants_window(_FakeNode(confirm=1), ask=False) is False

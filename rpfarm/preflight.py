@@ -294,66 +294,131 @@ def confirm(rows, missing, excluded, title="RunPodFarm Upload", parent=None):
 
 
 class UploadCancelled(Exception):
-    """The artist pressed Cancel in the confirmation window.
+    """The artist pressed Cancel in a confirmation window.
 
     Distinct from any failure: the caller must stop the cook, and must not
     fall back to uploading the previously remembered selection.
     """
 
 
-def resolve_upload_set(node, refs, ask=None, log=None):
-    """Decide what this node uploads, asking the artist when there is a UI.
+def wants_window(node, ask=None, log=None):
+    """Whether to open a confirmation window, and say why when not.
 
-    Returns ``(kept_refs, rows, missing, excluded)``. ``node`` is read and
-    written through ``evalParm``/``parm(...).set`` only -- no ``hou``
-    import here, which is what makes the whole flow testable with a fake
-    node.
+    Decided before the scan, not after, because the answer changes what is
+    scanned: with a window, Houdini's dialog is asked; without one, its
+    remembered selection is read instead.
+    """
+    say = log if log is not None else (lambda _m: None)
+    if ask is not None:
+        return bool(ask)
+    if not bool(node.evalParm("rpfarm_confirm")):
+        return False
+    reason = ui_unavailable_reason()
+    if reason:
+        say("confirmation window not shown: {}".format(reason))
+        return False
+    return True
 
-    ``ask`` overrides the decision to show the window: ``None`` (default)
-    means "when the node's Confirm toggle is on and a UI is actually
-    available", ``True`` forces it (the Preview button), ``False``
-    suppresses it.
 
-    Failure policy, in order of importance:
+def houdini_dialog(rop, forced_unselected_patterns=(), project_dir_variable="HIP",
+                   uploaded_files=()):
+    """Houdini's own file-dependency dialog -- the one File > Pre-Flight Scene opens.
 
-    - Cancel raises :class:`UploadCancelled` -- the cook stops.
-    - A window that *fails* (no Qt, no QApplication, a cook generating off
-      the main thread) is logged and the upload proceeds with what the node
-      remembers. A confirmation dialog must never be the reason a farm
-      submission dies.
-    - With no window at all, every directory reference is logged with its
-      full weight. "Do not expand a directory silently" is the rule; when
-      no one is there to be asked, the log is where it is not silent.
+    Same call SideFX make from ``cloud.py`` (``_onShowFileReferenceDialog``)
+    and ``hqrop.py`` (``copyProjectFilesToSharedFolder``), positionally, in
+    that order. Returns ``(pressed_ok, ((parm, pattern), ...))``.
+
+    ``forced_unselected_patterns`` is where the output references go: the
+    artist sees them as unchecked rows and can put them back, instead of
+    our code deciding for them out of sight. SideFX use it for exactly the
+    same thing -- the ROP's own output pattern.
+    """
+    import hou
+
+    return hou.ui.displayFileDependencyDialog(
+        rop, tuple(uploaded_files), tuple(forced_unselected_patterns),
+        project_dir_variable, True)
+
+
+def choose_uploads(node, scan, usd_paths=(), ask=False, log=None, rop=None,
+                   project_dir_variable="HIP", dialog=None, confirm_usd=None,
+                   expand=None, hip_path=None):
+    """The final list of local paths this cook uploads.
+
+    Two halves, because Houdini's dialog can only show one of them:
+
+    * **Parameter references** go through Houdini's own dependency dialog
+      (:func:`houdini_dialog`). Its answer is taken as given -- no
+      second-guessing, including references we would have dropped as
+      outputs, because the artist can see and re-check those.
+    * **USD references** have no parameter at all -- nothing in
+      ``hou.fileReferences()`` points at a texture a USD layer names from
+      inside itself, so Houdini's dialog has no row to show and no API to
+      add one. They get :func:`confirm`, this package's own window, and the
+      choice is remembered on the node (``rpfarm_exclude``). That parameter
+      is now ONLY about USD files: for parameter references Houdini keeps
+      its own selection state, and two sources of truth for one question is
+      how they disagree.
+
+    A dialog that FAILS (no Qt, no QApplication, generation off the main
+    thread) is logged and the scan's own answer is used. Cancel raises
+    :class:`UploadCancelled`. A window is never the reason a farm
+    submission dies; a Cancel always is.
+
+    ``dialog``/``confirm_usd`` are injection seams for the tests.
     """
     say = log if log is not None else (lambda _message: None)
     from . import deps as _deps
 
-    rows, missing = _deps.plan_refs(refs)
-    excluded = load_exclusions(node.evalParm("rpfarm_exclude"))
-    if ask is None:
-        wanted = bool(node.evalParm("rpfarm_confirm"))
-        reason = ui_unavailable_reason() if wanted else None
-        if reason:
-            say("confirmation window not shown: {}".format(reason))
-        ask = wanted and reason is None
-
+    parm_paths = list(scan.paths)
     if ask:
+        show = dialog or houdini_dialog
         try:
-            chosen = confirm(rows, missing, excluded)
-        except Exception as exc:  # Qt is optional; the upload is not
-            say("confirmation window unavailable ({}) -- using the remembered selection".format(exc))
-            chosen = excluded
-        if chosen is None:
-            raise UploadCancelled("upload cancelled in the confirmation window")
-        if chosen != excluded:
-            node.parm("rpfarm_exclude").set(dump_exclusions(chosen))
-        excluded = chosen
-    else:
-        blocked = {normalise(p) for p in excluded}
-        for row in rows:
-            if row.kind == "dir" and normalise(row.path) not in blocked:
-                say("directory reference {} -> {}, {}".format(
-                    row_label(row), row_detail(row), human_bytes(row.bytes)))
+            pressed_ok, selection = show(rop, scan.output_patterns, project_dir_variable)
+        except Exception as exc:
+            say("file dependency window unavailable ({}) -- using the scanned set".format(exc))
+            pressed_ok, selection = True, None
+        if not pressed_ok:
+            raise UploadCancelled("upload cancelled in the file dependency window")
+        if selection is not None:
+            if expand is None or hip_path is None:
+                import hou
 
-    say(header_text(rows, missing, excluded))
-    return apply_exclusions(refs, excluded), rows, missing, excluded
+                expand = expand or hou.text.expandString
+                hip_path = hip_path or hou.hipFile.path()
+            chosen, unresolved = _deps.expand_pairs(selection, expand)
+            # The dialog answers about references; the hip file is not one
+            # of them in every scene, and it is never optional.
+            parm_paths = list(dict.fromkeys([hip_path] + chosen))
+            say("file dependency window: {} reference(s) kept, {} forced unchecked".format(
+                len(selection), len(scan.output_patterns)))
+            if unresolved:
+                say("{} selected reference(s) resolved to nothing on disk".format(len(unresolved)))
+
+    excluded = load_exclusions(node.evalParm("rpfarm_exclude"))
+    usd_paths = list(usd_paths)
+    if usd_paths:
+        rows, missing = _deps.plan_refs(usd_paths)
+        if ask:
+            asker = confirm_usd or confirm
+            try:
+                chosen = asker(rows, missing, excluded,
+                               title="RunPodFarm -- USD dependencies (no parameter points at these)")
+            except Exception as exc:
+                say("USD window unavailable ({}) -- using the remembered selection".format(exc))
+                chosen = excluded
+            if chosen is None:
+                raise UploadCancelled("upload cancelled in the USD dependency window")
+            if chosen != excluded:
+                node.parm("rpfarm_exclude").set(dump_exclusions(chosen))
+            excluded = chosen
+        else:
+            blocked = {normalise(p) for p in excluded}
+            for row in rows:
+                if row.kind == "dir" and normalise(row.path) not in blocked:
+                    say("directory reference {} -> {}, {}".format(
+                        row_label(row), row_detail(row), human_bytes(row.bytes)))
+        say("usd: " + header_text(rows, missing, excluded))
+        usd_paths = apply_exclusions(usd_paths, excluded)
+
+    return list(dict.fromkeys(parm_paths + usd_paths))

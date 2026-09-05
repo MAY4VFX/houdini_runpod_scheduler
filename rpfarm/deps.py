@@ -105,65 +105,165 @@ class PlanRow:
     bytes: int
 
 
-def collect_refs(scope=SCOPE_SCENE, node=None, log=None):
-    """Collect this hip file's own path plus the file references it needs.
+def expand_reference(parm, pattern, expand, exists=os.path.exists, isdir=os.path.isdir):
+    """Every real path one ``(parm, pattern)`` file reference resolves to.
+
+    Two ways to resolve a reference, and neither is a superset of the other:
+
+    * ``parm.evalAsString()`` -- what the *parameter* means. It knows ``$OS``,
+      channel references and everything else only the node can expand. SideFX
+      recommend it in the ``displayFileDependencyDialog`` docs.
+    * ``hou.text.expandString(pattern)`` -- what the *string* means.
+
+    Following the recommendation alone loses files. Measured on
+    ``airship_v013.hip``: of 115 references, 38 resolve only through the
+    string and none only through the parameter. Those 38 are FBX, where
+    evaluating the parameter returns an address INTO the file --
+    ``/Users/may/Downloads/airship_v06.fbx#Airship_fullBindings,convertoff``
+    -- which is not a path on disk. So: try both, keep what exists, and when
+    both exist and disagree keep both. Uploading one file too many costs
+    bandwidth; missing one costs a failed render on a rented GPU.
+
+    A sequence/UDIM pattern (``$F``, ``%04d``, ``<UDIM>``, ...) names no single
+    file, so it reduces to its containing directory -- and only if that
+    directory is really there.
+
+    ``expand``/``exists``/``isdir`` are injected so this function is testable
+    without Houdini; the caller passes ``hou.text.expandString``.
+    """
+    out = []
+    candidates = []
+    if parm is not None:
+        try:
+            candidates.append(parm.evalAsString())
+        except Exception:
+            pass
+    if pattern:
+        try:
+            candidates.append(expand(pattern) if "$" in pattern else pattern)
+        except Exception:
+            pass
+    for value in candidates:
+        if not value:
+            continue
+        if _SEQ.search(value):
+            value = os.path.dirname(value)
+            ok = isdir(value)
+        else:
+            ok = exists(value)
+        if not ok:
+            continue
+        value = os.path.normpath(value)
+        if value not in out:
+            out.append(value)
+    return out
+
+
+@dataclass(frozen=True)
+class RefScan:
+    """What one pass over ``hou.fileReferences()`` found.
+
+    ``paths`` -- real local paths, deduplicated, hip file first.
+    ``output_patterns`` -- the unexpanded patterns of references that name
+    where output GOES. They are handed to Houdini's own file-dependency
+    dialog as ``forced_unselected_patterns``, so the artist sees the
+    decision as an unchecked row instead of not seeing it at all.
+    ``unresolved`` -- patterns that resolved to nothing on disk, kept for
+    the log: a reference that will not upload is worth one line.
+    """
+
+    paths: list
+    output_patterns: tuple
+    unresolved: tuple
+
+
+def expand_pairs(pairs, expand, exists=os.path.exists, isdir=os.path.isdir):
+    """``(parm, pattern)`` pairs -> ``(paths, unresolved patterns)``.
+
+    Used for both halves of the flow: the scan below, and the selection
+    Houdini's dependency dialog hands back (which is the same shape).
+    """
+    paths = []
+    unresolved = []
+    seen = set()
+    for parm, pattern in pairs:
+        if not pattern or pattern.startswith(("op:", "opdef:", "temp:")):
+            continue
+        found = expand_reference(parm, pattern, expand, exists=exists, isdir=isdir)
+        if not found:
+            unresolved.append(pattern)
+            continue
+        for path in found:
+            if path not in seen:
+                seen.add(path)
+                paths.append(path)
+    return paths, unresolved
+
+
+def scan_refs(scope=SCOPE_SCENE, node=None, log=None, project_dir_variable="HIP",
+              selected_only=False, drop_outputs=True,
+              exists=os.path.exists, isdir=os.path.isdir):
+    """Scan the scene's file references and resolve them to real paths.
 
     The only function in this module allowed to ``import hou`` -- done
     lazily inside the function body so the rest of ``rpfarm.deps`` stays
     pure and importable/testable without Houdini installed.
 
-    - The hip file itself (``hou.hipFile.path()``) is always first in the
-      returned list.
-    - Each ``(parm, path)`` pair from ``hou.fileReferences()`` is included
-      unless ``path`` is empty or starts with ``op:``, ``opdef:`` or
-      ``temp:`` (procedural/in-memory references, not real files).
-    - A reference whose parameter is named in :data:`_NON_DEPENDENCY_PARMS`
-      is dropped in *either* scope: it says where output goes, not what the
-      scene reads.
+    - The hip file itself (``hou.hipFile.path()``) is always first.
+    - ``selected_only`` reads Houdini's own selection state
+      (``hou.fileReferences(include_all_refs=False)``) -- what the artist
+      left checked the last time they answered the dependency dialog. This
+      is the same call SideFX's own HQueue ROP makes when the dialog is
+      skipped (``hqrop.getSelectedFileReferences``).
+    - ``drop_outputs`` removes references named in
+      :data:`_NON_DEPENDENCY_PARMS` and reports them as
+      ``output_patterns``. Turn it off after the artist has answered the
+      dialog: at that point their answer is the decision, not ours.
     - With ``scope=SCOPE_BRANCH`` and ``node`` set to the upload node, only
-      references owned by a node this cook actually reads survive -- see
+      references owned by a node this cook reads survive -- see
       :func:`_branch_node_paths`. A reference no parameter owns (Houdini
-      reports the installed .hda files that way) cannot be attributed to a
+      reports installed .hda files that way) cannot be attributed to a
       branch, so it is kept.
-    - A path containing ``$`` is expanded with ``hou.text.expandString``
-      (this covers ``$HIP``/``$JOB`` and any other Houdini variable).
-    - A path containing a sequence/UDIM token (``$F``, ``%04d``,
-      ``<UDIM>``, ``####``, ...) is reduced to its containing directory,
-      since the individual per-frame/per-tile files aren't resolvable from
-      the reference itself.
+    - Each surviving reference is resolved by :func:`expand_reference`,
+      both ways, keeping what exists.
 
-    ``log`` -- if given, a one-argument callable that receives human-readable
-    diagnostics (how the branch was resolved, how many references each
-    filter dropped). Nothing is printed by default.
+    ``log`` -- if given, a one-argument callable receiving human-readable
+    diagnostics. Nothing is printed by default.
     """
     import hou
 
     say = log if log is not None else (lambda _message: None)
     branch = _branch_node_paths(node, say) if scope == SCOPE_BRANCH else None
 
-    out = [hou.hipFile.path()]
-    outputs = 0
+    pairs = hou.fileReferences(project_dir_variable, include_all_refs=not selected_only)
+    kept = []
+    outputs = []
     off_branch = 0
-    for parm, path in hou.fileReferences():
-        if not path or path.startswith(("op:", "opdef:", "temp:")):
-            continue
+    for parm, pattern in pairs:
         if parm is not None:
-            if _parm_name(parm) in _NON_DEPENDENCY_PARMS:
-                outputs += 1
+            if drop_outputs and _parm_name(parm) in _NON_DEPENDENCY_PARMS:
+                outputs.append(pattern)
                 continue
             owner = _parm_node_path(parm)
             if branch is not None and owner is not None and owner not in branch:
                 off_branch += 1
                 continue
-        p = hou.text.expandString(path) if "$" in path else path
-        if _SEQ.search(p):
-            p = os.path.dirname(p)
-        out.append(p)
+        kept.append((parm, pattern))
+
+    paths, unresolved = expand_pairs(kept, hou.text.expandString, exists=exists, isdir=isdir)
+    paths.insert(0, hou.hipFile.path())
     if outputs:
-        say("skipped {} reference(s) naming outputs, not inputs".format(outputs))
+        say("{} reference(s) name outputs, not inputs".format(len(outputs)))
     if off_branch:
         say("skipped {} reference(s) outside this cook's branch".format(off_branch))
-    return out
+    if unresolved:
+        say("{} reference(s) resolved to nothing on disk".format(len(unresolved)))
+    return RefScan(paths=paths, output_patterns=tuple(outputs), unresolved=tuple(unresolved))
+
+
+def collect_refs(scope=SCOPE_SCENE, node=None, log=None, **kwargs):
+    """:func:`scan_refs` when only the paths are wanted."""
+    return scan_refs(scope=scope, node=node, log=log, **kwargs).paths
 
 
 def _parm_name(parm):
@@ -261,6 +361,39 @@ def _referenced_nodes(node):
     return out
 
 
+def cook_rops(node, log=None):
+    """The ROPs the TOP network containing *node* fetches.
+
+    One list, two consumers: the branch walk narrows file references to
+    what these ROPs read, and the USD walk needs the very same ROPs to find
+    the stages they render. Computing it twice, differently, is how the two
+    halves would drift apart.
+    """
+    say = log if log is not None else (lambda _m: None)
+    try:
+        topnet = node.parent()
+    except Exception:
+        return []
+    if topnet is None:
+        return []
+    rops = []
+    for candidate in _network_nodes(topnet):
+        try:
+            has_roppath = candidate.parm("roppath") is not None
+        except Exception:
+            continue
+        if not has_roppath:
+            continue
+        target = candidate.evalParm("roppath")
+        rop = _resolve_node(candidate, target)
+        if rop is None:
+            say("{} names {!r}, which is not a node".format(candidate.path(), target))
+            continue
+        if not any(r.path() == rop.path() for r in rops):
+            rops.append(rop)
+    return rops
+
+
 def _branch_node_paths(node, say):
     """Paths of the nodes this TOP network's cook actually reads, or None.
 
@@ -288,21 +421,7 @@ def _branch_node_paths(node, say):
         say("branch scope: this node has no parent network -- using the whole scene")
         return None
 
-    rops = []
-    for candidate in _network_nodes(topnet):
-        try:
-            has_roppath = candidate.parm("roppath") is not None
-        except Exception:
-            continue
-        if not has_roppath:
-            continue
-        target = candidate.evalParm("roppath")
-        rop = _resolve_node(candidate, target)
-        if rop is None:
-            say("branch scope: {} names {!r}, which is not a node".format(
-                candidate.path(), target))
-            continue
-        rops.append(rop)
+    rops = cook_rops(node, say)
 
     if not rops:
         say("branch scope: nothing in this network fetches a ROP -- using the whole scene")

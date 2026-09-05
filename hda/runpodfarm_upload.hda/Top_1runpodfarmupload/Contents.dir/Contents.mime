@@ -239,21 +239,25 @@ from rpfarm import config as rpcfg
 from rpfarm import deps as rpdeps
 from rpfarm import houdini_local as rphou
 from rpfarm import packages as rppkg
-from rpfarm import preflight as rppf
 
 # The asset and the package are updated together, but Python caches modules
 # for the life of the process: a Houdini that reloads this asset without
 # restarting runs the NEW generate against the OLD rpfarm, and the artist
 # gets \"unexpected keyword argument 'scope'\" instead of the one instruction
-# that helps. The full version-floor guard (scripts/hda_guard.py) lives in
-# the assets that import rpfarm while the scene is loading; here a single
-# capability check is enough, because nothing in this node runs until a cook.
-if not hasattr(rpdeps, \"SCOPE_BRANCH\"):
+# that helps. Checked before the newer modules are imported, so the message
+# is this one rather than a ModuleNotFoundError. The full version-floor
+# guard (scripts/hda_guard.py) lives in the assets that import rpfarm while
+# the scene is loading; here a single capability check is enough, because
+# nothing in this node runs until a cook.
+if not hasattr(rpdeps, \"scan_refs\"):
     raise hou.NodeError(
         \"Код фермы обновился, а Houdini держит в памяти старую версию.\\n\"
         \"\\n\"
         \"ПЕРЕЗАПУСТИТЕ HOUDINI. Больше ничего делать не нужно --\\n\"
         \"на диске всё правильно, чинить нечего.\")
+
+from rpfarm import preflight as rppf
+from rpfarm import usddeps as rpusd
 
 
 def _say(message):
@@ -284,22 +288,34 @@ if preset == \"install_houdini\":
     custom, post_command = rppkg.houdini_install_preset(tar, ver)
     mode = \"custom\"
 
-# Two separate questions, and until 2026-09-05 this node asked neither.
-# Which references belong to THIS cook (Dependencies: branch vs whole
-# scene), and which of them does the artist actually want moved (the
-# confirmation window, remembered on the node). Field case: the node
-# planned 794 files / 9.97 GB for a scene that reads 113 files / 1.32 GB,
-# because one unrelated TOP scheduler's pdg_workingdir named the project
-# folder and a directory reference is walked recursively. Custom mode
-# skips both -- there the artist typed the paths, so there is nothing to
-# narrow and nothing to confirm.
+# What this cook uploads, in two halves that no single Houdini API covers.
+#
+# 1. Parameter references -- hou.fileReferences(), narrowed to this cook's
+#    branch, with output parameters handed to Houdini's own dependency
+#    dialog as forced-unchecked rows rather than dropped out of sight.
+# 2. USD references -- everything a stage reads that no parameter points
+#    at. On airship_v013.hip that is 77 files the parameter scan cannot
+#    see, including both .usdc layers the render is made of. A farm render
+#    without them produces nothing.
+#
+# Whether to ask is decided BEFORE the scan, because it changes what is
+# scanned: with a window, Houdini's dialog is asked; without one, the
+# selection Houdini already remembers is read instead (selected_only) --
+# the same call SideFX make when their own dialog is skipped.
+#
+# Custom mode skips all of it: there the artist typed the paths.
 refs = []
 if mode == \"deps\":
-    refs = rpdeps.collect_refs(
-        scope=node.evalParm(\"rpfarm_scope\") or rpdeps.SCOPE_BRANCH, node=node, log=_say)
+    ask = rppf.wants_window(node, log=_say)
+    scan = rpdeps.scan_refs(
+        scope=node.evalParm(\"rpfarm_scope\") or rpdeps.SCOPE_BRANCH,
+        node=node, log=_say, selected_only=not ask)
+    rops = rpdeps.cook_rops(node, log=_say)
+    usd = rpusd.collect_usd_refs(
+        rops, log=_say, deep=bool(node.evalParm(\"rpfarm_usddeep\"))) if rops else []
     try:
-        refs, _plan_rows, _plan_missing, _plan_excluded = rppf.resolve_upload_set(
-            node, refs, log=_say)
+        refs = rppf.choose_uploads(
+            node, scan, usd, ask=ask, log=_say, rop=rops[0] if rops else None)
     except rppf.UploadCancelled as e:
         # A deliberate no, not a failure -- but generation has to stop, and
         # a NodeError is the only way to stop it that PDG reports plainly.
