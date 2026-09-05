@@ -43,7 +43,7 @@ import time
 import uuid
 from dataclasses import dataclass
 
-from rpfarm.compression import CompressionStrategy, classify_file, compress_file
+from rpfarm.compression import CompressionStrategy, archiver, classify_file, compress_file
 
 DEFAULT_MAX_BYTES = int(1.5 * 2**30)
 
@@ -261,8 +261,10 @@ def compress_stage(package, staging_dir, remote_root, level=3):
     limitation, they always go into ``raw_package`` uncompressed
     (v1's ``worker/compression.py`` ``compress_directory`` handled VDB batching
     for the older bulk-sync path). If ``zstd`` isn't available on this
-    machine (or compression otherwise fails), ``compress_file`` returns
-    False and the entry likewise goes into ``raw_package`` uncompressed.
+    machine (or compression otherwise fails), the whole package goes into
+    ``raw_package`` uncompressed and the log says so once -- verified by
+    test, because this paragraph described the behaviour correctly while the
+    code raised FileNotFoundError instead.
 
     Returns ``(raw_package, staged_package, post_command)`` where
     ``post_command`` is a single shell command that ``cd``s to
@@ -271,6 +273,16 @@ def compress_stage(package, staging_dir, remote_root, level=3):
     is empty.
     """
     staging_dir = str(staging_dir)
+    if archiver("zstd") is None:
+        # No archiver on this machine: everything goes up as it is. Decided
+        # once, here, instead of failing per file -- and it is a decision,
+        # not an error. Losing compression makes an upload slower; raising
+        # makes the work item fail, which is what happened on 2026-09-05
+        # (FileNotFoundError: 'zstd', on a machine where zstd was installed
+        # but outside Houdini's PATH). archiver() has already said so in the
+        # log, once.
+        return list(package), [], ""
+
     raw_package = []
     staged_package = []
     zst_rels = []

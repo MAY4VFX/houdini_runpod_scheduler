@@ -1308,3 +1308,52 @@ def test_doctor_says_nothing_about_regions_when_they_agree(tmp_path, monkeypatch
 
     cli.main(["doctor"])
     assert "no pod can mount it" not in capsys.readouterr().out
+
+
+# -- doctor checks the environment the COOK gets (field failure, 2026-09-05) ----
+
+
+def test_doctor_reports_zstd_by_absolute_path():
+    from rpfarm import cli as rpcli
+    from rpfarm import tools as rptools
+
+    said = []
+    found = rptools.Tool("/opt/homebrew/bin/zstd", "/opt/homebrew/bin", "zstd command line interface 64-bits v1.5.6")
+
+    got = rpcli._check_archiver(said.append, said.append, resolve=lambda name, **k: found)
+
+    assert got is found
+    assert "/opt/homebrew/bin/zstd" in said[0]
+    assert "by absolute path" in said[0], "and says WHY a cook will find it"
+
+
+def test_doctor_asks_about_houdinis_path_not_the_shells():
+    """The report used to flatter itself: run from a shell with Homebrew on
+    PATH it said everything was fine, while inside Houdini the same lookup
+    returned None."""
+    from rpfarm import cli as rpcli
+    from rpfarm import tools as rptools
+
+    asked = {}
+
+    def resolve(name, **kwargs):
+        asked.update(name=name, path=kwargs.get("path"))
+        return None
+
+    said = []
+    rpcli._check_archiver(said.append, said.append, resolve=resolve)
+
+    assert asked == {"name": "zstd", "path": rptools.HOUDINI_LIKE_PATH}
+
+
+def test_doctor_calls_a_missing_archiver_a_warning_not_a_failure():
+    """No zstd means slower uploads, not a broken farm -- so it must not
+    read like a broken farm."""
+    from rpfarm import cli as rpcli
+
+    oks, warns = [], []
+    rpcli._check_archiver(oks.append, warns.append, resolve=lambda name, **k: None)
+
+    assert not oks
+    assert len(warns) == 1 and "brew install zstd" in warns[0]
+    assert "slower, not broken" in warns[0]

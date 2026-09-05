@@ -45,6 +45,7 @@ from . import ledger as rpledger
 from . import packages as rppkg
 from . import pods as rppods
 from . import sync as rpsync
+from . import tools as rptools
 from .runpod_api import DEFAULT_DATACENTER, RunPodAPI, RunPodError, pod_public_endpoint
 from .worker_client import WorkerClient
 
@@ -517,6 +518,28 @@ def _measure_uplink(cfg, pod, client, rclone_bin, size_mb=20, copy_fn=rpsync.rcl
     return (stats.bytes * 8) / 1e6 / max(stats.seconds, 1e-3)
 
 
+def _check_archiver(ok, warn, resolve=None):
+    """Is there a zstd, and would a COOK find it?
+
+    Two different questions, and the doctor used to answer neither. It
+    reported "rclone v1.75.0" from a shell whose PATH had Homebrew in it,
+    while inside Houdini that PATH does not exist -- which is exactly how an
+    upload item came to die on `FileNotFoundError: 'zstd'` with zstd sitting
+    in /opt/homebrew/bin the whole time. So this checks with the PATH a
+    Dock-launched Houdini actually has, and reports the absolute path that
+    makes the answer the same either way.
+    """
+    resolve = resolve or rptools.resolve_tool
+    found = resolve("zstd", path=rptools.HOUDINI_LIKE_PATH)
+    if found is None:
+        warn("zstd not found -- uploads will not be compressed (slower, not "
+             "broken). macOS: brew install zstd, then restart Houdini")
+        return None
+    where = "on Houdini's own PATH" if found.how == "on PATH" else f"by absolute path ({found.how})"
+    ok(f"zstd: {found.version or 'ok'} -- {found.path}, found {where}")
+    return found
+
+
 def cmd_doctor(args):
     try:
         cfg = rpcfg.load()
@@ -585,11 +608,13 @@ def cmd_doctor(args):
     try:
         proc = subprocess.run([cfg.rclone_path, "--version"], capture_output=True, text=True, timeout=10)
         if proc.returncode == 0:
-            ok(f"rclone: {proc.stdout.splitlines()[0] if proc.stdout else 'ok'}")
+            ok(f"rclone: {proc.stdout.splitlines()[0] if proc.stdout else 'ok'} ({cfg.rclone_path})")
         else:
             fail(f"`rclone --version` failed: {proc.stderr.strip()}")
     except (OSError, subprocess.TimeoutExpired) as e:
         fail(f"rclone not runnable at {cfg.rclone_path} ({e}) -- rerun `rpfarm setup`")
+
+    _check_archiver(ok, warn)
 
     if os.path.exists(cfg.ssh_key_path) and os.path.exists(cfg.ssh_key_path + ".pub"):
         ok(f"SSH key present ({cfg.ssh_key_path})")

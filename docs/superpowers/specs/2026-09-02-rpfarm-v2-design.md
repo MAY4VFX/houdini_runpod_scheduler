@@ -409,6 +409,49 @@ policy (newer/always/never). Атрибуты как у upload.
   `$HIP`/`$JOB`/волюм нельзя. В README это записано как правило подготовки
   сцены; `scripts/build_demo_scene.py` его проверяет в `_verify()`.
 
+- **Внешние программы резолвятся абсолютным путём, а не через PATH
+  (Ruling R41).** 2026-09-05 айтем аплоада упал с
+
+      FileNotFoundError: [Errno 2] No such file or directory: 'zstd'
+
+  на машине, где zstd стоит и работает — `/opt/homebrew/bin/zstd`. PATH внутри
+  Houdini, запущенной из Дока:
+  `$HFS/bin:$HFS/toolkit/bin:/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin` —
+  homebrew там нет, поэтому `shutil.which("zstd")` внутри Houdini отдаёт None,
+  а в оболочке артиста находится мгновенно. То же семейство, что дефект с
+  интерпретатором (e277fe7): **среда разработчика ничего не говорит о среде
+  кука**.
+
+  * `rpfarm/tools.py` — та же форма, что у `resolve_package_python`:
+    упорядоченные кандидаты (PATH, затем `/opt/homebrew/bin`, `/usr/local/bin`,
+    `/usr/bin`, …), каждый **запускается** для проверки, результат кэшируется,
+    путь всегда абсолютный. Отдельная функция, а не переиспользованная: та
+    отвечает на вопрос «интерпретатор, способный импортировать rpfarm», эта —
+    «рабочий бинарник»; общий у них подход, а не код.
+  * **Нет архиватора — грузим без сжатия, а не падаем.** `compress_stage`
+    решает это один раз в начале и предупреждает в лог. Docstring этой функции
+    ровно так поведение и описывал («compress_file returns False and the entry
+    goes into raw_package uncompressed») — но код кидал FileNotFoundError,
+    потому что путь без zstd никто не проверял. Теперь проверяет тест.
+  * **`doctor` проверяет так, как это увидит кук.** Раньше он рапортовал
+    «rclone v1.75.0», потому что его запускали из оболочки с homebrew в PATH.
+    Теперь резолв идёт с `HOUDINI_LIKE_PATH` и печатается абсолютный путь плюс
+    ПОЧЕМУ он найдётся: `zstd: v1.5.7 -- /opt/homebrew/bin/zstd, found by
+    absolute path (/opt/homebrew/bin)`. Нет zstd — это `[WARN]`, а не `[FAIL]`:
+    медленнее ≠ сломано.
+  * **Аудит остальных вызовов.** В путях кука голыми именами звались только
+    `zstd` и `tar` (оба в `compression.py`) — починены. `rclone` никогда не
+    брался с PATH: `cfg.rclone_path` — это `~/.rpfarm/bin/rclone`, который
+    кладёт `setup` (поэтому он и работал; вторая копия в `/usr/local/bin` тут
+    ни при чём). `du` в `pod/housekeeping.py` и `ssh`/`scp` в
+    `scripts/measure_xpu_cache.py` оставлены: первый живёт в контейнере с
+    известным PATH, второй — девелоперский скрипт из оболочки.
+  * Проверено в воспроизведённой среде кука (`env -i PATH=/usr/bin:/bin:...`):
+    `shutil.which("zstd")` → None, `tools.resolve_tool("zstd")` →
+    `/opt/homebrew/bin/zstd`, `compress_stage` сжал 200 000 → 30 байт. Тот же
+    скрипт под hython из моей оболочки НЕ доказательство — там PATH мой, с
+    homebrew; это ровно та ошибка «проверять в удобном окружении».
+
 - **Защита от устаревшего кода судит по ФАЙЛАМ, а не по номеру версии
   (Ruling R40).** 2026-09-05 у владельца кук аплоада дал 2 айтема, оба
   CookedFail. Причина не в новом коде: в его Houdini жил rpfarm семикоммитной

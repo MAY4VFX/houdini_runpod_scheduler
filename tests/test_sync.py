@@ -251,3 +251,56 @@ def test_compress_stage_empty_post_command_when_nothing_compressed(tmp_path):
     assert post_command == ""
     assert staged == []
     assert raw[0].local == str(bgeo)
+
+
+# -- no archiver is slower, not broken (field failure, 2026-09-05) --------------
+
+
+def test_an_upload_without_zstd_goes_up_uncompressed(tmp_path, monkeypatch, caplog):
+    """The item that died read `FileNotFoundError: 'zstd'` and took the cook
+    with it. zstd was installed the whole time -- at /opt/homebrew/bin, which
+    a Dock-launched Houdini does not have on PATH. Whatever the reason, a
+    missing archiver must cost speed, not the job."""
+    from rpfarm import compression, tools
+
+    tools.clear_cache()
+    compression._MISSING_WARNED.clear()
+    monkeypatch.setattr(tools, "resolve_tool", lambda *a, **k: None)
+
+    src = tmp_path / "geo.bgeo"
+    src.write_bytes(b"g" * 4096)
+    package = [FileEntry(local=str(src), remote="/remote/root/geo.bgeo", size=4096)]
+
+    with caplog.at_level("WARNING"):
+        raw, staged, post = compress_stage(package, tmp_path / "staging", "/remote/root")
+
+    assert raw == package, "every file still uploads"
+    assert staged == [] and post == ""
+    assert any("not be compressed" in r.getMessage() for r in caplog.records), caplog.text
+    compression._MISSING_WARNED.clear()
+    tools.clear_cache()
+
+
+def test_compression_uses_an_absolute_binary_never_a_bare_name(tmp_path, monkeypatch):
+    """PATH is not to be trusted for external programs -- the same lesson as
+    resolve_package_python, which this reuses the shape of."""
+    from rpfarm import compression, tools
+
+    tools.clear_cache()
+    seen = []
+    monkeypatch.setattr(tools, "resolve_tool",
+                        lambda name, **k: tools.Tool("/opt/homebrew/bin/" + name, "/opt/homebrew/bin", "1.5.6"))
+
+    def fake_run(argv, **kwargs):
+        seen.append(argv[0])
+        raise AssertionError("stop here; the argv is the point")
+
+    monkeypatch.setattr(compression.subprocess, "run", fake_run)
+    src = tmp_path / "a.exr"
+    src.write_bytes(b"x" * 100)
+    with pytest.raises(AssertionError):
+        compression.compress_file(str(src), str(tmp_path / "a.exr.zst"),
+                                  compression.CompressionStrategy.ZSTD)
+
+    assert seen == ["/opt/homebrew/bin/zstd"]
+    tools.clear_cache()
