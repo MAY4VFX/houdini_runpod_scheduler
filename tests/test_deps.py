@@ -207,3 +207,252 @@ def test_collect_refs_import_guard(monkeypatch):
     assert "/job/other/plain.abc" in result
     assert not any(r.startswith(("op:", "opdef:", "temp:")) for r in result)
     assert len(result) == 4  # hip + 3 valid refs (empty/op:/opdef:/temp: skipped)
+
+
+# -- scope: whole scene vs. this cook's branch (field finding, 2026-09-05) --------
+#
+# On /Users/may/BS/airship/airship_v013.hip the upload node planned 794
+# files / 9.97 GB against a scene that references 113 files / 1.32 GB.
+# One parameter did it: `pdg_workingdir` on `/stage/lookdev_pdg/localscheduler`
+# -- a *different* TOP network's scratch root, pointing at the project
+# folder, which hou.fileReferences() hands over like any other file
+# reference and resolve_entries then walks recursively (827 files, 11.54 GB:
+# ten .hip versions, 467 finished EXRs and a 1.47 GB zip).
+#
+# Two independent defences, both tested here: a scheduler's working
+# directory is not a dependency of anything (parm-name filter, applies in
+# both scopes), and an upload only needs what the branch being cooked
+# actually reads (scope filter).
+
+
+class _StubTemplate:
+    def __init__(self, string_type=None):
+        self._string_type = string_type
+
+    def stringType(self):
+        if self._string_type is None:
+            raise AttributeError("not a string parm")
+        return self._string_type
+
+
+class _StubParm:
+    def __init__(self, name, node, value="", string_type=None):
+        self._name = name
+        self._node = node
+        self._value = value
+        self._template = _StubTemplate(string_type)
+
+    def name(self):
+        return self._name
+
+    def node(self):
+        return self._node
+
+    def parmTemplate(self):
+        return self._template
+
+    def evalAsString(self):
+        return self._value
+
+
+class _StubNode:
+    """Just enough hou.Node for the branch walk: path, parms, inputs, kids."""
+
+    def __init__(self, path, scene, parms=None, ancestors=(), children=(), refs=()):
+        self._path = path
+        self._scene = scene
+        self._parms = {}
+        self._ancestors = list(ancestors)
+        self._children = list(children)
+        scene[path] = self
+        for name, value in (parms or {}).items():
+            self._parms[name] = _StubParm(name, self, value)
+        for i, target in enumerate(refs):
+            name = "ref{}".format(i)
+            self._parms[name] = _StubParm(name, self, target, string_type="noderef")
+
+    def path(self):
+        return self._path
+
+    def parent(self):
+        return self._scene[self._path.rsplit("/", 1)[0]]
+
+    def parm(self, name):
+        return self._parms.get(name)
+
+    def parms(self):
+        return list(self._parms.values())
+
+    def evalParm(self, name):
+        p = self._parms.get(name)
+        return p.evalAsString() if p else ""
+
+    def node(self, path):
+        return self._scene.get(path)
+
+    def inputAncestors(self, **kwargs):
+        return [self._scene[p] for p in self._ancestors]
+
+    def children(self):
+        return [self._scene[p] for p in self._children]
+
+    def allSubChildren(self, **kwargs):
+        out = []
+        for p in self._children:
+            out.append(self._scene[p])
+            out.extend(self._scene[p].allSubChildren())
+        return out
+
+
+def _stub_hou(scene, refs):
+    return SimpleNamespace(
+        hipFile=SimpleNamespace(path=lambda: "/job/hip/scene.hip"),
+        fileReferences=lambda: refs,
+        text=_StubText(),
+        node=scene.get,
+        stringParmType=SimpleNamespace(NodeReference="noderef", NodeReferenceList="noderefs"),
+    )
+
+
+def _airship_like_scene():
+    """The shape of the field scene: two TOP networks, one shared project."""
+    scene = {}
+    stage = _StubNode("/stage", scene)
+
+    # the branch this cook renders: a render ROP fed by one geometry LOP
+    geo = _StubNode("/stage/geo_airship", scene)
+    render = _StubNode("/stage/render_shot0012", scene, ancestors=["/stage/geo_airship"])
+
+    # a lookdev network that has nothing to do with this cook
+    lookdev_geo = _StubNode("/stage/lookdev_geo", scene)
+    lookdev_rop = _StubNode("/stage/probe_render_nx", scene, ancestors=["/stage/lookdev_geo"])
+    lookdev_sched = _StubNode("/stage/lookdev_pdg/localscheduler", scene)
+    lookdev_pdg = _StubNode(
+        "/stage/lookdev_pdg", scene, children=["/stage/lookdev_pdg/localscheduler"]
+    )
+
+    # this cook's TOP network: upload -> gate -> ropfetch -> render_shot0012
+    fetch = _StubNode("/stage/shots_pdg/fetch_shot0012", scene, parms={"roppath": "/stage/render_shot0012"})
+    upload = _StubNode("/stage/shots_pdg/upload", scene)
+    shots_pdg = _StubNode(
+        "/stage/shots_pdg", scene,
+        children=["/stage/shots_pdg/fetch_shot0012", "/stage/shots_pdg/upload"],
+    )
+    stage._children = ["/stage/shots_pdg", "/stage/lookdev_pdg"]
+    return scene, upload, geo, lookdev_geo, lookdev_sched
+
+
+def test_a_schedulers_working_directory_is_not_a_dependency(monkeypatch):
+    """The 11.54 GB: `pdg_workingdir` pointed at the whole project folder."""
+    scene, upload, geo, lookdev_geo, sched = _airship_like_scene()
+    refs = [
+        (_StubParm("file", geo), "/job/tex/a.rat"),
+        (_StubParm("pdg_workingdir", sched), "/job"),
+        (_StubParm("pdg_transferroot", sched), "/job"),
+    ]
+    monkeypatch.setitem(sys.modules, "hou", _stub_hou(scene, refs))
+
+    result = collect_refs()  # whole scene -- the filter is not the scope
+
+    assert "/job/tex/a.rat" in result
+    assert "/job" not in result
+
+
+def test_an_output_path_is_not_a_dependency(monkeypatch):
+    """Where a render writes is not what the scene needs to read: a
+    `$F`-carrying outputimage reduces to its containing directory, and that
+    directory is the finished-frames folder (467 EXRs in the field case)."""
+    scene, upload, geo, _lookdev, _sched = _airship_like_scene()
+    refs = [
+        (_StubParm("file", geo), "/job/tex/a.rat"),
+        (_StubParm("outputimage", geo), "/job/render/shot0012/beauty.$F4.exr"),
+        (_StubParm("savetodirectory_directory", geo), "/job/usd"),
+        (_StubParm("taskgraphfile", geo), "/job/pdg/graph.py"),
+    ]
+    monkeypatch.setitem(sys.modules, "hou", _stub_hou(scene, refs))
+
+    result = collect_refs()
+
+    assert result == ["/job/hip/scene.hip", "/job/tex/a.rat"]
+
+
+def test_branch_scope_keeps_only_what_this_cook_reads(monkeypatch):
+    scene, upload, geo, lookdev_geo, _sched = _airship_like_scene()
+    refs = [
+        (_StubParm("file", geo), "/job/tex/airship.rat"),
+        (_StubParm("file", lookdev_geo), "/job/tex/probe.rat"),
+        (None, "/prefs/otls/runpodfarm_upload.hda"),
+    ]
+    monkeypatch.setitem(sys.modules, "hou", _stub_hou(scene, refs))
+
+    scoped = collect_refs(scope="branch", node=upload)
+    whole = collect_refs(scope="scene", node=upload)
+
+    assert "/job/tex/airship.rat" in scoped
+    assert "/job/tex/probe.rat" not in scoped, "another network's lookdev is not this cook"
+    # a reference no parm owns cannot be attributed to a branch, so it stays
+    assert "/prefs/otls/runpodfarm_upload.hda" in scoped
+    assert "/job/tex/probe.rat" in whole
+
+
+def test_branch_scope_follows_node_references_not_just_inputs(monkeypatch):
+    """A LOP reaches a SOP through a node-reference parm, not an input
+    wire -- miss those and the branch loses real geometry."""
+    scene, upload, geo, _lookdev, _sched = _airship_like_scene()
+    sop = _StubNode("/obj/geo1/cache", scene)
+    geo._parms["soppath"] = _StubParm("soppath", geo, "/obj/geo1/cache", string_type="noderef")
+    refs = [(_StubParm("file", sop), "/job/geo/airship.bgeo.sc")]
+    monkeypatch.setitem(sys.modules, "hou", _stub_hou(scene, refs))
+
+    assert "/job/geo/airship.bgeo.sc" in collect_refs(scope="branch", node=upload)
+
+
+def test_branch_scope_falls_back_to_the_whole_scene_when_it_finds_no_rop(monkeypatch):
+    """Nothing to narrow to means upload everything, loudly -- never
+    upload nothing."""
+    scene = {}
+    stage = _StubNode("/stage", scene)
+    geo = _StubNode("/stage/geo", scene)
+    upload = _StubNode("/stage/empty_pdg/upload", scene)
+    _StubNode("/stage/empty_pdg", scene, children=["/stage/empty_pdg/upload"])
+    refs = [(_StubParm("file", geo), "/job/tex/a.rat")]
+    monkeypatch.setitem(sys.modules, "hou", _stub_hou(scene, refs))
+    said = []
+
+    result = collect_refs(scope="branch", node=upload, log=said.append)
+
+    assert "/job/tex/a.rat" in result
+    assert any("whole scene" in m for m in said), said
+
+
+# -- plan_refs: what the confirmation window shows -------------------------------
+
+
+def test_plan_refs_weighs_a_directory_as_one_row(tmp_path):
+    """The 1.47 GB zip must be the first line of the window, not one of 827."""
+    d = tmp_path / "export"
+    (d / "sub").mkdir(parents=True)
+    (d / "big.zip").write_bytes(b"x" * 100)
+    (d / "sub" / "small.abc").write_bytes(b"y" * 10)
+    single = tmp_path / "tex.rat"
+    single.write_bytes(b"z" * 5)
+
+    rows, missing = deps.plan_refs([str(d), str(single), str(tmp_path / "gone.exr")])
+
+    assert [r.path for r in rows] == [str(d), str(single)]
+    assert rows[0].kind == "dir" and rows[0].files == 2 and rows[0].bytes == 110
+    assert rows[1].kind == "file" and rows[1].files == 1 and rows[1].bytes == 5
+    assert missing == [str(tmp_path / "gone.exr")]
+
+
+def test_plan_refs_dedups_and_honours_the_skip_rules(tmp_path):
+    job = tmp_path / "job"
+    (job / "backup").mkdir(parents=True)
+    (job / "backup" / "old.hip").write_bytes(b"o")
+    (job / "keep.exr").write_bytes(b"k")
+    (job / "keep.exr~").write_bytes(b"b")
+
+    rows, _ = deps.plan_refs([str(job), str(job), str(job / "backup"), str(job / "keep.exr~")])
+
+    assert len(rows) == 1
+    assert rows[0].path == str(job) and rows[0].files == 1  # backup/ and ~ pruned

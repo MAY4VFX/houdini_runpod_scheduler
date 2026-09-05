@@ -60,6 +60,70 @@ Mode:
     plus everything it references, expanded and de-duplicated. `Custom
     paths` uploads exactly the local -> remote pairs below.
 
+Dependencies:
+    #id: rpfarm_scope
+
+    Which references count. `This cook's branch` starts at every ROP Fetch
+    in this TOP network, resolves each `roppath`, and walks upstream from
+    there -- input ancestors, node-reference parameters (a LOP reaching a
+    SOP through `soppath`), and the contents of every node it reaches.
+    `Whole scene` is every file reference in the hip file, which is what
+    this node did unconditionally before 2026-09-05.
+
+    Why branch is the default: on a real scene the difference was 794 files
+    / 9.97 GB against 113 files / 1.32 GB, and everything extra is uplink
+    time paid before a rented GPU starts rendering. When the branch cannot
+    be resolved (nothing in the network fetches a ROP), `collect_refs`
+    falls back to the whole scene and says so in the log -- narrowing never
+    silently ships less than it can prove.
+
+    What NEITHER scope can see: assets a USD layer references from inside
+    itself. Those are resolved by USD at render time and never appear in
+    `hou.fileReferences()`, so they are missing from `Whole scene` too --
+    narrowing does not lose them, it was never able to find them. Add them
+    by hand in `Custom paths` (or upload the folder they live in once).
+
+    Output parameters are dropped in BOTH scopes: `pdg_workingdir`,
+    `outputimage`, `savetodirectory_directory`, cryptomatte side-cars and
+    the rest of `rpfarm.deps._NON_DEPENDENCY_PARMS`. A scheduler's working
+    directory is not a dependency of anything, and it is what turned one
+    parameter into 11.54 GB (ten .hip versions, 467 finished EXRs and a
+    1.47 GB export zip) the day this was found.
+
+Confirm Before Upload:
+    #id: rpfarm_confirm
+
+    Shows the plan before anything moves: every reference with its size,
+    heaviest first, with a checkbox. A directory reference is ONE line
+    carrying its whole recursive weight -- that is deliberate, it is how a
+    single parameter turns into gigabytes and it has to be visible as one
+    line you can uncheck, not 827 you scroll past.
+
+    Unchecking is remembered on the node (`rpfarm_exclude`, hidden), so the
+    window is not a tax on every cook: answer it once, and it comes back
+    the way you left it. Cancel stops the cook -- it does not fall through
+    to uploading what was there before.
+
+    Turn it off for batch/headless work. A cook without a UI never shows it
+    anyway (`hou.isUIAvailable()`), and a cook whose generation runs off the
+    main thread does not either -- Qt from another thread is not a raised
+    exception, it is a lost session. With no window, every directory
+    reference is still logged with its full weight, so nothing is expanded
+    silently either way. If the window itself fails to open, the upload
+    proceeds with the remembered selection and the reason is logged: a
+    confirmation dialog must never be the reason a farm submission dies.
+
+Preview Upload...:
+    #id: rpfarm_preview
+
+    Open that window now, without cooking -- and the way to set the
+    selection for a batch cook that will never open it.
+
+Re-check Everything:
+    #id: rpfarm_clearexclude
+
+    Forget every reference unchecked in the window.
+
 Project:
     #id: rpfarm_project
 

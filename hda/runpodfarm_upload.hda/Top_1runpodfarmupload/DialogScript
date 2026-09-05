@@ -25,6 +25,18 @@
         }
     }
     parm {
+        name    "rpfarm_scope"
+        label   "Dependencies"
+        type    string
+        default { "branch" }
+        help    "Branch: only what the ROPs this TOP network fetches actually read. Whole scene: every file reference in the hip file. Neither can see assets a USD layer references from inside itself -- those never appear in hou.fileReferences() in the first place."
+        hidewhen "{ rpfarm_mode != deps }"
+        menu {
+            "branch"    "This cook's branch"
+            "scene"     "Whole scene"
+        }
+    }
+    parm {
         name    "rpfarm_project"
         label   "Project"
         type    string
@@ -50,6 +62,42 @@
             "on"    "On"
             "off"   "Off"
         }
+    }
+    parm {
+        name    "rpfarm_confirm"
+        label   "Confirm Before Upload"
+        type    toggle
+        default { "1" }
+        help    "Show the plan -- every reference with its size, heaviest first -- and upload only what stays checked. Off for batch/headless cooks, which then use the selection this node already remembers. A cook with no UI (hython) never shows the window regardless."
+        hidewhen "{ rpfarm_mode != deps }"
+    }
+    parm {
+        name    "rpfarm_preview"
+        label   "Preview Upload..."
+        type    button
+        default { "0" }
+        help    "Open that window now, without cooking. This is how you set the selection for a batch cook that will never open it."
+        hidewhen "{ rpfarm_mode != deps }"
+        parmtag { "script_callback" "hou.phm().previewUpload(kwargs)" }
+        parmtag { "script_callback_language" "python" }
+    }
+    parm {
+        name    "rpfarm_clearexclude"
+        label   "Re-check Everything"
+        type    button
+        default { "0" }
+        help    "Forget every reference unchecked in the window."
+        hidewhen "{ rpfarm_mode != deps }"
+        parmtag { "script_callback" "hou.phm().clearExclusions(kwargs)" }
+        parmtag { "script_callback_language" "python" }
+    }
+    parm {
+        name    "rpfarm_exclude"
+        label   "Unchecked References"
+        type    string
+        invisible
+        default { "" }
+        help    "JSON list of references the artist unchecked. Cleared by Re-check Everything."
     }
     multiparm {
         name    "rpfarm_custom"

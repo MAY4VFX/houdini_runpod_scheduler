@@ -239,6 +239,25 @@ from rpfarm import config as rpcfg
 from rpfarm import deps as rpdeps
 from rpfarm import houdini_local as rphou
 from rpfarm import packages as rppkg
+from rpfarm import preflight as rppf
+
+# The asset and the package are updated together, but Python caches modules
+# for the life of the process: a Houdini that reloads this asset without
+# restarting runs the NEW generate against the OLD rpfarm, and the artist
+# gets \"unexpected keyword argument 'scope'\" instead of the one instruction
+# that helps. The full version-floor guard (scripts/hda_guard.py) lives in
+# the assets that import rpfarm while the scene is loading; here a single
+# capability check is enough, because nothing in this node runs until a cook.
+if not hasattr(rpdeps, \"SCOPE_BRANCH\"):
+    raise hou.NodeError(
+        \"Код фермы обновился, а Houdini держит в памяти старую версию.\\n\"
+        \"\\n\"
+        \"ПЕРЕЗАПУСТИТЕ HOUDINI. Больше ничего делать не нужно --\\n\"
+        \"на диске всё правильно, чинить нечего.\")
+
+
+def _say(message):
+    print(\"[rpfarm-upload] {}\".format(message))
 
 node = self.topNode().parent()
 
@@ -265,7 +284,26 @@ if preset == \"install_houdini\":
     custom, post_command = rppkg.houdini_install_preset(tar, ver)
     mode = \"custom\"
 
-refs = rpdeps.collect_refs() if mode == \"deps\" else []
+# Two separate questions, and until 2026-09-05 this node asked neither.
+# Which references belong to THIS cook (Dependencies: branch vs whole
+# scene), and which of them does the artist actually want moved (the
+# confirmation window, remembered on the node). Field case: the node
+# planned 794 files / 9.97 GB for a scene that reads 113 files / 1.32 GB,
+# because one unrelated TOP scheduler's pdg_workingdir named the project
+# folder and a directory reference is walked recursively. Custom mode
+# skips both -- there the artist typed the paths, so there is nothing to
+# narrow and nothing to confirm.
+refs = []
+if mode == \"deps\":
+    refs = rpdeps.collect_refs(
+        scope=node.evalParm(\"rpfarm_scope\") or rpdeps.SCOPE_BRANCH, node=node, log=_say)
+    try:
+        refs, _plan_rows, _plan_missing, _plan_excluded = rppf.resolve_upload_set(
+            node, refs, log=_say)
+    except rppf.UploadCancelled as e:
+        # A deliberate no, not a failure -- but generation has to stop, and
+        # a NodeError is the only way to stop it that PDG reports plainly.
+        raise hou.NodeError(str(e))
 
 items = rppkg.build_upload_items(mode, job_dir, user, project, custom, refs, package_gb)
 

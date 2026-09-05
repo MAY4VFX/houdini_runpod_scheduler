@@ -55,3 +55,38 @@ def project_default():
         return os.path.basename(os.path.normpath(job)) if job else ""
     except Exception:
         return ""
+
+
+# -- buttons (these may raise: unlike the default expressions above, they run
+#    on a click, not while the parameter dialog is being drawn) ---------------
+
+
+def _say(message):
+    print("[rpfarm-upload] {}".format(message))
+
+
+def previewUpload(kwargs):
+    """Show the upload plan without cooking anything.
+
+    The same window the cook shows, forced on (ask=True) regardless of the
+    Confirm toggle -- that is what the button is for. Any choice made here
+    is written back to the node, so previewing IS the way to set the
+    selection for a batch cook that will never open a window.
+    """
+    node = kwargs["node"]
+    from rpfarm import deps as rpdeps
+    from rpfarm import preflight as rppf
+
+    scope = node.evalParm("rpfarm_scope") or rpdeps.SCOPE_BRANCH
+    refs = rpdeps.collect_refs(scope=scope, node=node, log=_say)
+    try:
+        rppf.resolve_upload_set(node, refs, ask=True, log=_say)
+    except rppf.UploadCancelled:
+        _say("preview closed with Cancel -- nothing changed")
+
+
+def clearExclusions(kwargs):
+    """Re-check every reference this node was told to skip."""
+    node = kwargs["node"]
+    node.parm("rpfarm_exclude").set("")
+    _say("all references re-checked")
