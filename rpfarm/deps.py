@@ -172,6 +172,58 @@ def globbed(value, asset_re, glob_fn=None, exists=os.path.exists, isdir=os.path.
     return [os.path.normpath(value)] if exists(value) else []
 
 
+#: Dependencies Houdini takes from the ENVIRONMENT rather than from a
+#: parameter. No scanner can find these -- ours, Conductor's or Houdini's own
+#: Pre-Flight -- because ``hou.fileReferences()`` reports ``(Parm, path)``
+#: pairs and there is no Parm. They have to be asked for by name.
+#:
+#: $OCIO is the one that matters and the one that bites quietly. The owner's
+#: machine has
+#:     OCIO=/Users/may/color/ocio/aces_2.0/config.ocio  (may_aces-v2.0-baked)
+#: while a pod has no OCIO at all, so Houdini there falls back to the config
+#: shipped on the volume (houdini-config-v3.0.0_aces-v2.0). Nothing errors:
+#: his scene mostly uses `auto`/`Automatic`/`linear`, and which texture counts
+#: as sRGB and which as linear is decided BY THE LOADED CONFIG. The render
+#: finishes and the colour is wrong.
+ENV_DEPENDENCIES = ("OCIO",)
+
+
+def environment_refs(getenv=None, isfile=os.path.isfile, log=None):
+    """``(paths, problems)`` for dependencies named by environment variables.
+
+    Three cases, and the middle one is the whole point:
+
+    * unset -- nothing to do. Houdini falls back to its own bundled config
+      on both sides, so there is no difference to carry. Do not invent a
+      dependency where there is none.
+    * set and present -- the config's whole DIRECTORY travels, not just the
+      file: a config references LUTs beside it (the owner's has ``luts/``,
+      23 MB across 7 files) and a config without them is not a config.
+    * set and missing -- the artist's own setup is broken. Said plainly,
+      because silence here means the farm quietly renders in a different
+      colour space than the workstation.
+    """
+    say = log if log is not None else (lambda _m: None)
+    getenv = getenv or os.environ.get
+    paths = []
+    problems = []
+    for name in ENV_DEPENDENCIES:
+        value = (getenv(name) or "").strip()
+        if not value:
+            say("${} is not set -- the farm will use the same built-in config Houdini does".format(name))
+            continue
+        if not isfile(value):
+            problems.append(
+                "${} points at {} and there is no such file. The farm will render with a "
+                "DIFFERENT colour config than this machine, and nothing will say so. "
+                "Fix the variable or unset it.".format(name, value))
+            continue
+        directory = os.path.dirname(os.path.normpath(value))
+        paths.append(directory)
+        say("${} -> {} (uploading the whole directory)".format(name, directory))
+    return paths, problems
+
+
 def expand_reference(parm, pattern, expand, exists=os.path.exists, isdir=os.path.isdir,
                      glob_fn=None, asset_re=None, roots=()):
     """Every real path one ``(parm, pattern)`` file reference resolves to.

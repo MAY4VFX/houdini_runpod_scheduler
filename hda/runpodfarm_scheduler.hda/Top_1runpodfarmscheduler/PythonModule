@@ -201,7 +201,7 @@ _ASSET_FINGERPRINT = {
     'cli.py': (61628, '98763091948d537a'),
     'compression.py': (21496, '06c6306c4faf560f'),
     'config.py': (12718, 'c81813f3ccec7011'),
-    'deps.py': (36017, '17858b665c53edec'),
+    'deps.py': (38546, 'a2cc13cc1eecb505'),
     'dispatch.py': (21295, '9c0aa38ea12b3720'),
     'gpus.py': (8311, '7a28d5c2692b776e'),
     'houdini_local.py': (25206, 'a5ec6729405ccb1a'),
@@ -209,7 +209,7 @@ _ASSET_FINGERPRINT = {
     'package_runner.py': (8752, '96770e3879a6cb65'),
     'packages.py': (51475, '5c47658132aaf796'),
     'pods.py': (27040, '64cabd27b99479f6'),
-    'preflight.py': (28512, '84490c4e36f59e49'),
+    'preflight.py': (28602, 'bfad37b5ef089fc5'),
     'runpod_api.py': (14539, 'b90960f9860c97fb'),
     'smoke.py': (41503, 'd25dfbac9eddb12b'),
     'sync.py': (11950, '2a83513dc7e087e8'),
@@ -1245,6 +1245,7 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         # so they come out of here automatically.
         self.resolvePathMapping(task_env)
         self._ensurePathMapEnv(task_env)
+        self._ensureOcioEnv(task_env)
 
         # Resolves the environment specified in the Job Parms scheduler section
         add_env, remove_env = self.resolveEnvParams(
@@ -1257,6 +1258,36 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         task_env.update(add_env)
 
         return task_env
+
+    def _ensureOcioEnv(self, task_env):
+        """Point the farm at the colour config that came up with the scene.
+
+        $OCIO is a dependency no scanner can see -- there is no parameter
+        holding it -- and its absence does not fail a render, it changes one.
+        A pod has no OCIO at all, so Houdini there loads the config shipped on
+        the volume; the workstation loads the artist's. Which texture counts
+        as sRGB and which as linear is decided by whichever config is loaded,
+        so the frames come back finished and wrong.
+
+        The upload node ships the config's directory; this maps its local path
+        to where it landed on the farm, through the same path map everything
+        else uses. Unset locally means unset here: both sides then fall back
+        to the same bundled config, which is correct and needs no help.
+        """
+        local = os.environ.get("OCIO") or hou.getenv("OCIO")
+        if not local:
+            return
+        remote = rppkg.delocalize_via_pathmap(os.path.normpath(local), self._pathmap)
+        if not remote:
+            # The config lives outside anything this cook uploaded. Saying so
+            # is the point: the alternative is a silent colour difference.
+            self._log("$OCIO is {} but nothing in this cook maps it to the farm -- "
+                      "the render will use the pod's own colour config".format(local))
+            return
+        task_env["OCIO"] = remote
+        if not getattr(self, "_ocio_logged", False):
+            self._ocio_logged = True
+            self._log("OCIO: {} -> {}".format(local, remote))
 
     def _ensurePathMapEnv(self, task_env):
         """Backstop for $PDG_PATHMAP.

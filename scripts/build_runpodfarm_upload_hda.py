@@ -244,7 +244,7 @@ _ASSET_FINGERPRINT = {
     'cli.py': (61628, '98763091948d537a'),
     'compression.py': (21496, '06c6306c4faf560f'),
     'config.py': (12718, 'c81813f3ccec7011'),
-    'deps.py': (36017, '17858b665c53edec'),
+    'deps.py': (38546, 'a2cc13cc1eecb505'),
     'dispatch.py': (21295, '9c0aa38ea12b3720'),
     'gpus.py': (8311, '7a28d5c2692b776e'),
     'houdini_local.py': (25206, 'a5ec6729405ccb1a'),
@@ -252,7 +252,7 @@ _ASSET_FINGERPRINT = {
     'package_runner.py': (8752, '96770e3879a6cb65'),
     'packages.py': (51475, '5c47658132aaf796'),
     'pods.py': (27040, '64cabd27b99479f6'),
-    'preflight.py': (28512, '84490c4e36f59e49'),
+    'preflight.py': (28602, 'bfad37b5ef089fc5'),
     'runpod_api.py': (14539, 'b90960f9860c97fb'),
     'smoke.py': (41503, 'd25dfbac9eddb12b'),
     'sync.py': (11950, '2a83513dc7e087e8'),
@@ -321,6 +321,19 @@ def project_default():
 
 def _say(message):
     print("[rpfarm-upload] {}".format(message))
+
+
+def _warn(message):
+    """A warning badge on THIS node.
+
+    Via `self` (a pdg.Node), never hou.Node.addWarning on another node --
+    that raises "Cannot set error badges on other nodes" and zeroes the
+    generated work items, which is how a warning once cost a whole cook.
+    """
+    try:
+        self.addWarning(message, False)
+    except Exception:
+        pass
 
 
 def previewUpload(kwargs):
@@ -471,8 +484,21 @@ if mode == "deps":
         rops, log=_say, deep=bool(node.evalParm("rpfarm_usddeep")),
         asset_regex=asset_regex) if rops else []
     usd = rpdeps.remove_pattern(usd, exclude_pattern)
+
+    # Dependencies named by the ENVIRONMENT, which no scanner can see: there
+    # is no Parm for $OCIO, so hou.fileReferences() has nothing to report and
+    # never will. Left alone, the farm renders with Houdini's own bundled
+    # colour config while the artist works in theirs -- no error, wrong
+    # colour, because `auto`/`Automatic` texture handling is resolved BY the
+    # config that happens to be loaded.
+    env_refs, env_problems = rpdeps.environment_refs(
+        getenv=lambda name: hou.getenv(name) or os.environ.get(name), log=_say)
+    env_refs = rpdeps.remove_pattern(env_refs, exclude_pattern)
+    for problem in env_problems:
+        _say("WARNING: " + problem)
+        _warn(problem)
     try:
-        refs = rppf.choose_uploads(node, scan, usd, ask=ask, log=_say)
+        refs = rppf.choose_uploads(node, scan, usd, env_refs, ask=ask, log=_say)
     except rppf.UploadCancelled as e:
         # A deliberate no, not a failure -- but generation has to stop, and
         # a NodeError is the only way to stop it that PDG reports plainly.

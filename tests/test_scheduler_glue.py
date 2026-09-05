@@ -25,6 +25,7 @@ import types
 import pytest
 
 from rpfarm import dispatch as rpdispatch
+from rpfarm import packages as rppkg
 from rpfarm.runpod_api import RunPodError
 
 MODULE = (
@@ -1129,3 +1130,66 @@ def test_the_scheduler_checks_before_it_rents_anything():
 
     assert guard < first_pod, "the check must come before a machine is rented"
     assert "raise CookError(_stale)" in src[setup:first_pod]
+
+
+# ---------------------------------------------------------------------------
+# $OCIO on the farm (2026-09-05)
+#
+# A pod has no OCIO, so Houdini there loads the config from the volume while
+# the artist works in his own. The render finishes; the colour is wrong. The
+# upload ships the config directory, and this is the half that points the
+# farm at it.
+# ---------------------------------------------------------------------------
+
+
+def test_the_task_environment_points_at_the_uploaded_colour_config(monkeypatch):
+    ns = load_methods(["_ensureOcioEnv"], {
+        "os": __import__("os"),
+        "hou": types.SimpleNamespace(getenv=lambda name: None),
+        "rppkg": rppkg,
+    })
+    monkeypatch.setenv("OCIO", "/Users/may/color/ocio/aces_2.0/config.ocio")
+    self = types.SimpleNamespace(
+        _pathmap={"/Users/may/color/ocio/aces_2.0": "/workspace/projects/may/shot/_ext/Users/may/color/ocio/aces_2.0"},
+        _log=lambda m: None)
+    env = {}
+
+    ns["_ensureOcioEnv"](self, env)
+
+    assert env["OCIO"] == (
+        "/workspace/projects/may/shot/_ext/Users/may/color/ocio/aces_2.0/config.ocio")
+
+
+def test_no_ocio_locally_means_no_ocio_on_the_farm(monkeypatch):
+    """Both sides fall back to Houdini's own config, which is the same on
+    both. Setting anything here would be inventing a difference."""
+    ns = load_methods(["_ensureOcioEnv"], {
+        "os": __import__("os"),
+        "hou": types.SimpleNamespace(getenv=lambda name: None),
+        "rppkg": rppkg,
+    })
+    monkeypatch.delenv("OCIO", raising=False)
+    env = {}
+
+    ns["_ensureOcioEnv"](types.SimpleNamespace(_pathmap={}, _log=lambda m: None), env)
+
+    assert "OCIO" not in env
+
+
+def test_an_unmapped_colour_config_is_reported_not_guessed(monkeypatch):
+    """If the config was not part of this cook there is nothing to point at.
+    Say so -- the alternative is a silent colour difference."""
+    ns = load_methods(["_ensureOcioEnv"], {
+        "os": __import__("os"),
+        "hou": types.SimpleNamespace(getenv=lambda name: None),
+        "rppkg": rppkg,
+    })
+    monkeypatch.setenv("OCIO", "/somewhere/else/config.ocio")
+    said = []
+    env = {}
+
+    ns["_ensureOcioEnv"](types.SimpleNamespace(_pathmap={"/job": "/workspace/p"},
+                                               _log=said.append), env)
+
+    assert "OCIO" not in env
+    assert any("nothing in this cook maps it" in m for m in said), said

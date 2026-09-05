@@ -316,8 +316,21 @@ if mode == \"deps\":
         rops, log=_say, deep=bool(node.evalParm(\"rpfarm_usddeep\")),
         asset_regex=asset_regex) if rops else []
     usd = rpdeps.remove_pattern(usd, exclude_pattern)
+
+    # Dependencies named by the ENVIRONMENT, which no scanner can see: there
+    # is no Parm for $OCIO, so hou.fileReferences() has nothing to report and
+    # never will. Left alone, the farm renders with Houdini's own bundled
+    # colour config while the artist works in theirs -- no error, wrong
+    # colour, because `auto`/`Automatic` texture handling is resolved BY the
+    # config that happens to be loaded.
+    env_refs, env_problems = rpdeps.environment_refs(
+        getenv=lambda name: hou.getenv(name) or os.environ.get(name), log=_say)
+    env_refs = rpdeps.remove_pattern(env_refs, exclude_pattern)
+    for problem in env_problems:
+        _say(\"WARNING: \" + problem)
+        _warn(problem)
     try:
-        refs = rppf.choose_uploads(node, scan, usd, ask=ask, log=_say)
+        refs = rppf.choose_uploads(node, scan, usd, env_refs, ask=ask, log=_say)
     except rppf.UploadCancelled as e:
         # A deliberate no, not a failure -- but generation has to stop, and
         # a NodeError is the only way to stop it that PDG reports plainly.
