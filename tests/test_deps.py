@@ -196,6 +196,8 @@ def test_collect_refs_import_guard(monkeypatch):
         hipFile=SimpleNamespace(path=lambda: "/job/hip/scene.hip"),
         fileReferences=lambda *a, **k: refs,
         text=_StubText(),
+        nodeType=lambda _name: None,
+        getenv=lambda _name: None,
     )
     monkeypatch.setitem(sys.modules, "hou", stub)
 
@@ -242,6 +244,9 @@ class _StubParm:
         self._value = value
         self._template = _StubTemplate(string_type)
 
+    def unexpandedString(self):
+        return self._value
+
     def name(self):
         return self._name
 
@@ -258,9 +263,11 @@ class _StubParm:
 class _StubNode:
     """Just enough hou.Node for the branch walk: path, parms, inputs, kids."""
 
-    def __init__(self, path, scene, parms=None, ancestors=(), children=(), refs=()):
+    def __init__(self, path, scene, parms=None, ancestors=(), children=(), refs=(),
+                 type_name="stub"):
         self._path = path
         self._scene = scene
+        self._type_name = type_name
         self._parms = {}
         self._ancestors = list(ancestors)
         self._children = list(children)
@@ -274,8 +281,11 @@ class _StubNode:
     def path(self):
         return self._path
 
+    def type(self):
+        return SimpleNamespace(name=lambda: self._type_name)
+
     def parent(self):
-        return self._scene[self._path.rsplit("/", 1)[0]]
+        return self._scene.get(self._path.rsplit("/", 1)[0])
 
     def parm(self, name):
         return self._parms.get(name)
@@ -311,12 +321,23 @@ class _StubNode:
 _ANY_PATH = {"exists": lambda _p: True, "isdir": lambda _p: True}
 
 
-def _stub_hou(scene, refs):
+class _StubNodeType:
+    def __init__(self, nodes):
+        self._nodes = list(nodes)
+
+    def instances(self):
+        return self._nodes
+
+
+def _stub_hou(scene, refs, node_types=None):
+    types = node_types or {}
     return SimpleNamespace(
         hipFile=SimpleNamespace(path=lambda: "/job/hip/scene.hip"),
         fileReferences=lambda *a, **k: refs,
         text=_StubText(),
         node=scene.get,
+        nodeType=types.get,
+        getenv=lambda name: {"HIP": "/job/hip", "JOB": "/job"}.get(name),
         stringParmType=SimpleNamespace(NodeReference="noderef", NodeReferenceList="noderefs"),
     )
 
@@ -589,3 +610,105 @@ def test_a_frame_sequence_still_reduces_to_its_directory(tmp_path):
     (cache / "sim.0001.bgeo").write_bytes(b"c")
 
     assert deps.expand_reference(None, str(cache / "sim.$F4.bgeo"), expand=lambda s: s) == [str(cache)]
+
+
+# -- what Houdini does not report, and what we must not report to ourselves ------
+#
+# Conductor (ciohoudini/assets.py) hit both of these in production and
+# solved them the same way. Their comment is the finding in one line:
+# "Parms that don't have a string type of 'File' won't be returned by
+# hou.fileReferences()".
+
+
+def test_a_reference_lop_path_is_scanned_although_houdini_hides_it(monkeypatch, tmp_path):
+    """filepath1 on a Reference LOP is stringParmType.Regular, so it is
+    absent from hou.fileReferences() -- and it is the .usdc the render is
+    built from. No flag fixes that: the table of node type -> parm is the
+    fix."""
+    usd = tmp_path / "airship.usdc"
+    usd.write_bytes(b"u")
+    scene = {}
+    ref_node = _StubNode("/stage/airship_ref", scene, type_name="reference::2.0")
+    ref_node._parms["filepath1"] = _StubParm("filepath1", ref_node, str(usd))
+    stub = _stub_hou(scene, [], node_types={"Lop/reference::2.0": _StubNodeType([ref_node])})
+    monkeypatch.setitem(sys.modules, "hou", stub)
+
+    assert str(usd) in deps.scan_refs().paths
+
+
+def test_every_instance_of_a_multiparm_path_is_followed(monkeypatch, tmp_path):
+    """A Reference LOP with three references has filepath1..3."""
+    scene = {}
+    node = _StubNode("/stage/refs", scene, type_name="reference::2.0")
+    made = []
+    for i in (1, 2, 3):
+        path = tmp_path / "layer{}.usdc".format(i)
+        path.write_bytes(b"u")
+        made.append(str(path))
+        node._parms["filepath{}".format(i)] = _StubParm("filepath{}".format(i), node, str(path))
+    stub = _stub_hou(scene, [], node_types={"Lop/reference::2.0": _StubNodeType([node])})
+    monkeypatch.setitem(sys.modules, "hou", stub)
+
+    assert set(made).issubset(set(deps.scan_refs().paths))
+
+
+def test_we_do_not_scan_our_own_nodes(monkeypatch):
+    """The upload asset contains its own localscheduler, whose
+    pdg_workingdir is $HIP. Scan ourselves and the whole project folder
+    turns up as a row the artist never put there."""
+    scene = {}
+    stage = _StubNode("/stage", scene)
+    ours = _StubNode("/stage/shots_pdg/upload", scene, type_name="runpodfarmupload")
+    inner = _StubNode("/stage/shots_pdg/upload/localscheduler", scene, type_name="localscheduler")
+    refs = [(_StubParm("pdg_workingdir", inner), "$JOB")]
+    monkeypatch.setitem(sys.modules, "hou", _stub_hou(scene, refs))
+    said = []
+
+    got = deps.scan_refs(log=said.append, **_ANY_PATH)
+
+    assert got.paths == ["/job/hip/scene.hip"]
+    assert got.output_paths == [], "not even as an unchecked row -- it is not the scene's"
+    assert any("own nodes" in m for m in said), said
+
+
+def test_the_exclude_pattern_drops_matching_paths(monkeypatch, tmp_path):
+    scene, upload, geo, _lookdev, _sched = _airship_like_scene()
+    refs = [
+        (_StubParm("file", geo), "/job/tex/a.rat"),
+        (_StubParm("file", geo), "/job/backup/old.hip"),
+    ]
+    monkeypatch.setitem(sys.modules, "hou", _stub_hou(scene, refs))
+
+    got = deps.scan_refs(exclude_pattern="*/backup/*", **_ANY_PATH)
+
+    assert "/job/tex/a.rat" in got.paths
+    assert "/job/backup/old.hip" not in got.paths
+
+
+def test_a_broken_exclude_or_asset_pattern_does_not_break_the_cook(monkeypatch):
+    scene, upload, geo, _lookdev, _sched = _airship_like_scene()
+    refs = [(_StubParm("file", geo), "/job/tex/a.rat")]
+    monkeypatch.setitem(sys.modules, "hou", _stub_hou(scene, refs))
+    said = []
+
+    got = deps.scan_refs(asset_regex="(unclosed", log=said.append, **_ANY_PATH)
+
+    assert "/job/tex/a.rat" in got.paths
+    assert any("does not compile" in m for m in said), said
+
+
+def test_a_frame_number_globs_the_whole_sequence(tmp_path):
+    """Houdini expands $F4 to the CURRENT FRAME before anything here sees
+    it -- sim.$F4.bgeo arrives as sim.0001.bgeo. Treated literally, that
+    uploads one frame of a cache and the farm renders the rest of the shot
+    against nothing."""
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    for frame in ("0001", "0002", "0003"):
+        (cache / "sim.{}.bgeo".format(frame)).write_bytes(b"c")
+    (cache / "notes.txt").write_bytes(b"n")
+
+    got = deps.expand_reference(None, str(cache / "sim.0001.bgeo"), expand=lambda s: s)
+
+    assert got == [str(cache / "sim.{}.bgeo".format(f)) for f in ("0001", "0002", "0003")]
+    assert str(cache / "notes.txt") not in got

@@ -460,3 +460,17 @@ def test_every_embedded_callback_is_valid_python(builder):
         if not (name.endswith("_CODE") or name == "PYTHON_MODULE"):
             continue  # HELP_TEXT is prose
         ast.parse(code)  # raises SyntaxError, naming the line, if it ever breaks again
+
+
+def test_the_asset_pattern_default_matches_the_package():
+    """The builder cannot import rpfarm (it runs under hython against
+    whatever is installed), so the default varying-path pattern is spelled
+    out in both places. This is what keeps them the same string."""
+    from rpfarm import deps
+
+    builder = (REPO / "scripts" / "build_runpodfarm_upload_hda.py").read_text()
+    assert repr(deps.ASSET_REGEX)[1:-1] in builder or deps.ASSET_REGEX in builder, (
+        "scripts/build_runpodfarm_upload_hda.py and rpfarm.deps.ASSET_REGEX have drifted"
+    )
+    shipped = _asset_text("runpodfarm_upload.hda")
+    assert "rpfarm_assetregex" in shipped and "rpfarm_excludepattern" in shipped

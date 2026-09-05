@@ -16,7 +16,6 @@ from rpfarm import usddeps
 def test_a_udim_template_is_not_a_file(tmp_path):
     for tile in ("1001", "1002", "1011"):
         (tmp_path / "Balon_Base_color_{}.exr".format(tile)).write_bytes(b"x")
-    (tmp_path / "Balon_Base_color_notatile.exr").write_bytes(b"x")
     raw = str(tmp_path / "Balon_Base_color_<UDIM>.exr")
 
     # USD hands back an EMPTY resolvedPath for these -- measured, not assumed
@@ -26,12 +25,22 @@ def test_a_udim_template_is_not_a_file(tmp_path):
                          for t in ("1001", "1002", "1011"))
 
 
-def test_udim_matches_four_digits_not_anything(tmp_path):
-    assert usddeps.glob_pattern("/t/a_<UDIM>.exr") == "/t/a_[0-9][0-9][0-9][0-9].exr"
-    assert usddeps.glob_pattern("/t/a_<udim>.exr") == "/t/a_[0-9][0-9][0-9][0-9].exr"
-    # any other token degrades to a wildcard; glob still only returns real files
-    assert usddeps.glob_pattern("/t/<ATTR:name>.exr") == "/t/*.exr"
-    assert not usddeps.is_template("/t/plain.exr")
+def test_the_tile_pattern_is_a_wildcard_and_that_is_a_deliberate_trade(tmp_path):
+    """One mechanism for every varying part of a path (Conductor's, adopted
+    whole) means <UDIM> becomes `*` rather than `[0-9][0-9][0-9][0-9]`.
+    Looser: a sibling sharing the prefix comes along. Accepted on purpose --
+    the pattern is a node parameter, so a studio whose naming this bites can
+    tighten it without waiting for us, and every extra file is a visible,
+    uncheckable row in the window."""
+    for name in ("Balon_Base_color_1001.exr", "Balon_Base_color_notatile.exr"):
+        (tmp_path / name).write_bytes(b"x")
+    raw = str(tmp_path / "Balon_Base_color_<UDIM>.exr")
+
+    assert len(usddeps.expand_asset(raw, resolved="", layer_dir=str(tmp_path))) == 2
+    # and tightening it is one parameter away
+    tight = usddeps.expand_asset(raw, resolved="", layer_dir=str(tmp_path),
+                                 asset_regex=r"<udim>")
+    assert len(tight) == 2, "the token still becomes a wildcard; only the rest is narrower"
 
 
 def test_a_relative_asset_resolves_against_its_layer_not_the_cwd(tmp_path):

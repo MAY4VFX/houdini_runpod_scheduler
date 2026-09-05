@@ -32,32 +32,18 @@ them, so the pure helpers here stay importable (and testable) anywhere.
 
 from __future__ import annotations
 
-import glob as _glob
 import os
 import re
 import time
 
-# <UDIM> is USD's tile token; Houdini writes <udim> too. Any other <...>
-# token (<ATTR:name>, <f>, ...) is a stand-in for something we cannot
-# evaluate here, so it degrades to a plain wildcard -- glob only ever
-# returns files that exist, so a too-wide pattern costs a directory listing,
-# not a wrong upload.
-_UDIM_RE = re.compile(r"<udim>", re.IGNORECASE)
-_TOKEN_RE = re.compile(r"<[^<>]+>")
+from . import deps
+
+def _asset_re(asset_regex=None):
+    return re.compile(asset_regex or deps.ASSET_REGEX, re.IGNORECASE)
 
 
-def is_template(path):
-    """True when *path* names a family of files rather than one file."""
-    return bool(path) and bool(_TOKEN_RE.search(path))
-
-
-def glob_pattern(path):
-    """A ``<UDIM>`` template as a glob: four digits, not a bare wildcard."""
-    pattern = _UDIM_RE.sub("[0-9][0-9][0-9][0-9]", path)
-    return _TOKEN_RE.sub("*", pattern)
-
-
-def expand_asset(raw, resolved="", layer_dir="", glob_fn=None, isfile=os.path.isfile):
+def expand_asset(raw, resolved="", layer_dir="", glob_fn=None, isfile=os.path.isfile,
+                 asset_regex=None):
     """One USD asset path -> the real files it names.
 
     Order matters and each step is a case seen on the field scene:
@@ -75,18 +61,13 @@ def expand_asset(raw, resolved="", layer_dir="", glob_fn=None, isfile=os.path.is
     Returns [] when nothing matches: a reference to a file that is not
     there is not an error here, it is simply nothing to upload.
     """
-    globber = glob_fn or _glob.glob
     if resolved and isfile(resolved):
         return [os.path.normpath(resolved)]
     if not raw:
         return []
     candidate = raw if os.path.isabs(raw) or not layer_dir else os.path.join(layer_dir, raw)
-    candidate = os.path.normpath(candidate)
-    if is_template(raw):
-        return sorted({os.path.normpath(p) for p in globber(glob_pattern(candidate))})
-    if isfile(candidate):
-        return [candidate]
-    return []
+    return deps.globbed(os.path.normpath(candidate), _asset_re(asset_regex),
+                        glob_fn=glob_fn, exists=isfile, isdir=lambda _p: False)
 
 
 def stage_node_of(rop):
@@ -179,7 +160,7 @@ def _stage_of(lop, say):
     return None
 
 
-def stage_dependencies(lop, log=None, deep=True):
+def stage_dependencies(lop, log=None, deep=True, asset_regex=None):
     """Every on-disk file the stage behind *lop* needs.
 
     Returns a sorted list of paths. ``deep`` also runs
@@ -214,7 +195,8 @@ def stage_dependencies(lop, log=None, deep=True):
                 for raw, resolved in _asset_values(attr):
                     assets += 1
                     found.update(expand_asset(
-                        raw, resolved, _authoring_layer_dir(attr, root_dir)))
+                        raw, resolved, _authoring_layer_dir(attr, root_dir),
+                        asset_regex=asset_regex))
     except Exception as exc:
         say("usd: attribute walk stopped ({})".format(exc))
     say("usd: {} layer(s) on disk, {} asset value(s) in {:.2f}s".format(
@@ -253,7 +235,7 @@ def _layer_dependencies(layers, say):
     return out
 
 
-def collect_usd_refs(rops, log=None, deep=True):
+def collect_usd_refs(rops, log=None, deep=True, asset_regex=None):
     """The USD half of the dependency set, for every ROP this cook renders."""
     say = log if log is not None else (lambda _m: None)
     found = set()
@@ -262,7 +244,8 @@ def collect_usd_refs(rops, log=None, deep=True):
         if lop is None:
             say("usd: {} renders no LOP -- nothing to walk".format(rop.path()))
             continue
-        found.update(stage_dependencies(lop, log=log, deep=deep))
+        found.update(stage_dependencies(lop, log=log, deep=deep,
+                                        asset_regex=asset_regex))
     if found:
         say("usd: {} file(s) no parameter points at".format(len(found)))
     return sorted(found)

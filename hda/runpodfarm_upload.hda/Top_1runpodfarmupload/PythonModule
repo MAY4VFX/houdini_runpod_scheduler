@@ -78,10 +78,15 @@ def previewUpload(kwargs):
     from rpfarm import usddeps as rpusd
 
     scope = node.evalParm("rpfarm_scope") or rpdeps.SCOPE_BRANCH
-    scan = rpdeps.scan_refs(scope=scope, node=node, log=_say)
+    asset_regex = node.evalParm("rpfarm_assetregex") or rpdeps.ASSET_REGEX
+    exclude_pattern = node.evalParm("rpfarm_excludepattern")
+    scan = rpdeps.scan_refs(scope=scope, node=node, log=_say,
+                            asset_regex=asset_regex, exclude_pattern=exclude_pattern)
     rops = rpdeps.cook_rops(node, log=_say)
     usd = rpusd.collect_usd_refs(
-        rops, log=_say, deep=bool(node.evalParm("rpfarm_usddeep"))) if rops else []
+        rops, log=_say, deep=bool(node.evalParm("rpfarm_usddeep")),
+        asset_regex=asset_regex) if rops else []
+    usd = rpdeps.remove_pattern(usd, exclude_pattern)
     try:
         paths = rppf.choose_uploads(node, scan, usd, ask=True, log=_say)
     except rppf.UploadCancelled:

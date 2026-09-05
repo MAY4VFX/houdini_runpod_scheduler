@@ -16,6 +16,7 @@ testable without Houdini installed.
 
 from __future__ import annotations
 
+import fnmatch
 import glob
 import json
 import os
@@ -30,30 +31,45 @@ from .sync import FileEntry
 # the containing directory, which is the honest superset.
 _SEQ = re.compile(r"\$F\d*|%0?\d*d|#{2,}|\$\(F\d*\)|\$\{F\d*\}")
 
-# <UDIM>, <udim>, <ATTR:name>, ... -- a per-TILE template. Different
-# problem, different answer: every tile that exists IS a tile the render
-# reads, so these are globbed into the real files instead of dragging in
-# whatever else lives in the folder. Field case (airship_v013.hip):
-# `tex_mip/Balon_Base_color_<UDIM>.exr` on an mtlximage parameter reduced
-# to `tex_mip/`, uploading all 72 files / 995 MB of that folder to get the
-# six tiles that material uses.
-_UDIM_RE = re.compile(r"<udim>", re.IGNORECASE)
-_TOKEN_RE = re.compile(r"<[^<>]+>")
+# Everything in an evaluated path that stands for "this part varies": UDIM
+# and tile tokens, and a run of digits fenced by _ or . (frame numbers,
+# `_1001_`, `.0001.`). Matches become `*` and the result is globbed, so only
+# files that really exist come back.
+#
+# The default is Conductor's (ciohoudini/assets.py, an open-source
+# production submitter), verbatim, and for the same reason they made it a
+# user-editable parameter: one mechanism for every varying part of a path
+# beats a special case per token, and a studio with a naming convention
+# nobody anticipated can fix it themselves.
+#
+# It also closes a hole a token-by-token approach cannot see. Houdini
+# expands `$F4` to the CURRENT FRAME (`hou.text.expandString("sim.$F4.bgeo")`
+# -> `sim.0001.bgeo`, verified), so by the time any of this code sees a
+# cache sequence it looks like one concrete file -- and one frame is what
+# used to upload. `.0001.` matches this regex; `$F4` never survived to match
+# anything.
+ASSET_REGEX = r"(_|\.)\d+(_|\.)|<udim>|<u>|<v>|<u2>|<v2>|<obj_name>"
 
+# Parms that hold a path but which hou.fileReferences() does not report,
+# because their string type is not FileReference. Houdini has no flag to
+# fix this from outside, so the list is explicit and extensible -- exactly
+# what Conductor does (ADDITIONAL_PATH_PARMS in ciohoudini/assets.py), with
+# the same first entry: `filepath1` on a Reference LOP is
+# stringParmType.Regular, which is why the .usdc an entire render is built
+# from never appeared in any scan.
+#
+# A name ending in a digit is treated as the first instance of a multiparm
+# block and its siblings (filepath2, filepath3, ...) are followed until one
+# is missing.
+ADDITIONAL_PATH_PARMS = {
+    "Lop/reference::2.0": ("filepath1",),
+}
 
-def is_template(path):
-    """True when *path* names a family of tiles rather than one file."""
-    return bool(path) and bool(_TOKEN_RE.search(path))
-
-
-def glob_pattern(path):
-    """A ``<UDIM>`` template as a glob: four digits, not a bare wildcard.
-
-    Any other ``<...>`` token stands for something that cannot be evaluated
-    here and degrades to ``*`` -- glob only ever returns files that exist,
-    so a too-wide pattern costs a directory listing, not a wrong upload.
-    """
-    return _TOKEN_RE.sub("*", _UDIM_RE.sub("[0-9][0-9][0-9][0-9]", path))
+# Node types whose parameters are ours, not the scene's: scanning our own
+# upload/scheduler assets adds their internal localscheduler's
+# `pdg_workingdir` ($HIP -- the whole project) to the plan as a row nobody
+# asked about. Conductor skips their own submitter node the same way.
+_OUR_NODE_PREFIX = "runpodfarm"
 
 # Directories never worth uploading: PDG's own scratch dir, hand-rolled
 # backup folders, VCS metadata, bytecode cache. Pruned at any depth while
@@ -133,8 +149,30 @@ class PlanRow:
     source: str = "scene"
 
 
+def globbed(value, asset_re, glob_fn=None, exists=os.path.exists, isdir=os.path.isdir):
+    """Every real file *value* names, with its varying parts globbed.
+
+    Three cases, in this order:
+
+    1. Something in the path varies (``asset_re`` matched) -- substitute
+       ``*`` and glob. Only files that exist come back, so a pattern that is
+       too wide costs a directory listing, not a wrong upload.
+    2. A Houdini variable survived expansion (``$F`` in a string nothing
+       evaluated) -- fall back to the containing directory, which is the
+       honest superset when the frames cannot be enumerated.
+    3. A plain path -- keep it if it is there.
+    """
+    globber = glob_fn or glob.glob
+    if asset_re is not None and asset_re.search(value):
+        return sorted({os.path.normpath(p) for p in globber(asset_re.sub("*", value))})
+    if _SEQ.search(value):
+        parent = os.path.dirname(value)
+        return [os.path.normpath(parent)] if isdir(parent) else []
+    return [os.path.normpath(value)] if exists(value) else []
+
+
 def expand_reference(parm, pattern, expand, exists=os.path.exists, isdir=os.path.isdir,
-                     glob_fn=None):
+                     glob_fn=None, asset_re=None, roots=()):
     """Every real path one ``(parm, pattern)`` file reference resolves to.
 
     Two ways to resolve a reference, and neither is a superset of the other:
@@ -153,14 +191,14 @@ def expand_reference(parm, pattern, expand, exists=os.path.exists, isdir=os.path
     both exist and disagree keep both. Uploading one file too many costs
     bandwidth; missing one costs a failed render on a rented GPU.
 
-    A sequence/UDIM pattern (``$F``, ``%04d``, ``<UDIM>``, ...) names no single
-    file, so it reduces to its containing directory -- and only if that
-    directory is really there.
+    Whatever varies in the path -- a UDIM tile, a frame number -- is
+    globbed rather than checked literally (see :func:`globbed`).
 
     ``expand``/``exists``/``isdir`` are injected so this function is testable
     without Houdini; the caller passes ``hou.text.expandString``.
     """
-    globber = glob_fn or glob.glob
+    if asset_re is None:
+        asset_re = re.compile(ASSET_REGEX, re.IGNORECASE)
     out = []
     candidates = []
     if parm is not None:
@@ -173,21 +211,23 @@ def expand_reference(parm, pattern, expand, exists=os.path.exists, isdir=os.path
             candidates.append(expand(pattern) if "$" in pattern else pattern)
         except Exception:
             pass
+    for value in list(candidates):
+        # A relative path is resolved against $HIP and against $JOB, keeping
+        # whichever exists -- Conductor's _resolve_absolute_existing_paths
+        # does the same, and "it's the best we can do for now" is their own
+        # honest comment on it.
+        if value and not value.startswith(("op:", "opdef:", "temp:")) and not os.path.isabs(value):
+            candidates.extend(os.path.join(root, value) for root in roots if root)
+
     for value in candidates:
-        if not value:
-            continue
-        if _SEQ.search(value):
-            parent = os.path.dirname(value)
-            found = [parent] if isdir(parent) else []
-        elif is_template(value):
-            # Globbed BEFORE any existence check: the literal path with the
-            # token in it never exists, so checking first is how a whole
-            # material's worth of textures goes missing.
-            found = sorted({os.path.normpath(p) for p in globber(glob_pattern(value))})
-        else:
-            found = [value] if exists(value) else []
-        for item in found:
-            item = os.path.normpath(item)
+        if not value or value.startswith(("op:", "opdef:", "temp:")):
+            continue  # internal references, not files (Conductor skips these too)
+        if not os.path.isabs(value):
+            continue  # only the rooted forms above can be checked
+        # Globbed BEFORE any existence check: a path with <UDIM> or a frame
+        # number in it never exists literally, so checking first is how a
+        # whole material's textures -- or every frame but one -- goes missing.
+        for item in globbed(value, asset_re, glob_fn=glob_fn, exists=exists, isdir=isdir):
             if item not in out:
                 out.append(item)
     return out
@@ -212,7 +252,8 @@ class RefScan:
     unresolved: tuple
 
 
-def expand_pairs(pairs, expand, exists=os.path.exists, isdir=os.path.isdir, glob_fn=None):
+def expand_pairs(pairs, expand, exists=os.path.exists, isdir=os.path.isdir, glob_fn=None,
+                 asset_re=None, roots=()):
     """``(parm, pattern)`` pairs -> ``(paths, unresolved patterns)``.
 
     Used for both halves of the flow: the scan below, and the selection
@@ -225,7 +266,7 @@ def expand_pairs(pairs, expand, exists=os.path.exists, isdir=os.path.isdir, glob
         if not pattern or pattern.startswith(("op:", "opdef:", "temp:")):
             continue
         found = expand_reference(parm, pattern, expand, exists=exists, isdir=isdir,
-                                 glob_fn=glob_fn)
+                                 glob_fn=glob_fn, asset_re=asset_re, roots=roots)
         if not found:
             unresolved.append(pattern)
             continue
@@ -236,8 +277,84 @@ def expand_pairs(pairs, expand, exists=os.path.exists, isdir=os.path.isdir, glob
     return paths, unresolved
 
 
+def additional_ref_pairs(log=None):
+    """``(parm, value)`` pairs for parameters ``hou.fileReferences()`` misses.
+
+    Houdini decides what is a file reference by the parameter's string
+    TYPE, not by what it holds. ``filepath1`` on a Reference LOP is
+    ``stringParmType.Regular``, so the .usdc a whole render is built from is
+    simply not in the list, and no flag fixes that from outside. The answer
+    -- Conductor's, arrived at independently and running in production --
+    is an explicit table of node type -> parameter names, walked through
+    ``hou.nodeType(name).instances()``.
+
+    A declared name ending in a digit is the first entry of a multiparm
+    block, so its siblings are followed too: a Reference LOP with three
+    references has ``filepath1``, ``filepath2``, ``filepath3``.
+    """
+    import hou
+
+    say = log if log is not None else (lambda _m: None)
+    out = []
+    for type_name, parm_names in ADDITIONAL_PATH_PARMS.items():
+        try:
+            node_type = hou.nodeType(type_name)
+        except Exception as exc:  # a supplement must never break the scan
+            say("cannot look up node type {} ({})".format(type_name, exc))
+            continue
+        if node_type is None:
+            say("no node type {} in this Houdini -- skipped".format(type_name))
+            continue
+        for node in node_type.instances():
+            for parm_name in parm_names:
+                for parm in _multiparm_series(node, parm_name):
+                    try:
+                        value = parm.unexpandedString()
+                    except Exception:
+                        continue
+                    if value:
+                        out.append((parm, value))
+    if out:
+        say("{} path parm(s) Houdini does not report as file references".format(len(out)))
+    return out
+
+
+def _multiparm_series(node, parm_name):
+    """``filepath1`` -> that parm and every ``filepath2..N`` that exists."""
+    parm = node.parm(parm_name)
+    if parm is None:
+        return []
+    out = [parm]
+    stem = parm_name.rstrip("0123456789")
+    digits = parm_name[len(stem):]
+    if not digits:
+        return out
+    index = int(digits) + 1
+    while True:
+        nxt = node.parm("{}{}".format(stem, index))
+        if nxt is None:
+            return out
+        out.append(nxt)
+        index += 1
+
+
+def remove_pattern(paths, pattern):
+    """Drop paths matching a glob *pattern* -- the node's exclusion field.
+
+    ``fnmatch`` semantics against the whole path, so ``*/backup/*`` and
+    ``*.abc`` both work. An empty pattern removes nothing.
+    """
+    if not pattern:
+        return list(paths)
+    parts = [p.strip() for p in pattern.split(",") if p.strip()]
+    if not parts:
+        return list(paths)
+    return [p for p in paths if not any(fnmatch.fnmatch(p, part) for part in parts)]
+
+
 def scan_refs(scope=SCOPE_SCENE, node=None, log=None, project_dir_variable="HIP",
-              exists=os.path.exists, isdir=os.path.isdir, glob_fn=None):
+              exists=os.path.exists, isdir=os.path.isdir, glob_fn=None,
+              asset_regex=ASSET_REGEX, exclude_pattern=""):
     """Scan the scene's file references and resolve them to real paths.
 
     The only function in this module allowed to ``import hou`` -- done
@@ -265,12 +382,16 @@ def scan_refs(scope=SCOPE_SCENE, node=None, log=None, project_dir_variable="HIP"
     say = log if log is not None else (lambda _message: None)
     branch = _branch_node_paths(node, say) if scope == SCOPE_BRANCH else None
 
-    pairs = hou.fileReferences(project_dir_variable)
+    pairs = list(hou.fileReferences(project_dir_variable)) + additional_ref_pairs(say)
     kept = []
     outputs = []
     off_branch = 0
+    ours = 0
     for parm, pattern in pairs:
         if parm is not None:
+            if _is_our_own(parm):
+                ours += 1
+                continue
             owner = _parm_node_path(parm)
             if branch is not None and owner is not None and owner not in branch:
                 off_branch += 1
@@ -280,10 +401,26 @@ def scan_refs(scope=SCOPE_SCENE, node=None, log=None, project_dir_variable="HIP"
                 continue
         kept.append((parm, pattern))
 
-    expand = dict(expand=hou.text.expandString, exists=exists, isdir=isdir, glob_fn=glob_fn)
+    try:
+        asset_re = re.compile(asset_regex, re.IGNORECASE) if asset_regex else None
+    except re.error as exc:
+        say("asset pattern {!r} does not compile ({}) -- using the default".format(asset_regex, exc))
+        asset_re = re.compile(ASSET_REGEX, re.IGNORECASE)
+    expand = dict(expand=hou.text.expandString, exists=exists, isdir=isdir,
+                  glob_fn=glob_fn, asset_re=asset_re,
+                  roots=(hou.getenv("HIP"), hou.getenv("JOB")))
     paths, unresolved = expand_pairs(kept, **expand)
     output_paths, _ = expand_pairs(outputs, **expand)
     paths.insert(0, hou.hipFile.path())
+    if exclude_pattern:
+        before = len(paths) + len(output_paths)
+        paths = remove_pattern(paths, exclude_pattern)
+        output_paths = remove_pattern(output_paths, exclude_pattern)
+        dropped = before - len(paths) - len(output_paths)
+        if dropped:
+            say("{} path(s) dropped by the exclude pattern {!r}".format(dropped, exclude_pattern))
+    if ours:
+        say("skipped {} reference(s) on RunPodFarm's own nodes".format(ours))
     if outputs:
         say("{} reference(s) name outputs, not inputs -- offered unchecked".format(len(outputs)))
     if off_branch:
@@ -296,6 +433,24 @@ def scan_refs(scope=SCOPE_SCENE, node=None, log=None, project_dir_variable="HIP"
 def collect_refs(scope=SCOPE_SCENE, node=None, log=None, **kwargs):
     """:func:`scan_refs` when only the paths are wanted."""
     return scan_refs(scope=scope, node=node, log=log, **kwargs).paths
+
+
+def _is_our_own(parm):
+    """True for a parameter inside a RunPodFarm asset.
+
+    Our upload node contains its own localscheduler, whose `pdg_workingdir`
+    is `$HIP` -- scan ourselves and the whole project directory turns up in
+    the plan as a row the artist never put there.
+    """
+    try:
+        node = parm.node()
+        while node is not None:
+            if node.type().name().startswith(_OUR_NODE_PREFIX):
+                return True
+            node = node.parent()
+    except Exception:
+        pass
+    return False
 
 
 def _parm_name(parm):

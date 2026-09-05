@@ -146,10 +146,15 @@ def previewUpload(kwargs):
     from rpfarm import usddeps as rpusd
 
     scope = node.evalParm("rpfarm_scope") or rpdeps.SCOPE_BRANCH
-    scan = rpdeps.scan_refs(scope=scope, node=node, log=_say)
+    asset_regex = node.evalParm("rpfarm_assetregex") or rpdeps.ASSET_REGEX
+    exclude_pattern = node.evalParm("rpfarm_excludepattern")
+    scan = rpdeps.scan_refs(scope=scope, node=node, log=_say,
+                            asset_regex=asset_regex, exclude_pattern=exclude_pattern)
     rops = rpdeps.cook_rops(node, log=_say)
     usd = rpusd.collect_usd_refs(
-        rops, log=_say, deep=bool(node.evalParm("rpfarm_usddeep"))) if rops else []
+        rops, log=_say, deep=bool(node.evalParm("rpfarm_usddeep")),
+        asset_regex=asset_regex) if rops else []
+    usd = rpdeps.remove_pattern(usd, exclude_pattern)
     try:
         paths = rppf.choose_uploads(node, scan, usd, ask=True, log=_say)
     except rppf.UploadCancelled:
@@ -268,11 +273,16 @@ if preset == "install_houdini":
 refs = []
 if mode == "deps":
     ask = rppf.wants_window(node, log=_say)
+    asset_regex = node.evalParm("rpfarm_assetregex") or rpdeps.ASSET_REGEX
+    exclude_pattern = node.evalParm("rpfarm_excludepattern")
     scan = rpdeps.scan_refs(
-        scope=node.evalParm("rpfarm_scope") or rpdeps.SCOPE_BRANCH, node=node, log=_say)
+        scope=node.evalParm("rpfarm_scope") or rpdeps.SCOPE_BRANCH, node=node, log=_say,
+        asset_regex=asset_regex, exclude_pattern=exclude_pattern)
     rops = rpdeps.cook_rops(node, log=_say)
     usd = rpusd.collect_usd_refs(
-        rops, log=_say, deep=bool(node.evalParm("rpfarm_usddeep"))) if rops else []
+        rops, log=_say, deep=bool(node.evalParm("rpfarm_usddeep")),
+        asset_regex=asset_regex) if rops else []
+    usd = rpdeps.remove_pattern(usd, exclude_pattern)
     try:
         refs = rppf.choose_uploads(node, scan, usd, ask=ask, log=_say)
     except rppf.UploadCancelled as e:
@@ -862,6 +872,33 @@ def main():
     clearexclude_pt.setScriptCallbackLanguage(hou.scriptLanguage.Python)
     clearexclude_pt.setConditional(hou.parmCondType.HideWhen, "{ rpfarm_mode != deps }")
 
+    # Kept in sync with rpfarm.deps.ASSET_REGEX by
+    # tests/test_hda_assets.py -- the builder cannot import rpfarm (it runs
+    # under hython against whatever is installed), so the default is spelled
+    # out here and a test holds the two together.
+    assetregex_pt = hou.StringParmTemplate(
+        "rpfarm_assetregex", "Varying Path Pattern", 1,
+        default_value=(r"(_|\.)\d+(_|\.)|<udim>|<u>|<v>|<u2>|<v2>|<obj_name>",))
+    assetregex_pt.setHelp(
+        "Whatever matches this in an evaluated path is replaced by * and globbed, "
+        "so tile sets and frame sequences upload whole. Houdini expands $F4 to the "
+        "CURRENT frame before anything sees it, so `.0001.` is what a cache sequence "
+        "looks like here -- match it or upload one frame. Default is Conductor's "
+        "(ciohoudini). Wildcards only ever return files that exist, so a pattern that "
+        "is too wide costs a directory listing and some visible extra rows in the "
+        "window; too narrow silently loses tiles or frames."
+    )
+    assetregex_pt.setConditional(hou.parmCondType.HideWhen, "{ rpfarm_mode != deps }")
+
+    excludepattern_pt = hou.StringParmTemplate(
+        "rpfarm_excludepattern", "Exclude Paths Matching", 1, default_value=("",))
+    excludepattern_pt.setHelp(
+        "Comma-separated glob patterns dropped from the plan before the window opens, "
+        "e.g. */backup/*, *.abc. Matched against the whole path. Empty means nothing "
+        "is excluded."
+    )
+    excludepattern_pt.setConditional(hou.parmCondType.HideWhen, "{ rpfarm_mode != deps }")
+
     # On by default: a layer file names things the composed stage never
     # shows (an unloaded payload, an unselected variant), and a missing
     # texture is a rendered-nothing GPU hour. Measured cost on the field
@@ -969,7 +1006,8 @@ def main():
 
     for pt in (
         mode_pt, scope_pt, project_pt, packagegb_pt, compress_pt,
-        confirm_pt, usddeep_pt, preview_pt, clearexclude_pt, exclude_pt,
+        confirm_pt, usddeep_pt, assetregex_pt, excludepattern_pt,
+        preview_pt, clearexclude_pt, exclude_pt,
         custom_pt, postcmd_pt, preset_pt, houtar_pt, houver_pt, inprocess_pt,
     ):
         ptg.append(pt)
