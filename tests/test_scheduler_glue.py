@@ -928,3 +928,123 @@ def test_a_bad_key_at_first_work_fails_the_cook_there_and_then():
 
     assert len(sched.cook_errors) == 1
     assert "not a temporary shortage" in sched.cook_errors[0]
+
+
+# ---------------------------------------------------------------------------
+# sync pod: stop first, delete later -- and Houdini is the only executor
+# ---------------------------------------------------------------------------
+
+
+class _SyncAPI:
+    def __init__(self, pods):
+        self.pods = pods
+        self.stopped, self.terminated = [], []
+
+    def list_pods(self, prefix=""):
+        return [p for p in self.pods if p.get("name", "").startswith(prefix)]
+
+    def stop_pod(self, pod_id):
+        self.stopped.append(pod_id)
+
+    def terminate_pod(self, pod_id):
+        self.terminated.append(pod_id)
+
+
+def _sync_step(now, stamp="0"):
+    ns = load_methods(
+        ["_sync_pod_step", "_seconds_since"],
+        extra_globals={
+            "time": types.SimpleNamespace(time=lambda: now),
+            "rppods": rpdispatch and __import__("rpfarm.pods", fromlist=["pods"]),
+            "WorkerClient": lambda pid, tok: types.SimpleNamespace(
+                read_file=lambda path: stamp),
+            "_SYNC_LAST_USED": "/workspace/.rpfarm/sync_last_used",
+        },
+    )
+    ns["_seconds_since"] = ns["_seconds_since"]
+    return ns
+
+
+def test_an_idle_running_sync_pod_is_stopped_not_deleted():
+    api = _SyncAPI([{"id": "s1", "name": "rpfarm-sync-u", "desiredStatus": "RUNNING"}])
+    cfg = types.SimpleNamespace(user="u")
+    ns = _sync_step(now=3600.0, stamp="0")          # last used an hour ago
+
+    ns["_sync_pod_step"](api, cfg, "tok", 15 * 60, 120 * 60, lambda m: None)
+
+    assert api.stopped == ["s1"]
+    assert api.terminated == []
+
+
+def test_a_busy_running_sync_pod_is_left_alone():
+    api = _SyncAPI([{"id": "s1", "name": "rpfarm-sync-u", "desiredStatus": "RUNNING"}])
+    cfg = types.SimpleNamespace(user="u")
+    ns = _sync_step(now=60.0, stamp="0")            # used a minute ago
+
+    ns["_sync_pod_step"](api, cfg, "tok", 15 * 60, 120 * 60, lambda m: None)
+
+    assert api.stopped == [] and api.terminated == []
+
+
+def test_a_long_stopped_sync_pod_is_deleted():
+    """Stopped is ~20x cheaper than running but not free -- RunPod bills the
+    container disk at double rate while stopped."""
+    api = _SyncAPI([{"id": "s1", "name": "rpfarm-sync-u", "desiredStatus": "EXITED",
+                     "lastStatusChange": "2020-01-01T00:00:00Z"}])
+    cfg = types.SimpleNamespace(user="u")
+    ns = _sync_step(now=0.0)
+
+    ns["_sync_pod_step"](api, cfg, "tok", 15 * 60, 120 * 60, lambda m: None)
+
+    assert api.terminated == ["s1"]
+    assert api.stopped == []
+
+
+def test_a_stopped_pod_with_an_unreadable_timestamp_is_left_alone():
+    """Unknown never triggers an action: doing nothing costs a little money."""
+    api = _SyncAPI([{"id": "s1", "name": "rpfarm-sync-u", "desiredStatus": "EXITED",
+                     "lastStatusChange": "who knows"}])
+    cfg = types.SimpleNamespace(user="u")
+    ns = _sync_step(now=0.0)
+
+    ns["_sync_pod_step"](api, cfg, "tok", 15 * 60, 120 * 60, lambda m: None)
+
+    assert api.terminated == [] and api.stopped == []
+
+
+def test_another_users_sync_pod_is_never_touched():
+    """rpfarm-sync-u is a prefix of rpfarm-sync-usha; the account is shared."""
+    api = _SyncAPI([{"id": "mine", "name": "rpfarm-sync-u", "desiredStatus": "RUNNING"},
+                    {"id": "theirs", "name": "rpfarm-sync-usha", "desiredStatus": "RUNNING"}])
+    cfg = types.SimpleNamespace(user="u")
+    ns = _sync_step(now=3600.0, stamp="0")
+
+    ns["_sync_pod_step"](api, cfg, "tok", 15 * 60, 120 * 60, lambda m: None)
+
+    assert api.stopped == ["mine"]
+
+
+def test_the_watch_runs_between_cooks_not_only_at_cook_start():
+    """The check used to live only in onSetupCook, which is why a pod once sat
+    for hours: finish a cook, start no other, and nothing looked again."""
+    src = MODULE.read_text()
+
+    assert "def startSyncPodWatch" in src
+    assert "_SYNC_WATCH_INTERVAL_S" in src
+    assert "hou.ui.addEventLoopCallback" in src
+    # ...and the same policy function decides in both places
+    assert src.count("rppods.sync_pod_action") >= 1
+    assert "self._manageSyncPod()" in src
+
+
+def test_the_houdini_only_limit_is_stated_where_it_is_configured():
+    """The owner chose Houdini-as-executor knowingly; the choice must not be
+    silent to whoever reads the parameter later."""
+    dialog = (pathlib.Path(__file__).resolve().parent.parent / "hda"
+              / "runpodfarm_scheduler.hda" / "Top_1runpodfarmscheduler"
+              / "DialogScript").read_text(encoding="utf-8")
+
+    assert "WORKS ONLY WHILE HOUDINI IS OPEN" in dialog
+    assert "only while Houdini is open" in dialog
+    # and there is finally a way to finish for the day from the interface
+    assert 'name    "rpfarm_killsync"' in dialog

@@ -122,6 +122,42 @@ def pod_cook(pod):
     return (env.get("RPFARM_COOK") or "").strip()
 
 
+SYNC_KEEP = "keep"
+SYNC_STOP = "stop"
+SYNC_DELETE = "delete"
+
+
+def sync_pod_action(pod, idle_s, stopped_s, stop_after_s, delete_after_s):
+    """What to do with the sync pod right now: keep it, stop it, or delete it.
+
+    The owner's policy, in one pure function so both the cook-start check and
+    the timer that runs while Houdini is open decide identically.
+
+    Stop first, delete later, because the two states cost very differently and
+    neither is free: running is about $43/month, stopped about $2/month (RunPod
+    bills a stopped pod's container disk at double the running rate, and 10 GB
+    is what the sync pod has). Parking it keeps the disk and lets the next cook
+    resume in seconds; deleting it reclaims the last couple of dollars at the
+    price of a rebuild.
+
+    A threshold of 0 means "never" for that step -- someone who wants the pod
+    parked indefinitely should not have to invent a large number.
+
+    ``idle_s`` is time since the pod was last used, ``stopped_s`` time since it
+    was stopped; either may be ``None`` when unknown, and unknown never
+    triggers an action. Same asymmetry as everywhere else here: doing nothing
+    costs a little money, doing the wrong thing costs someone's work.
+    """
+    running = pod.get("desiredStatus") == "RUNNING"
+    if running:
+        if stop_after_s > 0 and idle_s is not None and idle_s >= stop_after_s:
+            return SYNC_STOP
+        return SYNC_KEEP
+    if delete_after_s > 0 and stopped_s is not None and stopped_s >= delete_after_s:
+        return SYNC_DELETE
+    return SYNC_KEEP
+
+
 def classify_for_kill(pod, me, health=None, health_error=None,
                       grace_s=COOK_ALIVE_GRACE_S):
     """``(verdict, reason)`` -- may this pod be terminated without being asked?
@@ -368,9 +404,29 @@ def _find_or_create_sync_pod(api, cfg, token, pubkey, log, cloud_type=None):
     running = _dedupe_running(api, [p for p in existing if p.get("desiredStatus") == "RUNNING"], log)
     if running:
         return running[0]
+
+    # A pod that is not RUNNING used to be terminated here and replaced. That
+    # was harmless while nothing ever stopped one -- and becomes the opposite
+    # of a fix the moment the scheduler starts parking the sync pod instead of
+    # deleting it: we would pay for the stopped pod AND its replacement, having
+    # thrown away the container disk we stopped it to keep.
+    #
+    # Resume rather than replace. Which exact `desiredStatus` a stopped pod
+    # reports is not relied on: anything not RUNNING is offered to start_pod,
+    # and only a pod that refuses to come back is terminated and rebuilt. That
+    # keeps this correct whatever RunPod calls the state.
     for p in existing:
-        log(f"sync pod {p['id']} not running ({p.get('desiredStatus')}); terminating")
-        api.terminate_pod(p["id"])
+        state = p.get("desiredStatus")
+        try:
+            api.start_pod(p["id"])
+            log(f"sync pod {p['id']} was {state}; started it again")
+            return p
+        except RunPodError as e:
+            log(f"sync pod {p['id']} ({state}) would not start ({e}); replacing it")
+            try:
+                api.terminate_pod(p["id"])
+            except RunPodError as e2:
+                log(f"  and could not terminate it either: {e2}")
     # cfg.datacenter, not the API's fallback: the sync pod has to be created
     # in the same region as the network volume it mounts (finding 5).
     pod = api.create_cpu_pod(

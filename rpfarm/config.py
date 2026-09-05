@@ -79,7 +79,12 @@ class Config:
     houdini_version: str = "22.0.393"
     sesinetd_host: str = "lic.ai-vfx.com"
     sesinetd_port: int = 1715
+    # Sync pod lifecycle, in two steps: stop it when it has been unused this
+    # long, then delete it when it has been stopped this long. Stopping is ~20x
+    # cheaper than running but is NOT free -- RunPod bills the container disk at
+    # double the running rate while stopped -- so the second threshold matters.
     sync_idle_min: int = 15
+    sync_delete_min: int = 120
     # How long a work item waits for a free machine before it -- and only it --
     # is failed. RunPod pods are not spot instances, so a shortage is a queue,
     # not an eviction: waiting is the correct response, and 15 minutes is the

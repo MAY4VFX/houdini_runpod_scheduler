@@ -279,6 +279,170 @@ def cfg_default(name, fallback=""):
         return fallback
 
 
+# How often the session-level watch re-checks the sync pod while Houdini is
+# open. A minute is far finer than the thresholds it enforces and costs one
+# GET /pods; the point is only that it happens at all between cooks.
+_SYNC_WATCH_INTERVAL_S = 60.0
+
+# Set once per Houdini session so several scheduler nodes do not each start
+# their own timer.
+_sync_watch_started = False
+
+
+def _sync_pod_step(api, cfg, token, stop_after_s, delete_after_s, log):
+    """One pass of the stop-then-delete policy. Shared by the cook and the timer.
+
+    Two clocks. Idleness comes from the timestamp cooks leave on the volume
+    (`sync_last_used`), which is why it can only be read while the pod is
+    running. Time-since-stopped comes from RunPod's own `lastStatusChange` --
+    the pod is off, so there is nothing of ours to ask.
+    """
+    name = rppods.sync_pod_name(cfg.user)
+    pods_seen = [p for p in api.list_pods(name) if p.get("name") == name]
+    for pod in pods_seen:
+        idle_s = stopped_s = None
+        if pod.get("desiredStatus") == "RUNNING":
+            stamp = WorkerClient(pod["id"], token).read_file(_SYNC_LAST_USED)
+            try:
+                idle_s = time.time() - float((stamp or "").strip())
+            except (TypeError, ValueError):
+                idle_s = None
+        else:
+            stopped_s = _seconds_since(pod.get("lastStatusChange"))
+
+        action = rppods.sync_pod_action(pod, idle_s, stopped_s,
+                                        stop_after_s, delete_after_s)
+        if action == rppods.SYNC_STOP:
+            log("sync pod {} unused for {:.0f} min -- stopping it (it keeps its "
+                "disk and restarts in seconds)".format(pod["id"], idle_s / 60.0))
+            api.stop_pod(pod["id"])
+        elif action == rppods.SYNC_DELETE:
+            log("sync pod {} stopped for {:.0f} min -- deleting it".format(
+                pod["id"], (stopped_s or 0) / 60.0))
+            api.terminate_pod(pod["id"])
+    return pods_seen
+
+
+def _seconds_since(stamp):
+    """Seconds since an ISO-8601 timestamp from RunPod, or None if unreadable.
+
+    Never raises and never guesses: an unparsable timestamp yields None, and
+    sync_pod_action treats unknown as "do nothing".
+    """
+    if not stamp:
+        return None
+    try:
+        import datetime
+
+        text = str(stamp).replace("Z", "+00:00")
+        when = datetime.datetime.fromisoformat(text)
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=datetime.timezone.utc)
+        return (datetime.datetime.now(datetime.timezone.utc) - when).total_seconds()
+    except Exception:
+        return None
+
+
+def startSyncPodWatch(kwargs=None):
+    """Re-check the sync pod every minute for as long as Houdini is open.
+
+    The check used to run only in onSetupCook, which is precisely why a pod
+    once sat for hours: finish a cook, close nothing, start no new cook, and
+    nothing ever looked again. A session timer closes that gap for the case
+    the owner actually hits.
+
+    It does NOT close the real hole, and the parameter help says so: Houdini
+    is the only executor, so a closed or crashed Houdini retires nothing. An
+    atexit hook is registered too, but as a courtesy rather than a guarantee --
+    it does not run on a crash, a SIGKILL, or a power cut.
+    """
+    global _sync_watch_started
+    if _sync_watch_started:
+        return
+    try:
+        import hou
+
+        if not hou.isUIAvailable():
+            return  # hython has no event loop to hang a timer on
+    except Exception:
+        return
+
+    def _tick():
+        try:
+            cfg = rpcfg.load()
+            stop_after = max(0, int(getattr(cfg, "sync_idle_min", 0) or 0)) * 60
+            delete_after = max(0, int(getattr(cfg, "sync_delete_min", 0) or 0)) * 60
+            if not stop_after and not delete_after:
+                return
+            seen = _sync_pod_step(RunPodAPI(cfg.api_key), cfg, rpcfg.session_token(),
+                                   stop_after, delete_after,
+                                   lambda m: print("[rpfarm] " + m, flush=True))
+            _showSyncPodBetweenCooks(seen)
+        except Exception:
+            # A housekeeping timer must never surface in the UI; the next tick
+            # tries again and Farm Status still shows what is out there.
+            pass
+
+    try:
+        hou.ui.addEventLoopCallback(_throttle(_tick, _SYNC_WATCH_INTERVAL_S))
+        import atexit
+
+        atexit.register(_tick)
+        _sync_watch_started = True
+    except Exception:
+        pass
+
+
+def _showSyncPodBetweenCooks(pods_seen):
+    """Put the sync pod's state on the node, so it is not only in RunPod's panel.
+
+    _update_status_text writes only while a cook is running, which is exactly
+    the window in which a leftover pod is invisible: finish a cook, start no
+    other, and the tab keeps showing the finished cook forever while a machine
+    quietly bills. This fills that gap and steps aside the moment a cook owns
+    the field again -- a status beginning with "cook " belongs to the cook.
+    """
+    try:
+        import hou
+
+        if pods_seen:
+            pod = pods_seen[0]
+            state = pod.get("desiredStatus", "?")
+            rate = pod.get("costPerHr")
+            money = ("  about {:.3f} USD/h".format(float(rate))
+                     if state == "RUNNING" and rate else
+                     "  stopped: still paying for its disk" if state != "RUNNING" else "")
+            text = "sync pod {} {}{}\n(housekeeping runs while Houdini is open)".format(
+                pod["id"], state, money)
+        else:
+            text = "no sync pod running"
+        for node in hou.nodeType(hou.topNodeTypeCategory(),
+                                 "runpodfarmscheduler").instances():
+            parm = node.parm("rpfarm_status_text")
+            if parm is None:
+                continue
+            current = parm.evalAsString()
+            if current.startswith("cook "):
+                continue  # a live cook owns this field
+            parm.set(text)
+    except Exception:
+        pass
+
+
+def _throttle(fn, every_s):
+    """Run fn at most once per every_s -- Houdini's event loop calls back fast."""
+    state = {"last": 0.0}
+
+    def wrapped():
+        now = time.time()
+        if now - state["last"] < every_s:
+            return
+        state["last"] = now
+        fn()
+
+    return wrapped
+
+
 def cfg_default_int(name, fallback=0):
     """Like :func:`cfg_default`, but for an integer parm.
 
@@ -437,6 +601,66 @@ def onKillAll(kwargs):
         )
     except (rpcfg.ConfigError, RunPodError) as e:
         _report(node, "rpfarm_status_text", "Kill all failed: {}".format(e))
+
+
+def onKillAllIncludingSync(kwargs):
+    """Terminate everything of this user's, sync pod included.
+
+    Kill All Pods spares the sync pod on purpose -- the next cook reuses it --
+    but that left no way to actually finish for the day from the interface,
+    and someone had to do it from a terminal. This is that button.
+
+    Scoped to this user. The account is shared, so another artist's pods are
+    never touched, and anything mid-cook is named and confirmed before it goes
+    rather than being taken silently.
+    """
+    node = kwargs["node"]
+    try:
+        cfg, api = _node_config(node)
+        victims = list(rppods.find_orphans(api, cfg.user))
+        sync_name = rppods.sync_pod_name(cfg.user)
+        victims += [p for p in api.list_pods(sync_name) if p.get("name") == sync_name]
+        if not victims:
+            _report(node, "rpfarm_status_text", "Nothing of yours is running.")
+            return
+
+        busy = []
+        for pod in victims:
+            try:
+                health = WorkerClient(pod["id"], rpcfg.session_token()).health()
+            except Exception:  # noqa: BLE001 - unreachable counts as "cannot clear"
+                health, err = None, "unreachable"
+            else:
+                err = None
+            verdict, reason = rppods.classify_for_kill(pod, cfg.user, health, err)
+            if verdict != "safe":
+                busy.append((pod, reason))
+
+        if busy:
+            import hou
+
+            names = "\n".join("  {} -- {}".format(p.get("name", p["id"]), r)
+                               for p, r in busy)
+            message = ("{} of your pods are not idle:\n\n{}\n\n"
+                       "Terminating them now loses whatever they are doing."
+                       .format(len(busy), names))
+            if not hou.isUIAvailable():
+                _report(node, "rpfarm_status_text",
+                        message + "\nRefusing without a UI to confirm.")
+                return
+            if hou.ui.displayMessage(
+                    message, buttons=("Terminate anyway", "Leave them"),
+                    default_choice=1, close_choice=1,
+                    severity=hou.severityType.Warning) != 0:
+                _report(node, "rpfarm_status_text", "Left everything running.")
+                return
+
+        for pod in victims:
+            api.terminate_pod(pod["id"])
+        _report(node, "rpfarm_status_text", "Terminated {} pod(s): {}".format(
+            len(victims), ", ".join(p.get("name", p["id"]) for p in victims)))
+    except (rpcfg.ConfigError, RunPodError) as e:
+        _report(node, "rpfarm_status_text", "Could not terminate everything: {}".format(e))
 
 
 def onSyncLedger(kwargs):
@@ -763,6 +987,7 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
                 {"name": "rpfarm_slots", "type": "Integer"},
                 {"name": "rpfarm_idletimeout", "type": "Integer"},
                 {"name": "rpfarm_syncidle", "type": "Integer"},
+                {"name": "rpfarm_syncdelete", "type": "Integer"},
                 # -- Budget --
                 {"name": "rpfarm_maxcost", "type": "Float"},
                 {"name": "rpfarm_minbalance", "type": "Float"},
@@ -1788,7 +2013,7 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         self._registerPathMap()
 
         self._checkBalance()
-        self._retireStaleSyncPod()
+        self._manageSyncPod()
         self._warnAboutOrphans()
 
         self._log("cook {} project '{}' -> {} (gpus: {})".format(
@@ -1864,38 +2089,29 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         if hou.isUIAvailable():
             hou.ui.displayMessage(message, severity=hou.severityType.Warning)
 
-    def _retireStaleSyncPod(self):
-        """Terminate the sync pod when it has been unused past Sync Pod Idle.
+    def _manageSyncPod(self):
+        """Stop the sync pod when idle, delete it once it has been stopped a while.
 
-        The pod cannot do this itself without holding a RunPod API key, so the
-        next cook to start does it instead, reading the timestamp the previous
-        cook left on the volume.
+        The owner's policy, and Houdini is the only thing that can carry it
+        out: the pod holds no RunPod key and cannot retire itself. Which is
+        also this design's honest limit -- a closed or crashed Houdini leaves
+        the pod exactly as it was. That is why the same check runs on a timer
+        while Houdini is open (see startSyncPodWatch) and not only here, and
+        why Farm Status names the pod and its cost rather than leaving it to be
+        discovered in RunPod's panel.
+
+        Shared with the timer through rpfarm.pods.sync_pod_action so both
+        decide identically.
         """
-        idle_min = self["rpfarm_syncidle"].evaluateInt()
-        if idle_min <= 0:
+        stop_after = max(0, self["rpfarm_syncidle"].evaluateInt()) * 60
+        delete_after = max(0, self["rpfarm_syncdelete"].evaluateInt()) * 60
+        if not stop_after and not delete_after:
             return
-        name = rppods.sync_pod_name(self._cfg.user)
         try:
-            existing = [p for p in self._api.list_pods(name) if p.get("name") == name]
+            _sync_pod_step(self._api, self._cfg, self._token,
+                           stop_after, delete_after, self._log)
         except RunPodError as e:
-            self._verboseLog("sync pod lookup failed: {}".format(e))
-            return
-        for pod in existing:
-            if pod.get("desiredStatus") != "RUNNING":
-                continue
-            stamp = WorkerClient(pod["id"], self._token).read_file(_SYNC_LAST_USED)
-            try:
-                last_used = float((stamp or "").strip())
-            except ValueError:
-                continue
-            idle_for = time.time() - last_used
-            if idle_for > idle_min * 60:
-                self._log("sync pod {} idle for {:.0f} min, terminating".format(
-                    pod["id"], idle_for / 60.0))
-                try:
-                    self._api.terminate_pod(pod["id"])
-                except RunPodError as e:
-                    self._verboseLog("terminate sync pod failed: {}".format(e))
+            self._verboseLog("sync pod housekeeping failed: {}".format(e))
 
     def _warnAboutOrphans(self):
         """Offer to kill this user's leftover GPU pods from an earlier cook."""
