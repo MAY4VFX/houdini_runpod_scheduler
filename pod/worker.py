@@ -256,6 +256,7 @@ class Liveness:
         self._listdir = listdir or os.listdir
         self._clock = clock
         self._last_busy = None
+        self._last_bytes = None
         self._lock = threading.Lock()
 
     @staticmethod
@@ -333,12 +334,64 @@ class Liveness:
         fields = after.split()
         return bool(fields) and fields[0] == "Z"
 
+    def moved_bytes(self):
+        """Total bytes read+written by live transfer processes, or None.
+
+        This is the difference between WORK and PRESENCE. A live sftp-server
+        holding an open connection and doing nothing is not a transfer, and
+        counting it would pin the pod at "busy" just as surely as counting
+        zombies did -- the same failure with a longer fuse. Bytes moving
+        between two samples is the thing that actually means "in progress".
+        """
+        try:
+            entries = self._listdir(self._proc)
+        except Exception:  # noqa: BLE001
+            return None
+        total = 0
+        seen = False
+        for entry in entries:
+            if not entry.isdigit():
+                continue
+            try:
+                comm = self._read(os.path.join(self._proc, entry, "comm")).strip()
+            except Exception:  # noqa: BLE001
+                continue
+            if comm not in _TRANSFER_COMMS or self._is_zombie(entry):
+                continue
+            try:
+                io = self._read(os.path.join(self._proc, entry, "io"))
+            except Exception:  # noqa: BLE001 - no /proc/<pid>/io on this kernel
+                continue
+            seen = True
+            for line in io.splitlines():
+                key, _sep, value = line.partition(":")
+                if key in ("read_bytes", "write_bytes"):
+                    try:
+                        total += int(value.strip())
+                    except ValueError:
+                        pass
+        return total if seen else None
+
     def sample(self):
-        """Note whether anything looks alive right now. Cheap; call often."""
+        """Note whether real work is happening. Cheap; call often.
+
+        Two things count as work, and mere existence is not one of them:
+
+        * an established connection -- somebody is there, even between files;
+        * bytes MOVED since the previous sample by a live transfer process.
+
+        The first sample cannot show a delta, so it never marks busy on bytes
+        alone; two seconds later the next one can.
+        """
         sessions = self.ssh_sessions()
-        transfers = self.transfers()
-        if (sessions or 0) > 0 or (transfers or 0) > 0:
-            with self._lock:
+        moved = self.moved_bytes()
+        with self._lock:
+            previous = self._last_bytes
+            self._last_bytes = moved
+            busy = (sessions or 0) > 0
+            if not busy and moved is not None and previous is not None:
+                busy = moved != previous
+            if busy:
                 self._last_busy = self._clock()
 
     def busy_idle_s(self):

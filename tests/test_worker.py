@@ -534,38 +534,43 @@ def test_a_process_name_with_spaces_does_not_break_zombie_detection():
     assert worker.Liveness(read=read, listdir=lambda p: ["7"]).transfers() == 0
 
 
-def test_the_sampler_remembers_when_anything_last_looked_alive():
+def test_the_sampler_remembers_when_work_last_happened():
     """One sample is not evidence: mid-upload there are instants with no
-    socket and no live child, and calling that idle cuts a transfer in half."""
+    socket and no byte moving, and calling that idle cuts a transfer in half."""
     clock = [1000.0]
-    state = {"comm": "rclone", "st": "R"}
+    moved = {"bytes": 500}
 
     def read(path):
         if path == "/proc/net/tcp":
             return _NET_TCP_HEADER
         if path.endswith("/comm"):
-            return state["comm"] + "\n"
+            return "rclone\n"
         if path.endswith("/stat"):
-            return "9 (%s) %s 1 1 0\n" % (state["comm"], state["st"])
+            return "9 (rclone) R 1 1 0\n"
+        if path.endswith("/io"):
+            return "read_bytes: 0\nwrite_bytes: %d\n" % moved["bytes"]
         raise FileNotFoundError(path)
 
-    live = worker.Liveness(read=read, listdir=lambda p: ["9"],
-                           clock=lambda: clock[0])
+    live = worker.Liveness(read=read, listdir=lambda p: ["9"], clock=lambda: clock[0])
 
     assert live.busy_idle_s() is None          # nothing seen yet
-    live.sample()
+    live.sample()                              # first sample: no delta yet
+    moved["bytes"] += 4096
+    clock[0] += 2
+    live.sample()                              # bytes moved -> work
     assert live.busy_idle_s() == 0.0
 
-    # the transfer finishes; the age grows from the last time it was alive
-    state["st"] = "Z"
+    # the transfer finishes; the age grows from the last time work happened
     clock[0] += 30
     live.sample()
     assert live.busy_idle_s() == 30.0
 
 
-def test_a_gap_between_files_does_not_read_as_idle():
+def test_a_gap_between_files_stays_well_inside_the_grace_window():
+    """rclone opens and closes a connection per file. The gap must read as a
+    few seconds since work, not as idle -- classify_for_kill's grace covers it."""
     clock = [0.0]
-    alive = {"now": True}
+    moved = {"bytes": 0}
 
     def read(path):
         if path == "/proc/net/tcp":
@@ -573,17 +578,114 @@ def test_a_gap_between_files_does_not_read_as_idle():
         if path.endswith("/comm"):
             return "sftp-server\n"
         if path.endswith("/stat"):
-            return "9 (sftp-server) %s 1 1 0\n" % ("R" if alive["now"] else "Z")
+            return "9 (sftp-server) S 1 1 0\n"
+        if path.endswith("/io"):
+            return "read_bytes: 0\nwrite_bytes: %d\n" % moved["bytes"]
         raise FileNotFoundError(path)
 
     live = worker.Liveness(read=read, listdir=lambda p: ["9"], clock=lambda: clock[0])
-    live.sample()                       # file 1 transferring
-    alive["now"] = False
+    live.sample()
+    moved["bytes"] += 1 << 20        # file 1 transferring
     clock[0] += 2
-    live.sample()                       # between files: nothing alive
-    alive["now"] = True
+    live.sample()
+    clock[0] += 2                    # between files: nothing moves
+    live.sample()
+    moved["bytes"] += 1 << 20        # file 2 transferring
     clock[0] += 2
-    live.sample()                       # file 2 transferring
+    live.sample()
 
-    # never looked idle for more than the gap
     assert live.busy_idle_s() == 0.0
+
+
+# ---------------------------------------------------------------------------
+# work, not presence
+#
+# Excluding zombies was not enough. A live sftp-server holding an open
+# connection and doing nothing is presence, not work, and counting it pins the
+# pod at "busy" exactly as zombies did -- the same failure with a longer fuse.
+# Observed shape: cook cancelled mid-upload, directory grew 0 bytes in 10s, no
+# process holding a file open, and the old counter still said 11.
+# ---------------------------------------------------------------------------
+
+
+def _io_proc(pids, net_tcp=""):
+    """pids: {pid: (comm, state, read_bytes, write_bytes)}."""
+    files = {"/proc/net/tcp": _NET_TCP_HEADER + net_tcp}
+    for pid, (comm, state, rb, wb) in pids.items():
+        files["/proc/%s/comm" % pid] = comm + "\n"
+        files["/proc/%s/stat" % pid] = "%s (%s) %s 1 1 0\n" % (pid, comm, state)
+        files["/proc/%s/io" % pid] = (
+            "rchar: 1\nwchar: 2\nread_bytes: %d\nwrite_bytes: %d\n" % (rb, wb))
+
+    def read(path):
+        if path not in files:
+            raise FileNotFoundError(path)
+        return files[path]
+
+    return read, lambda p: list(pids), files
+
+
+def test_an_idle_live_transfer_process_is_not_work():
+    """The cancelled-cook shape: process alive, nothing moving."""
+    clock = [0.0]
+    read, listdir, files = _io_proc({"9": ("sftp-server", "S", 1000, 2000)})
+    live = worker.Liveness(read=read, listdir=listdir, clock=lambda: clock[0])
+
+    live.sample()                    # first sample: no delta available yet
+    clock[0] += 2
+    live.sample()                    # bytes unchanged -> not work
+    clock[0] += 300
+    live.sample()
+
+    assert live.busy_idle_s() is None
+
+
+def test_bytes_moving_is_work():
+    clock = [0.0]
+    read, listdir, files = _io_proc({"9": ("sftp-server", "S", 1000, 2000)})
+    live = worker.Liveness(read=read, listdir=listdir, clock=lambda: clock[0])
+
+    live.sample()
+    files["/proc/9/io"] = "rchar: 1\nwchar: 2\nread_bytes: 1000\nwrite_bytes: 9999\n"
+    clock[0] += 2
+    live.sample()
+
+    assert live.busy_idle_s() == 0.0
+
+
+def test_an_open_session_counts_even_with_nothing_moving():
+    """Somebody logged in is somebody present, between files or otherwise."""
+    clock = [0.0]
+    read, listdir, _f = _io_proc({}, net_tcp=_ESTABLISHED_SSH)
+    live = worker.Liveness(read=read, listdir=listdir, clock=lambda: clock[0])
+
+    live.sample()
+
+    assert live.busy_idle_s() == 0.0
+
+
+def test_eleven_zombies_left_by_a_cancelled_cook_are_not_work():
+    """The exact live reading, now from both angles: dead AND not moving."""
+    clock = [0.0]
+    read, listdir, _f = _io_proc(
+        {str(p): ("sftp-server", "Z", 500, 500) for p in range(11)})
+    live = worker.Liveness(read=read, listdir=listdir, clock=lambda: clock[0])
+
+    live.sample()
+    clock[0] += 2
+    live.sample()
+
+    assert live.transfers() == 0
+    assert live.busy_idle_s() is None
+
+
+def test_a_kernel_without_proc_pid_io_does_not_report_false_activity():
+    read, listdir, files = _io_proc({"9": ("rclone", "R", 0, 0)})
+    del files["/proc/9/io"]
+    live = worker.Liveness(read=read, listdir=listdir, clock=lambda: 0.0)
+
+    live.sample()
+    live.sample()
+
+    assert live.moved_bytes() is None
+    assert live.busy_idle_s() is None
