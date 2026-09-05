@@ -9,7 +9,11 @@ import logging
 import os
 import shutil
 import struct
+import collections
+import gzip
+import shlex
 import subprocess
+import zlib
 from enum import Enum
 from pathlib import Path
 from types import SimpleNamespace
@@ -19,6 +23,11 @@ from . import tools as _tools
 log = logging.getLogger(__name__)
 
 try:
+    import lzma as _lzma
+except ImportError:  # a Python built without liblzma; zlib is always there
+    _lzma = None
+
+try:
     import zstandard as _zstd
 except ImportError:
     _zstd = None
@@ -26,7 +35,11 @@ except ImportError:
 
 class CompressionStrategy(Enum):
     SKIP = "skip"
-    ZSTD = "zstd"
+    #: Compress this file. The VALUE stays "zstd" because it is written into
+    #: package manifests, but the name no longer claims to know which codec
+    #: does the work -- see select_codec.
+    COMPRESS = "zstd"
+    ZSTD = COMPRESS  # the old name, kept so existing callers and manifests read
     TAR_ZSTD = "tar_zstd"
 
 
@@ -145,24 +158,11 @@ def _probe_compressibility(path: str, sample_size: int = 65536) -> CompressionSt
         if not sample:
             return CompressionStrategy.SKIP
 
-        if _zstd is not None:
-            cctx = _zstd.ZstdCompressor(level=1)
-            compressed = cctx.compress(sample)
-            ratio = len(compressed) / len(sample)
-        else:
-            # Fallback to subprocess
-            binary = archiver("zstd")
-            if binary is None:
-                return CompressionStrategy.SKIP
-            result = subprocess.run(
-                [binary, "-1", "-c"],
-                input=sample,
-                capture_output=True,
-                timeout=5,
-            )
-            if result.returncode != 0:
-                return CompressionStrategy.SKIP
-            ratio = len(result.stdout) / len(sample)
+        # zlib at level 1 on a 64 KB sample: microseconds, no subprocess, no
+        # external program. This used to shell out to zstd, which meant that
+        # on a machine without it EVERY file classified SKIP -- compression
+        # silently off, with nothing said.
+        ratio = len(zlib.compress(sample, 1)) / len(sample)
 
         if ratio < 0.95:
             log.debug("File %s compressible (ratio=%.2f)", path, ratio)
@@ -176,7 +176,84 @@ def _probe_compressibility(path: str, sample_size: int = 65536) -> CompressionSt
         return CompressionStrategy.SKIP
 
 
-_MISSING_WARNED = set()
+#: What lzma costs and buys, measured on the owner's own files against his
+#: own uplink (4.7 Mbps = 0.59 MB/s, `rpfarm doctor`):
+#:
+#:     Zeppelin_Balon_Test.usdc, 29 MB   raw upload 51.6 s
+#:       lzma preset 1   ratio 0.341   10.1 MB/s   total 20.4 s
+#:       lzma preset 3   ratio 0.340    6.0 MB/s   total 22.4 s
+#:       lzma preset 6   ratio 0.323    2.9 MB/s   total 26.8 s
+#:       zlib level 6    ratio 0.474   26.0 MB/s   total 25.6 s
+#:
+#: Preset 1 wins the only race that matters -- compress time PLUS transfer
+#: time -- and every higher preset loses ground it cannot make back on a
+#: slow link. zlib is faster per byte and still slower overall, because at
+#: 0.59 MB/s the bytes you did not send are worth more than the CPU you did
+#: not spend. Already-compressed files (EXR, most of the weight) never get
+#: here: classify_file sends them straight to SKIP, and the same measurement
+#: shows why -- every codec made them bigger in total time.
+LZMA_PRESET = 1
+ZLIB_LEVEL = 6
+
+Codec = collections.namedtuple("Codec", "name ext binary")
+
+#: The stdlib codecs, in order of preference. No downloads, no PATH, no
+#: execute bit, identical on macOS, Windows and Linux -- which is the whole
+#: requirement: a repository someone can clone, type their RunPod keys into,
+#: and use.
+CODEC_XZ = Codec("xz", ".xz", None)
+CODEC_GZ = Codec("gz", ".gz", None)
+
+
+def select_codec(allow_external: bool = True, resolve=None) -> Codec:
+    """Which codec this machine will use for this package.
+
+    ``zstd`` is an OPTIONAL accelerator, taken only when a real binary is
+    found by absolute path (never by bare name on PATH -- that is what died
+    on 2026-09-05). Its absence is a normal mode, not a problem: lzma is in
+    the standard library of every Python this tool runs on, including the
+    one bundled with Houdini and the one on the pod (verified: 3.10.12 there,
+    lzma/gzip/zlib all importable).
+    """
+    if allow_external:
+        found = (resolve or _tools.resolve_tool)("zstd")
+        if found is not None:
+            return Codec("zstd", ".zst", found.path)
+    if _lzma is not None:
+        return CODEC_XZ
+    return CODEC_GZ
+
+
+def codec_for(path: str) -> Codec:
+    """The codec a staged file's extension names."""
+    for codec in (CODEC_XZ, CODEC_GZ, Codec("zstd", ".zst", None)):
+        if path.endswith(codec.ext):
+            return codec
+    return CODEC_XZ
+
+
+# The pod has python3 and lzma but NO xz binary (checked on the live sync
+# pod: python 3.10.12, lzma/gzip/zlib importable, `which xz` empty, zstd at
+# /usr/bin/zstd). So a .xz/.gz package is unpacked by python, not by a
+# command-line tool that may not be installed.
+_PY_DECOMPRESS = (
+    "import gzip,lzma,os,shutil,sys\n"
+    "for p in sys.argv[1:]:\n"
+    "    o = gzip.open if p.endswith('.gz') else lzma.open\n"
+    "    with o(p,'rb') as s, open(p[:p.rindex('.')],'wb') as d: shutil.copyfileobj(s,d)\n"
+    "    os.remove(p)\n"
+)
+
+
+def decompress_command(remote_root: str, rel_paths, codec: Codec) -> str:
+    """The shell command that unpacks a staged package on the sync pod."""
+    if not rel_paths:
+        return ""
+    quoted = " ".join(shlex.quote(r) for r in rel_paths)
+    if codec.name == "zstd":
+        return "cd {} && zstd -d --rm {}".format(shlex.quote(remote_root), quoted)
+    return "cd {} && python3 -c {} {}".format(
+        shlex.quote(remote_root), shlex.quote(_PY_DECOMPRESS), quoted)
 
 
 def archiver(name: str = "zstd"):
@@ -187,21 +264,23 @@ def archiver(name: str = "zstd"):
     on a machine where zstd was installed the whole time (2026-09-05, an
     upload item died on it). :mod:`rpfarm.tools` resolves and verifies it by
     absolute path instead.
+
+    Absence is silent on purpose. zstd is an accelerator here, not a
+    dependency: without it the standard library does the work, which is the
+    normal case on a fresh clone and not worth alarming anyone about.
     """
     found = _tools.resolve_tool(name)
-    if found is None and name not in _MISSING_WARNED:
-        _MISSING_WARNED.add(name)
-        log.warning(
-            "%s not found on this machine -- uploads will not be compressed "
-            "(slower, not broken). Install it (macOS: brew install %s) and "
-            "restart Houdini to get compression back.", name, name)
     return found.path if found else None
 
 
-def compress_file(src: str, dst: str, strategy: CompressionStrategy, level: int = 3) -> bool:
-    """
-    Compress a single file according to strategy.
-    Returns True on success, False if skipped.
+def compress_file(src: str, dst: str, strategy: CompressionStrategy, level: int = 3,
+                  codec: Codec = None) -> bool:
+    """Compress one file into *dst*. Returns True if it was compressed.
+
+    False is a normal outcome, never an exception: a file that will not
+    compress, or a machine with no codec at all, means the file uploads as
+    it is. Losing compression is slower; raising fails the work item, which
+    is what a bare ``"zstd"`` did to the owner's cook.
     """
     if strategy == CompressionStrategy.SKIP:
         return False
@@ -209,25 +288,53 @@ def compress_file(src: str, dst: str, strategy: CompressionStrategy, level: int 
     if strategy == CompressionStrategy.TAR_ZSTD:
         raise ValueError("TAR_ZSTD should not be used on single files; use compress_directory for batching")
 
-    if strategy == CompressionStrategy.ZSTD:
-        binary = archiver("zstd")
-        if binary is None:
-            # Not an error: the file uploads uncompressed. Losing compression
-            # is slower; failing the work item is a dead cook.
+    if strategy != CompressionStrategy.COMPRESS:
+        return False
+
+    codec = codec or select_codec()
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+
+    if codec.binary:
+        try:
+            result = subprocess.run(
+                [codec.binary, "-T0", f"-{level}", "-f", src, "-o", dst],
+                capture_output=True,
+                text=True,
+            )
+        except OSError as e:
+            # The binary was resolved and verified once, and is gone or
+            # unrunnable now. This is the 2026-09-05 failure in its purest
+            # form: an upload item died on FileNotFoundError instead of
+            # uploading the file uncompressed.
+            log.warning("zstd at %s did not run (%s) -- uploading uncompressed",
+                        codec.binary, e)
             return False
-        os.makedirs(os.path.dirname(dst), exist_ok=True)
-        result = subprocess.run(
-            [binary, "-T0", f"-{level}", "-f", src, "-o", dst],
-            capture_output=True,
-            text=True,
-        )
         if result.returncode != 0:
             log.error("zstd compress failed for %s: %s", src, result.stderr)
             return False
         log.debug("Compressed %s -> %s", src, dst)
         return True
 
-    return False
+    opener = _stdlib_opener(codec)
+    if opener is None:
+        return False
+    try:
+        with open(src, "rb") as source, opener(dst) as target:
+            shutil.copyfileobj(source, target, length=1024 * 1024)
+    except OSError as e:
+        log.error("%s compress failed for %s: %s", codec.name, src, e)
+        return False
+    log.debug("Compressed %s -> %s (%s)", src, dst, codec.name)
+    return True
+
+
+def _stdlib_opener(codec: Codec):
+    """A ``open(dst) -> writable file`` for a standard-library codec."""
+    if codec.name == "xz" and _lzma is not None:
+        return lambda dst: _lzma.open(dst, "wb", preset=LZMA_PRESET)
+    if codec.name == "gz":
+        return lambda dst: gzip.open(dst, "wb", compresslevel=ZLIB_LEVEL)
+    return None
 
 
 def decompress_file(src: str, dst: str, strategy: CompressionStrategy) -> bool:
@@ -240,16 +347,37 @@ def decompress_file(src: str, dst: str, strategy: CompressionStrategy) -> bool:
 
     os.makedirs(os.path.dirname(dst), exist_ok=True)
 
-    if strategy == CompressionStrategy.ZSTD:
+    if strategy == CompressionStrategy.COMPRESS:
+        # Which codec is a fact about the FILE, not about this machine: a
+        # package staged as .xz on a Mac must unpack as .xz wherever it lands.
+        codec = codec_for(src)
+        if codec.name != "zstd":
+            opener = _stdlib_opener(codec)
+            if opener is None:
+                log.error("cannot decompress %s: no %s codec here", src, codec.name)
+                return False
+            reader = _lzma.open if codec.name == "xz" else gzip.open
+            try:
+                with reader(src, "rb") as source, open(dst, "wb") as target:
+                    shutil.copyfileobj(source, target, length=1024 * 1024)
+            except OSError as e:
+                log.error("%s decompress failed for %s: %s", codec.name, src, e)
+                return False
+            return True
+
         binary = archiver("zstd")
         if binary is None:
-            log.error("cannot decompress %s: no zstd on this machine", src)
+            log.error("cannot decompress %s: it is zstd and this machine has none", src)
             return False
-        result = subprocess.run(
-            [binary, "-d", "-f", src, "-o", dst],
-            capture_output=True,
-            text=True,
-        )
+        try:
+            result = subprocess.run(
+                [binary, "-d", "-f", src, "-o", dst],
+                capture_output=True,
+                text=True,
+            )
+        except OSError as e:
+            log.error("zstd at %s did not run (%s)", binary, e)
+            return False
         if result.returncode != 0:
             log.error("zstd decompress failed for %s: %s", src, result.stderr)
             return False
@@ -262,11 +390,15 @@ def decompress_file(src: str, dst: str, strategy: CompressionStrategy) -> bool:
         if binary is None:
             log.error("cannot unpack %s: no tar on this machine", src)
             return False
-        result = subprocess.run(
-            [binary, "--zstd", "-xf", src, "-C", dst_dir],
-            capture_output=True,
-            text=True,
-        )
+        try:
+            result = subprocess.run(
+                [binary, "--zstd", "-xf", src, "-C", dst_dir],
+                capture_output=True,
+                text=True,
+            )
+        except OSError as e:
+            log.error("tar at %s did not run (%s)", binary, e)
+            return False
         if result.returncode != 0:
             log.error("tar+zstd decompress failed for %s: %s", src, result.stderr)
             return False
@@ -351,11 +483,14 @@ def compress_directory(src_dir: str, staging_dir: str, enabled: bool = True) -> 
             # individually. No archiver is slower, never broken.
             result = SimpleNamespace(returncode=1, stderr="no tar on this machine")
         else:
-            result = subprocess.run(
-                [binary, "--zstd", "-cf", archive_path, "-C", src_dir] + file_args,
-                capture_output=True,
-                text=True,
-            )
+            try:
+                result = subprocess.run(
+                    [binary, "--zstd", "-cf", archive_path, "-C", src_dir] + file_args,
+                    capture_output=True,
+                    text=True,
+                )
+            except OSError as e:
+                result = SimpleNamespace(returncode=1, stderr=str(e))
 
         if result.returncode != 0:
             log.error("VDB batch tar failed for %s: %s", parent_dir, result.stderr)

@@ -2,6 +2,8 @@ import json
 import os
 import stat
 
+from types import SimpleNamespace
+
 import pytest
 
 from rpfarm import cli
@@ -1313,47 +1315,61 @@ def test_doctor_says_nothing_about_regions_when_they_agree(tmp_path, monkeypatch
 # -- doctor checks the environment the COOK gets (field failure, 2026-09-05) ----
 
 
-def test_doctor_reports_zstd_by_absolute_path():
+def test_doctor_names_the_codec_the_cook_will_use():
     from rpfarm import cli as rpcli
-    from rpfarm import tools as rptools
+    from rpfarm import compression
 
     said = []
-    found = rptools.Tool("/opt/homebrew/bin/zstd", "/opt/homebrew/bin", "zstd command line interface 64-bits v1.5.6")
+    codec = rpcli._check_compression(said.append, resolve=lambda name, **k: None)
 
-    got = rpcli._check_archiver(said.append, said.append, resolve=lambda name, **k: found)
+    assert codec is compression.CODEC_XZ
+    assert "standard library" in said[0]
+    assert "which is fine" in said[0], "no zstd is a normal mode, not an alarm"
 
-    assert got is found
+
+def test_doctor_reports_zstd_by_absolute_path_when_it_is_really_there():
+    from rpfarm import cli as rpcli
+    from rpfarm import tools
+
+    found = tools.Tool("/opt/homebrew/bin/zstd", "/opt/homebrew/bin", "v1.5.7")
+    said = []
+
+    codec = rpcli._check_compression(said.append, resolve=lambda name, **k: found)
+
+    assert codec.binary == "/opt/homebrew/bin/zstd"
     assert "/opt/homebrew/bin/zstd" in said[0]
-    assert "by absolute path" in said[0], "and says WHY a cook will find it"
 
 
-def test_doctor_asks_about_houdinis_path_not_the_shells():
+def test_doctor_asks_about_houdinis_path_not_the_shells(monkeypatch):
     """The report used to flatter itself: run from a shell with Homebrew on
     PATH it said everything was fine, while inside Houdini the same lookup
     returned None."""
     from rpfarm import cli as rpcli
-    from rpfarm import tools as rptools
+    from rpfarm import tools
 
     asked = {}
 
-    def resolve(name, **kwargs):
+    def resolve_tool(name, **kwargs):
         asked.update(name=name, path=kwargs.get("path"))
         return None
 
-    said = []
-    rpcli._check_archiver(said.append, said.append, resolve=resolve)
+    monkeypatch.setattr(tools, "resolve_tool", resolve_tool)
+    rpcli._check_compression(lambda m: None)
 
-    assert asked == {"name": "zstd", "path": rptools.HOUDINI_LIKE_PATH}
+    assert asked == {"name": "zstd", "path": tools.HOUDINI_LIKE_PATH}
 
 
-def test_doctor_calls_a_missing_archiver_a_warning_not_a_failure():
-    """No zstd means slower uploads, not a broken farm -- so it must not
-    read like a broken farm."""
+def test_doctor_can_be_asked_to_use_the_cooks_path(monkeypatch, capsys):
+    """--dock-env, the same idea as the demo cook's --dock-env: check in the
+    environment that fails, not the one that passes."""
     from rpfarm import cli as rpcli
+    from rpfarm import config as rpcfg
+    from rpfarm import tools
 
-    oks, warns = [], []
-    rpcli._check_archiver(oks.append, warns.append, resolve=lambda name, **k: None)
+    monkeypatch.setenv("PATH", "/opt/homebrew/bin:/usr/bin")
+    monkeypatch.setattr(rpcfg, "load", lambda: (_ for _ in ()).throw(rpcfg.ConfigError("stop here")))
 
-    assert not oks
-    assert len(warns) == 1 and "brew install zstd" in warns[0]
-    assert "slower, not broken" in warns[0]
+    rpcli.cmd_doctor(SimpleNamespace(dock_env=True))
+
+    assert os.environ["PATH"] == tools.HOUDINI_LIKE_PATH
+    assert "--dock-env" in capsys.readouterr().out

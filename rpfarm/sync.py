@@ -43,7 +43,8 @@ import time
 import uuid
 from dataclasses import dataclass
 
-from rpfarm.compression import CompressionStrategy, archiver, classify_file, compress_file
+from rpfarm.compression import (
+    CompressionStrategy, classify_file, compress_file, decompress_command, select_codec)
 
 DEFAULT_MAX_BYTES = int(1.5 * 2**30)
 
@@ -273,16 +274,11 @@ def compress_stage(package, staging_dir, remote_root, level=3):
     is empty.
     """
     staging_dir = str(staging_dir)
-    if archiver("zstd") is None:
-        # No archiver on this machine: everything goes up as it is. Decided
-        # once, here, instead of failing per file -- and it is a decision,
-        # not an error. Losing compression makes an upload slower; raising
-        # makes the work item fail, which is what happened on 2026-09-05
-        # (FileNotFoundError: 'zstd', on a machine where zstd was installed
-        # but outside Houdini's PATH). archiver() has already said so in the
-        # log, once.
-        return list(package), [], ""
-
+    # One codec for the whole package, chosen once: the standard library
+    # unless a real zstd binary is on this machine. The extension it stages
+    # under is what tells the pod how to unpack -- so the format travels
+    # with the files rather than being assumed at the far end.
+    codec = select_codec()
     raw_package = []
     staged_package = []
     zst_rels = []
@@ -297,13 +293,14 @@ def compress_stage(package, staging_dir, remote_root, level=3):
             raw_package.append(e)
             continue
 
-        staged_path = os.path.join(staging_dir, rel + ".zst")
+        staged_path = os.path.join(staging_dir, rel + codec.ext)
         os.makedirs(os.path.dirname(staged_path), exist_ok=True)
-        if compress_file(e.local, staged_path, strategy, level=level):
+        if compress_file(e.local, staged_path, strategy, level=level, codec=codec):
             staged_package.append(
-                FileEntry(local=staged_path, remote=e.remote + ".zst", size=os.path.getsize(staged_path))
+                FileEntry(local=staged_path, remote=e.remote + codec.ext,
+                          size=os.path.getsize(staged_path))
             )
-            zst_rels.append(rel + ".zst")
+            zst_rels.append(rel + codec.ext)
         else:
             # No zstd available (or compression failed): leave uncompressed.
             raw_package.append(e)
@@ -311,6 +308,4 @@ def compress_stage(package, staging_dir, remote_root, level=3):
     if not zst_rels:
         return raw_package, staged_package, ""
 
-    decompress = " && ".join(f"zstd -d --rm {shlex.quote(r)}" for r in zst_rels)
-    post_command = f"cd {shlex.quote(remote_root)} && {decompress}"
-    return raw_package, staged_package, post_command
+    return raw_package, staged_package, decompress_command(remote_root, zst_rels, codec)
