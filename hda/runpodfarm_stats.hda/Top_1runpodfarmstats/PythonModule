@@ -79,10 +79,8 @@ def _ondisk_rpfarm_version(root):
 def _ondisk_fingerprint(package_dir):
     """The same measurement rpfarm takes of itself, computed here.
 
-    Deliberately a second implementation: the first one lives in the module
-    that may be stale, and asking a stale module to measure staleness is how
-    you get a guard that agrees with itself and nothing else.
-    tests/test_scheduler_glue.py holds the two to the same answer.
+    Only used by the bake script and the tests -- the runtime check never
+    looks at the disk (see _asset_mismatch for why).
     """
     out = {}
     try:
@@ -101,78 +99,102 @@ def _ondisk_fingerprint(package_dir):
     return out
 
 
-def _changed_module_files(package):
-    """Module files that differ from what this process imported, by content.
+def _asset_mismatch(package, baked):
+    """Modules whose loaded content is not what this asset was built against.
 
-    A package too old to carry a FINGERPRINT at all is itself the answer:
-    it predates this check, so it cannot be the code we just shipped.
+    Both sides live INSIDE this Houdini: ``package.FINGERPRINT`` is what the
+    modules were when this process imported them, ``baked`` is what they were
+    when this asset was built. The disk is deliberately not consulted.
+
+    That is the whole correction. Comparing against the disk answered the
+    wrong question -- "has anyone touched the checkout?" -- so every push
+    while an artist had Houdini open blocked their next cook, while a
+    session that was genuinely broken (an asset reinstalled under a running
+    Houdini, which reloads definitions without reopening the scene) could
+    still look fine. Comparing the asset with the package it was built
+    against answers the only question that matters to the artist: is my tool
+    consistent with itself?
+
+    An asset with no baked fingerprint predates this and gets a warning, not
+    a stop -- it may well be fine, and refusing to cook on "I cannot tell"
+    is how a guard gets switched off.
     """
     loaded = getattr(package, "FINGERPRINT", None)
     if not isinstance(loaded, dict):
         return ["<no fingerprint: this rpfarm predates the check>"]
-    try:
-        package_dir = os.path.dirname(os.path.abspath(package.__file__))
-    except Exception:
+    if not baked:
         return []
-    current = _ondisk_fingerprint(package_dir)
-    if not current:
-        return []  # cannot read the files: say nothing rather than cry wolf
-    return sorted(name for name in set(current) | set(loaded)
-                  if current.get(name) != loaded.get(name))
+    return sorted(name for name in baked if loaded.get(name) != baked[name])
 
 
-def _stale_module_message(minimum, loaded, on_disk, root, changed=()):
+def _stale_module_message(minimum, loaded, on_disk, root, changed=(), baked=True):
     """The sentence to show the artist, or None when nothing is wrong.
 
-    Two different causes, two different fixes, and telling them apart is the
-    whole point of reading the on-disk version as well as the loaded one:
-
-    * the files changed since this process imported them, or the loaded
-      version is below the floor -> a running Houdini is holding the old
-      package. Restart it.
-    * on disk it is old too -> the checkout itself is behind the asset, and
-      restarting will change nothing. Update it and rerun `rpfarm setup`.
+    ``changed`` is the answer from :func:`_asset_mismatch`; the version
+    arguments only make the message concrete. An asset that carries no baked
+    fingerprint at all cannot be judged, so it says so quietly instead of
+    refusing to work.
     """
     changed = list(changed)
-    behind = _version_tuple(loaded) < _version_tuple(minimum)
-    if not changed and not behind:
+    if not changed:
         return None
-    seen = loaded or "неизвестна (старая копия без VERSION)"
-    if changed or _version_tuple(on_disk) >= _version_tuple(minimum):
-        detail = ""
-        if changed:
-            shown = ", ".join(changed[:4])
-            more = " и ещё {}".format(len(changed) - 4) if len(changed) > 4 else ""
-            detail = ("\n\nИзменились с момента загрузки: {}{}.".format(shown, more))
+    if not baked or any(name.startswith("<") for name in changed):
         return (
-            "Код фермы обновился, а Houdini держит в памяти старую версию.\n"
+            "ВНИМАНИЕ: не могу проверить, сходится ли нода с кодом фермы.\n"
             "\n"
-            "ПЕРЕЗАПУСТИТЕ HOUDINI. Больше ничего делать не нужно —\n"
-            "на диске всё правильно, чинить нечего.\n"
-            "\n"
-            "Подробности: в памяти rpfarm {seen}, на диске {disk}.{detail}".format(
-                seen=seen, disk=on_disk or "не найдена", detail=detail)
+            "Это старая нода или старый пакет rpfarm. Кук пойдёт, но если он\n"
+            "упадёт странно — перезапустите Houdini, а потом обновите ноды:\n"
+            "    python3 -m rpfarm setup"
         )
+    shown = ", ".join(changed[:4])
+    more = " и ещё {}".format(len(changed) - 4) if len(changed) > 4 else ""
     return (
-        "Код фермы на диске старее, чем установленная нода.\n"
+        "Нода собрана против другого кода фермы, чем сейчас в памяти Houdini.\n"
         "\n"
-        "Перезапуск здесь не поможет. Обновите репозиторий и выполните\n"
-        "    python3 -m rpfarm setup\n"
-        "чтобы нода и пакет снова совпали.\n"
+        "ПЕРЕЗАПУСТИТЕ HOUDINI. Больше ничего делать не нужно.\n"
         "\n"
-        "Подробности: нода требует rpfarm {min}, на диске {disk} ({root}),\n"
-        "в памяти {seen}.".format(min=minimum, disk=on_disk or "не найдена",
-                                  root=root, seen=seen)
+        "Разошлись: {shown}{more}.\n"
+        "В памяти rpfarm {seen}, нода собрана против {disk}.".format(
+            shown=shown, more=more, seen=loaded or "неизвестной версии",
+            disk=on_disk or "неизвестной версии")
     )
+
+# BEGIN baked by scripts/bake_asset_fingerprint.py -- do not edit
+_ASSET_BUILT_AGAINST_VERSION = '2.3.0'
+_ASSET_FINGERPRINT = {
+    '__init__.py': (2490, 'c1250306daf5961f'),
+    '__main__.py': (52, '13a1a5b340cdcfc1'),
+    'cli.py': (61628, '98763091948d537a'),
+    'compression.py': (21496, '06c6306c4faf560f'),
+    'config.py': (12718, 'c81813f3ccec7011'),
+    'deps.py': (36017, '17858b665c53edec'),
+    'dispatch.py': (21295, '9c0aa38ea12b3720'),
+    'gpus.py': (8311, '7a28d5c2692b776e'),
+    'houdini_local.py': (25206, 'a5ec6729405ccb1a'),
+    'ledger.py': (17327, '70425e75fb216f01'),
+    'package_runner.py': (8752, '96770e3879a6cb65'),
+    'packages.py': (51475, '5c47658132aaf796'),
+    'pods.py': (27040, '64cabd27b99479f6'),
+    'preflight.py': (28512, '84490c4e36f59e49'),
+    'runpod_api.py': (14539, 'b90960f9860c97fb'),
+    'smoke.py': (41503, 'd25dfbac9eddb12b'),
+    'sync.py': (11950, '2a83513dc7e087e8'),
+    'tls.py': (3642, 'f3e50ea6ebd0308f'),
+    'tools.py': (4290, 'c5d3b026f125578f'),
+    'usddeps.py': (9631, '3c7192d3bd94d07f'),
+    'worker_client.py': (8816, 'c1cd036661f82a96'),
+}
+# END baked
 
 import rpfarm as _rpfarm_pkg
 
 _stale = _stale_module_message(
     _MIN_RPFARM_VERSION,
     getattr(_rpfarm_pkg, "VERSION", None),
-    _ondisk_rpfarm_version(_RPFARM_ROOT),
+    _ASSET_BUILT_AGAINST_VERSION,
     _RPFARM_ROOT,
-    _changed_module_files(_rpfarm_pkg),
+    _asset_mismatch(_rpfarm_pkg, _ASSET_FINGERPRINT),
+    bool(_ASSET_FINGERPRINT),
 )
 if _stale:
     # Raised, not printed: this is the same place the ImportError used
