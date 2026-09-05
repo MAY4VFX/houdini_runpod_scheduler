@@ -236,24 +236,60 @@ def codec_for(path: str) -> Codec:
 # pod: python 3.10.12, lzma/gzip/zlib importable, `which xz` empty, zstd at
 # /usr/bin/zstd). So a .xz/.gz package is unpacked by python, not by a
 # command-line tool that may not be installed.
+#
+# It also RESTORES THE ORIGINAL MTIME, and that is not a nicety. Measured on
+# the pod: a file with mtime 2026-01-02 came out of `zstd -d --rm` and out of
+# this script stamped with the moment of unpacking. A farm whose files all
+# claim to be seconds old cannot be compared against a local original by
+# anything except a hash -- so every compressed file looked stale on the next
+# cook and was sent again. Two arguments per file: path, then mtime.
 _PY_DECOMPRESS = (
     "import gzip,lzma,os,shutil,sys\n"
-    "for p in sys.argv[1:]:\n"
+    "a = sys.argv[1:]\n"
+    "for p, t in zip(a[::2], a[1::2]):\n"
     "    o = gzip.open if p.endswith('.gz') else lzma.open\n"
-    "    with o(p,'rb') as s, open(p[:p.rindex('.')],'wb') as d: shutil.copyfileobj(s,d)\n"
+    "    d = p[:p.rindex('.')]\n"
+    "    with o(p,'rb') as s, open(d,'wb') as f: shutil.copyfileobj(s,f)\n"
     "    os.remove(p)\n"
+    "    os.utime(d, (float(t), float(t)))\n"
+)
+
+# The same restore, for the codec that unpacks itself.
+_PY_UTIME = (
+    "import os,sys\n"
+    "a = sys.argv[1:]\n"
+    "for p, t in zip(a[::2], a[1::2]):\n"
+    "    os.utime(p, (float(t), float(t)))\n"
 )
 
 
-def decompress_command(remote_root: str, rel_paths, codec: Codec) -> str:
-    """The shell command that unpacks a staged package on the sync pod."""
-    if not rel_paths:
+def decompress_command(remote_root: str, staged, codec: Codec) -> str:
+    """The shell command that unpacks a staged package on the sync pod.
+
+    ``staged`` is ``[(rel path of the archive, mtime of the original), ...]``.
+    The mtime travels because the farm's copy has to end up looking like the
+    file it came from -- otherwise nothing can tell next cook whether it is
+    already there (see sync.already_on_farm).
+    """
+    staged = list(staged)
+    if not staged:
         return ""
-    quoted = " ".join(shlex.quote(r) for r in rel_paths)
+    cd = "cd {}".format(shlex.quote(remote_root))
+    pairs = " ".join(
+        "{} {}".format(shlex.quote(rel), shlex.quote("{:.0f}".format(mtime)))
+        for rel, mtime in staged)
     if codec.name == "zstd":
-        return "cd {} && zstd -d --rm {}".format(shlex.quote(remote_root), quoted)
-    return "cd {} && python3 -c {} {}".format(
-        shlex.quote(remote_root), shlex.quote(_PY_DECOMPRESS), quoted)
+        archives = " ".join(shlex.quote(rel) for rel, _ in staged)
+        originals = " ".join(
+            "{} {}".format(shlex.quote(rel[:rel.rindex(".")]), shlex.quote("{:.0f}".format(mtime)))
+            for rel, mtime in staged)
+        # -f because the file is very likely ALREADY there: this is what a
+        # second upload of the same project looks like, and without it zstd
+        # stops to ask "overwrite (y/n)?" on a pod where nobody can answer
+        # and the work item fails. Found by running two uploads in a row.
+        return "{} && zstd -d --rm -f {} && python3 -c {} {}".format(
+            cd, archives, shlex.quote(_PY_UTIME), originals)
+    return "{} && python3 -c {} {}".format(cd, shlex.quote(_PY_DECOMPRESS), pairs)
 
 
 def archiver(name: str = "zstd"):

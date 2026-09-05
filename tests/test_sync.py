@@ -218,7 +218,10 @@ def test_compress_stage_compresses_compressible_and_skips_bgeo_sc(tmp_path):
         # staging_dir whenever e.remote was absolute, per R8's convention).
         assert staged_entry.local.startswith(str(staging) + os.sep)
         assert staged_entry.local != str(txt)
-        assert "zstd -d --rm notes.txt.zst" in post_command
+        assert "zstd -d --rm -f notes.txt.zst" in post_command
+        assert "os.utime" in post_command and " notes.txt " in post_command, (
+            "the farm copy must wear the original's mtime, or the next "
+            "cook cannot tell it is already there")
         assert f"cd {remote_root}" in post_command
 
         # R8 invariant must hold for staged_package too: uploading it with
@@ -287,18 +290,24 @@ def test_compression_needs_no_external_program_at_all(tmp_path, monkeypatch):
     assert "python3 -c" in post, "the pod has lzma but no xz binary -- checked on the pod"
 
 
-def test_the_package_says_which_format_it_is_in(tmp_path):
-    """The pod cannot guess. The extension names the codec and the post
-    command matches it -- both come from the same choice, made once."""
+def test_the_package_says_which_format_it_is_in_and_what_mtime_to_restore(tmp_path):
+    """The pod cannot guess either one. The extension names the codec, and
+    the mtime travels because the farm's copy has to end up looking like the
+    file it came from -- otherwise nothing can tell, next cook, that it is
+    already there."""
     from rpfarm import compression
 
     zstd = compression.Codec("zstd", ".zst", "/opt/homebrew/bin/zstd")
 
-    assert compression.decompress_command("/root", ["a.zst"], zstd) == (
-        "cd /root && zstd -d --rm a.zst")
-    xz = compression.decompress_command("/root", ["a.xz", "b.xz"], compression.CODEC_XZ)
+    cmd = compression.decompress_command("/root", [("a.zst", 1767323045.0)], zstd)
+    assert cmd.startswith("cd /root && zstd -d --rm -f a.zst && python3 -c ")
+    assert " -f " in cmd, "the file is already there on any second upload"
+    assert cmd.endswith(" a 1767323045"), "restores the ORIGINAL's mtime on the unpacked file"
+
+    xz = compression.decompress_command(
+        "/root", [("a.xz", 1767323045.0), ("b.xz", 1700000000.0)], compression.CODEC_XZ)
     assert xz.startswith("cd /root && python3 -c ")
-    assert xz.endswith(" a.xz b.xz")
+    assert xz.endswith(" a.xz 1767323045 b.xz 1700000000")
     assert compression.decompress_command("/root", [], compression.CODEC_XZ) == ""
 
 
@@ -346,3 +355,87 @@ def test_the_codec_is_the_standard_library_unless_a_real_binary_is_found():
     found = tools.Tool("/opt/homebrew/bin/zstd", "/opt/homebrew/bin", "1.5.7")
     picked = compression.select_codec(resolve=lambda name, **k: found)
     assert picked.name == "zstd" and picked.binary == found.path
+
+
+# -- compression must not defeat incremental upload (2026-09-05) ----------------
+#
+# A compressed file travels as an archive that is DELETED after unpacking, so
+# rclone -- comparing archive name against archive name -- finds nothing on the
+# far side and sends the whole set again. For the owner that is 2.8 GB over a
+# 4.7 Mbps link: a minute if only the .hip moved, an hour and a half if not.
+
+
+def _index_from(entries, size_delta=0, mtime_delta=0.0):
+    return {os.path.basename(e.remote): (os.path.getsize(e.local) + size_delta,
+                                         os.path.getmtime(e.local) + mtime_delta)
+            for e in entries}
+
+
+def test_a_file_already_on_the_farm_is_not_sent_again(tmp_path):
+    src = tmp_path / "cache.bgeo"
+    src.write_bytes(b"g" * 4096)
+    entry = FileEntry(local=str(src), remote="/remote/root/cache.bgeo", size=4096)
+
+    assert rpsync.already_on_farm(entry, _index_from([entry]), str(tmp_path), "/remote/root")
+
+
+def test_a_changed_file_is_sent(tmp_path):
+    src = tmp_path / "scene.hip"
+    src.write_bytes(b"h" * 100)
+    entry = FileEntry(local=str(src), remote="/remote/root/scene.hip", size=100)
+
+    assert not rpsync.already_on_farm(entry, _index_from([entry], size_delta=-5),
+                                      str(tmp_path), "/remote/root")
+    assert not rpsync.already_on_farm(entry, _index_from([entry], mtime_delta=600),
+                                      str(tmp_path), "/remote/root")
+
+
+def test_a_file_the_farm_never_got_is_sent(tmp_path):
+    """Half a package left by a cancelled cook is exactly this case, and it
+    is why the farm is asked instead of a manifest being kept: whatever is
+    actually there is the answer, with no state to drift."""
+    src = tmp_path / "tex.rat"
+    src.write_bytes(b"t")
+    entry = FileEntry(local=str(src), remote="/remote/root/tex.rat", size=1)
+
+    assert not rpsync.already_on_farm(entry, {}, str(tmp_path), "/remote/root")
+    assert not rpsync.already_on_farm(entry, {"other.rat": (1, 0.0)}, str(tmp_path), "/remote/root")
+
+
+def test_a_second_of_slack_is_not_a_change(tmp_path):
+    """Filesystems and transports round timestamps differently; a second of
+    slack costs nothing next to re-sending a gigabyte."""
+    src = tmp_path / "a.exr"
+    src.write_bytes(b"x")
+    entry = FileEntry(local=str(src), remote="/remote/root/a.exr", size=1)
+
+    assert rpsync.already_on_farm(entry, _index_from([entry], mtime_delta=1.0),
+                                  str(tmp_path), "/remote/root")
+
+
+def test_the_index_is_read_from_the_farm_itself(monkeypatch):
+    seen = {}
+
+    def fake_run(rclone_bin, args):
+        seen["args"] = args
+        return [{"Path": "BS/airship/scene.hip", "Size": 48866843,
+                 "ModTime": "2026-09-05T11:50:00.123456789+00:00"},
+                {"Path": "tex/a.rat", "Size": 10, "ModTime": "2026-01-02T03:04:05Z"}]
+
+    index = rpsync.remote_index(SftpTarget(host="h", port=22, key_path="/k"),
+                                "/bin/rclone", "/workspace/projects/may/airship",
+                                run=fake_run)
+
+    assert "lsjson" in seen["args"] and "--recursive" in seen["args"]
+    assert index["BS/airship/scene.hip"][0] == 48866843
+    assert index["tex/a.rat"] == (10, 1767323045.0), "RFC3339 with a Z, nanoseconds dropped"
+
+
+def test_a_farm_that_cannot_be_listed_just_means_send_everything():
+    """The listing is an optimisation. A first cook has nothing there, a
+    broken rclone has nothing to say -- neither may fail the upload."""
+    def boom(rclone_bin, args):
+        raise rpsync.SyncError("no such project yet")
+
+    assert rpsync.remote_index(SftpTarget(host="h", port=22, key_path="/k"),
+                               "/bin/rclone", "/nope", run=boom) == {}
