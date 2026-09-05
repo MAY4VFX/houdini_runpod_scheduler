@@ -1284,6 +1284,24 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         report -- it is a change to the scene, not something to do behind the
         artist's back.
 
+        Overlapping roots, measured rather than assumed. Our map can hold a
+        root nested inside another -- an external directory that landed under
+        _ext while its parent maps to the project mirror. Two facts from the
+        pod:
+
+        * With both targets present, Houdini picks the LONGEST matching
+          prefix, so the nested entry wins and its files resolve correctly.
+          The whole map goes over, unpruned: dropping the nested entry would
+          hand the path to the shorter root and silently produce a path
+          inside the project mirror where nothing is.
+        * A mapping whose TARGET DOES NOT EXIST is silently deactivated
+          ("Not active. Target path not found." in `pathmap`), and then the
+          shorter root takes the path instead -- a wrong path rather than a
+          missing one. In a cook that ordering is safe, because each task is
+          a fresh process and the upload has finished before any task runs;
+          it is a hazard only for a file that was never uploaded (unchecked
+          in the confirmation window, say).
+
         Additive: PDG_PATHMAP keeps doing its job untouched.
         """
         if self["pdg_mapmode"].evaluateInt() == 1 or not self._pathmap:
