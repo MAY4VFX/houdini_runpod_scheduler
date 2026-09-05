@@ -256,7 +256,7 @@ if mode == "outputs":
 
     if _scheduler_downloads_outputs():
         _warn(
-            "The scheduler's \"Download Outputs\" is ON, so every item's outputs "
+            "The scheduler's \\"Download Outputs\\" is ON, so every item's outputs "
             "are already fetched the moment it succeeds -- while the farm is "
             "still rendering. This node in Outputs mode will fetch the same "
             "files a second time at the end of the cook, re-transferring them "
