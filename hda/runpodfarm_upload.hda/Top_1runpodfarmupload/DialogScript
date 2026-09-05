@@ -80,6 +80,22 @@
         hidewhen "{ rpfarm_mode != deps }"
     }
     parm {
+        name    "rpfarm_assetregex"
+        label   "Varying Path Pattern"
+        type    string
+        default { "(_|\\.)\\d+(_|\\.)|<udim>|<u>|<v>|<u2>|<v2>|<obj_name>" }
+        help    "Whatever matches this in an evaluated path is replaced by * and globbed, so tile sets and frame sequences upload whole. Houdini expands $F4 to the CURRENT frame before anything sees it, so `.0001.` is what a cache sequence looks like here -- match it or upload one frame. Default is Conductor's (ciohoudini). Wildcards only ever return files that exist, so a pattern that is too wide costs a directory listing and some visible extra rows in the window; too narrow silently loses tiles or frames."
+        hidewhen "{ rpfarm_mode != deps }"
+    }
+    parm {
+        name    "rpfarm_excludepattern"
+        label   "Exclude Paths Matching"
+        type    string
+        default { "" }
+        help    "Comma-separated glob patterns dropped from the plan before the window opens, e.g. */backup/*, *.abc. Matched against the whole path. Empty means nothing is excluded."
+        hidewhen "{ rpfarm_mode != deps }"
+    }
+    parm {
         name    "rpfarm_preview"
         label   "Preview Upload..."
         type    button
