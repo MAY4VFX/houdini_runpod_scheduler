@@ -18,6 +18,7 @@ here: rename a collaborator and this fails.
 """
 
 import ast
+import json
 import pathlib
 import sys
 import types
@@ -1196,75 +1197,45 @@ def test_an_unmapped_colour_config_is_reported_not_guessed(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Making the local path exist on the pod (cook 41f78681, 2026-09-05)
+# Houdini's own path map (cook 41f78681, 2026-09-05)
 #
-# PDG_PATHMAP rewrites paths held in parameters Houdini TAGGED as file
-# references. filepath1 on a Reference LOP is stringParmType.Regular, so it is
-# neither scanned nor rewritten -- and a path written inside a USD layer is
-# resolved by USD's own resolver, which knows nothing about PDG_PATHMAP. The
-# file was on the pod and the node still looked for /Users/may/...
+# $PDG_PATHMAP is applied by PDG, not by Houdini -- pdgcmd.localizePath covers
+# the paths PDG resolves. $HOUDINI_PATHMAP is read by Houdini's core. Measured
+# on the pod: it maps hou.findFile and makes hou.hda.installFile find an
+# uploaded .hda, and USD's resolver ignores it completely (Ar.Resolve -> '').
 # ---------------------------------------------------------------------------
 
 
-def _links(pathmap, **attrs):
-    ns = load_methods(["_localRootLinks"], {"shlex": __import__("shlex")})
-    self = types.SimpleNamespace(_pathmap=pathmap, _log=attrs.pop("log", lambda m: None),
-                                 _UNSAFE_LINK_ROOTS=frozenset({
-                                     "usr", "bin", "sbin", "lib", "lib64", "etc", "var",
-                                     "opt", "proc", "sys", "dev", "boot", "run", "root",
-                                     "tmp", "workspace"}), **attrs)
-    return ns["_localRootLinks"](self)
+def _pathmap_env(pathmap, mapmode=0, log=None):
+    ns = load_methods(["_ensureHoudiniPathmapEnv"], {"json": __import__("json")})
+    self = types.SimpleNamespace(
+        _pathmap=pathmap, _log=log or (lambda m: None),
+        __getitem__=None)
+    self.__dict__["_parms"] = {"pdg_mapmode": mapmode}
+    env = {}
+
+    class _Self:
+        def __init__(self, inner):
+            self.__dict__.update(inner.__dict__)
+
+        def __getitem__(self, name):
+            return types.SimpleNamespace(evaluateInt=lambda: mapmode)
+
+    ns["_ensureHoudiniPathmapEnv"](_Self(self), env)
+    return env
 
 
-def test_the_local_root_becomes_a_link_to_the_uploaded_project():
-    got = _links({"/Users/may": "/workspace/projects/may/airship"})
+def test_houdinis_own_path_map_gets_the_same_mapping():
+    env = _pathmap_env({"/Users/may": "/workspace/projects/may/airship"})
 
-    assert "ln -sfn /workspace/projects/may/airship /Users/may" in got
-    assert "[ -L /Users/may ]" in got, "replace a symlink or nothing"
-    assert "[ ! -e /Users/may ]" in got, "never a real directory"
-
-
-def test_a_root_inside_a_linked_root_is_left_to_the_link():
-    """Creating it would write THROUGH the outer symlink, into the uploaded
-    project -- and it is reachable through that link anyway."""
-    said = []
-    got = _links({
-        "/Users/may": "/workspace/projects/may/airship",
-        "/Users/may/color/ocio": "/workspace/projects/may/airship/_ext/Users/may/color/ocio",
-    }, log=said.append)
-
-    assert got.count("ln -sfn") == 1
-    assert "/Users/may/color/ocio" not in got.split("ln -sfn")[1]
-    assert any("sit inside a linked root" in m for m in said), said
+    assert json.loads(env["HOUDINI_PATHMAP"]) == {
+        "/Users/may": "/workspace/projects/may/airship"}
 
 
-def test_an_external_root_outside_the_job_gets_its_own_link():
-    got = _links({
-        "/Users/may/BS/airship": "/workspace/projects/may/airship",
-        "/Volumes/lib/hdri": "/workspace/projects/may/airship/_ext/Volumes/lib/hdri",
-    })
-
-    assert got.count("ln -sfn") == 2
+def test_path_mapping_set_to_none_is_honoured():
+    """The artist turned mapping off deliberately; do not put it back."""
+    assert _pathmap_env({"/Users/may": "/workspace/p"}, mapmode=1) == {}
 
 
-def test_system_directories_are_never_linked_over():
-    got = _links({
-        "/usr/local": "/workspace/p/_ext/usr/local",
-        "/etc": "/workspace/p/_ext/etc",
-        "/": "/workspace/p",
-        "/Users": "/workspace/p",
-    })
-
-    assert got == "", "a symlink at /usr or / inside the container is a broken pod"
-
-
-def test_a_windows_local_root_is_said_out_loud_not_half_done():
-    """C:\\Users\\may cannot exist on a Linux pod. Tagged parameters still map
-    through PDG_PATHMAP; the rest will not resolve, and that is worth saying."""
-    said = []
-
-    got = _links({"C:/Users/may": "/workspace/projects/may/airship"}, log=said.append)
-
-    assert got == ""
-    assert any("not a POSIX path" in m for m in said), said
-    assert any("PDG_PATHMAP" in m for m in said), said
+def test_no_map_no_variable():
+    assert _pathmap_env({}) == {}

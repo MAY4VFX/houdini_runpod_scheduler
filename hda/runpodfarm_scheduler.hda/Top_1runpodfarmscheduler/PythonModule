@@ -1246,6 +1246,7 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         # so they come out of here automatically.
         self.resolvePathMapping(task_env)
         self._ensurePathMapEnv(task_env)
+        self._ensureHoudiniPathmapEnv(task_env)
         self._ensureOcioEnv(task_env)
 
         # Resolves the environment specified in the Job Parms scheduler section
@@ -1260,84 +1261,39 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
 
         return task_env
 
-    #: Never link over these: a symlink at /usr or /etc inside the container
-    #: is a broken pod, and nothing an artist owns lives there.
-    _UNSAFE_LINK_ROOTS = frozenset({
-        "usr", "bin", "sbin", "lib", "lib64", "etc", "var", "opt", "proc",
-        "sys", "dev", "boot", "run", "root", "tmp", "workspace",
-    })
+    def _ensureHoudiniPathmapEnv(self, task_env):
+        """Give Houdini's OWN path map the same mapping PDG has.
 
-    def _localRootLinks(self):
-        """Shell that makes this cook's LOCAL absolute paths exist on the pod.
+        $PDG_PATHMAP is applied by PDG, not by Houdini: pdgcmd.localizePath
+        rewrites the paths PDG itself resolves -- the hip file, outputs, item
+        results. $HOUDINI_PATHMAP is read by Houdini's core, so it also covers
+        what Houdini looks up on its own.
 
-        Why a symlink and not more path substitution. PDG_PATHMAP rewrites
-        paths held in parameters Houdini tagged as file references. A
-        parameter it did not tag -- `filepath1` on a Reference LOP is
-        `stringParmType.Regular` -- is neither scanned NOR rewritten, and an
-        absolute path written inside a USD layer is resolved by USD's own
-        resolver, which has never heard of PDG_PATHMAP. Extending our
-        ADDITIONAL_PATH_PARMS list fixes finding those files; it cannot fix
-        resolving them. Making the local path exist fixes both at once, and
-        every future case of the same shape.
+        Measured on the pod, with the map set and no symlink anywhere
+        (2026-09-05):
 
-        Field failure it closes (cook 41f78681, 2026-09-05): the scene loaded,
-        the layer was on the pod at
-        /workspace/projects/may/airship/BS/airship/.../Zeppelin_Balon_Test.usdc,
-        and the node still looked for /Users/may/BS/... -- "Unable to find
-        layer file", exit 1 in 42 s.
+            pathmap -t <local path>      -> mapped
+            hou.findFile(<local path>)   -> the farm path
+            hou.hda.installFile(<local>) -> ok        <- the shipped-HDA problem
+            Ar.Resolve(<local path>)     -> ''        <- USD does NOT see it
+            Sdf.Layer.FindOrOpen(...)    -> None
 
-        Rules, in order:
+        So this is worth setting and it is not a fix for USD layers: USD
+        resolves asset paths through its own resolver, which knows nothing
+        about Houdini's map. What remains for those is written up in the
+        report -- it is a change to the scene, not something to do behind the
+        artist's back.
 
-        * One link per pathmap root, shortest first; a root nested inside one
-          already linked is skipped, because creating it would write THROUGH
-          the outer link into the uploaded project.
-        * Roots with fewer than two path components, or whose first component
-          is a system directory, are refused outright.
-        * A Windows local root (``C:`` and a drive letter) cannot be represented on a Linux
-          pod at all. Said once, in the log, rather than silently doing half
-          the job.
-        * An existing real directory is left alone; only a symlink or nothing
-          is replaced. The pathmap keeps working either way -- this is an
-          addition to it, never a substitute.
+        Additive: PDG_PATHMAP keeps doing its job untouched.
         """
-        chosen = []
-        skipped_nested = []
-        for local, farm in sorted(self._pathmap.items(), key=lambda kv: len(kv[0])):
-            if not local.startswith("/"):
-                if not getattr(self, "_win_root_logged", False):
-                    self._win_root_logged = True
-                    self._log(
-                        "local root {} is not a POSIX path, so it cannot exist on a Linux "
-                        "pod. Parameters Houdini tags as file references still map through "
-                        "PDG_PATHMAP; untagged ones and absolute paths inside USD will "
-                        "not resolve.".format(local))
-                continue
-            parts = [p for p in local.split("/") if p]
-            if len(parts) < 2 or parts[0] in self._UNSAFE_LINK_ROOTS:
-                continue
-            if any(local == c or local.startswith(c + "/") for c, _ in chosen):
-                skipped_nested.append(local)
-                continue
-            chosen.append((local, farm))
-
-        if skipped_nested and not getattr(self, "_nested_roots_logged", False):
-            self._nested_roots_logged = True
-            self._log("{} path root(s) sit inside a linked root and are reached through "
-                      "it: {}".format(len(skipped_nested), ", ".join(skipped_nested[:3])))
-
-        parts = []
-        for local, farm in chosen:
-            local_q = shlex.quote(local)
-            farm_q = shlex.quote(farm)
-            # Replace a symlink or nothing; never a real directory.
-            parts.append(
-                "if [ -L {l} ] || [ ! -e {l} ]; then mkdir -p \"$(dirname {l})\" && "
-                "ln -sfn {f} {l}; fi".format(l=local_q, f=farm_q))
-        if chosen and not getattr(self, "_links_logged", False):
-            self._links_logged = True
-            self._log("local paths on the pod: " + ", ".join(
-                "{} -> {}".format(l, f) for l, f in chosen))
-        return " ; ".join(parts)
+        if self["pdg_mapmode"].evaluateInt() == 1 or not self._pathmap:
+            return
+        task_env["HOUDINI_PATHMAP"] = json.dumps(
+            {local: farm for local, farm in sorted(self._pathmap.items())})
+        if not getattr(self, "_houdini_pathmap_logged", False):
+            self._houdini_pathmap_logged = True
+            self._log("HOUDINI_PATHMAP: {} mapping(s) for Houdini's own lookups "
+                      "(PDG_PATHMAP unchanged)".format(len(self._pathmap)))
 
     def _ensureOcioEnv(self, task_env):
         """Point the farm at the colour config that came up with the scene.
@@ -2670,15 +2626,6 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         if post_task_command:
             full_command = "{} && {}".format(full_command, post_task_command)
 
-        # 3b. Make this cook's local absolute paths exist on the pod, so the
-        #     paths PDG_PATHMAP cannot reach -- untagged parameters, and
-        #     anything a USD layer names absolutely -- resolve to the files
-        #     that were uploaded. Joined with ";" rather than "&&": if the
-        #     link cannot be made the task still runs, because for tagged
-        #     parameters the path map alone is enough.
-        links = self._localRootLinks()
-        if links:
-            full_command = "{} ; {}".format(links, full_command)
 
         # 4. Prepare task env
         task_env = self._prepareTaskEnv(work_item.node, work_item)
