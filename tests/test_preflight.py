@@ -31,13 +31,6 @@ def test_human_bytes_reads_like_a_file_manager():
     assert pf.human_bytes(1024) == "1.0 KB"
     assert pf.human_bytes(1_500_000_000) == "1.4 GB"
 
-
-def test_the_heaviest_reference_is_the_first_line():
-    assert [r.path for r in pf.sort_rows(_rows())] == [
-        "/job/export", "/job/geo/b.bgeo.sc", "/job/tex/a.rat",
-    ]
-
-
 def test_a_directory_reads_as_a_directory():
     rows = {r.kind: r for r in _rows()}
     assert pf.row_label(rows["dir"]) == "/job/export" + os.sep
@@ -46,48 +39,43 @@ def test_a_directory_reads_as_a_directory():
     assert pf.row_detail(rows["file"]) == "1 file"
 
 
-def test_header_states_what_is_selected_against_what_was_offered():
-    text = pf.header_text(_rows(), missing=["/job/gone.exr"], excluded={"/job/export"})
-    assert text.startswith("2 of 3 references")
-    assert "1.4 GB" in text  # the total offered
+def test_header_states_what_is_selected_against_what_was_offered(tmp_path):
+    a = tmp_path / "big.zip"
+    a.write_bytes(b"x" * 1500)
+    b = tmp_path / "small.rat"
+    b.write_bytes(b"y" * 10)
+    rows, _ = deps.plan_refs([str(a), str(b)], source="scene")
+    roots = pf.build_tree(rows)
+
+    text = pf.header_text(roots, checked=[str(b)], missing=["/job/gone.exr"])
+
+    assert text.startswith("1 of 2 files")
+    assert "1.5 KB" in text  # the total offered
     assert "1 reference(s) name nothing on disk" in text
 
 
 # -- the remembered choice -------------------------------------------------------
 
-
-def test_an_unchecked_reference_does_not_upload():
-    refs = ["/job/hip/scene.hip", "/job/export", "/job/tex/a.rat"]
-    assert pf.apply_exclusions(refs, {"/job/export"}) == ["/job/hip/scene.hip", "/job/tex/a.rat"]
-
-
 def test_an_unchecked_box_stays_unchecked_next_cook():
-    """The whole reason the choice lives on the node: a window that has to
+    """The whole reason the answer lives on the node: a window that has to
     be re-answered every cook is a tax, and a taxed artist turns it off."""
-    stored = pf.dump_exclusions({"/job/export/", "/job/tex/a.rat"})
+    stored = pf.dump_choices({"/job/export/", "/job/tex/a.rat"}, on={"/job/render"})
 
-    remembered = pf.load_exclusions(stored)
+    off, on = pf.load_choices(stored)
 
-    assert remembered == {"/job/export", "/job/tex/a.rat"}  # trailing sep normalised away
-    assert pf.apply_exclusions(["/job/export", "/job/tex/a.rat", "/job/keep.abc"], remembered) == [
-        "/job/keep.abc"
-    ]
+    assert off == {"/job/export", "/job/tex/a.rat"}  # trailing sep normalised away
+    assert on == {"/job/render"}
 
 
 def test_an_exclusion_survives_a_reference_that_vanished_for_a_version():
-    kept = pf.load_exclusions(pf.dump_exclusions({"/job/export"}))
-    assert "/job/export" in pf.load_exclusions(pf.dump_exclusions(kept))
+    off, _on = pf.load_choices(pf.dump_choices({"/job/export"}))
+    assert "/job/export" in pf.load_choices(pf.dump_choices(off))[0]
 
 
 def test_exclusions_accept_a_hand_typed_list():
     assert pf.load_exclusions("/job/a\n/job/b\n") == {"/job/a", "/job/b"}
     assert pf.load_exclusions("") == set()
     assert pf.load_exclusions("[not json") == {"[not json"}
-
-
-def test_totals_count_only_the_checked_rows():
-    assert pf.totals(_rows(), excluded={"/job/export"}) == (2, 51_024)
-
 
 def test_ui_is_not_available_without_houdini():
     assert pf.ui_available() is False
@@ -100,24 +88,40 @@ def test_ui_is_not_available_without_houdini():
     importlib.util.find_spec("PySide6") is None,
     reason="PySide6 ships with Houdini's Python, not the system one",
 )
-def test_dialog_reflects_the_remembered_exclusions():
+def test_the_widget_tree_opens_one_level_and_folds_the_folder_state(tmp_path):
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     from PySide6 import QtCore, QtWidgets
 
+    render = tmp_path / "render"
+    render.mkdir()
+    for frame in ("0001", "0002"):
+        (render / "beauty.{}.exr".format(frame)).write_bytes(b"e" * 100)
+    (tmp_path / "scene.hip").write_bytes(b"h")
+    rows, _ = deps.plan_refs([str(tmp_path / "scene.hip"), str(render)], source="scene")
+    roots = pf.build_tree(rows)
+    checked = {n.path for n in pf.leaves(roots)}
+
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-    dialog = pf.build_dialog(_rows(), missing=["/job/gone.exr"], excluded={"/job/export"})
+    dialog = pf.build_dialog(roots, missing=["/job/gone.exr"], checked=checked)
     tree = dialog.findChild(QtWidgets.QTreeWidget)
+    top = tree.topLevelItem(0)
 
-    labels = [tree.topLevelItem(i).text(0) for i in range(tree.topLevelItemCount())]
-    states = [tree.topLevelItem(i).checkState(0) for i in range(tree.topLevelItemCount())]
+    assert tree.topLevelItemCount() == 1 and top.isExpanded(), "top level open"
+    folder = next(top.child(i) for i in range(top.childCount())
+                  if top.child(i).text(0).endswith(os.sep))
+    assert not folder.isExpanded(), "and nothing below it"
+    assert folder.childCount() == 2, "but it opens all the way to the file"
+    assert folder.text(1) == pf.human_bytes(200) and folder.text(2) == "2 files"
+    assert folder.checkState(0) == QtCore.Qt.Checked
 
-    assert labels[0] == "/job/export" + os.sep, "heaviest first"
-    assert states[0] == QtCore.Qt.Unchecked, "and remembered as unchecked"
-    assert states[1] == QtCore.Qt.Checked
-    assert dialog.rpfarm_exclusions() == {"/job/export"}
+    # a folder in a mixed state has to LOOK mixed, or a collapsed row lies
+    folder.child(0).setCheckState(0, QtCore.Qt.Unchecked)
+    assert folder.checkState(0) == QtCore.Qt.PartiallyChecked
+    assert dialog.rpfarm_checked() == checked - {folder.child(0).data(0, QtCore.Qt.UserRole)}
 
-    tree.topLevelItem(1).setCheckState(0, QtCore.Qt.Unchecked)
-    assert dialog.rpfarm_exclusions() == {"/job/export", "/job/geo/b.bgeo.sc"}
+    # and toggling the folder itself carries everything under it
+    folder.setCheckState(0, QtCore.Qt.Unchecked)
+    assert folder.child(1).checkState(0) == QtCore.Qt.Unchecked
     assert app is not None
 
 
@@ -168,27 +172,30 @@ def test_one_window_carries_every_source(tmp_path):
     hip, tex, usd, work = _files(tmp_path)
     seen = {}
 
-    def _window(rows, missing, excluded, **kw):
-        seen["rows"] = [(r.path, r.source) for r in rows]
-        seen["excluded"] = set(excluded)
-        return excluded
+    def _window(roots, missing, checked, **kw):
+        seen["leaves"] = [(n.path, n.source) for n in pf.leaves(roots)]
+        seen["checked"] = set(checked)
+        return checked
 
     got = pf.choose_uploads(_FakeNode(), _scan([hip, tex], output_paths=[work]),
                             usd_paths=[usd], ask=True, window=_window)
 
-    assert seen["rows"] == [(hip, "scene"), (tex, "scene"), (usd, "usd"), (work, "output")]
-    assert seen["excluded"] == {work}, "an output starts unchecked, but it IS on the list"
+    assert sorted(seen["leaves"]) == sorted([
+        (hip, "scene"), (tex, "scene"), (usd, "usd"),
+        (os.path.join(work, "old.exr"), "output")])
+    assert seen["checked"] == {hip, tex, usd}, "an output starts unchecked, but it IS in the tree"
     assert got == [hip, tex, usd]
 
 
 def test_an_output_the_artist_re_checks_uploads_and_stays_checked(tmp_path):
-    hip, tex, usd, work = _files(tmp_path)
+    hip, _tex, _usd, work = _files(tmp_path)
     node = _FakeNode()
 
-    got = pf.choose_uploads(node, _scan([hip], output_paths=[work]), ask=True,
-                            window=lambda rows, missing, excluded, **kw: set())
+    got = pf.choose_uploads(
+        node, _scan([hip], output_paths=[work]), ask=True,
+        window=lambda roots, missing, checked, **kw: {n.path for n in pf.leaves(roots)})
 
-    assert work in got
+    assert work in got, "a fully checked folder uploads as one reference"
     off, on = pf.load_choices(node.evalParm("rpfarm_exclude"))
     assert off == set() and on == {work}
     # and the next cook, with no window at all, honours it
@@ -200,7 +207,7 @@ def test_an_unchecked_reference_stays_unchecked_next_cook(tmp_path):
     node = _FakeNode()
 
     pf.choose_uploads(node, _scan([hip, tex]), usd_paths=[usd], ask=True,
-                      window=lambda rows, missing, excluded, **kw: {usd})
+                      window=lambda roots, missing, checked, **kw: {hip, tex})
 
     assert pf.load_choices(node.evalParm("rpfarm_exclude"))[0] == {usd}
     assert pf.choose_uploads(node, _scan([hip, tex]), usd_paths=[usd], ask=False) == [hip, tex]
@@ -258,3 +265,155 @@ def test_wants_window_says_which_condition_refused(monkeypatch):
     monkeypatch.setattr(pf, "ui_unavailable_reason", lambda: None)
     assert pf.wants_window(_FakeNode()) is True
     assert pf.wants_window(_FakeNode(), ask=False) is False
+
+
+# -- the tree the window shows ---------------------------------------------------
+#
+# The owner's requirement, verbatim: "должно быть дерево с возможностью
+# раскрыть до самого низа, но по дефолту только верхний открыт и галки
+# можно снять на всех уровнях или поставить". A flat list cannot do that:
+# 500 rendered frames of an output reference is 500 rows nobody reads.
+
+
+def _rows_for_tree(tmp_path):
+    """A hip, a texture, and an output folder holding three frames."""
+    hip = tmp_path / "scene.hip"
+    hip.write_bytes(b"h")
+    tex = tmp_path / "tex" / "wood.rat"
+    tex.parent.mkdir()
+    tex.write_bytes(b"t" * 10)
+    render = tmp_path / "render"
+    render.mkdir()
+    for frame in ("0001", "0002", "0003"):
+        (render / "beauty.{}.exr".format(frame)).write_bytes(b"e" * 100)
+    scene_rows, _ = deps.plan_refs([str(hip), str(tex)], source="scene")
+    out_rows, _ = deps.plan_refs([str(render)], source="output")
+    return scene_rows + out_rows, str(hip), str(tex), str(render)
+
+
+def test_a_directory_becomes_a_folder_you_can_open(tmp_path):
+    rows, hip, tex, render = _rows_for_tree(tmp_path)
+
+    roots = pf.build_tree(rows)
+
+    assert len(roots) == 1, "one common root, not a chain of single-child folders"
+    root = roots[0]
+    assert root.path == str(tmp_path)
+    names = [c.name for c in root.children]
+    assert "render" in names and "tex" in names and "scene.hip" in names
+    render_node = next(c for c in root.children if c.name == "render")
+    assert [c.name for c in render_node.children] == [
+        "beauty.0001.exr", "beauty.0002.exr", "beauty.0003.exr"]
+    assert render_node.files == 3 and render_node.bytes == 300
+
+
+def test_folders_carry_the_weight_of_everything_under_them(tmp_path):
+    rows, _hip, _tex, _render = _rows_for_tree(tmp_path)
+
+    root = pf.build_tree(rows)[0]
+
+    assert root.files == 5  # hip + texture + three frames
+    assert root.bytes == 1 + 10 + 300
+
+
+def test_heaviest_first_within_each_level(tmp_path):
+    rows, _hip, _tex, _render = _rows_for_tree(tmp_path)
+
+    root = pf.build_tree(rows)[0]
+
+    assert [c.name for c in root.children] == ["render", "tex", "scene.hip"]
+
+
+def test_a_folder_of_one_source_says_so_and_a_mixed_one_does_not(tmp_path):
+    rows, _hip, _tex, render = _rows_for_tree(tmp_path)
+
+    root = pf.build_tree(rows)[0]
+
+    assert next(c for c in root.children if c.name == "render").source == "output"
+    assert root.source == "", "scene + output under one folder is not one source"
+
+
+# -- the answer, recorded where the decision was made ----------------------------
+
+
+def test_unchecking_a_folder_stores_the_folder_not_its_files(tmp_path):
+    """Requirement 6: a parm holding 500 paths because one folder was
+    unchecked is unreadable and grows without bound."""
+    rows, hip, tex, render = _rows_for_tree(tmp_path)
+    roots = pf.build_tree(rows)
+    checked = {hip, tex}  # the whole render folder unchecked
+
+    off, on = pf.compact_answer(roots, checked, default_off=lambda n: False)
+
+    assert off == {render}
+    assert on == set()
+
+
+def test_one_unchecked_file_is_stored_as_that_file(tmp_path):
+    rows, hip, tex, render = _rows_for_tree(tmp_path)
+    roots = pf.build_tree(rows)
+    dropped = os.path.join(render, "beauty.0002.exr")
+    checked = {hip, tex, os.path.join(render, "beauty.0001.exr"),
+               os.path.join(render, "beauty.0003.exr")}
+
+    off, on = pf.compact_answer(roots, checked, default_off=lambda n: False)
+
+    assert off == {dropped}
+
+
+def test_an_output_folder_left_alone_records_nothing(tmp_path):
+    """Outputs default to unchecked, so leaving them unchecked is not a
+    decision worth storing."""
+    rows, hip, tex, _render = _rows_for_tree(tmp_path)
+    roots = pf.build_tree(rows)
+
+    off, on = pf.compact_answer(roots, {hip, tex},
+                                default_off=lambda n: n.source == "output")
+
+    assert off == set() and on == set()
+
+
+def test_a_re_checked_output_folder_is_stored_once(tmp_path):
+    rows, hip, tex, render = _rows_for_tree(tmp_path)
+    roots = pf.build_tree(rows)
+    everything = {hip, tex} | {os.path.join(render, "beauty.{}.exr".format(f))
+                               for f in ("0001", "0002", "0003")}
+
+    off, on = pf.compact_answer(roots, everything,
+                                default_off=lambda n: n.source == "output")
+
+    assert on == {render} and off == set()
+
+
+def test_the_nearest_answer_wins(tmp_path):
+    """A file re-checked inside an unchecked folder stays checked."""
+    render = str(tmp_path / "render")
+    keep = os.path.join(render, "beauty.0002.exr")
+
+    assert pf.is_excluded(os.path.join(render, "beauty.0001.exr"), {render}, {keep}, False) is True
+    assert pf.is_excluded(keep, {render}, {keep}, False) is False
+    assert pf.is_excluded("/elsewhere/a.exr", {render}, set(), False) is False
+    assert pf.is_excluded("/elsewhere/a.exr", set(), set(), True) is True
+
+
+# -- turning the answer back into an upload set ----------------------------------
+
+
+def test_a_fully_checked_directory_uploads_as_one_reference(tmp_path):
+    """resolve_entries walks a directory itself, so keeping the reference
+    whole is both smaller to carry and identical in outcome."""
+    rows, hip, tex, render = _rows_for_tree(tmp_path)
+    everything = {hip, tex} | {os.path.join(render, "beauty.{}.exr".format(f))
+                               for f in ("0001", "0002", "0003")}
+
+    assert pf.selected_paths(rows, everything) == [hip, tex, render]
+
+
+def test_a_partly_checked_directory_uploads_the_files_that_stayed(tmp_path):
+    rows, hip, tex, render = _rows_for_tree(tmp_path)
+    keep = os.path.join(render, "beauty.0002.exr")
+
+    got = pf.selected_paths(rows, {hip, tex, keep})
+
+    assert got == [hip, tex, keep]
+    assert render not in got, "the folder as a whole would drag the other two frames in"

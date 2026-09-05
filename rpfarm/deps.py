@@ -147,6 +147,7 @@ class PlanRow:
     files: int
     bytes: int
     source: str = "scene"
+    contents: tuple = ()
 
 
 def globbed(value, asset_re, glob_fn=None, exists=os.path.exists, isdir=os.path.isdir):
@@ -641,10 +642,23 @@ def _branch_node_paths(node, say):
     return set(seen)
 
 
+# A directory reference is listed file by file so the confirmation window
+# can be a tree the artist opens all the way down. Above this many files
+# the list is dropped and the row stays a single aggregate leaf: nobody
+# scrolls 20000 checkboxes, and holding them costs more than it is worth.
+_DIR_LIST_CAP = 20000
+
+
 def _dir_weight(path):
-    """``(files, bytes)`` under *path*, with the same skip rules as the upload."""
+    """``(files, bytes, contents)`` under *path*, with the upload's skip rules.
+
+    ``contents`` is ``((path, size), ...)`` -- empty when the directory has
+    more than :data:`_DIR_LIST_CAP` files, in which case the caller keeps
+    the aggregate and the tree stops there.
+    """
     files = 0
     total = 0
+    contents = []
     for root, dirs, names in os.walk(path, followlinks=False):
         dirs[:] = [d for d in dirs if d not in _SKIP_DIR_NAMES]
         for name in names:
@@ -652,11 +666,14 @@ def _dir_weight(path):
             if _is_skipped_file(fp):
                 continue
             try:
-                total += os.path.getsize(fp)
+                size = os.path.getsize(fp)
             except OSError:
                 continue  # broken symlink, vanished mid-walk
+            total += size
             files += 1
-    return files, total
+            if len(contents) < _DIR_LIST_CAP:
+                contents.append((fp, size))
+    return files, total, tuple(contents) if files <= _DIR_LIST_CAP else ()
 
 
 def plan_refs(paths, source="scene"):
@@ -689,8 +706,9 @@ def plan_refs(paths, source="scene"):
         if os.path.isdir(path):
             if os.path.basename(path) in _SKIP_DIR_NAMES:
                 continue
-            files, total = _dir_weight(path)
-            rows.append(PlanRow(path=path, kind="dir", files=files, bytes=total, source=source))
+            files, total, contents = _dir_weight(path)
+            rows.append(PlanRow(path=path, kind="dir", files=files, bytes=total,
+                                source=source, contents=contents))
         elif os.path.isfile(path):
             if _is_skipped_file(path):
                 continue

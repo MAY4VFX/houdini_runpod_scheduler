@@ -116,9 +116,18 @@ Dependencies:
 Confirm Before Upload:
     #id: rpfarm_confirm
 
-    Shows what will move, before it moves: ONE window, every reference in
-    it, with a size, a checkbox, and a `Found by` column saying why the row
-    is there.
+    Shows what will move, before it moves: ONE window, a TREE of everything
+    that could upload, with a size, a checkbox and a `Found by` column
+    saying why the row is there.
+
+    Folders open all the way down to the individual file; only the top
+    level is open to begin with, so 500 rendered frames are one collapsed
+    row rather than 500. A checkbox on any level: unchecking a folder
+    unchecks everything under it, and a folder holding a mix shows the
+    partially-checked box -- otherwise a collapsed row would hide the fact
+    that something inside was dropped. Weight and file count on a folder
+    are the totals of what is under it, so the line says what saying no to
+    it is worth.
 
     * `scene` -- a Houdini parameter holds the path.
     * `USD` -- a stage reads it and no parameter names it.
@@ -128,9 +137,10 @@ Confirm Before Upload:
       field scene that is how one parameter's 11.54 GB became visible
       instead of invisible.
 
-    A directory is ONE line carrying its whole recursive weight, and the
-    list is sorted heaviest first -- that is the line worth arguing with,
-    and it must not hide among the 827 files it would otherwise become.
+    Heaviest first within every level -- the row worth arguing with is the
+    first one you see. A file that is not on disk is never a row: it goes
+    to the `Not on disk, skipped` line at the bottom, because an empty row
+    with a dash for a size reads as a bug.
 
     Why not Houdini's own `File > Pre-Flight Scene` window
     (`hou.ui.displayFileDependencyDialog`): it is fed entirely by
@@ -145,10 +155,11 @@ Confirm Before Upload:
     the .usdc the whole render is built from is simply absent). One window
     that shows everything beats two that each show half.
 
-    Your answer is remembered on the node (`rpfarm_exclude`, hidden), so
-    the window is not a tax on every cook: answer once, and it comes back
-    the way you left it. Cancel stops the cook -- it does not fall through
-    to uploading what was there before.
+    Your answer is remembered on the node (`rpfarm_exclude`, hidden) at the
+    level you gave it: unchecking a folder of 500 frames stores that one
+    folder, not 500 paths. A nearer answer wins, so a single file re-checked
+    inside an unchecked folder stays checked. Cancel stops the cook -- it
+    does not fall through to uploading what was there before.
 
     Turn it off for batch/headless work. A cook without a UI never shows a
     window anyway (`hou.isUIAvailable()`), and a cook whose generation runs
@@ -189,8 +200,8 @@ Preview Upload...:
 Re-check Everything:
     #id: rpfarm_clearexclude
 
-    Forget every answer given in the window: everything checked again
-    except output references, which go back to unchecked.
+    Forget every answer given in the window, at every level: everything
+    checked again except output references, which go back to unchecked.
 
 Project:
     #id: rpfarm_project
