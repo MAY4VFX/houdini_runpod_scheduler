@@ -29,19 +29,25 @@ GUARD_SOURCE = """\
 #
 # The asset and the package ship together and are updated together, but Python
 # caches modules in sys.modules for the life of the process. A Houdini that was
-# already open when the checkout updated loads the NEW asset against the OLD
-# package, and the only thing the artist sees is
+# already open when the checkout updated runs the NEW asset against the OLD
+# package, and the artist sees either an ImportError naming a symbol they have
+# never heard of, or -- worse, and this is what happened on 2026-09-05 -- a
+# cook whose work items simply fail.
 #
-#     ImportError: cannot import name 'CLOUD_TYPE_SECURE' from 'rpfarm.runpod_api'
+# THE CHECK IS A FACT, NOT A NUMBER. It compares the package's own
+# FINGERPRINT (size + content digest of every module file, taken when this
+# process imported it) against those files as they are now. If anything
+# differs, the code in memory is not the code on disk, and no version needs
+# to have been bumped for us to know it.
 #
-# which happened in the field on scene open. That message names a symbol the
-# artist has never heard of and says nothing about the fix, which is simply to
-# restart Houdini. So: check first, in words.
-#
-# A FLOOR, not an equality. The asset declares the oldest package it can work
-# with, so a newer package with an older asset is fine (that direction never
-# breaks) and bumping rpfarm.VERSION on its own cannot make every scene shout.
-_MIN_RPFARM_VERSION = "2.1.0"
+# That matters because the version check that used to be the whole guard
+# failed exactly where it was needed: rpfarm.VERSION sat at 2.2.0 through
+# seven commits that changed deps.py, preflight.py and usddeps.py, so
+# "loaded >= minimum" was true while the loaded code was a week behind. A
+# guard that depends on someone remembering to bump a number is a guard that
+# is off whenever they forget. The version is still read -- but only to make
+# the message concrete.
+_MIN_RPFARM_VERSION = "2.3.0"
 
 
 def _version_tuple(text):
@@ -71,31 +77,82 @@ def _ondisk_rpfarm_version(root):
     return None
 
 
-def _stale_module_message(minimum, loaded, on_disk, root):
+def _ondisk_fingerprint(package_dir):
+    \"\"\"The same measurement rpfarm takes of itself, computed here.
+
+    Deliberately a second implementation: the first one lives in the module
+    that may be stale, and asking a stale module to measure staleness is how
+    you get a guard that agrees with itself and nothing else.
+    tests/test_scheduler_glue.py holds the two to the same answer.
+    \"\"\"
+    out = {}
+    try:
+        names = sorted(os.listdir(package_dir))
+    except Exception:
+        return out
+    for name in names:
+        if not name.endswith(".py"):
+            continue
+        try:
+            with open(os.path.join(package_dir, name), "rb") as handle:
+                data = handle.read()
+        except Exception:
+            continue
+        out[name] = (len(data), hashlib.sha256(data).hexdigest()[:16])
+    return out
+
+
+def _changed_module_files(package):
+    \"\"\"Module files that differ from what this process imported, by content.
+
+    A package too old to carry a FINGERPRINT at all is itself the answer:
+    it predates this check, so it cannot be the code we just shipped.
+    \"\"\"
+    loaded = getattr(package, "FINGERPRINT", None)
+    if not isinstance(loaded, dict):
+        return ["<no fingerprint: this rpfarm predates the check>"]
+    try:
+        package_dir = os.path.dirname(os.path.abspath(package.__file__))
+    except Exception:
+        return []
+    current = _ondisk_fingerprint(package_dir)
+    if not current:
+        return []  # cannot read the files: say nothing rather than cry wolf
+    return sorted(name for name in set(current) | set(loaded)
+                  if current.get(name) != loaded.get(name))
+
+
+def _stale_module_message(minimum, loaded, on_disk, root, changed=()):
     \"\"\"The sentence to show the artist, or None when nothing is wrong.
 
     Two different causes, two different fixes, and telling them apart is the
     whole point of reading the on-disk version as well as the loaded one:
 
-    * on disk it is new enough, in memory it is not -> a running Houdini is
-      holding the old package. Restart it.
+    * the files changed since this process imported them, or the loaded
+      version is below the floor -> a running Houdini is holding the old
+      package. Restart it.
     * on disk it is old too -> the checkout itself is behind the asset, and
       restarting will change nothing. Update it and rerun `rpfarm setup`.
     \"\"\"
-    if _version_tuple(loaded) >= _version_tuple(minimum):
+    changed = list(changed)
+    behind = _version_tuple(loaded) < _version_tuple(minimum)
+    if not changed and not behind:
         return None
     seen = loaded or "неизвестна (старая копия без VERSION)"
-    if _version_tuple(on_disk) >= _version_tuple(minimum):
+    if changed or _version_tuple(on_disk) >= _version_tuple(minimum):
+        detail = ""
+        if changed:
+            shown = ", ".join(changed[:4])
+            more = " и ещё {}".format(len(changed) - 4) if len(changed) > 4 else ""
+            detail = ("\\n\\nИзменились с момента загрузки: {}{}.".format(shown, more))
         return (
             "Код фермы обновился, а Houdini держит в памяти старую версию.\\n"
             "\\n"
             "ПЕРЕЗАПУСТИТЕ HOUDINI. Больше ничего делать не нужно —\\n"
             "на диске всё правильно, чинить нечего.\\n"
             "\\n"
-            "Подробности: нода фермы требует rpfarm {min}, на диске лежит {disk},\\n"
-            "а в памяти этого Houdini осталась {seen}. Python загружает модуль\\n"
-            "один раз за запуск, поэтому обновление кода не подхватывается\\n"
-            "открытым Houdini.".format(min=minimum, disk=on_disk, seen=seen)
+            "Подробности: в памяти rpfarm {seen}, на диске {disk}.{detail}".format(
+                seen=seen, disk=on_disk or "не найдена", detail=detail)
         )
     return (
         "Код фермы на диске старее, чем установленная нода.\\n"
@@ -112,7 +169,11 @@ def _stale_module_message(minimum, loaded, on_disk, root):
 
 
 def guard_call(minimum):
-    """The lines that run the guard, for an asset declaring ``minimum``."""
+    """The lines that run the guard, for an asset declaring ``minimum``.
+
+    ``minimum`` is only the version floor for the message; the decision is
+    the fingerprint comparison, which needs nothing to be remembered.
+    """
     return (
         'import rpfarm as _rpfarm_pkg\n'
         '\n'
@@ -121,6 +182,7 @@ def guard_call(minimum):
         '    getattr(_rpfarm_pkg, "VERSION", None),\n'
         '    _ondisk_rpfarm_version(_RPFARM_ROOT),\n'
         '    _RPFARM_ROOT,\n'
+        '    _changed_module_files(_rpfarm_pkg),\n'
         ')\n'
         'if _stale:\n'
         '    # Raised, not printed: this is the same place the ImportError used\n'

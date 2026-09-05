@@ -426,3 +426,35 @@ def test_a_partly_checked_directory_uploads_the_files_that_stayed(tmp_path):
 
     assert got == [hip, tex, keep]
     assert render not in got, "the folder as a whole would drag the other two frames in"
+
+
+# -- how long it will take, before it starts ------------------------------------
+
+
+def test_the_window_says_how_long_the_upload_will_take():
+    """The owner's uplink measures 4.7 Mbps, so his 2.8 GB is about 80
+    minutes. That is a fact worth having BEFORE the upload starts."""
+    assert pf.eta_text(2_800_000_000, 4.7) == "~1 h 20 min at 4.7 Mbps"
+    assert pf.eta_text(50_000_000, 100.0) == "~1 min at 100.0 Mbps"
+    assert pf.eta_text(1000, 100.0) == "~1 min at 100.0 Mbps", "rounded up, never <1"
+
+
+def test_no_measurement_means_no_guess():
+    """`rpfarm doctor` is what measures the uplink. Without it, saying
+    nothing beats inventing a number."""
+    assert pf.eta_text(2_800_000_000, None) == ""
+    assert pf.eta_text(2_800_000_000, 0) == ""
+    assert pf.eta_text(0, 4.7) == ""
+    assert pf.eta_text(1000, "not a number") == ""
+
+
+def test_the_header_carries_the_estimate(tmp_path):
+    big = tmp_path / "big.exr"
+    big.write_bytes(b"x" * 5_000_000)
+    rows, _ = deps.plan_refs([str(big)], source="scene")
+    roots = pf.build_tree(rows)
+
+    text = pf.header_text(roots, checked=[str(big)], mbps=4.7)
+
+    assert "4.7 Mbps" in text and "min" in text
+    assert "Mbps" not in pf.header_text(roots, checked=[str(big)])

@@ -474,3 +474,39 @@ def test_the_asset_pattern_default_matches_the_package():
     )
     shipped = _asset_text("runpodfarm_upload.hda")
     assert "rpfarm_assetregex" in shipped and "rpfarm_excludepattern" in shipped
+
+
+def test_the_upload_asset_checks_the_code_before_it_cooks():
+    """The owner's cook failed with two CookedFail items because this
+    session's rpfarm was seven commits old. The check has to run at COOK
+    time -- a guard on scene load answers a different question -- and it has
+    to run before anything is imported from the package it is judging."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "hda_guard", REPO / "scripts" / "hda_guard.py")
+    hda_guard = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(hda_guard)
+
+    blocks = _string_constants("build_runpodfarm_upload_hda.py")
+    assert hda_guard.GUARD_SOURCE in blocks["PYTHON_MODULE"], "guard drifted"
+    assert "def farmCodeMessage(" in blocks["PYTHON_MODULE"]
+
+    generate = blocks["GENERATE_CODE"]
+    check = generate.index("farmCodeMessage()")
+    assert check < generate.index("from rpfarm import"), "check first, import second"
+    assert "raise hou.NodeError(_stale)" in generate
+
+    shipped = _asset_text("runpodfarm_upload.hda")
+    assert "farmCodeMessage" in shipped, "and it is in the asset that ships"
+
+
+def test_the_upload_guard_does_not_raise_while_the_ui_draws():
+    """That module also backs the parameter DEFAULT expressions, which are
+    evaluated on every redraw of the parameter dialog. A module-scope raise
+    there turns a stale session into an unusable one."""
+    module = _string_constants("build_runpodfarm_upload_hda.py")["PYTHON_MODULE"]
+    tree = ast.parse(module)
+    toplevel_raises = [n for n in tree.body if isinstance(n, ast.Raise)]
+    assert not toplevel_raises
+    assert "raise ImportError(_stale)" not in module
