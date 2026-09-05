@@ -233,7 +233,12 @@ def selected_paths(rows, checked):
     return list(dict.fromkeys(out))
 
 
-SOURCE_LABELS = {"scene": "scene", "usd": "USD", "output": "output (not a dependency)"}
+SOURCE_LABELS = {
+    "scene": "scene",
+    "usd": "USD",
+    "env": "environment ($OCIO)",
+    "output": "output (not a dependency)",
+}
 
 
 def load_choices(raw):
@@ -355,7 +360,7 @@ def header_text(roots, checked, missing=(), mbps=None):
     if eta:
         text += "  ({})".format(eta)
     by_source = []
-    for source in ("scene", "usd", "output"):
+    for source in ("scene", "usd", "env", "output"):
         count = len([n for n in all_leaves if n.source == source])
         if count:
             by_source.append("{} {}".format(count, SOURCE_LABELS.get(source, source)))
@@ -675,7 +680,7 @@ def wants_window(node, ask=None, log=None):
     return True
 
 
-def choose_uploads(node, scan, usd_paths=(), ask=False, log=None, window=None):
+def choose_uploads(node, scan, usd_paths=(), env_paths=(), ask=False, log=None, window=None):
     """The final list of local paths this cook uploads.
 
     One window, one tree, one stored answer. Every reference this cook could
@@ -710,7 +715,7 @@ def choose_uploads(node, scan, usd_paths=(), ask=False, log=None, window=None):
     missing = []
     seen = set()
     for source, paths in (("scene", scan.paths), ("usd", usd_paths),
-                          ("output", scan.output_paths)):
+                          ("env", env_paths), ("output", scan.output_paths)):
         fresh = [p for p in paths if normalise(p) not in seen]
         seen.update(normalise(p) for p in fresh)
         found, gone = _deps.plan_refs(fresh, source=source)

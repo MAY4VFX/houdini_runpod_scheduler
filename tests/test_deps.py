@@ -712,3 +712,51 @@ def test_a_frame_number_globs_the_whole_sequence(tmp_path):
 
     assert got == [str(cache / "sim.{}.bgeo".format(f)) for f in ("0001", "0002", "0003")]
     assert str(cache / "notes.txt") not in got
+
+
+# -- dependencies named by the environment, not by a parameter -------------------
+#
+# $OCIO is the one that matters. hou.fileReferences() reports (Parm, path)
+# pairs, and there is no Parm for an environment variable, so no scanner --
+# ours, Conductor's, or Houdini's own Pre-Flight -- can ever find it. Field
+# state (2026-09-05): the owner's machine has OCIO pointing at his ACES 2.0
+# config; a pod has none, so Houdini there loads the config shipped on the
+# volume. Nothing errors and the colour is wrong, because `auto`/`Automatic`
+# texture handling is resolved BY the loaded config.
+
+
+def test_an_ocio_config_travels_as_its_whole_directory(tmp_path):
+    """A config references LUTs beside it; a config without them is not a
+    config. The owner's is 23 MB across 7 files including luts/."""
+    config_dir = tmp_path / "aces_2.0"
+    (config_dir / "luts").mkdir(parents=True)
+    config = config_dir / "config.ocio"
+    config.write_text("ocio_profile_version: 2")
+
+    paths, problems = deps.environment_refs(getenv=lambda name: str(config))
+
+    assert paths == [str(config_dir)]
+    assert problems == []
+
+
+def test_no_ocio_set_means_nothing_to_do(tmp_path):
+    """Both sides then fall back to the same bundled config. Inventing a
+    dependency where there is none is its own kind of wrong."""
+    said = []
+
+    paths, problems = deps.environment_refs(getenv=lambda name: "", log=said.append)
+
+    assert paths == [] and problems == []
+    assert any("not set" in m for m in said), said
+
+
+def test_an_ocio_that_points_at_nothing_is_said_out_loud(tmp_path):
+    """The artist's own setup is broken. Silence here is a farm that renders
+    in a different colour space than the workstation, with nothing to show
+    for it."""
+    paths, problems = deps.environment_refs(getenv=lambda name: str(tmp_path / "gone.ocio"))
+
+    assert paths == []
+    assert len(problems) == 1
+    assert "no such file" in problems[0]
+    assert "DIFFERENT colour config" in problems[0]
