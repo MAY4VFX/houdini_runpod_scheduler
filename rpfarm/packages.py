@@ -42,7 +42,8 @@ import tempfile
 import time
 
 from .deps import resolve_entries
-from .sync import FileEntry, SyncStats, compress_stage, rclone_copy
+from .sync import (
+    FileEntry, SyncStats, already_on_farm, compress_stage, rclone_copy, remote_index)
 
 DEFAULT_MAX_BYTES = int(1.5 * 2**30)
 
@@ -1093,6 +1094,31 @@ def run_upload_item(item, cfg, sftp, sync_client, compress, progress_cb=None):
         total_files += stats.files
         total_bytes += stats.bytes
         total_seconds += stats.seconds
+
+    # What is already on the farm, asked of the farm, BEFORE anything is
+    # compressed. Without this, compression cancels incremental upload:
+    # a compressed file travels as an archive that is deleted after
+    # unpacking, so rclone -- comparing archive name to archive name --
+    # finds nothing on the far side and sends the whole set again. For the
+    # owner that is 2.8 GB over a 4.7 Mbps link, an hour and a half, on
+    # every cook where he only changed the .hip.
+    #
+    # Uncompressed transfers did not need this (rclone compares the real
+    # names and skips), but the same filter is applied to them too: one
+    # rule, one log line, and the artist is told what is being skipped
+    # instead of having to infer it from rclone's counters.
+    before = len(entries)
+    index = remote_index(sftp, cfg.rclone_path, remote_root)
+    if index:
+        entries = [e for e in entries
+                   if not already_on_farm(e, index, local_root, remote_root)]
+        skipped = before - len(entries)
+        if skipped:
+            _stderr_log("{} of {} file(s) already on the farm and unchanged -- "
+                        "not sent".format(skipped, before))
+    if not entries and not (item.get("post_command") or ""):
+        touch_sync_pod(sync_client)
+        return {"files": 0, "bytes": 0, "seconds": 0.0}
 
     if compress:
         with tempfile.TemporaryDirectory() as staging_dir:

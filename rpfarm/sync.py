@@ -33,9 +33,11 @@ needs its own ``local_root`` for R8 to hold.
 
 from __future__ import annotations
 
+import datetime
 import json
 import os
 import posixpath
+import re
 import shlex
 import subprocess
 import tempfile
@@ -133,6 +135,107 @@ def _sftp_flags(target: SftpTarget):
         f"--sftp-user={target.user}",
         f"--sftp-key-file={target.key_path}",
     ]
+
+
+def remote_index(target, rclone_bin, remote_root, run=None):
+    """``{rel path: (size, mtime)}`` for everything already on the farm.
+
+    One listing, asked of the farm itself rather than kept in a manifest
+    beside the project. A manifest is separate state, and separate state
+    drifts: a cancelled cook leaves half a package uploaded and a manifest
+    that says otherwise (the owner has already cancelled one mid-upload).
+    What is actually there is the only thing worth comparing against, and
+    asking costs one round trip before a package is even compressed.
+
+    Missing remote root is not an error -- the first cook of a project has
+    nothing on the farm, and that is exactly the case that must not fail.
+    """
+    runner = run or _run_rclone_json
+    remote = ":sftp:{}".format(remote_root)
+    args = ["lsjson", "--recursive", "--files-only", remote]
+    args += _sftp_flags(target)
+    try:
+        listing = runner(rclone_bin, args)
+    except SyncError:
+        return {}
+    out = {}
+    for row in listing:
+        path = row.get("Path")
+        if not path:
+            continue
+        out[path] = (int(row.get("Size", -1)), _parse_modtime(row.get("ModTime")))
+    return out
+
+
+def _run_rclone_json(rclone_bin, args):
+    try:
+        proc = subprocess.run([rclone_bin, *args], capture_output=True, text=True)
+    except OSError as e:
+        # No rclone, or not runnable. The listing is an optimisation: without
+        # it every file is sent, which is slower and still correct.
+        raise SyncError("rclone lsjson could not run ({})".format(e))
+    if proc.returncode != 0:
+        raise SyncError("rclone lsjson exit {}: {}".format(
+            proc.returncode, (proc.stderr or "").strip()[:200]))
+    try:
+        return json.loads(proc.stdout or "[]")
+    except ValueError as e:
+        raise SyncError("rclone lsjson returned no JSON ({})".format(e))
+
+
+def _parse_modtime(text):
+    """rclone's RFC3339 ModTime -> epoch seconds, or None.
+
+    Fractional seconds are dropped rather than parsed: rclone prints
+    nanoseconds, datetime accepts microseconds, and the comparison has a
+    two-second tolerance anyway, so the precision is noise either way.
+    """
+    if not text:
+        return None
+    cleaned = re.sub(r"\.\d+", "", str(text).strip())
+    if cleaned.endswith("Z"):
+        cleaned = cleaned[:-1] + "+00:00"
+    try:
+        return datetime.datetime.fromisoformat(cleaned).timestamp()
+    except ValueError:
+        return None
+
+
+#: How far apart two mtimes may be and still count as the same file. rclone
+#: uses a modify-window for the same reason: filesystems and transports round
+#: timestamps differently, and a second of slack costs nothing next to
+#: re-sending a gigabyte.
+MTIME_TOLERANCE_S = 2.0
+
+
+def already_on_farm(entry, index, local_root, remote_root, tolerance=MTIME_TOLERANCE_S,
+                    getsize=os.path.getsize, getmtime=os.path.getmtime):
+    """Is this entry already on the farm, current, under its FINAL name?
+
+    Compared against the file as it ends up on the farm -- the original,
+    decompressed -- never against the archive it travelled in. The archive
+    is deleted after unpacking, so comparing archive to archive is what made
+    every compressed file look missing and re-sent it on every cook.
+
+    Size and mtime, not a hash: with the mtime restored on unpack (see
+    compression.decompress_command) these are exactly what rclone itself
+    trusts, and hashing gigabytes on the pod every cook would cost more than
+    the transfer it saves.
+    """
+    rel = posixpath.relpath(entry.remote, remote_root)
+    found = index.get(rel)
+    if not found:
+        return False
+    size, mtime = found
+    try:
+        if getsize(entry.local) != size:
+            return False
+        local_mtime = getmtime(entry.local)
+    except OSError:
+        return False
+    if mtime is None:
+        return False
+    return abs(local_mtime - mtime) <= tolerance
 
 
 def build_rclone_args(package, target, direction, local_root, remote_root, tmp_dir):
@@ -300,7 +403,9 @@ def compress_stage(package, staging_dir, remote_root, level=3):
                 FileEntry(local=staged_path, remote=e.remote + codec.ext,
                           size=os.path.getsize(staged_path))
             )
-            zst_rels.append(rel + codec.ext)
+            # The ORIGINAL's mtime, not the archive's: it is what the farm
+            # copy must end up wearing so the next cook can see it is there.
+            zst_rels.append((rel + codec.ext, os.path.getmtime(e.local)))
         else:
             # No zstd available (or compression failed): leave uncompressed.
             raw_package.append(e)
