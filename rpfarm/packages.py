@@ -419,9 +419,70 @@ def houdini_install_preset(tar_local_path, version):
         f"ver=$(./bin/hython -c 'import hou; print(hou.applicationVersionString())' 2>/dev/null | tail -1) && "
         f'{{ [ "$ver" = "{version}" ] || '
         f'{{ echo "install check FAILED: hython reported \'$ver\', expected \'{version}\'" >&2; exit 1; }} ; }} && '
-        f'echo "install verified: hython reports $ver"'
+        f'echo "install verified: hython reports $ver" && '
+        + usd_resolver_command(install_dir)
     )
     return pairs, post_command
+
+
+#: Build-only packages for SideFX's resolver sample. None of these ever enter
+#: the pod image: the build happens once, here, while Houdini is being
+#: installed onto the volume, and only the 33 KB .so survives.
+#:
+#:   build-essential  -- there is no compiler in the image at all
+#:   csh              -- hcustom IS a csh script ("bad interpreter" without it)
+#:   libgl1-mesa-dev, libx11-dev, libxext-dev, libxi-dev
+#:                    -- hcustom links -lGL -lX11 -lXext -lXi unconditionally,
+#:                       even for a resolver that draws nothing; without them
+#:                       the compile succeeds and the LINK fails
+_RESOLVER_BUILD_PACKAGES = (
+    "build-essential csh libgl1-mesa-dev libx11-dev libxext-dev libxi-dev")
+
+
+def usd_resolver_command(install_dir):
+    """Build SideFX's HOUDINI_PATHMAP asset resolver into this Houdini.
+
+    Why it is needed: ``$HOUDINI_PATHMAP`` is read by Houdini's file layer,
+    so ``hou.findFile`` and ``hou.hda.installFile`` honour it -- and USD does
+    not, because USD resolves asset paths through its OWN resolver. Measured
+    on a pod: with the map set, ``pathmap -t`` mapped the path while
+    ``Ar.Resolve`` returned ``''`` and a Reference LOP still failed with
+    "Unable to find layer file". SideFX ship exactly the missing bridge as a
+    sample -- ``$HFS/toolkit/samples/USD/USD_HoudiniPathMapArResolver``,
+    Apache 2.0, whose ``_Resolve`` runs the path through
+    ``FS_Info::getPathOnDisk`` (the layer where HOUDINI_PATHMAP lives) before
+    handing it to ``ArDefaultResolver``.
+
+    Why it is built HERE, into the Houdini on the volume:
+
+    * it is compiled against this Houdini's USD ABI, so it belongs with this
+      Houdini version, not with our image -- a new Houdini rebuilds it, and
+      rebuilding the image cannot lose it;
+    * ``$HFS/houdini/dso/usd`` is already on Houdini's DSO path, so a cook
+      needs no extra environment to find it;
+    * the compiler and the X/GL dev libraries stay OUT of the pod image,
+      which is deliberately thin (a fat image is paid on every cold start).
+
+    Non-fatal on purpose (``|| echo``): a Houdini install that works is worth
+    keeping even if this extra step fails, and the failure is visible in the
+    install output rather than silently swallowed.
+    """
+    sample = f"{install_dir}/toolkit/samples/USD/USD_HoudiniPathMapArResolver"
+    build = "/tmp/rpfarm_usd_resolver"
+    return (
+        f'( export DEBIAN_FRONTEND=noninteractive && apt-get update -qq && '
+        f'apt-get install -y -qq --no-install-recommends {_RESOLVER_BUILD_PACKAGES} && '
+        f'rm -rf {build} && mkdir -p {build} && cp -r {sample}/* {build}/ && '
+        f'cd {build} && cd {install_dir} && source ./houdini_setup_bash >/dev/null 2>&1 && '
+        f'cd {build} && $HFS/bin/hcustom -U USD_HoudiniPathMapArResolver.C && '
+        f'mkdir -p {install_dir}/houdini/dso/usd && '
+        f'cp $HOME/houdini*/dso/usd/USD_HoudiniPathMapArResolver.so {install_dir}/houdini/dso/usd/ && '
+        f'cp -r {build}/usd_plugins {install_dir}/houdini/dso/ && '
+        f'rm -rf {build} && '
+        f'echo "USD path-map resolver installed" ) || '
+        f'echo "WARNING: the USD path-map resolver did not build -- USD layers '
+        f'referenced by absolute local paths will not resolve on the farm" >&2'
+    )
 
 
 # -- remote command execution -----------------------------------------------

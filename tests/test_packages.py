@@ -1,5 +1,8 @@
 import json
 import os
+import pathlib
+
+import rpfarm.packages as rppkg
 
 import pytest
 
@@ -1758,3 +1761,51 @@ def test_missing_sizes_pack_as_zero_rather_than_dropping_the_file():
     assert sorted(remote for _local, remote, _size in planned) == ["/w/a.exr", "/w/gone.exr"]
     assert [size for _local, remote, size in planned if remote == "/w/gone.exr"] == [0]
     assert [size for _local, remote, size in planned if remote == "/w/a.exr"] == [100]
+
+
+# -- the USD path-map resolver ships with the Houdini install (2026-09-05) ------
+
+
+def test_installing_houdini_also_builds_the_usd_resolver():
+    """$HOUDINI_PATHMAP is read by Houdini's file layer and ignored by USD's
+    resolver -- measured on a pod: pathmap -t mapped the path while
+    Ar.Resolve returned '' and the layer would not load. SideFX ship the
+    bridge as a toolkit sample; a deployment has to build it, not a human."""
+    _pairs, post = rppkg.houdini_install_preset("/local/houdini-22.0.393.tar.gz", "22.0.393")
+
+    assert "USD_HoudiniPathMapArResolver.C" in post
+    assert "hcustom -U" in post
+    assert "/workspace/houdini/22.0.393/houdini/dso/usd" in post, "into Houdini's own DSO path"
+    assert "usd_plugins" in post, "USD cannot register the plugin without it"
+
+
+def test_the_resolver_build_installs_what_hcustom_needs():
+    """Facts from the pod, each one a failure that actually happened:
+    no compiler at all; hcustom is a csh script ("bad interpreter"); and it
+    links -lGL -lX11 -lXext -lXi even for a resolver that draws nothing."""
+    _pairs, post = rppkg.houdini_install_preset("/local/h.tar.gz", "22.0.393")
+
+    for package in ("build-essential", "csh", "libgl1-mesa-dev", "libx11-dev",
+                    "libxext-dev", "libxi-dev"):
+        assert package in post, package
+
+
+def test_a_failed_resolver_build_does_not_fail_the_houdini_install():
+    """A working Houdini is worth keeping even if the extra step fails --
+    and the failure has to be visible, not swallowed."""
+    _pairs, post = rppkg.houdini_install_preset("/local/h.tar.gz", "22.0.393")
+
+    tail = post[post.index("USD path-map resolver installed"):]
+    assert "||" in tail and "WARNING" in tail
+    assert ">&2" in tail
+
+
+def test_the_resolver_is_built_into_the_volume_not_the_image():
+    """It is compiled against this Houdini's USD ABI, so it belongs with the
+    Houdini it was built for; and the compiler stays out of an image that is
+    deliberately thin."""
+    _pairs, post = rppkg.houdini_install_preset("/local/h.tar.gz", "22.0.393")
+    dockerfile = (pathlib.Path(__file__).resolve().parent.parent / "pod" / "Dockerfile").read_text()
+
+    assert "toolkit/samples/USD/USD_HoudiniPathMapArResolver" in post
+    assert "build-essential" not in dockerfile, "the image must stay thin"

@@ -250,7 +250,7 @@ _ASSET_FINGERPRINT = {
     'houdini_local.py': (25206, 'a5ec6729405ccb1a'),
     'ledger.py': (17327, '70425e75fb216f01'),
     'package_runner.py': (8752, '96770e3879a6cb65'),
-    'packages.py': (51475, '5c47658132aaf796'),
+    'packages.py': (54851, '943944cbd6ab8f83'),
     'pods.py': (27040, '64cabd27b99479f6'),
     'preflight.py': (28602, 'bfad37b5ef089fc5'),
     'runpod_api.py': (14539, 'b90960f9860c97fb'),
