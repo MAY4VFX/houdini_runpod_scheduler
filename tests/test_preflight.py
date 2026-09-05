@@ -89,6 +89,11 @@ def test_ui_is_not_available_without_houdini():
     reason="PySide6 ships with Houdini's Python, not the system one",
 )
 def test_the_widget_tree_opens_one_level_and_folds_the_folder_state(tmp_path):
+    """The rows live in a QStandardItemModel because Houdini's own view
+    class (hou.qt.TreeView == _houqt.QT_HighlightTreeView) is a QTreeView,
+    not a QTreeWidget. Only the two container classes differ between here
+    and a real Houdini; the model and every checkbox rule is the same
+    object, which is what makes this test worth anything."""
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     from PySide6 import QtCore, QtWidgets
 
@@ -103,25 +108,29 @@ def test_the_widget_tree_opens_one_level_and_folds_the_folder_state(tmp_path):
 
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     dialog = pf.build_dialog(roots, missing=["/job/gone.exr"], checked=checked)
-    tree = dialog.findChild(QtWidgets.QTreeWidget)
-    top = tree.topLevelItem(0)
+    model = dialog.rpfarm_model
+    view = dialog.rpfarm_view
+    top = model.item(0)
 
-    assert tree.topLevelItemCount() == 1 and top.isExpanded(), "top level open"
-    folder = next(top.child(i) for i in range(top.childCount())
-                  if top.child(i).text(0).endswith(os.sep))
-    assert not folder.isExpanded(), "and nothing below it"
-    assert folder.childCount() == 2, "but it opens all the way to the file"
-    assert folder.text(1) == pf.human_bytes(200) and folder.text(2) == "2 files"
-    assert folder.checkState(0) == QtCore.Qt.Checked
+    assert model.rowCount() == 1
+    assert view.isExpanded(model.indexFromItem(top)), "top level open"
+    folder = next(top.child(r) for r in range(top.rowCount())
+                  if top.child(r).text().endswith(os.sep))
+    assert not view.isExpanded(model.indexFromItem(folder)), "and nothing below it"
+    assert folder.rowCount() == 2, "but it opens all the way to the file"
+    assert model.item(0).child(folder.row(), 1).text() == pf.human_bytes(200)
+    assert model.item(0).child(folder.row(), 2).text() == "2 files"
+    assert folder.checkState() == QtCore.Qt.Checked
 
     # a folder in a mixed state has to LOOK mixed, or a collapsed row lies
-    folder.child(0).setCheckState(0, QtCore.Qt.Unchecked)
-    assert folder.checkState(0) == QtCore.Qt.PartiallyChecked
-    assert dialog.rpfarm_checked() == checked - {folder.child(0).data(0, QtCore.Qt.UserRole)}
+    folder.child(0).setCheckState(QtCore.Qt.Unchecked)
+    assert folder.checkState() == QtCore.Qt.PartiallyChecked
+    assert dialog.rpfarm_checked() == checked - {
+        folder.child(0).data(QtCore.Qt.UserRole + 1)}
 
     # and toggling the folder itself carries everything under it
-    folder.setCheckState(0, QtCore.Qt.Unchecked)
-    assert folder.child(1).checkState(0) == QtCore.Qt.Unchecked
+    folder.setCheckState(QtCore.Qt.Unchecked)
+    assert folder.child(1).checkState() == QtCore.Qt.Unchecked
     assert app is not None
 
 
