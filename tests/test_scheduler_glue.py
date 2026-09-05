@@ -1239,3 +1239,22 @@ def test_path_mapping_set_to_none_is_honoured():
 
 def test_no_map_no_variable():
     assert _pathmap_env({}) == {}
+
+
+def test_a_nested_root_is_not_pruned_from_houdinis_map():
+    """Measured on the pod: with both targets present Houdini takes the
+    LONGEST matching prefix, so a nested entry resolves its own files. Prune
+    it and the shorter root takes the path instead -- silently producing a
+    path inside the project mirror where nothing is. So the map goes over
+    whole."""
+    env = _pathmap_env({
+        "/Users/may": "/workspace/projects/may/airship",
+        "/Users/may/color/ocio/aces_2.0":
+            "/workspace/projects/may/airship/_ext/Users/may/color/ocio/aces_2.0",
+    })
+
+    assert json.loads(env["HOUDINI_PATHMAP"]) == {
+        "/Users/may": "/workspace/projects/may/airship",
+        "/Users/may/color/ocio/aces_2.0":
+            "/workspace/projects/may/airship/_ext/Users/may/color/ocio/aces_2.0",
+    }
