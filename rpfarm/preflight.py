@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import os
+from dataclasses import dataclass, field
 
 _UNITS = ("B", "KB", "MB", "GB", "TB")
 
@@ -47,18 +48,189 @@ def human_bytes(size):
     return "{:.1f} TB".format(value)
 
 
-def sort_rows(rows):
-    """Heaviest first, ties by path.
-
-    The whole point of the window is that the 1.47 GB zip is the FIRST
-    line, not the 431st: a list in reference order hides exactly the rows
-    worth arguing with.
-    """
-    return sorted(rows, key=lambda r: (-r.bytes, r.path))
-
-
 def normalise(path):
     return os.path.normpath(path) if path else path
+
+
+@dataclass
+class TreeNode:
+    """One row of the confirmation window: a file, or a folder holding files.
+
+    Folders exist so the artist can answer at the level they think at --
+    "not the whole render folder" is one decision, not five hundred. Weight
+    and file count aggregate upward, so a folder's line says what saying no
+    to it is worth.
+    """
+
+    path: str
+    name: str
+    kind: str = "file"
+    files: int = 0
+    bytes: int = 0
+    source: str = ""
+    children: list = field(default_factory=list)
+
+    @property
+    def is_leaf(self):
+        return not self.children
+
+
+def _insert(index, path, size, source):
+    parts = [p for p in path.split(os.sep) if p]
+    walked = ""
+    node = index.setdefault("", TreeNode(path=os.sep, name=os.sep, kind="dir"))
+    for i, part in enumerate(parts):
+        walked = walked + os.sep + part
+        child = index.get(walked)
+        if child is None:
+            leaf = i == len(parts) - 1
+            child = TreeNode(path=walked, name=part, kind="file" if leaf else "dir",
+                             files=1 if leaf else 0, bytes=size if leaf else 0,
+                             source=source if leaf else "")
+            index[walked] = child
+            node.children.append(child)
+        node = child
+    return node
+
+
+def _aggregate(node):
+    """Weight, file count and a folder's common source, bottom-up."""
+    if node.is_leaf:
+        return node.files, node.bytes, {node.source}
+    files = 0
+    total = 0
+    sources = set()
+    for child in node.children:
+        c_files, c_bytes, c_sources = _aggregate(child)
+        files += c_files
+        total += c_bytes
+        sources |= c_sources
+    node.files, node.bytes = files, total
+    # One source, or none: a folder mixing scene and output files says
+    # nothing useful in that column, and a guess there would be a lie.
+    node.source = next(iter(sources)) if len(sources) == 1 else ""
+    node.children.sort(key=lambda c: (-c.bytes, c.name))
+    return files, total, sources
+
+
+def _collapse(node):
+    """Fold single-child folder chains: /Users/may/BS/airship, not /, Users, may.
+
+    Without this the top level of the window is `/`, and "expand the top
+    level only" shows the artist one useless row.
+    """
+    while node.kind == "dir" and len(node.children) == 1 and node.children[0].kind == "dir":
+        only = node.children[0]
+        node = TreeNode(path=only.path, name=node.name.rstrip(os.sep) + os.sep + only.name
+                        if node.name != os.sep else os.sep + only.name,
+                        kind="dir", files=only.files, bytes=only.bytes,
+                        source=only.source, children=only.children)
+    node.children = [_collapse(c) for c in node.children]
+    return node
+
+
+def build_tree(rows):
+    """Plan rows -> the roots of a directory tree, heaviest child first.
+
+    A directory row with a known file list (:attr:`PlanRow.contents`)
+    becomes a real folder the artist can open all the way down; one without
+    (a folder too large to list) stays a single aggregate leaf.
+    """
+    index = {}
+    for row in rows:
+        if row.kind == "dir" and row.contents:
+            for path, size in row.contents:
+                _insert(index, path, size, row.source)
+        else:
+            node = _insert(index, row.path, row.bytes, row.source)
+            node.kind = row.kind
+            node.files = row.files
+    root = index.get("")
+    if root is None:
+        return []
+    _aggregate(root)
+    root = _collapse(root)
+    return [root] if root.path != os.sep else root.children
+
+
+def is_excluded(path, off, on, default_off):
+    """Is *path* unchecked, given answers recorded at any level above it?
+
+    Nearest answer wins, so a file re-checked inside an unchecked folder
+    stays checked. ``default_off`` is what applies when nothing was ever
+    said about this path or any of its parents.
+    """
+    walked = normalise(path)
+    while True:
+        if walked in off:
+            return True
+        if walked in on:
+            return False
+        parent = os.path.dirname(walked)
+        if parent == walked:
+            return bool(default_off)
+        walked = parent
+
+
+def compact_answer(roots, checked, default_off):
+    """Record each decision at the highest level where it is uniform.
+
+    An unchecked folder is one entry, not one per file under it. Anything
+    that already matches the default is not recorded at all -- the
+    parameter holds decisions, not a snapshot.
+    """
+    off = set()
+    on = set()
+    normalised = {normalise(p) for p in checked}
+
+    def state(node):
+        """(all children checked?, all children defaulting to off?) or None if mixed."""
+        if node.is_leaf:
+            return normalise(node.path) in normalised, bool(default_off(node))
+        checks = set()
+        defaults = set()
+        for child in node.children:
+            c_check, c_default = state(child)
+            checks.add(c_check)
+            defaults.add(c_default)
+        return (checks.pop() if len(checks) == 1 else None,
+                defaults.pop() if len(defaults) == 1 else None)
+
+    def visit(node):
+        is_checked, defaults_off = state(node)
+        if is_checked is not None and defaults_off is not None:
+            if is_checked == (not defaults_off):
+                return  # matches the default: nothing to remember
+            (on if is_checked else off).add(normalise(node.path))
+            return
+        for child in node.children:
+            visit(child)
+
+    for root in roots:
+        visit(root)
+    return off, on
+
+
+def selected_paths(rows, checked):
+    """The upload set: whole references where nothing under them was dropped.
+
+    A directory nobody touched stays ONE reference -- ``resolve_entries``
+    walks it itself, which is smaller to carry and identical in outcome.
+    A directory with something unchecked inside is replaced by the files
+    that stayed, because a reference cannot express "all but that one".
+    """
+    normalised = {normalise(p) for p in checked}
+    out = []
+    for row in rows:
+        if row.kind == "dir" and row.contents:
+            kept = [p for p, _size in row.contents if normalise(p) in normalised]
+            if len(kept) == len(row.contents):
+                out.append(row.path)
+            else:
+                out.extend(kept)
+        elif normalise(row.path) in normalised:
+            out.append(row.path)
+    return list(dict.fromkeys(out))
 
 
 SOURCE_LABELS = {"scene": "scene", "usd": "USD", "output": "output (not a dependency)"}
@@ -101,26 +273,6 @@ def dump_choices(off, on=()):
     })
 
 
-def default_excluded(rows, off, on):
-    """Which rows start unchecked, given what the node remembers."""
-    out = set()
-    for row in rows:
-        path = normalise(row.path)
-        if path in off:
-            out.add(path)
-        elif row.source == "output" and path not in on:
-            out.add(path)
-    return out
-
-
-def split_answer(rows, excluded):
-    """The window's answer as ``(unchecked, re-checked outputs)`` to store."""
-    blocked = {normalise(p) for p in excluded}
-    on = {normalise(r.path) for r in rows
-          if r.source == "output" and normalise(r.path) not in blocked}
-    return blocked, on
-
-
 def load_exclusions(raw):
     """Parse the node's remembered exclusions.
 
@@ -142,44 +294,29 @@ def load_exclusions(raw):
     return {normalise(line.strip()) for line in text.splitlines() if line.strip()}
 
 
-def dump_exclusions(paths):
-    """Render exclusions for the node parameter: sorted JSON, stable in git.
-
-    Paths that no longer appear in the plan are kept, not pruned: a
-    reference that disappears for a version and comes back must come back
-    unchecked, or the choice quietly undoes itself.
-    """
-    return json.dumps(sorted(normalise(p) for p in paths if p))
-
-
-def apply_exclusions(refs, excluded):
-    """The references left after the artist's unchecked rows are removed."""
-    blocked = {normalise(p) for p in excluded}
-    return [r for r in refs if normalise(r) not in blocked]
+def leaves(roots):
+    """Every file row in the tree, in display order."""
+    out = []
+    for node in roots:
+        if node.is_leaf:
+            out.append(node)
+        else:
+            out.extend(leaves(node.children))
+    return out
 
 
-def selected(rows, excluded):
-    blocked = {normalise(p) for p in excluded}
-    return [r for r in rows if normalise(r.path) not in blocked]
-
-
-def totals(rows, excluded):
-    """``(files, bytes)`` of the checked rows."""
-    keep = selected(rows, excluded)
-    return sum(r.files for r in keep), sum(r.bytes for r in keep)
-
-
-def header_text(rows, missing, excluded):
-    """The one line that has to be true before anyone reads the list."""
-    files, size = totals(rows, excluded)
-    total_bytes = sum(r.bytes for r in rows)
-    text = "{} of {} references -- {} files, {} of {}".format(
-        len(selected(rows, excluded)), len(rows), files,
-        human_bytes(size), human_bytes(total_bytes),
+def header_text(roots, checked, missing=()):
+    """The one line that has to be true before anyone reads the tree."""
+    all_leaves = leaves(roots)
+    picked = [n for n in all_leaves if normalise(n.path) in {normalise(p) for p in checked}]
+    text = "{} of {} files -- {} of {}".format(
+        len(picked), len(all_leaves),
+        human_bytes(sum(n.bytes for n in picked)),
+        human_bytes(sum(n.bytes for n in all_leaves)),
     )
     by_source = []
     for source in ("scene", "usd", "output"):
-        count = len([r for r in rows if r.source == source])
+        count = len([n for n in all_leaves if n.source == source])
         if count:
             by_source.append("{} {}".format(count, SOURCE_LABELS.get(source, source)))
     if by_source:
@@ -239,48 +376,73 @@ def ui_available():
     return ui_unavailable_reason() is None
 
 
-def build_dialog(rows, missing, excluded, title="RunPodFarm Upload", parent=None):
+def build_dialog(roots, missing, checked, title="RunPodFarm", parent=None):
     """Construct (but do not run) the confirmation window.
 
     Split out from :func:`confirm` so the whole widget tree can be built
-    and inspected head-less -- ``QT_QPA_PLATFORM=offscreen`` -- which is
-    the only way any of this gets tested at all without a human at a
-    screen.
+    and inspected head-less -- ``QT_QPA_PLATFORM=offscreen`` -- which is the
+    only way any of this gets tested without a human at a screen.
+
+    A folder is checkable like anything else, and Qt's ``ItemIsAutoTristate``
+    does the rest: toggling a folder sets everything under it, and a folder
+    with a mix shows the partially-checked box, which is the only way to see
+    from a collapsed row that something inside was dropped.
     """
     from PySide6 import QtCore, QtWidgets
 
-    ordered = sort_rows(rows)
-    blocked = {normalise(p) for p in excluded}
+    picked = {normalise(p) for p in checked}
 
     dialog = QtWidgets.QDialog(parent)
     dialog.setWindowTitle(title)
-    dialog.setMinimumSize(940, 560)
+    dialog.setMinimumSize(980, 620)
 
     layout = QtWidgets.QVBoxLayout(dialog)
-
-    head = QtWidgets.QLabel(header_text(rows, missing, excluded))
+    head = QtWidgets.QLabel(header_text(roots, checked, missing))
     head.setWordWrap(True)
     layout.addWidget(head)
 
     tree = QtWidgets.QTreeWidget()
     tree.setColumnCount(4)
     tree.setHeaderLabels(["Reference", "Size", "Contains", "Found by"])
-    tree.setRootIsDecorated(False)
     tree.setUniformRowHeights(True)
     tree.setAlternatingRowColors(True)
     tree.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
-    for row in ordered:
+
+    leaf_items = []
+
+    def add(node, parent_item):
+        detail = "1 file" if node.files == 1 else "{} files".format(node.files)
         item = QtWidgets.QTreeWidgetItem([
-            row_label(row), human_bytes(row.bytes), row_detail(row),
-            SOURCE_LABELS.get(row.source, row.source)])
-        item.setFlags(item.flags() | QtCore.Qt.ItemIsUserCheckable)
-        item.setCheckState(
-            0,
-            QtCore.Qt.Unchecked if normalise(row.path) in blocked else QtCore.Qt.Checked,
-        )
-        item.setData(0, QtCore.Qt.UserRole, row.path)
+            node.name if node.is_leaf else node.name.rstrip(os.sep) + os.sep,
+            human_bytes(node.bytes), detail, SOURCE_LABELS.get(node.source, "")])
+        item.setData(0, QtCore.Qt.UserRole, node.path)
         item.setTextAlignment(1, QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
-        tree.addTopLevelItem(item)
+        flags = item.flags() | QtCore.Qt.ItemIsUserCheckable
+        if not node.is_leaf:
+            flags |= QtCore.Qt.ItemIsAutoTristate
+        item.setFlags(flags)
+        if parent_item is None:
+            tree.addTopLevelItem(item)
+        else:
+            parent_item.addChild(item)
+        if node.is_leaf:
+            leaf_items.append((item, node))
+        for child in node.children:
+            add(child, item)
+        return item
+
+    for root in roots:
+        add(root, None).setExpanded(True)  # only the top level opens by default
+
+    # States go on AFTER the tree is assembled: auto-tristate derives every
+    # folder from its children, so a folder set before its children exist
+    # would be overwritten by them.
+    tree.blockSignals(True)
+    for item, node in leaf_items:
+        item.setCheckState(0, QtCore.Qt.Checked
+                           if normalise(node.path) in picked else QtCore.Qt.Unchecked)
+    tree.blockSignals(False)
+
     tree.setColumnWidth(0, 560)
     tree.setColumnWidth(1, 100)
     tree.setColumnWidth(2, 90)
@@ -304,23 +466,18 @@ def build_dialog(rows, missing, excluded, title="RunPodFarm Upload", parent=None
     buttons.addWidget(box)
     layout.addLayout(buttons)
 
-    def _items():
-        return [tree.topLevelItem(i) for i in range(tree.topLevelItemCount())]
-
-    def _current_exclusions():
-        return {
-            normalise(item.data(0, QtCore.Qt.UserRole))
-            for item in _items()
-            if item.checkState(0) != QtCore.Qt.Checked
-        }
+    def _checked():
+        return {node.path for item, node in leaf_items
+                if item.checkState(0) == QtCore.Qt.Checked}
 
     def _refresh():
-        head.setText(header_text(rows, missing, _current_exclusions()))
-        upload.setEnabled(len(_current_exclusions()) < len(ordered))
+        chosen = _checked()
+        head.setText(header_text(roots, chosen, missing))
+        upload.setEnabled(bool(chosen))
 
     def _set_all(state):
         tree.blockSignals(True)
-        for item in _items():
+        for item, _node in leaf_items:
             item.setCheckState(0, state)
         tree.blockSignals(False)
         _refresh()
@@ -335,15 +492,15 @@ def build_dialog(rows, missing, excluded, title="RunPodFarm Upload", parent=None
     # Read back by confirm() (and by the head-less test) rather than
     # returned through a signal: the dialog is modal, so the caller reads
     # the answer straight off the object after exec().
-    dialog.rpfarm_exclusions = _current_exclusions
+    dialog.rpfarm_checked = _checked
     return dialog
 
 
-def confirm(rows, missing, excluded, title="RunPodFarm Upload", parent=None):
-    """Show the plan. Returns the new exclusion set, or None if cancelled.
+def confirm(roots, missing, checked, title="RunPodFarm", parent=None):
+    """Show the plan. Returns the checked paths, or None if cancelled.
 
-    None means the artist said no -- the caller must stop the cook, not
-    quietly upload the previous selection.
+    None means the artist said no -- the caller must stop the cook, and must
+    not fall back to uploading the previously remembered answer.
     """
     from PySide6 import QtWidgets
 
@@ -356,10 +513,10 @@ def confirm(rows, missing, excluded, title="RunPodFarm Upload", parent=None):
             parent = None
     if QtWidgets.QApplication.instance() is None:  # pragma: no cover - Houdini always has one
         QtWidgets.QApplication([])
-    dialog = build_dialog(rows, missing, excluded, title=title, parent=parent)
+    dialog = build_dialog(roots, missing, checked, title=title, parent=parent)
     if not dialog.exec():
         return None
-    return dialog.rpfarm_exclusions()
+    return dialog.rpfarm_checked()
 
 
 class UploadCancelled(Exception):
@@ -392,22 +549,23 @@ def wants_window(node, ask=None, log=None):
 def choose_uploads(node, scan, usd_paths=(), ask=False, log=None, window=None):
     """The final list of local paths this cook uploads.
 
-    One window, one list, one stored answer. Every reference this cook could
-    upload is a row in it, whatever found it:
+    One window, one tree, one stored answer. Every reference this cook could
+    upload is in it, whatever found it:
 
     * ``scene`` -- a Houdini parameter holds the path.
     * ``USD`` -- a stage reads it and no parameter anywhere names it. There
       is no way to put these in Houdini's own dependency dialog: that dialog
-      is fed entirely by ``hou.fileReferences()``, whose rows are
+      is fed entirely by ``hou.fileReferences()``, its rows are
       ``(hou.Parm, pattern)`` pairs, and it takes no argument for anything
       else. That is the whole reason this window exists.
     * ``output`` -- a parameter holds it, but it says where results GO
-      (``pdg_workingdir``, ``outputimage``). Unchecked by default, shown
-      with its real weight, and the artist can overrule it: that is how one
-      parameter's 11.54 GB became visible instead of invisible.
+      (``pdg_workingdir``, ``outputimage``). Unchecked to start with, shown
+      with its real weight, and overrulable: that is how one parameter's
+      11.54 GB became visible instead of invisible.
 
-    A directory stays ONE row carrying its whole recursive weight, sorted
-    heaviest first, because that is the row worth arguing with.
+    Directories are folders in the tree, opened all the way down to the
+    file, so "not this one frame" and "not this whole folder" are both one
+    click -- and the answer is stored at whichever level it was made.
 
     Failure policy: Cancel raises :class:`UploadCancelled` and the cook
     stops. A window that FAILS (no Qt, no QApplication, generation off the
@@ -430,27 +588,36 @@ def choose_uploads(node, scan, usd_paths=(), ask=False, log=None, window=None):
         rows.extend(found)
         missing.extend(gone)
 
+    roots = build_tree(rows)
     off, on = load_choices(node.evalParm("rpfarm_exclude"))
-    excluded = default_excluded(rows, off, on)
+
+    def default_off(leaf):
+        return leaf.source == "output"
+
+    checked = {leaf.path for leaf in leaves(roots)
+               if not is_excluded(leaf.path, off, on, default_off(leaf))}
 
     if ask:
         asker = window or confirm
         try:
-            chosen = asker(rows, missing, excluded, title="RunPodFarm -- what will upload")
+            chosen = asker(roots, missing, checked, title="RunPodFarm -- what will upload")
         except Exception as exc:
             say("confirmation window unavailable ({}) -- using the remembered answer".format(exc))
-            chosen = excluded
+            chosen = checked
         if chosen is None:
             raise UploadCancelled("upload cancelled in the confirmation window")
-        if chosen != excluded:
-            node.parm("rpfarm_exclude").set(dump_choices(*split_answer(rows, chosen)))
-        excluded = {normalise(p) for p in chosen}
+        chosen = {normalise(p) for p in chosen}
+        if chosen != {normalise(p) for p in checked}:
+            node.parm("rpfarm_exclude").set(
+                dump_choices(*compact_answer(roots, chosen, default_off)))
+        checked = chosen
     else:
-        blocked = excluded
         for row in rows:
-            if row.kind == "dir" and normalise(row.path) not in blocked:
+            if row.kind == "dir" and normalise(row.path) in {normalise(p) for p in checked} or (
+                    row.kind == "dir" and any(normalise(p) in {normalise(c) for c in checked}
+                                              for p, _s in row.contents)):
                 say("directory reference {} -> {}, {}".format(
                     row_label(row), row_detail(row), human_bytes(row.bytes)))
 
-    say(header_text(rows, missing, excluded))
-    return [r.path for r in rows if normalise(r.path) not in excluded]
+    say(header_text(roots, checked, missing))
+    return selected_paths(rows, checked)
