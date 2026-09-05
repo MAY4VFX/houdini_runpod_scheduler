@@ -1028,6 +1028,7 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         self._last_status_update = 0.0
         self._last_health_poll = {}
         self._last_task_poll = {}
+        self._announced_cached = False
         # Tells "the pods are dead" apart from "our uplink is down", and
         # remembers pods whose terminate call failed (they are still
         # billing) so the tick and onStopCook can try again.
@@ -1877,12 +1878,67 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
                 # Not under any mapping we know: nothing to pull it to.
                 continue
             pairs.append(pair)
+        if not pairs:
+            # PDG reported nothing this cook can pull. Ask the ROP where it
+            # was told to write -- see _ropOutputPair for why that happens.
+            fallback = self._ropOutputPair(work_item)
+            if fallback is not None:
+                self._log("item {} reported no downloadable output; taking the "
+                          "ROP's own output path instead: {}".format(
+                              work_item.id, fallback[0]))
+                pairs.append(fallback)
+
         groups = rppkg.group_download_pairs(pairs)
         for local_root, remote_root, entries in groups:
             self._sync_queue.append((local_root, remote_root, entries))
         if groups:
             self._verboseLog("queued {} output(s) of item {} for download".format(
                 sum(len(entries) for _, _, entries in groups), work_item.id))
+
+    #: Where a ROP writes its pictures, in the order worth trying. The same
+    #: names rpfarm.deps treats as "output, not a dependency" -- one list of
+    #: what a ROP's output parameter is called, used from both ends.
+    _ROP_OUTPUT_PARMS = ("outputimage", "picture", "vm_picture", "sopoutput",
+                         "copoutput", "dopoutput", "lopoutput", "usdoutput",
+                         "outputfilepath1")
+
+    def _ropOutputPair(self, work_item):
+        """``(farm, local)`` for where this item's ROP was told to write.
+
+        PDG asks a ROP for its "default output parm" and reports that as the
+        item's output. For a `usdrender_rop` it answers `__render__.usd` --
+        the intermediate stage, not the picture. Measured end to end on the
+        owner's own scene (cook bf062eaa): the frame rendered on the farm, a
+        6 MB EXR exactly where the ROP asked for it, the item went
+        CookedSuccess, and nothing came home, because that name was all the
+        download had to work with.
+
+        So when the reported outputs give this cook nothing to pull, ask the
+        ROP: it knows its own output parameter, and the item knows its frame.
+        Returns None when there is no ROP, no output parameter, or the path
+        belongs to no mapping -- in which case the artist gets the same
+        silence as before, but never a wrong file.
+        """
+        try:
+            import hou
+
+            node = self.topNode().parent().node(work_item.node.name)
+            roppath = node.parm("roppath") if node is not None else None
+            rop = hou.node(roppath.eval() or "") if roppath is not None else None
+            if rop is None:
+                return None
+            frame = float(work_item.frame) if work_item.hasFrame else hou.frame()
+            for name in self._ROP_OUTPUT_PARMS:
+                parm = rop.parm(name)
+                if parm is None:
+                    continue
+                local = parm.evalAsStringAtFrame(frame)
+                if not local or local.endswith("/"):
+                    continue
+                return rppkg.map_output_pair(local, self._pathmap)
+        except Exception as e:
+            self._verboseLog("could not read the ROP's output path: {}".format(e))
+        return None
 
     def _queueSettle(self, work_item_id, work_item, duration):
         """Hold a finished item until its MQ result data has landed."""
@@ -2847,6 +2903,59 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
             self._log("autoscale: {} pending, adding {} pod(s)".format(pending, count))
             self._scale_up(count)
 
+    def _announceCachedItems(self):
+        """Say out loud when PDG skipped work because the outputs exist.
+
+        Not a defect in PDG -- it is doing what it is for. But silence about
+        it cost the owner three separate evenings' worth of confusion in one
+        night: he pressed the button, nothing happened, and the farm looked
+        broken when in fact every frame he asked for was already on disk.
+        One line, with a path he can go and look at, is the whole fix.
+
+        Read from PDG's own item states rather than by checking files: PDG
+        decides what counts as cached, and second-guessing it here would be
+        a different answer than the one that governed the cook.
+        """
+        cached = 0
+        example = ""
+        looked_at = 0
+        try:
+            import pdg
+
+            for node in self.topNode().parent().children():
+                get_pdg = getattr(node, "getPDGNode", None)
+                pdg_node = get_pdg() if get_pdg else None
+                # Not every TOP node has work items: this very scheduler is
+                # one of the topnet's children, and its PDG object is the
+                # scheduler itself.
+                items = getattr(pdg_node, "workItems", None) if pdg_node else None
+                if items is None:
+                    continue
+                for item in items:
+                    looked_at += 1
+                    if item.state != pdg.workItemState.CookedCache:
+                        continue
+                    cached += 1
+                    if not example:
+                        files = list(item.outputFiles) or list(item.expectedOutputFiles)
+                        if files:
+                            example = str(getattr(files[0], "path", files[0]))
+        except Exception as e:
+            # A courtesy message must never break a cook -- but it must not
+            # fail silently either, which is the very habit it exists to fix.
+            self._verboseLog("could not count cached items: {}".format(e))
+            return
+        self._verboseLog("cache check: {} item(s) looked at, {} cached".format(
+            looked_at, cached))
+
+        if not cached:
+            return
+        self._log(
+            "{} work item(s) skipped: their output files already exist, so PDG "
+            "has nothing to render for them{}. Delete the outputs, or change the "
+            "output path/version, to render them again.".format(
+                cached, " (e.g. {})".format(example) if example else ""))
+
     def _xpuRops(self):
         """ROPs this topnet is about to render that ask for Karma XPU.
 
@@ -2966,6 +3075,16 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         self._log("cook {} stopping (cancel={}), {} pod(s), {} task(s) in flight".format(
             self._cook_id, cancel, len(self._dispatcher.pods),
             len(self._dispatcher.running_tasks())))
+
+        # Said HERE and not on the first tick: PDG decides what is cached as
+        # it cooks, so an early look finds nothing and announces nothing --
+        # which is exactly what happened the first time this was tried. At
+        # stop the states are final, and for a cook where everything was
+        # cached that is two seconds after the button, which is when the
+        # artist is looking at an empty log wondering what broke.
+        if not self._announced_cached:
+            self._announced_cached = True
+            self._announceCachedItems()
 
         # Anything still waiting for its output files has to be reported now:
         # PDG must never be left waiting on an item this scheduler is holding.

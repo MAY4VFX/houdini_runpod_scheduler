@@ -1423,3 +1423,96 @@ def _capture_ledger(path):
         with open(path, "a") as f:
             f.write(json.dumps(row, default=str) + "\n")
     return append
+
+
+def test_skipped_work_is_announced_with_a_path_to_look_at():
+    """PDG not cooking an item whose outputs exist is correct behaviour and
+    our silence about it is not: the owner pressed the button three times in
+    one evening and each time the farm looked broken when every frame he
+    asked for was already on disk."""
+    import types as _types
+
+    class _Item:
+        def __init__(self, state, path):
+            self.state = state
+            self.outputFiles = [_types.SimpleNamespace(path=path)]
+            self.expectedOutputFiles = []
+
+    cached_state = object()
+    other_state = object()
+    pdg_stub = _types.SimpleNamespace(workItemState=_types.SimpleNamespace(CookedCache=cached_state))
+
+    class _PdgNode:
+        workItems = [_Item(cached_state, "/Users/may/BS/airship/render/shot0018/f.0001.exr"),
+                     _Item(cached_state, "/x/b.exr"),
+                     _Item(other_state, "/x/c.exr")]
+
+    class _HouNode:
+        def getPDGNode(self):
+            return _PdgNode()
+
+    sched = FakeScheduler()
+    sched.topNode = lambda: _types.SimpleNamespace(
+        parent=lambda: _types.SimpleNamespace(children=lambda: [_HouNode()]))
+
+    ns = load_methods(["_announceCachedItems"], {})
+    sys.modules["pdg"] = pdg_stub
+    try:
+        ns["_announceCachedItems"](sched)
+    finally:
+        sys.modules.pop("pdg", None)
+
+    said = " ".join(sched.logs)
+    assert "2 work item(s) skipped" in said, sched.logs
+    assert "shot0018/f.0001.exr" in said, "and a path the artist can go and look at"
+
+
+def test_nothing_is_said_when_nothing_was_skipped():
+    import types as _types
+
+    sched = FakeScheduler()
+    sched.topNode = lambda: _types.SimpleNamespace(
+        parent=lambda: _types.SimpleNamespace(children=lambda: []))
+
+    load_methods(["_announceCachedItems"], {})["_announceCachedItems"](sched)
+
+    assert sched.logs == []
+
+
+def test_a_rop_that_reports_only_its_intermediate_still_brings_the_frame_home():
+    """Cook bf062eaa on the owner's scene: PDG asked the usdrender_rop for its
+    default output parm and got `__render__.usd` -- the intermediate stage,
+    not the picture. The frame rendered on the farm (6 MB EXR, exactly where
+    the ROP asked for it), the item went CookedSuccess, and nothing came home.
+    """
+    import types as _types
+
+    pathmap = {"/Users/may": "/workspace/projects/may/airship"}
+    rop = _types.SimpleNamespace(
+        parm=lambda name: _types.SimpleNamespace(
+            evalAsStringAtFrame=lambda f:
+                "/Users/may/BS/airship/render/shot0018/airship_0018_v003.acescg.%04d.exr" % f
+        ) if name == "outputimage" else None)
+    fetch = _types.SimpleNamespace(
+        parm=lambda name: _types.SimpleNamespace(eval=lambda: "/stage/render_shot0018"))
+    hou_stub = _types.SimpleNamespace(node=lambda path: rop, frame=lambda: 1.0)
+
+    sched = FakeScheduler()
+    sched._pathmap = pathmap
+    sched.topNode = lambda: _types.SimpleNamespace(
+        parent=lambda: _types.SimpleNamespace(node=lambda name: fetch))
+    sched._ROP_OUTPUT_PARMS = ("outputimage",)
+
+    item = _types.SimpleNamespace(
+        node=_types.SimpleNamespace(name="fetch_shot0018"), frame=1.0, hasFrame=True)
+
+    ns = load_methods(["_ropOutputPair"], {"rppkg": rppkg})
+    sys.modules["hou"] = hou_stub
+    try:
+        farm, local = ns["_ropOutputPair"](sched, item)
+    finally:
+        sys.modules.pop("hou", None)
+
+    assert local == "/Users/may/BS/airship/render/shot0018/airship_0018_v003.acescg.0001.exr"
+    assert farm == ("/workspace/projects/may/airship/BS/airship/render/shot0018/"
+                    "airship_0018_v003.acescg.0001.exr")
