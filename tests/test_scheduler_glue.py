@@ -1193,3 +1193,78 @@ def test_an_unmapped_colour_config_is_reported_not_guessed(monkeypatch):
 
     assert "OCIO" not in env
     assert any("nothing in this cook maps it" in m for m in said), said
+
+
+# ---------------------------------------------------------------------------
+# Making the local path exist on the pod (cook 41f78681, 2026-09-05)
+#
+# PDG_PATHMAP rewrites paths held in parameters Houdini TAGGED as file
+# references. filepath1 on a Reference LOP is stringParmType.Regular, so it is
+# neither scanned nor rewritten -- and a path written inside a USD layer is
+# resolved by USD's own resolver, which knows nothing about PDG_PATHMAP. The
+# file was on the pod and the node still looked for /Users/may/...
+# ---------------------------------------------------------------------------
+
+
+def _links(pathmap, **attrs):
+    ns = load_methods(["_localRootLinks"], {"shlex": __import__("shlex")})
+    self = types.SimpleNamespace(_pathmap=pathmap, _log=attrs.pop("log", lambda m: None),
+                                 _UNSAFE_LINK_ROOTS=frozenset({
+                                     "usr", "bin", "sbin", "lib", "lib64", "etc", "var",
+                                     "opt", "proc", "sys", "dev", "boot", "run", "root",
+                                     "tmp", "workspace"}), **attrs)
+    return ns["_localRootLinks"](self)
+
+
+def test_the_local_root_becomes_a_link_to_the_uploaded_project():
+    got = _links({"/Users/may": "/workspace/projects/may/airship"})
+
+    assert "ln -sfn /workspace/projects/may/airship /Users/may" in got
+    assert "[ -L /Users/may ]" in got, "replace a symlink or nothing"
+    assert "[ ! -e /Users/may ]" in got, "never a real directory"
+
+
+def test_a_root_inside_a_linked_root_is_left_to_the_link():
+    """Creating it would write THROUGH the outer symlink, into the uploaded
+    project -- and it is reachable through that link anyway."""
+    said = []
+    got = _links({
+        "/Users/may": "/workspace/projects/may/airship",
+        "/Users/may/color/ocio": "/workspace/projects/may/airship/_ext/Users/may/color/ocio",
+    }, log=said.append)
+
+    assert got.count("ln -sfn") == 1
+    assert "/Users/may/color/ocio" not in got.split("ln -sfn")[1]
+    assert any("sit inside a linked root" in m for m in said), said
+
+
+def test_an_external_root_outside_the_job_gets_its_own_link():
+    got = _links({
+        "/Users/may/BS/airship": "/workspace/projects/may/airship",
+        "/Volumes/lib/hdri": "/workspace/projects/may/airship/_ext/Volumes/lib/hdri",
+    })
+
+    assert got.count("ln -sfn") == 2
+
+
+def test_system_directories_are_never_linked_over():
+    got = _links({
+        "/usr/local": "/workspace/p/_ext/usr/local",
+        "/etc": "/workspace/p/_ext/etc",
+        "/": "/workspace/p",
+        "/Users": "/workspace/p",
+    })
+
+    assert got == "", "a symlink at /usr or / inside the container is a broken pod"
+
+
+def test_a_windows_local_root_is_said_out_loud_not_half_done():
+    """C:\\Users\\may cannot exist on a Linux pod. Tagged parameters still map
+    through PDG_PATHMAP; the rest will not resolve, and that is worth saying."""
+    said = []
+
+    got = _links({"C:/Users/may": "/workspace/projects/may/airship"}, log=said.append)
+
+    assert got == ""
+    assert any("not a POSIX path" in m for m in said), said
+    assert any("PDG_PATHMAP" in m for m in said), said
