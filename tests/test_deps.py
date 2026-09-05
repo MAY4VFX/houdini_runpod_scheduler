@@ -541,13 +541,13 @@ def test_a_reference_that_resolves_to_nothing_yields_nothing(tmp_path):
     assert deps.expand_reference(None, str(tmp_path / "missing.exr"), expand=lambda s: s) == []
 
 
-# -- what the built-in dependency dialog needs from us ---------------------------
+# -- outputs are shown, not hidden ----------------------------------------------
 
 
-def test_output_patterns_come_back_for_the_dialog_to_show_unchecked(monkeypatch):
-    """Houdini's own dialog takes forced_unselected_patterns. Handing it the
-    output references is honester than dropping them behind the artist's
-    back: they see the decision and can undo it."""
+def test_an_output_reference_is_offered_unchecked_rather_than_dropped(monkeypatch):
+    """Houdini's own dialog cannot show these (its rows are (Parm, pattern)
+    pairs it picks itself), so our window has to -- and it can only show
+    what the scan hands over separately instead of swallowing."""
     scene, upload, geo, _lookdev, sched = _airship_like_scene()
     refs = [
         (_StubParm("file", geo), "$JOB/tex/a.rat"),
@@ -557,34 +557,35 @@ def test_output_patterns_come_back_for_the_dialog_to_show_unchecked(monkeypatch)
 
     got = deps.scan_refs(**_ANY_PATH)
 
-    assert got.output_patterns == ("$JOB",)
-    assert "/job/tex/a.rat" in got.paths
+    assert got.paths == ["/job/hip/scene.hip", "/job/tex/a.rat"]
+    assert got.output_paths == ["/job"], "kept, but on the other list"
 
 
-def test_after_the_artist_answers_the_dialog_we_do_not_second_guess_them(monkeypatch):
-    scene, upload, geo, _lookdev, sched = _airship_like_scene()
-    refs = [(_StubParm("pdg_workingdir", sched), "$JOB")]
-    monkeypatch.setitem(sys.modules, "hou", _stub_hou(scene, refs))
+def test_a_udim_texture_on_a_parameter_is_globbed_not_reduced_to_its_folder(tmp_path):
+    """The field case that made this a defect rather than a nicety: an
+    mtlximage parameter holding tex_mip/Balon_Base_color_<UDIM>.exr. The
+    literal path never exists, so an existence check alone drops it -- and
+    reducing to the containing directory (what this did before) uploaded
+    all 72 files / 995 MB of that folder to get six tiles."""
+    tex = tmp_path / "tex_mip"
+    tex.mkdir()
+    for tile in ("1011", "1012"):
+        (tex / "Balon_Base_color_{}.exr".format(tile)).write_bytes(b"x")
+    (tex / "unrelated_map.exr").write_bytes(b"y")
 
-    got = deps.scan_refs(drop_outputs=False, **_ANY_PATH)
+    got = deps.expand_reference(None, str(tex / "Balon_Base_color_<UDIM>.exr"),
+                                expand=lambda s: s)
 
-    assert "/job" in got.paths
-    assert got.output_patterns == ()
+    assert got == [str(tex / "Balon_Base_color_1011.exr"),
+                   str(tex / "Balon_Base_color_1012.exr")]
+    assert str(tex) not in got, "the folder is not the answer, the tiles are"
 
 
-def test_selected_only_asks_houdini_for_its_own_selection(monkeypatch):
-    scene, upload, geo, _lookdev, _sched = _airship_like_scene()
-    seen = {}
+def test_a_frame_sequence_still_reduces_to_its_directory(tmp_path):
+    """Different question, different answer: the frames on disk now are not
+    the frames the farm will read, so the directory is the honest superset."""
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    (cache / "sim.0001.bgeo").write_bytes(b"c")
 
-    def _refs(project_dir_variable="HIP", include_all_refs=True):
-        seen["all"] = include_all_refs
-        seen["var"] = project_dir_variable
-        return [(_StubParm("file", geo), "$JOB/tex/a.rat")]
-
-    stub = _stub_hou(scene, [])
-    stub.fileReferences = _refs
-    monkeypatch.setitem(sys.modules, "hou", stub)
-
-    deps.scan_refs(selected_only=True, project_dir_variable="JOB", **_ANY_PATH)
-
-    assert seen == {"all": False, "var": "JOB"}
+    assert deps.expand_reference(None, str(cache / "sim.$F4.bgeo"), expand=lambda s: s) == [str(cache)]

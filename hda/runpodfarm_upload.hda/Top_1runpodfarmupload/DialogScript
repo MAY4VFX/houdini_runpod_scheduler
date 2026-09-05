@@ -101,11 +101,11 @@
     }
     parm {
         name    "rpfarm_exclude"
-        label   "Unchecked USD Files"
+        label   "Window Answer"
         type    string
         invisible
         default { "" }
-        help    "JSON list of USD files the artist unchecked. Cleared by Re-check Everything."
+        help    "JSON {\"off\": [...], \"on\": [...]} -- what the artist unchecked, and which output references they re-checked. Cleared by Re-check Everything."
     }
     multiparm {
         name    "rpfarm_custom"

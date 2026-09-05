@@ -61,6 +61,66 @@ def normalise(path):
     return os.path.normpath(path) if path else path
 
 
+SOURCE_LABELS = {"scene": "scene", "usd": "USD", "output": "output (not a dependency)"}
+
+
+def load_choices(raw):
+    """The node's remembered answer: ``(unchecked, re-checked)``.
+
+    One parameter, one answer, two halves of it -- because two kinds of row
+    have opposite defaults. A normal reference is checked until the artist
+    says otherwise; an output reference (``pdg_workingdir``, ``outputimage``)
+    is unchecked until the artist says otherwise. Keeping both in the same
+    parameter, written by the same window in the same moment, is what stops
+    this becoming two sources of truth that disagree.
+
+    A bare JSON list (what this parameter held before outputs were shown at
+    all) reads as the unchecked half, so an existing scene keeps its answer.
+    """
+    if not raw:
+        return set(), set()
+    text = raw.strip()
+    if text.startswith("{"):
+        try:
+            data = json.loads(text)
+        except ValueError:
+            data = {}
+        if isinstance(data, dict):
+            return (
+                {normalise(str(p)) for p in data.get("off") or () if p},
+                {normalise(str(p)) for p in data.get("on") or () if p},
+            )
+    return load_exclusions(raw), set()
+
+
+def dump_choices(off, on=()):
+    """Render the answer for the node parameter: sorted JSON, stable in git."""
+    return json.dumps({
+        "off": sorted(normalise(p) for p in off if p),
+        "on": sorted(normalise(p) for p in on if p),
+    })
+
+
+def default_excluded(rows, off, on):
+    """Which rows start unchecked, given what the node remembers."""
+    out = set()
+    for row in rows:
+        path = normalise(row.path)
+        if path in off:
+            out.add(path)
+        elif row.source == "output" and path not in on:
+            out.add(path)
+    return out
+
+
+def split_answer(rows, excluded):
+    """The window's answer as ``(unchecked, re-checked outputs)`` to store."""
+    blocked = {normalise(p) for p in excluded}
+    on = {normalise(r.path) for r in rows
+          if r.source == "output" and normalise(r.path) not in blocked}
+    return blocked, on
+
+
 def load_exclusions(raw):
     """Parse the node's remembered exclusions.
 
@@ -112,12 +172,18 @@ def totals(rows, excluded):
 def header_text(rows, missing, excluded):
     """The one line that has to be true before anyone reads the list."""
     files, size = totals(rows, excluded)
-    total_files = sum(r.files for r in rows)
     total_bytes = sum(r.bytes for r in rows)
     text = "{} of {} references -- {} files, {} of {}".format(
         len(selected(rows, excluded)), len(rows), files,
         human_bytes(size), human_bytes(total_bytes),
     )
+    by_source = []
+    for source in ("scene", "usd", "output"):
+        count = len([r for r in rows if r.source == source])
+        if count:
+            by_source.append("{} {}".format(count, SOURCE_LABELS.get(source, source)))
+    if by_source:
+        text += "  [" + " | ".join(by_source) + "]"
     if missing:
         text += "  ({} reference(s) name nothing on disk and are skipped)".format(len(missing))
     return text
@@ -197,14 +263,16 @@ def build_dialog(rows, missing, excluded, title="RunPodFarm Upload", parent=None
     layout.addWidget(head)
 
     tree = QtWidgets.QTreeWidget()
-    tree.setColumnCount(3)
-    tree.setHeaderLabels(["Reference", "Size", "Contains"])
+    tree.setColumnCount(4)
+    tree.setHeaderLabels(["Reference", "Size", "Contains", "Found by"])
     tree.setRootIsDecorated(False)
     tree.setUniformRowHeights(True)
     tree.setAlternatingRowColors(True)
     tree.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
     for row in ordered:
-        item = QtWidgets.QTreeWidgetItem([row_label(row), human_bytes(row.bytes), row_detail(row)])
+        item = QtWidgets.QTreeWidgetItem([
+            row_label(row), human_bytes(row.bytes), row_detail(row),
+            SOURCE_LABELS.get(row.source, row.source)])
         item.setFlags(item.flags() | QtCore.Qt.ItemIsUserCheckable)
         item.setCheckState(
             0,
@@ -213,8 +281,9 @@ def build_dialog(rows, missing, excluded, title="RunPodFarm Upload", parent=None
         item.setData(0, QtCore.Qt.UserRole, row.path)
         item.setTextAlignment(1, QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
         tree.addTopLevelItem(item)
-    tree.setColumnWidth(0, 620)
-    tree.setColumnWidth(1, 110)
+    tree.setColumnWidth(0, 560)
+    tree.setColumnWidth(1, 100)
+    tree.setColumnWidth(2, 90)
     layout.addWidget(tree, 1)
 
     if missing:
@@ -320,105 +389,68 @@ def wants_window(node, ask=None, log=None):
     return True
 
 
-def houdini_dialog(rop, forced_unselected_patterns=(), project_dir_variable="HIP",
-                   uploaded_files=()):
-    """Houdini's own file-dependency dialog -- the one File > Pre-Flight Scene opens.
-
-    Same call SideFX make from ``cloud.py`` (``_onShowFileReferenceDialog``)
-    and ``hqrop.py`` (``copyProjectFilesToSharedFolder``), positionally, in
-    that order. Returns ``(pressed_ok, ((parm, pattern), ...))``.
-
-    ``forced_unselected_patterns`` is where the output references go: the
-    artist sees them as unchecked rows and can put them back, instead of
-    our code deciding for them out of sight. SideFX use it for exactly the
-    same thing -- the ROP's own output pattern.
-    """
-    import hou
-
-    return hou.ui.displayFileDependencyDialog(
-        rop, tuple(uploaded_files), tuple(forced_unselected_patterns),
-        project_dir_variable, True)
-
-
-def choose_uploads(node, scan, usd_paths=(), ask=False, log=None, rop=None,
-                   project_dir_variable="HIP", dialog=None, confirm_usd=None,
-                   expand=None, hip_path=None):
+def choose_uploads(node, scan, usd_paths=(), ask=False, log=None, window=None):
     """The final list of local paths this cook uploads.
 
-    Two halves, because Houdini's dialog can only show one of them:
+    One window, one list, one stored answer. Every reference this cook could
+    upload is a row in it, whatever found it:
 
-    * **Parameter references** go through Houdini's own dependency dialog
-      (:func:`houdini_dialog`). Its answer is taken as given -- no
-      second-guessing, including references we would have dropped as
-      outputs, because the artist can see and re-check those.
-    * **USD references** have no parameter at all -- nothing in
-      ``hou.fileReferences()`` points at a texture a USD layer names from
-      inside itself, so Houdini's dialog has no row to show and no API to
-      add one. They get :func:`confirm`, this package's own window, and the
-      choice is remembered on the node (``rpfarm_exclude``). That parameter
-      is now ONLY about USD files: for parameter references Houdini keeps
-      its own selection state, and two sources of truth for one question is
-      how they disagree.
+    * ``scene`` -- a Houdini parameter holds the path.
+    * ``USD`` -- a stage reads it and no parameter anywhere names it. There
+      is no way to put these in Houdini's own dependency dialog: that dialog
+      is fed entirely by ``hou.fileReferences()``, whose rows are
+      ``(hou.Parm, pattern)`` pairs, and it takes no argument for anything
+      else. That is the whole reason this window exists.
+    * ``output`` -- a parameter holds it, but it says where results GO
+      (``pdg_workingdir``, ``outputimage``). Unchecked by default, shown
+      with its real weight, and the artist can overrule it: that is how one
+      parameter's 11.54 GB became visible instead of invisible.
 
-    A dialog that FAILS (no Qt, no QApplication, generation off the main
-    thread) is logged and the scan's own answer is used. Cancel raises
-    :class:`UploadCancelled`. A window is never the reason a farm
-    submission dies; a Cancel always is.
+    A directory stays ONE row carrying its whole recursive weight, sorted
+    heaviest first, because that is the row worth arguing with.
 
-    ``dialog``/``confirm_usd`` are injection seams for the tests.
+    Failure policy: Cancel raises :class:`UploadCancelled` and the cook
+    stops. A window that FAILS (no Qt, no QApplication, generation off the
+    main thread) is logged and the remembered answer is used instead -- a
+    confirmation window must never be the reason a farm submission dies.
+
+    ``window`` is an injection seam for the tests.
     """
     say = log if log is not None else (lambda _message: None)
     from . import deps as _deps
 
-    parm_paths = list(scan.paths)
+    rows = []
+    missing = []
+    seen = set()
+    for source, paths in (("scene", scan.paths), ("usd", usd_paths),
+                          ("output", scan.output_paths)):
+        fresh = [p for p in paths if normalise(p) not in seen]
+        seen.update(normalise(p) for p in fresh)
+        found, gone = _deps.plan_refs(fresh, source=source)
+        rows.extend(found)
+        missing.extend(gone)
+
+    off, on = load_choices(node.evalParm("rpfarm_exclude"))
+    excluded = default_excluded(rows, off, on)
+
     if ask:
-        show = dialog or houdini_dialog
+        asker = window or confirm
         try:
-            pressed_ok, selection = show(rop, scan.output_patterns, project_dir_variable)
+            chosen = asker(rows, missing, excluded, title="RunPodFarm -- what will upload")
         except Exception as exc:
-            say("file dependency window unavailable ({}) -- using the scanned set".format(exc))
-            pressed_ok, selection = True, None
-        if not pressed_ok:
-            raise UploadCancelled("upload cancelled in the file dependency window")
-        if selection is not None:
-            if expand is None or hip_path is None:
-                import hou
+            say("confirmation window unavailable ({}) -- using the remembered answer".format(exc))
+            chosen = excluded
+        if chosen is None:
+            raise UploadCancelled("upload cancelled in the confirmation window")
+        if chosen != excluded:
+            node.parm("rpfarm_exclude").set(dump_choices(*split_answer(rows, chosen)))
+        excluded = {normalise(p) for p in chosen}
+    else:
+        blocked = excluded
+        for row in rows:
+            if row.kind == "dir" and normalise(row.path) not in blocked:
+                say("directory reference {} -> {}, {}".format(
+                    row_label(row), row_detail(row), human_bytes(row.bytes)))
 
-                expand = expand or hou.text.expandString
-                hip_path = hip_path or hou.hipFile.path()
-            chosen, unresolved = _deps.expand_pairs(selection, expand)
-            # The dialog answers about references; the hip file is not one
-            # of them in every scene, and it is never optional.
-            parm_paths = list(dict.fromkeys([hip_path] + chosen))
-            say("file dependency window: {} reference(s) kept, {} forced unchecked".format(
-                len(selection), len(scan.output_patterns)))
-            if unresolved:
-                say("{} selected reference(s) resolved to nothing on disk".format(len(unresolved)))
-
-    excluded = load_exclusions(node.evalParm("rpfarm_exclude"))
-    usd_paths = list(usd_paths)
-    if usd_paths:
-        rows, missing = _deps.plan_refs(usd_paths)
-        if ask:
-            asker = confirm_usd or confirm
-            try:
-                chosen = asker(rows, missing, excluded,
-                               title="RunPodFarm -- USD dependencies (no parameter points at these)")
-            except Exception as exc:
-                say("USD window unavailable ({}) -- using the remembered selection".format(exc))
-                chosen = excluded
-            if chosen is None:
-                raise UploadCancelled("upload cancelled in the USD dependency window")
-            if chosen != excluded:
-                node.parm("rpfarm_exclude").set(dump_exclusions(chosen))
-            excluded = chosen
-        else:
-            blocked = {normalise(p) for p in excluded}
-            for row in rows:
-                if row.kind == "dir" and normalise(row.path) not in blocked:
-                    say("directory reference {} -> {}, {}".format(
-                        row_label(row), row_detail(row), human_bytes(row.bytes)))
-        say("usd: " + header_text(rows, missing, excluded))
-        usd_paths = apply_exclusions(usd_paths, excluded)
-
-    return list(dict.fromkeys(parm_paths + usd_paths))
+    say(header_text(rows, missing, excluded))
+    return [r.path for r in rows if normalise(r.path) not in excluded]

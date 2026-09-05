@@ -136,11 +136,9 @@ def _say(message):
 def previewUpload(kwargs):
     """Show the upload plan without cooking anything.
 
-    The same two windows the cook shows -- Houdini's own file dependency
-    dialog, then this package's window for the USD files Houdini's dialog
-    has no row for -- forced on regardless of the Confirm toggle. Any
-    choice made here is kept, so previewing IS how you set the selection
-    for a batch cook that will never open a window.
+    The same single window the cook shows, forced on regardless of the
+    Confirm toggle. Any choice made here is kept, so previewing IS how you
+    set the selection for a batch cook that will never open a window.
     """
     node = kwargs["node"]
     from rpfarm import deps as rpdeps
@@ -153,8 +151,7 @@ def previewUpload(kwargs):
     usd = rpusd.collect_usd_refs(
         rops, log=_say, deep=bool(node.evalParm("rpfarm_usddeep"))) if rops else []
     try:
-        paths = rppf.choose_uploads(
-            node, scan, usd, ask=True, log=_say, rop=rops[0] if rops else None)
+        paths = rppf.choose_uploads(node, scan, usd, ask=True, log=_say)
     except rppf.UploadCancelled:
         _say("preview closed with Cancel -- nothing changed")
         return
@@ -162,14 +159,10 @@ def previewUpload(kwargs):
 
 
 def clearExclusions(kwargs):
-    """Re-check every USD file this node was told to skip.
-
-    Only the USD half: Houdini keeps its own selection state for parameter
-    references, and this button has no business pretending to reset that.
-    """
+    """Forget every answer given in the window -- back to the defaults."""
     node = kwargs["node"]
     node.parm("rpfarm_exclude").set("")
-    _say("all USD files re-checked")
+    _say("window answers cleared: everything checked again except outputs")
 '''
 
 GENERATE_CODE = '''\
@@ -255,34 +248,33 @@ if preset == "install_houdini":
     custom, post_command = rppkg.houdini_install_preset(tar, ver)
     mode = "custom"
 
-# What this cook uploads, in two halves that no single Houdini API covers.
+# What this cook uploads, from two places no single Houdini API covers,
+# shown in ONE window.
 #
 # 1. Parameter references -- hou.fileReferences(), narrowed to this cook's
-#    branch, with output parameters handed to Houdini's own dependency
-#    dialog as forced-unchecked rows rather than dropped out of sight.
-# 2. USD references -- everything a stage reads that no parameter points
-#    at. On airship_v013.hip that is 77 files the parameter scan cannot
-#    see, including both .usdc layers the render is made of. A farm render
-#    without them produces nothing.
+#    branch. Output parameters (pdg_workingdir, outputimage) come back on
+#    their own list and appear unchecked rather than dropped out of sight.
+# 2. USD references -- what a stage reads that no parameter names. On
+#    airship_v013.hip that is 77 files, including both .usdc layers the
+#    render is made of; a farm render without them produces nothing.
 #
-# Whether to ask is decided BEFORE the scan, because it changes what is
-# scanned: with a window, Houdini's dialog is asked; without one, the
-# selection Houdini already remembers is read instead (selected_only) --
-# the same call SideFX make when their own dialog is skipped.
+# Houdini's own dependency dialog cannot carry (2): it is fed entirely by
+# hou.fileReferences(), its rows ARE (hou.Parm, pattern) pairs, and its
+# five arguments offer no way to add a row that is not one. So the window
+# is ours, and it is the only one -- two windows for one question was
+# rejected, correctly.
 #
 # Custom mode skips all of it: there the artist typed the paths.
 refs = []
 if mode == "deps":
     ask = rppf.wants_window(node, log=_say)
     scan = rpdeps.scan_refs(
-        scope=node.evalParm("rpfarm_scope") or rpdeps.SCOPE_BRANCH,
-        node=node, log=_say, selected_only=not ask)
+        scope=node.evalParm("rpfarm_scope") or rpdeps.SCOPE_BRANCH, node=node, log=_say)
     rops = rpdeps.cook_rops(node, log=_say)
     usd = rpusd.collect_usd_refs(
         rops, log=_say, deep=bool(node.evalParm("rpfarm_usddeep"))) if rops else []
     try:
-        refs = rppf.choose_uploads(
-            node, scan, usd, ask=ask, log=_say, rop=rops[0] if rops else None)
+        refs = rppf.choose_uploads(node, scan, usd, ask=ask, log=_say)
     except rppf.UploadCancelled as e:
         # A deliberate no, not a failure -- but generation has to stop, and
         # a NodeError is the only way to stop it that PDG reports plainly.
@@ -561,12 +553,21 @@ whichever exists (an FBX parameter evaluates to
 `airship_v06.fbx#Airship_bindings,convertoff`, an address into the file
 that is not a path on disk; 38 of that scene's references resolve only
 through the string, so following SideFX's "evaluate the parameter" advice
-alone would drop all 38). USD references come from the stage the ROP
-renders, plus `UsdUtils.ComputeAllDependencies` on each layer file --
-textures, sublayers and `<UDIM>` sets that no parameter anywhere points
-at. Measured on `airship_v013.hip`: 78 files / 1.2 GB from parameters,
-155 files / 2.8 GB with the USD half, and without it both `.usdc` layers
-the render is made of stay on the artist's machine.
+alone would drop all 38). A `<UDIM>` template is globbed into
+its real tiles rather than reduced to its folder (that reduction is why
+one material's six tiles used to drag all 72 files of `tex_mip` along).
+USD references come from the stage the ROP renders, plus
+`UsdUtils.ComputeAllDependencies` on each layer file.
+
+`hou.fileReferences()` is not blind to USD: what a layer's textures are
+duplicated onto -- `mtlximage` parameters, say -- it reports like any
+other file reference. What it cannot report is what lives only inside a
+layer, and what sits on a parameter SideFX never tagged as a file
+reference: `filepath1` on a `reference::2.0` LOP is
+`stringParmType.Regular`, so the `.usdc` the whole render is built from
+does not appear at all. Measured on `airship_v013.hip`: 78 files / 1.2 GB
+from parameters, 155 files / 2.8 GB with the USD half -- and without that
+half both `.usdc` layers stay on the artist's machine.
 
 @parameters
 
@@ -610,40 +611,49 @@ Dependencies:
 Confirm Before Upload:
     #id: rpfarm_confirm
 
-    Shows what will move, before it moves, in TWO windows -- because no
-    single Houdini API covers both halves of the answer.
+    Shows what will move, before it moves: ONE window, every reference in
+    it, with a size, a checkbox, and a `Found by` column saying why the row
+    is there.
 
-    First: Houdini's own file dependency window, the one `File > Pre-Flight
-    Scene` opens (`hou.ui.displayFileDependencyDialog`). It is the same
-    call SideFX make from their HQueue ROP and their cloud submitter, so
-    the artist sees the window they already know, with the selection state
-    Houdini itself keeps. Output references (`pdg_workingdir`,
-    `outputimage`, ...) arrive in it already unchecked rather than silently
-    dropped -- if you re-check one, it uploads: your answer, not ours.
+    * `scene` -- a Houdini parameter holds the path.
+    * `USD` -- a stage reads it and no parameter names it.
+    * `output (not a dependency)` -- a parameter holds it, but it says
+      where results GO (`pdg_workingdir`, `outputimage`, ...). Unchecked to
+      start with, shown with its real weight, and yours to overrule: on the
+      field scene that is how one parameter's 11.54 GB became visible
+      instead of invisible.
 
-    Second, and only when there is something to show: the USD window from
-    this package. Everything a USD stage reads from inside its own layers
-    has NO parameter -- `hou.fileReferences()` has no row for it, so
-    Houdini's dialog has none either, and there is no API to add one. On
-    the field scene that was 77 files, both `.usdc` layers among them.
-    That window lists them with sizes, heaviest first, and the unchecked
-    ones are remembered on the node (`rpfarm_exclude`, hidden). It is the
-    only place a 1.6 GB folder of source textures can be dropped from the
-    upload in two clicks.
+    A directory is ONE line carrying its whole recursive weight, and the
+    list is sorted heaviest first -- that is the line worth arguing with,
+    and it must not hide among the 827 files it would otherwise become.
 
-    Cancel in either window stops the cook -- it does not fall through to
-    uploading what was there before.
+    Why not Houdini's own `File > Pre-Flight Scene` window
+    (`hou.ui.displayFileDependencyDialog`): it is fed entirely by
+    `hou.fileReferences()` and its rows ARE `(hou.Parm, pattern)` pairs.
+    A file a USD layer names from inside itself has no parameter, so it
+    cannot become a row, and none of the call's five arguments adds one.
+    `hou.fileReferences()` is not blind to USD -- it finds exactly what is
+    duplicated onto a parameter Houdini tagged as a file reference (the
+    `mtlximage` textures on the field scene) -- but it misses both what
+    lives only inside a layer AND what sits on an untagged parameter
+    (`filepath1` on a `reference::2.0` LOP is `stringParmType.Regular`, so
+    the .usdc the whole render is built from is simply absent). One window
+    that shows everything beats two that each show half.
+
+    Your answer is remembered on the node (`rpfarm_exclude`, hidden), so
+    the window is not a tax on every cook: answer once, and it comes back
+    the way you left it. Cancel stops the cook -- it does not fall through
+    to uploading what was there before.
 
     Turn it off for batch/headless work. A cook without a UI never shows a
     window anyway (`hou.isUIAvailable()`), and a cook whose generation runs
     off the main thread does not either -- Qt from another thread is not a
     raised exception, it is a lost session; the log then says which
-    condition refused. With no window, the parameter side falls back to the
-    selection Houdini already remembers (`include_all_refs=False`, the same
-    call SideFX's own skip-the-dialog path makes) and every directory
-    reference is logged with its full weight. If a window FAILS to open,
-    the upload proceeds with the scanned set and the reason is logged: a
-    confirmation dialog must never be the reason a farm submission dies.
+    condition refused. With no window, the remembered answer is used and
+    every directory that will upload is logged with its full weight. If the
+    window FAILS to open, the upload proceeds with that same remembered
+    answer and the reason is logged: a confirmation window must never be
+    the reason a farm submission dies.
 
 Scan USD Layer Files Too:
     #id: rpfarm_usddeep
@@ -668,14 +678,14 @@ Scan USD Layer Files Too:
 Preview Upload...:
     #id: rpfarm_preview
 
-    Open both windows now, without cooking -- and the way to set the USD
-    selection for a batch cook that will never open them.
+    Open that window now, without cooking -- and the way to set the
+    selection for a batch cook that will never open it.
 
 Re-check Everything:
     #id: rpfarm_clearexclude
 
-    Forget every USD file unchecked in the USD window. Parameter references
-    are not touched: Houdini keeps that state itself.
+    Forget every answer given in the window: everything checked again
+    except output references, which go back to unchecked.
 
 Project:
     #id: rpfarm_project
@@ -869,11 +879,14 @@ def main():
 
     # Hidden, but a real parameter and not user data: it has to travel with
     # the scene, survive save/load, and be diffable when someone asks why a
-    # file did not upload. USD files ONLY -- Houdini keeps its own selection
-    # state for parameter references (hou.fileReferences(include_all_refs=False))
-    # and two sources of truth for one question is how they disagree.
-    exclude_pt = hou.StringParmTemplate("rpfarm_exclude", "Unchecked USD Files", 1, default_value=("",))
-    exclude_pt.setHelp("JSON list of USD files the artist unchecked. Cleared by Re-check Everything.")
+    # file did not upload. ONE parameter holds the whole answer -- what was
+    # unchecked and which outputs were re-checked -- written by one window
+    # in one moment, because two stores for one question is how they end up
+    # disagreeing.
+    exclude_pt = hou.StringParmTemplate("rpfarm_exclude", "Window Answer", 1, default_value=("",))
+    exclude_pt.setHelp(
+        'JSON {"off": [...], "on": [...]} -- what the artist unchecked, and which '
+        "output references they re-checked. Cleared by Re-check Everything.")
     exclude_pt.hide(True)
     # Matches runpodfarm_scheduler's own rpfarm_project parm: empty string,
     # with the "basename of $JOB" fallback implemented in onGenerate

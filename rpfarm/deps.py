@@ -16,6 +16,7 @@ testable without Houdini installed.
 
 from __future__ import annotations
 
+import glob
 import json
 import os
 import re
@@ -23,10 +24,36 @@ from dataclasses import dataclass
 
 from .sync import FileEntry
 
-# $F, $F4, %04d, <UDIM>, ####, $(F4), ${F4} -- any of these inside a
-# reference means the ref names a per-frame/per-tile sequence rather than
-# one real file, so collect_refs wants the containing directory instead.
-_SEQ = re.compile(r"\$F\d*|%0?\d*d|<UDIM>|<udim>|#{2,}|\$\(F\d*\)|\$\{F\d*\}")
+# $F, $F4, %04d, ####, $(F4), ${F4} -- a per-FRAME sequence. The frames
+# that exist on disk are not the frames the farm will read (a cache may be
+# partially written, a render range may start anywhere), so these reduce to
+# the containing directory, which is the honest superset.
+_SEQ = re.compile(r"\$F\d*|%0?\d*d|#{2,}|\$\(F\d*\)|\$\{F\d*\}")
+
+# <UDIM>, <udim>, <ATTR:name>, ... -- a per-TILE template. Different
+# problem, different answer: every tile that exists IS a tile the render
+# reads, so these are globbed into the real files instead of dragging in
+# whatever else lives in the folder. Field case (airship_v013.hip):
+# `tex_mip/Balon_Base_color_<UDIM>.exr` on an mtlximage parameter reduced
+# to `tex_mip/`, uploading all 72 files / 995 MB of that folder to get the
+# six tiles that material uses.
+_UDIM_RE = re.compile(r"<udim>", re.IGNORECASE)
+_TOKEN_RE = re.compile(r"<[^<>]+>")
+
+
+def is_template(path):
+    """True when *path* names a family of tiles rather than one file."""
+    return bool(path) and bool(_TOKEN_RE.search(path))
+
+
+def glob_pattern(path):
+    """A ``<UDIM>`` template as a glob: four digits, not a bare wildcard.
+
+    Any other ``<...>`` token stands for something that cannot be evaluated
+    here and degrades to ``*`` -- glob only ever returns files that exist,
+    so a too-wide pattern costs a directory listing, not a wrong upload.
+    """
+    return _TOKEN_RE.sub("*", _UDIM_RE.sub("[0-9][0-9][0-9][0-9]", path))
 
 # Directories never worth uploading: PDG's own scratch dir, hand-rolled
 # backup folders, VCS metadata, bytecode cache. Pruned at any depth while
@@ -103,9 +130,11 @@ class PlanRow:
     kind: str
     files: int
     bytes: int
+    source: str = "scene"
 
 
-def expand_reference(parm, pattern, expand, exists=os.path.exists, isdir=os.path.isdir):
+def expand_reference(parm, pattern, expand, exists=os.path.exists, isdir=os.path.isdir,
+                     glob_fn=None):
     """Every real path one ``(parm, pattern)`` file reference resolves to.
 
     Two ways to resolve a reference, and neither is a superset of the other:
@@ -131,6 +160,7 @@ def expand_reference(parm, pattern, expand, exists=os.path.exists, isdir=os.path
     ``expand``/``exists``/``isdir`` are injected so this function is testable
     without Houdini; the caller passes ``hou.text.expandString``.
     """
+    globber = glob_fn or glob.glob
     out = []
     candidates = []
     if parm is not None:
@@ -147,15 +177,19 @@ def expand_reference(parm, pattern, expand, exists=os.path.exists, isdir=os.path
         if not value:
             continue
         if _SEQ.search(value):
-            value = os.path.dirname(value)
-            ok = isdir(value)
+            parent = os.path.dirname(value)
+            found = [parent] if isdir(parent) else []
+        elif is_template(value):
+            # Globbed BEFORE any existence check: the literal path with the
+            # token in it never exists, so checking first is how a whole
+            # material's worth of textures goes missing.
+            found = sorted({os.path.normpath(p) for p in globber(glob_pattern(value))})
         else:
-            ok = exists(value)
-        if not ok:
-            continue
-        value = os.path.normpath(value)
-        if value not in out:
-            out.append(value)
+            found = [value] if exists(value) else []
+        for item in found:
+            item = os.path.normpath(item)
+            if item not in out:
+                out.append(item)
     return out
 
 
@@ -164,20 +198,21 @@ class RefScan:
     """What one pass over ``hou.fileReferences()`` found.
 
     ``paths`` -- real local paths, deduplicated, hip file first.
-    ``output_patterns`` -- the unexpanded patterns of references that name
-    where output GOES. They are handed to Houdini's own file-dependency
-    dialog as ``forced_unselected_patterns``, so the artist sees the
-    decision as an unchecked row instead of not seeing it at all.
+    ``output_paths`` -- paths of references that name where output GOES
+    (:data:`_NON_DEPENDENCY_PARMS`). Kept apart rather than dropped: they
+    become rows in the confirmation window, unchecked, so the decision is
+    visible and the artist can overrule it. That is where the 11.54 GB
+    ``pdg_workingdir`` folder shows up as one line with its real weight.
     ``unresolved`` -- patterns that resolved to nothing on disk, kept for
     the log: a reference that will not upload is worth one line.
     """
 
     paths: list
-    output_patterns: tuple
+    output_paths: list
     unresolved: tuple
 
 
-def expand_pairs(pairs, expand, exists=os.path.exists, isdir=os.path.isdir):
+def expand_pairs(pairs, expand, exists=os.path.exists, isdir=os.path.isdir, glob_fn=None):
     """``(parm, pattern)`` pairs -> ``(paths, unresolved patterns)``.
 
     Used for both halves of the flow: the scan below, and the selection
@@ -189,7 +224,8 @@ def expand_pairs(pairs, expand, exists=os.path.exists, isdir=os.path.isdir):
     for parm, pattern in pairs:
         if not pattern or pattern.startswith(("op:", "opdef:", "temp:")):
             continue
-        found = expand_reference(parm, pattern, expand, exists=exists, isdir=isdir)
+        found = expand_reference(parm, pattern, expand, exists=exists, isdir=isdir,
+                                 glob_fn=glob_fn)
         if not found:
             unresolved.append(pattern)
             continue
@@ -201,8 +237,7 @@ def expand_pairs(pairs, expand, exists=os.path.exists, isdir=os.path.isdir):
 
 
 def scan_refs(scope=SCOPE_SCENE, node=None, log=None, project_dir_variable="HIP",
-              selected_only=False, drop_outputs=True,
-              exists=os.path.exists, isdir=os.path.isdir):
+              exists=os.path.exists, isdir=os.path.isdir, glob_fn=None):
     """Scan the scene's file references and resolve them to real paths.
 
     The only function in this module allowed to ``import hou`` -- done
@@ -210,15 +245,10 @@ def scan_refs(scope=SCOPE_SCENE, node=None, log=None, project_dir_variable="HIP"
     pure and importable/testable without Houdini installed.
 
     - The hip file itself (``hou.hipFile.path()``) is always first.
-    - ``selected_only`` reads Houdini's own selection state
-      (``hou.fileReferences(include_all_refs=False)``) -- what the artist
-      left checked the last time they answered the dependency dialog. This
-      is the same call SideFX's own HQueue ROP makes when the dialog is
-      skipped (``hqrop.getSelectedFileReferences``).
-    - ``drop_outputs`` removes references named in
-      :data:`_NON_DEPENDENCY_PARMS` and reports them as
-      ``output_patterns``. Turn it off after the artist has answered the
-      dialog: at that point their answer is the decision, not ours.
+    - References named in :data:`_NON_DEPENDENCY_PARMS` come back separately
+      as ``output_paths``: they are where results go, so they are not
+      uploaded by default, but they are shown -- and overrulable -- rather
+      than dropped out of sight.
     - With ``scope=SCOPE_BRANCH`` and ``node`` set to the upload node, only
       references owned by a node this cook reads survive -- see
       :func:`_branch_node_paths`. A reference no parameter owns (Houdini
@@ -235,30 +265,32 @@ def scan_refs(scope=SCOPE_SCENE, node=None, log=None, project_dir_variable="HIP"
     say = log if log is not None else (lambda _message: None)
     branch = _branch_node_paths(node, say) if scope == SCOPE_BRANCH else None
 
-    pairs = hou.fileReferences(project_dir_variable, include_all_refs=not selected_only)
+    pairs = hou.fileReferences(project_dir_variable)
     kept = []
     outputs = []
     off_branch = 0
     for parm, pattern in pairs:
         if parm is not None:
-            if drop_outputs and _parm_name(parm) in _NON_DEPENDENCY_PARMS:
-                outputs.append(pattern)
-                continue
             owner = _parm_node_path(parm)
             if branch is not None and owner is not None and owner not in branch:
                 off_branch += 1
                 continue
+            if _parm_name(parm) in _NON_DEPENDENCY_PARMS:
+                outputs.append((parm, pattern))
+                continue
         kept.append((parm, pattern))
 
-    paths, unresolved = expand_pairs(kept, hou.text.expandString, exists=exists, isdir=isdir)
+    expand = dict(expand=hou.text.expandString, exists=exists, isdir=isdir, glob_fn=glob_fn)
+    paths, unresolved = expand_pairs(kept, **expand)
+    output_paths, _ = expand_pairs(outputs, **expand)
     paths.insert(0, hou.hipFile.path())
     if outputs:
-        say("{} reference(s) name outputs, not inputs".format(len(outputs)))
+        say("{} reference(s) name outputs, not inputs -- offered unchecked".format(len(outputs)))
     if off_branch:
         say("skipped {} reference(s) outside this cook's branch".format(off_branch))
     if unresolved:
         say("{} reference(s) resolved to nothing on disk".format(len(unresolved)))
-    return RefScan(paths=paths, output_patterns=tuple(outputs), unresolved=tuple(unresolved))
+    return RefScan(paths=paths, output_paths=output_paths, unresolved=tuple(unresolved))
 
 
 def collect_refs(scope=SCOPE_SCENE, node=None, log=None, **kwargs):
@@ -472,7 +504,7 @@ def _dir_weight(path):
     return files, total
 
 
-def plan_refs(paths):
+def plan_refs(paths, source="scene"):
     """Weigh each reference for the confirmation window, without expanding it.
 
     Returns ``(rows, missing)``: one :class:`PlanRow` per surviving
@@ -503,11 +535,12 @@ def plan_refs(paths):
             if os.path.basename(path) in _SKIP_DIR_NAMES:
                 continue
             files, total = _dir_weight(path)
-            rows.append(PlanRow(path=path, kind="dir", files=files, bytes=total))
+            rows.append(PlanRow(path=path, kind="dir", files=files, bytes=total, source=source))
         elif os.path.isfile(path):
             if _is_skipped_file(path):
                 continue
-            rows.append(PlanRow(path=path, kind="file", files=1, bytes=os.path.getsize(path)))
+            rows.append(PlanRow(path=path, kind="file", files=1,
+                                bytes=os.path.getsize(path), source=source))
         else:
             missing.append(path)
     return rows, missing
