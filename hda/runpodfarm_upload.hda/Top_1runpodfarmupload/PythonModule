@@ -68,25 +68,37 @@ def _say(message):
 def previewUpload(kwargs):
     """Show the upload plan without cooking anything.
 
-    The same window the cook shows, forced on (ask=True) regardless of the
-    Confirm toggle -- that is what the button is for. Any choice made here
-    is written back to the node, so previewing IS the way to set the
-    selection for a batch cook that will never open a window.
+    The same two windows the cook shows -- Houdini's own file dependency
+    dialog, then this package's window for the USD files Houdini's dialog
+    has no row for -- forced on regardless of the Confirm toggle. Any
+    choice made here is kept, so previewing IS how you set the selection
+    for a batch cook that will never open a window.
     """
     node = kwargs["node"]
     from rpfarm import deps as rpdeps
     from rpfarm import preflight as rppf
+    from rpfarm import usddeps as rpusd
 
     scope = node.evalParm("rpfarm_scope") or rpdeps.SCOPE_BRANCH
-    refs = rpdeps.collect_refs(scope=scope, node=node, log=_say)
+    scan = rpdeps.scan_refs(scope=scope, node=node, log=_say)
+    rops = rpdeps.cook_rops(node, log=_say)
+    usd = rpusd.collect_usd_refs(
+        rops, log=_say, deep=bool(node.evalParm("rpfarm_usddeep"))) if rops else []
     try:
-        rppf.resolve_upload_set(node, refs, ask=True, log=_say)
+        paths = rppf.choose_uploads(
+            node, scan, usd, ask=True, log=_say, rop=rops[0] if rops else None)
     except rppf.UploadCancelled:
         _say("preview closed with Cancel -- nothing changed")
+        return
+    _say("{} file(s)/directory(ies) would upload".format(len(paths)))
 
 
 def clearExclusions(kwargs):
-    """Re-check every reference this node was told to skip."""
+    """Re-check every USD file this node was told to skip.
+
+    Only the USD half: Houdini keeps its own selection state for parameter
+    references, and this button has no business pretending to reset that.
+    """
     node = kwargs["node"]
     node.parm("rpfarm_exclude").set("")
-    _say("all references re-checked")
+    _say("all USD files re-checked")
