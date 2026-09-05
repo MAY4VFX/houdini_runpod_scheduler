@@ -4,11 +4,29 @@ try:
     _scheduler_class = kwargs['type'].hdaModule().RunPodFarmScheduler
 except AttributeError:
     # The PythonModule did not finish importing, so its class never got
-    # defined. The real reason is in the error right above this one; by far
-    # the most common one is a Houdini that was started before the code
-    # updated, which re-raises here as a second, meaningless AttributeError
-    # about a name the artist has never heard of. Say the useful thing again
-    # instead of that.
+    # defined. The real reason is in the error right above this one, and it
+    # re-raises here as a second, meaningless AttributeError about a name the
+    # artist has never heard of. Say the useful thing instead -- but say the
+    # RIGHT useful thing, because there are two very different causes.
+    import importlib.util
+
+    if importlib.util.find_spec("rpfarm") is None:
+        # rpfarm is not installed in this Python at all. That is the normal
+        # state on a RENDER POD, where this scene is opened only to render a
+        # ROP: seen in a real render log (2026-09-05), where the old wording
+        # told a farm machine to "restart Houdini" -- advice that means
+        # nothing there and would send whoever reads that log next chasing
+        # the wrong thing.
+        raise ImportError(
+            "rpfarm не установлен в этом Python, поэтому нода фермы здесь не "
+            "работает.\n\nНА РЕНДЕР-ПОДЕ ЭТО НОРМАЛЬНО: сцена всё равно "
+            "загрузится и отрендерится, задачи планирует ваша машина, а не "
+            "под.\n\nНа рабочей машине это значит, что пакет не установлен:\n"
+            "    python3 -m rpfarm setup"
+        ) from None
+
+    # rpfarm IS importable, so the module broke on something inside it -- by
+    # far the most common cause is a Houdini started before the code updated.
     raise ImportError(
         "Модуль ноды фермы не загрузился — настоящая причина в сообщении "
         "выше.\n\nЧаще всего это значит, что Houdini был запущен до "

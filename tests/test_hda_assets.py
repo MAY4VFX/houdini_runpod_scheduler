@@ -556,3 +556,23 @@ def test_the_shipped_asset_carries_what_it_was_built_against(asset, typedir):
     for name in ("deps.py", "preflight.py", "__init__.py"):
         size, digest = rpfarm.FINGERPRINT[name]
         assert f"{name!r}: ({size}, {digest!r})" in src, f"{asset} is stale for {name}"
+
+
+def test_a_render_pod_is_not_told_to_restart_houdini():
+    """Seen in a real render log (2026-09-05): a pod has no rpfarm installed,
+    so the scheduler's PythonModule cannot import and this handler told a
+    farm machine to "restart Houdini". The scene loads and renders fine
+    without the node; the advice was noise that would send whoever reads that
+    log next chasing the wrong thing."""
+    src = (REPO / "hda" / "runpodfarm_scheduler.hda" / "Top_1runpodfarmscheduler"
+           / "PreFirstCreate").read_text(encoding="utf-8")
+    ast.parse(src)
+
+    not_installed = src.index('find_spec("rpfarm") is None')
+    restart = src.index("ПЕРЕЗАПУСТИТЕ HOUDINI")
+    assert not_installed < restart, "check 'not installed' BEFORE blaming a stale session"
+
+    pod_branch = src[not_installed:restart]
+    assert "РЕНДЕР-ПОДЕ ЭТО НОРМАЛЬНО" in pod_branch
+    assert "ПЕРЕЗАПУСТИТЕ" not in pod_branch, "wrong advice for a pod"
+    assert "rpfarm setup" in pod_branch, "and the right advice for a workstation"
