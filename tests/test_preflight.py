@@ -212,3 +212,24 @@ def test_a_broken_window_never_stalls_the_cook(tmp_path, monkeypatch):
 
     assert kept == refs
     assert any("no QApplication" in m for m in said), said
+
+
+def test_a_skipped_window_says_which_condition_refused(tmp_path, monkeypatch):
+    """Silence here reads as "the window is broken". The artist has a
+    working alternative when it is the thread check that refused, and the
+    log is where they find out."""
+    monkeypatch.setattr(pf, "ui_unavailable_reason", lambda: "no UI (headless cook)")
+    said = []
+
+    pf.resolve_upload_set(_FakeNode(confirm=1), _scene(tmp_path), log=said.append)
+
+    assert any("confirmation window not shown: no UI (headless cook)" in m for m in said), said
+
+
+def test_no_reason_is_logged_when_the_window_was_not_wanted(tmp_path, monkeypatch):
+    monkeypatch.setattr(pf, "ui_unavailable_reason", lambda: "no UI (headless cook)")
+    said = []
+
+    pf.resolve_upload_set(_FakeNode(confirm=0), _scene(tmp_path), log=said.append)
+
+    assert not any("not shown" in m for m in said), said

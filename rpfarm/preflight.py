@@ -139,27 +139,38 @@ def row_detail(row):
 # -- the window ----------------------------------------------------------------
 
 
-def ui_available():
-    """True only where a modal Qt dialog is actually safe to open.
+def ui_unavailable_reason():
+    """None when a modal Qt dialog is safe to open here; else why it is not.
 
-    Two conditions, both required. ``hou.isUIAvailable()`` is false under
-    hython, so every headless cook skips the window without a special case.
-    The main-thread check is the one that matters in Houdini itself: PDG
-    generation is not guaranteed to run on the main thread, and Qt from
-    another thread does not raise politely -- it can take the session down.
+    Two conditions, both required, and the artist deserves to know which
+    one refused. ``hou.isUIAvailable()`` is false under hython, so every
+    headless cook skips the window with no special case. The main-thread
+    check is the one that matters inside Houdini: PDG generation is not
+    guaranteed to run on the main thread, and Qt from another thread does
+    not raise politely -- it can take the session down. When that is what
+    happened, the artist has a working alternative (the Preview button is a
+    parameter callback, always on the main thread), so the reason says so
+    instead of the cook going quiet.
     """
-    import threading
-
     try:
         import hou
     except ImportError:
-        return False
-    if threading.current_thread() is not threading.main_thread():
-        return False
+        return "no Houdini in this process"
     try:
-        return bool(hou.isUIAvailable())
-    except Exception:
-        return False
+        if not hou.isUIAvailable():
+            return "no UI (headless cook)"
+    except Exception as exc:
+        return "cannot tell whether a UI exists ({})".format(exc)
+    import threading
+
+    if threading.current_thread() is not threading.main_thread():
+        return ("generation is not running on Houdini's main thread -- "
+                "use the Preview Upload... button to choose")
+    return None
+
+
+def ui_available():
+    return ui_unavailable_reason() is None
 
 
 def build_dialog(rows, missing, excluded, title="RunPodFarm Upload", parent=None):
@@ -320,7 +331,11 @@ def resolve_upload_set(node, refs, ask=None, log=None):
     rows, missing = _deps.plan_refs(refs)
     excluded = load_exclusions(node.evalParm("rpfarm_exclude"))
     if ask is None:
-        ask = bool(node.evalParm("rpfarm_confirm")) and ui_available()
+        wanted = bool(node.evalParm("rpfarm_confirm"))
+        reason = ui_unavailable_reason() if wanted else None
+        if reason:
+            say("confirmation window not shown: {}".format(reason))
+        ask = wanted and reason is None
 
     if ask:
         try:
