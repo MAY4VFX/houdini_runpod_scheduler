@@ -442,3 +442,21 @@ def test_the_scheduler_sorts_the_gpu_set_by_price_before_sending_it():
     assert "rpgpus.order_for_request(chosen, rows)" in src
     # and a catalogue it cannot fetch must not stop the cook
     assert "using it as given" in src
+
+
+@pytest.mark.parametrize("builder", sorted(BUILDERS))
+def test_every_embedded_callback_is_valid_python(builder):
+    """The code a builder bakes into an asset has to parse.
+
+    Twice now the same trap: the ``*_CODE`` constants are plain (non-raw)
+    triple-quoted strings, so a ``\\n`` written inside one becomes a REAL
+    newline in the emitted callback and cuts a string literal in half. The
+    asset then builds fine and installs fine, and the artist finds out at
+    cook time with ``SyntaxError: unterminated string literal`` from a
+    ``pdg.ExpressionError`` five frames deep. Parsing here costs nothing
+    and needs no Houdini.
+    """
+    for name, code in _string_constants(builder).items():
+        if not (name.endswith("_CODE") or name == "PYTHON_MODULE"):
+            continue  # HELP_TEXT is prose
+        ast.parse(code)  # raises SyntaxError, naming the line, if it ever breaks again
