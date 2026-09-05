@@ -11,6 +11,7 @@ class FakeAPI:
     def __init__(self):
         self.created, self.pods, self.terminated = [], {}, []
         self.create_kwargs = []
+        self.started = []
 
     def list_pods(self, prefix=""):
         return [p for p in self.pods.values() if p["name"].startswith(prefix)]
@@ -34,6 +35,15 @@ class FakeAPI:
     def terminate_pod(self, pid):
         self.terminated.append(pid)
         self.pods.pop(pid, None)
+
+    def start_pod(self, pid):
+        self.started.append(pid)
+        self.pods[pid]["desiredStatus"] = "RUNNING"
+        return self.pods[pid]
+
+    def stop_pod(self, pid):
+        self.pods[pid]["desiredStatus"] = "EXITED"
+        return self.pods[pid]
 
 
 class FakeClient:
@@ -72,21 +82,32 @@ def test_ensure_sync_pod_creates_once(tmp_path, monkeypatch):
     assert api.created[0]["RPFARM_ROLE"] == "sync" and api.created[0]["PUBLIC_KEY"].startswith("ssh-ed25519")
 
 
-def test_ensure_sync_pod_terminates_non_running_and_recreates(tmp_path, monkeypatch):
+def test_ensure_sync_pod_resumes_a_stopped_pod_instead_of_recreating(tmp_path, monkeypatch):
+    """This used to terminate any non-RUNNING pod and build a fresh one.
+
+    Harmless while nothing ever stopped one -- and exactly wrong now that the
+    scheduler parks the sync pod rather than deleting it: replacing it would
+    pay for the stopped pod AND its replacement, after discarding the container
+    disk that stopping it was meant to preserve.
+    """
     monkeypatch.setenv("RPFARM_HOME", str(tmp_path))
     api = FakeAPI()
+    # A resumed pod gets its endpoint back, so wait_ready can succeed -- with
+    # no ports it polls for its whole timeout, which is a hung test rather
+    # than a failing one.
     api.pods["old1"] = {
         "id": "old1",
         "name": pods.sync_pod_name("may"),
         "desiredStatus": "EXITED",
-        "publicIp": None,
-        "portMappings": {},
+        "publicIp": "1.2.3.4",
+        "portMappings": {"22": 12345},
     }
     p = pods.ensure_sync_pod(api, cfg(), "tok", "ssh-ed25519 AAA", client_factory=lambda pid: FakeClient(), sleep=lambda s: None)
-    assert "old1" not in api.pods
-    assert api.terminated == ["old1"]
-    assert p["id"] == "sync1"
-    assert len(api.created) == 1
+
+    assert p["id"] == "old1"
+    assert api.started == ["old1"]
+    assert api.terminated == []
+    assert api.created == []
 
 
 def test_ensure_sync_pod_does_not_adopt_prefix_match(tmp_path, monkeypatch):
@@ -627,3 +648,132 @@ def test_an_old_pod_that_cannot_report_the_new_fields_is_not_assumed_idle():
 
     assert verdict == "unknown"
     assert "cannot" in reason.lower() or "did not" in reason.lower()
+
+
+# ---------------------------------------------------------------------------
+# sync pod lifecycle: stop first, delete later
+#
+# The owner's policy. Both steps are node parameters because neither state is
+# free: running is ~$43/month, stopped ~$2/month (RunPod bills a stopped pod's
+# container disk at DOUBLE the running rate, and the sync pod carries 10GB).
+# ---------------------------------------------------------------------------
+
+_HOUR = 3600.0
+
+
+def _sync(status="RUNNING"):
+    return {"id": "sync1", "name": "rpfarm-sync-may", "desiredStatus": status}
+
+
+def test_a_busy_running_pod_is_left_alone():
+    action = rppods.sync_pod_action(_sync(), idle_s=60, stopped_s=None,
+                                    stop_after_s=15 * 60, delete_after_s=2 * _HOUR)
+
+    assert action == rppods.SYNC_KEEP
+
+
+def test_an_idle_running_pod_is_stopped_not_deleted():
+    """Stopping keeps the container disk, so the next cook resumes in seconds."""
+    action = rppods.sync_pod_action(_sync(), idle_s=16 * 60, stopped_s=None,
+                                    stop_after_s=15 * 60, delete_after_s=2 * _HOUR)
+
+    assert action == rppods.SYNC_STOP
+
+
+def test_a_recently_stopped_pod_is_kept_stopped():
+    action = rppods.sync_pod_action(_sync("EXITED"), idle_s=None, stopped_s=600,
+                                    stop_after_s=15 * 60, delete_after_s=2 * _HOUR)
+
+    assert action == rppods.SYNC_KEEP
+
+
+def test_a_long_stopped_pod_is_deleted():
+    """Stopped is cheap, not free -- the last couple of dollars are reclaimed."""
+    action = rppods.sync_pod_action(_sync("EXITED"), idle_s=None, stopped_s=3 * _HOUR,
+                                    stop_after_s=15 * 60, delete_after_s=2 * _HOUR)
+
+    assert action == rppods.SYNC_DELETE
+
+
+def test_zero_means_never_for_either_step():
+    """Someone who wants it parked indefinitely should not invent a big number."""
+    assert rppods.sync_pod_action(_sync(), idle_s=10 * _HOUR, stopped_s=None,
+                                  stop_after_s=0, delete_after_s=2 * _HOUR) == rppods.SYNC_KEEP
+    assert rppods.sync_pod_action(_sync("EXITED"), idle_s=None, stopped_s=10 * _HOUR,
+                                  stop_after_s=15 * 60, delete_after_s=0) == rppods.SYNC_KEEP
+
+
+def test_an_unknown_age_never_triggers_an_action():
+    """Doing nothing costs a little money; doing the wrong thing costs work."""
+    assert rppods.sync_pod_action(_sync(), idle_s=None, stopped_s=None,
+                                  stop_after_s=60, delete_after_s=60) == rppods.SYNC_KEEP
+    assert rppods.sync_pod_action(_sync("EXITED"), idle_s=None, stopped_s=None,
+                                  stop_after_s=60, delete_after_s=60) == rppods.SYNC_KEEP
+
+
+# ---------------------------------------------------------------------------
+# ...and the pod that was stopped must be RESUMED, never duplicated
+# ---------------------------------------------------------------------------
+
+
+class _ResumeAPI:
+    """One stopped sync pod on the account."""
+
+    def __init__(self, start_ok=True, status="EXITED"):
+        self.start_ok = start_ok
+        self.status = status
+        self.started, self.terminated, self.created = [], [], []
+
+    def list_pods(self, prefix=""):
+        # exact name for the config user under test -- the real lookup filters
+        # on it, because "rpfarm-sync-may" is a prefix of "rpfarm-sync-mayakovsky"
+        return [{"id": "sync1", "name": "rpfarm-sync-u", "desiredStatus": self.status}]
+
+    def start_pod(self, pod_id):
+        self.started.append(pod_id)
+        if not self.start_ok:
+            raise rppods.RunPodError(400, "cannot start")
+        return {"id": pod_id}
+
+    def terminate_pod(self, pod_id):
+        self.terminated.append(pod_id)
+
+    def create_cpu_pod(self, *a, **kw):
+        self.created.append(kw.get("cloud_type"))
+        return {"id": "sync2", "name": "rpfarm-sync-may", "desiredStatus": "RUNNING"}
+
+
+def test_a_stopped_sync_pod_is_started_again_not_replaced(tmp_path):
+    """Replacing it would pay for the stopped pod AND its replacement, and
+    throw away the container disk we stopped it to keep."""
+    api = _ResumeAPI()
+    cfg = _cfg_for_capacity(tmp_path)
+
+    pod = rppods._find_or_create_sync_pod(api, cfg, "tok", "pub", lambda m: None)
+
+    assert pod["id"] == "sync1"
+    assert api.started == ["sync1"]
+    assert api.terminated == []
+    assert api.created == []
+
+
+def test_a_pod_that_refuses_to_start_is_replaced(tmp_path):
+    api = _ResumeAPI(start_ok=False)
+    cfg = _cfg_for_capacity(tmp_path)
+
+    pod = rppods._find_or_create_sync_pod(api, cfg, "tok", "pub", lambda m: None)
+
+    assert api.started == ["sync1"]
+    assert api.terminated == ["sync1"]
+    assert pod["id"] == "sync2"
+
+
+def test_resume_does_not_depend_on_what_runpod_calls_the_stopped_state(tmp_path):
+    """The exact desiredStatus of a stopped pod is not something we can check
+    without stopping one, so anything not RUNNING is offered to start_pod."""
+    for state in ("EXITED", "STOPPED", "PAUSED", "something-new"):
+        api = _ResumeAPI(status=state)
+        pod = rppods._find_or_create_sync_pod(
+            api, _cfg_for_capacity(tmp_path), "tok", "pub", lambda m: None)
+        assert api.started == ["sync1"], state
+        assert pod["id"] == "sync1", state

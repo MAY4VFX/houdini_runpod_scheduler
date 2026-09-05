@@ -196,6 +196,23 @@ class RunPodAPI:
     def terminate_pod(self, pod_id):
         self._call("DELETE", f"/pods/{pod_id}", ok404=True)
 
+    def stop_pod(self, pod_id):
+        """Stop a pod without deleting it. Its container disk survives.
+
+        Stopping is not free -- RunPod keeps charging for the container disk,
+        and at DOUBLE the running rate ($0.20/GB/month against $0.10). For the
+        sync pod (10 GB, no volume) that is roughly $2/month stopped against
+        $43/month running: about twenty times cheaper, and emphatically not
+        zero. The pair with :meth:`start_pod` is what lets the sync pod be
+        parked between cooks instead of rebuilt, which is the whole point --
+        a stopped pod starts in seconds and keeps whatever it had.
+        """
+        return self._call("POST", f"/pods/{pod_id}/stop", ok404=True)
+
+    def start_pod(self, pod_id):
+        """Bring a stopped pod back. Raises if it cannot be resumed."""
+        return self._call("POST", f"/pods/{pod_id}/start")
+
     def list_pods(self, name_prefix=""):
         pods = self._call("GET", "/pods") or []
         return [p for p in pods if p.get("name", "").startswith(name_prefix)]

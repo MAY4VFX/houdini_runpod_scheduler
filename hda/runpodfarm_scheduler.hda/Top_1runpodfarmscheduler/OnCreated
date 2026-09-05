@@ -17,3 +17,12 @@
 node = kwargs["node"]
 node.setColor(hou.Color((0.549, 0.361, 0.882)))
 node.setUserData("nodeshape", "rpfarm")
+
+# Start the once-per-session sync-pod watch. The check used to live only in
+# onSetupCook, so between cooks nothing ever looked again and a pod could sit
+# for hours. Safe to call from every node: it is a no-op after the first, and
+# a no-op without a UI.
+try:
+    kwargs["node"].hdaModule().startSyncPodWatch(kwargs)
+except Exception:
+    pass

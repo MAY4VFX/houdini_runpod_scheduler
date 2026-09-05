@@ -163,11 +163,19 @@
         }
         parm {
             name    "rpfarm_syncidle"
-            label   "Sync Pod Idle (min)"
+            label   "Stop Sync Pod After (min)"
             type    integer
-            default { "15" }
+            default { [ "hou.phm().cfg_default_int(\"sync_idle_min\", 15)" python ] }
             range   { 0 240 }
-            help    "The shared CPU sync pod is retired at the start of the next cook once it has gone unused for this long. 0 keeps it forever."
+            help    "Stop -- not delete -- the shared CPU sync pod once it has gone unused this long. A stopped pod keeps its container disk and starts again in seconds, and costs about $2/month against roughly $43/month running. 0 never stops it. WORKS ONLY WHILE HOUDINI IS OPEN: the pod holds no API key and cannot retire itself, so a closed or crashed Houdini leaves it as it is; the node's Farm Status shows what is out there."
+        }
+        parm {
+            name    "rpfarm_syncdelete"
+            label   "Delete Stopped Sync Pod After (min)"
+            type    integer
+            default { [ "hou.phm().cfg_default_int(\"sync_delete_min\", 120)" python ] }
+            range   { 0 1440 }
+            help    "Delete the sync pod once it has been STOPPED this long. Stopped is cheap but not free -- RunPod bills a stopped pod's container disk at double the running rate ($0.20/GB/month against $0.10), which is about $2/month for the sync pod's 10GB. Deleting reclaims that, at the cost of a full rebuild next time instead of a few-second resume. 0 keeps it stopped indefinitely. Same limitation as above: only while Houdini is open."
         }
         parm {
             name    "rpfarm_minbalance"
@@ -183,6 +191,15 @@
         name    "folder_status"
         label   "Status"
 
+        parm {
+            name    "rpfarm_killsync"
+            label   "Stop Everything, Sync Pod Too"
+            type    button
+            default { "0" }
+            parmtag { "script_callback" "hou.phm().onKillAllIncludingSync(kwargs)" }
+            parmtag { "script_callback_language" "python" }
+            help    "Terminate every pod of YOURS, the CPU sync pod included, and leave the farm empty. Kill All Pods deliberately spares the sync pod because the next cook reuses it; this is the button for finishing work. It never touches another artist's pods -- the account is shared -- and it asks before killing anything that is mid-cook."
+        }
         parm {
             name    "rpfarm_killall"
             label   "Kill All Pods"
