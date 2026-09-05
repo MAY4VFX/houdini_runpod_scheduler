@@ -1474,7 +1474,12 @@ def test_nothing_is_said_when_nothing_was_skipped():
     sched.topNode = lambda: _types.SimpleNamespace(
         parent=lambda: _types.SimpleNamespace(children=lambda: []))
 
-    load_methods(["_announceCachedItems"], {})["_announceCachedItems"](sched)
+    sys.modules["pdg"] = _types.SimpleNamespace(
+        workItemState=_types.SimpleNamespace(CookedCache=object()))
+    try:
+        load_methods(["_announceCachedItems"], {})["_announceCachedItems"](sched)
+    finally:
+        sys.modules.pop("pdg", None)
 
     assert not any("skipped" in m for m in sched.logs), sched.logs
     assert any("0 cached" in m for m in sched.logs), (
