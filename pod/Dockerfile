@@ -44,6 +44,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 # "libatomic.so.1: cannot open shared object file".
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 openssh-server rsync curl ca-certificates zstd unzip \
+    tini \
     libatomic1 \
     libgl1-mesa-glx libglu1-mesa libxi6 libxmu6 libxrandr2 libxcursor1 \
     libxinerama1 libxss1 libasound2 libxkbcommon0 libnss3 libdbus-1-3 \
@@ -60,4 +61,17 @@ RUN chmod +x /opt/rpfarm/entrypoint.sh
 
 EXPOSE 22 4440 4442 8000
 
-ENTRYPOINT ["/opt/rpfarm/entrypoint.sh"]
+# tini as PID 1, purely to reap orphans.
+#
+# entrypoint.sh ends in `exec python3 worker.py`, so PID 1 was the worker. When
+# an sshd session process exits, its sftp-server child is reparented to PID 1
+# -- and a Python PID 1 never wait()s on adopted orphans, so every finished
+# SFTP session left a <defunct> behind forever. Observed on a live sync pod:
+# eleven of them after one upload, plus two orphaned sshd. They also made the
+# liveness counter read "busy" permanently before it learned to skip zombies.
+#
+# tini exists to do exactly this and nothing else: it forwards signals and
+# reaps whatever it inherits, without touching how the worker manages its own
+# children (which is why a SIGCHLD handler in the worker would have been the
+# wrong tool -- it would race with subprocess's own waitpid for task exit codes).
+ENTRYPOINT ["/usr/bin/tini", "--", "/opt/rpfarm/entrypoint.sh"]
