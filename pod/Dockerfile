@@ -49,6 +49,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1-mesa-glx libglu1-mesa libxi6 libxmu6 libxrandr2 libxcursor1 \
     libxinerama1 libxss1 libasound2 libxkbcommon0 libnss3 libdbus-1-3 \
     libegl1 libxcomposite1 \
+    # ROP_OpenGL.so needs these four, and without it the `opengl` node type
+    # never registers -- which makes hou.hipFile.load() FAIL, not warn, on any
+    # scene that contains a viewport-preview ROP. Measured on a live pod
+    # (2026-09-07): `ldd ROP_OpenGL.so` reported libXdamage.so.1, libXtst.so.6,
+    # libfontconfig.so.1 and libpci.so.3 "not found", and the artist's scene
+    # died with "Bad node type found: opengl". All four were in the v1 image
+    # list and were dropped as redundant when it was trimmed; they were not.
+    libxdamage1 libxtst6 libfontconfig1 libpci3 \
     && rm -rf /var/lib/apt/lists/* \
     && curl -fsSL https://rclone.org/install.sh -o /tmp/rclone-install.sh \
     && bash /tmp/rclone-install.sh \
