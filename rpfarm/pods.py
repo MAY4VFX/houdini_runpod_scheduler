@@ -71,6 +71,10 @@ def pod_env(cfg, role, token, slots, pubkey, extra=None, cook="", project=""):
     The name carries the same facts, but parsing it is guesswork -- a user or
     project containing "-" makes ``rpfarm-<user>-<project>-<cook>-<n>``
     ambiguous. These are unambiguous; the name stays for humans.
+
+    Raises :class:`rpfarm.config.ConfigError` when no license server is
+    configured -- the cheapest place to stop, since this runs before the
+    pod is created.
     """
     env = {
         "RPFARM_TOKEN": token,
@@ -81,7 +85,9 @@ def pod_env(cfg, role, token, slots, pubkey, extra=None, cook="", project=""):
         "RPFARM_PROJECT": project,
         "PUBLIC_KEY": pubkey,
         "HOUDINI_VERSION": cfg.houdini_version,
-        "SESINETD_HOST": cfg.sesinetd_host,
+        # Raises rather than starting a pod with an empty SESINETD_HOST:
+        # such a pod boots, bills, and fails every task on a license error.
+        "SESINETD_HOST": rpcfg.require_sesinetd_host(cfg),
         "SESINETD_PORT": str(cfg.sesinetd_port),
     }
     if extra:

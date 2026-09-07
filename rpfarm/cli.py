@@ -349,7 +349,10 @@ def _pick_template(api, args, cfg_stub, log=print):
         log(f"[OK] using existing template {existing['id']} (rpfarm-pod, image {existing.get('imageName')})")
         return existing["id"]
     env = {
-        "SESINETD_HOST": cfg_stub.sesinetd_host,
+        # No license server -> no template. A template carries the license
+        # host into every pod created from it, so baking an empty one in is
+        # a farm that boots and fails.
+        "SESINETD_HOST": rpcfg.require_sesinetd_host(cfg_stub),
         "SESINETD_PORT": str(cfg_stub.sesinetd_port),
         "HOUDINI_VERSION": cfg_stub.houdini_version,
     }
@@ -439,7 +442,30 @@ def cmd_setup(args, prompt=input):
     else:
         cfg = rpcfg.Config(api_key=api_key, user=user, volume_id=volume_id, template_id="", datacenter=datacenter)
 
-    cfg.template_id = _resolve_template_id(api, args, existing, cfg)
+    # The license server has no default (see rpfarm.config.Config): it is
+    # the artist's own, so setup asks rather than guessing. Asked here --
+    # before a template or a pod exists -- because a farm configured
+    # without one boots, bills, and fails every task on a license error.
+    lic = (getattr(args, "sesinetd_host", None) or cfg.sesinetd_host or "").strip()
+    if not lic and not args.non_interactive:
+        lic = prompt(
+            "SideFX license server -- host of YOUR sesinetd, e.g. lic.example.com: "
+        ).strip()
+    cfg.sesinetd_host = lic
+    if getattr(args, "sesinetd_port", None):
+        cfg.sesinetd_port = args.sesinetd_port
+    if lic:
+        print(f"[OK] license server {cfg.sesinetd_host}:{cfg.sesinetd_port}")
+    else:
+        print("[WARN] no license server set -- pods cannot be created until "
+              "sesinetd_host is in "
+              f"{home / rpcfg.CONFIG_FILENAME} (or rerun with --sesinetd-host)")
+
+    try:
+        cfg.template_id = _resolve_template_id(api, args, existing, cfg)
+    except rpcfg.ConfigError as e:
+        print(f"[FAIL] {e}", file=sys.stderr)
+        return 1
 
     rpcfg.save(cfg)
     print(f"[OK] wrote {home / rpcfg.CONFIG_FILENAME}")
@@ -609,11 +635,17 @@ def cmd_doctor(args):
     except RunPodError as e:
         fail(f"could not list templates: {e}")
 
-    try:
-        with socket.create_connection((cfg.sesinetd_host, cfg.sesinetd_port), timeout=5):
-            ok(f"{cfg.sesinetd_host}:{cfg.sesinetd_port} reachable (license server)")
-    except OSError as e:
-        fail(f"{cfg.sesinetd_host}:{cfg.sesinetd_port} unreachable ({e}) -- check network/VPN")
+    if not (cfg.sesinetd_host or "").strip():
+        fail(f"no license server configured -- set sesinetd_host in "
+             f"{rpcfg.home() / rpcfg.CONFIG_FILENAME} (or rerun `rpfarm setup`). "
+             f"It must be your own SideFX sesinetd, reachable from the pods; "
+             f"there is no default, and pods cannot be created without it")
+    else:
+        try:
+            with socket.create_connection((cfg.sesinetd_host, cfg.sesinetd_port), timeout=5):
+                ok(f"{cfg.sesinetd_host}:{cfg.sesinetd_port} reachable (license server)")
+        except OSError as e:
+            fail(f"{cfg.sesinetd_host}:{cfg.sesinetd_port} unreachable ({e}) -- check network/VPN")
 
     try:
         proc = subprocess.run([cfg.rclone_path, "--version"], capture_output=True, text=True, timeout=10)
@@ -1310,6 +1342,8 @@ def build_parser():
     p_setup.add_argument("--user", help="your farm username (default: config.toml's, else the OS login name)")
     p_setup.add_argument("--volume", help="use this network volume id instead of discovering/keeping one")
     p_setup.add_argument("--template", help="use this pod template id instead of discovering/keeping one")
+    p_setup.add_argument("--sesinetd-host", help="your SideFX license server (no default: it is yours, not ours)")
+    p_setup.add_argument("--sesinetd-port", type=int, help="license server port (default: sesinetd's own 1715)")
     p_setup.add_argument("--non-interactive", action="store_true", help="never prompt; fail instead of asking")
 
     p_doctor = sub.add_parser(

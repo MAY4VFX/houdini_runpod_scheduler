@@ -95,6 +95,7 @@ def _write_cfg(tmp_path, **overrides):
     fields = dict(
         api_key="k", user="tester", volume_id="vol123", template_id="tpl123",
         gpu_priority=["NVIDIA GeForce RTX 4090"],
+        sesinetd_host="lic.example.com",
     )
     fields.update(overrides)
     cfg = rpcfg.Config(**fields)
@@ -111,7 +112,7 @@ def test_setup_non_interactive_creates_config_and_token(tmp_path, monkeypatch):
     monkeypatch.setattr(houdini_local, "find_houdini_installations", lambda: [])
     monkeypatch.setattr(rpcfg, "rclone_bin", lambda *a, **k: str(tmp_path / "bin" / "rclone"))
 
-    rc = cli.main(["setup", "--non-interactive", "--api-key", "testkey", "--user", "tester"])
+    rc = cli.main(["setup", "--non-interactive", "--api-key", "testkey", "--user", "tester", "--sesinetd-host", "lic.example.com"])
     assert rc == 0
 
     assert stat.S_IMODE(os.stat(tmp_path / "config.toml").st_mode) == 0o600
@@ -149,7 +150,7 @@ def test_setup_creates_volume_and_template_when_none_exist(tmp_path, monkeypatch
     monkeypatch.setattr(houdini_local, "find_houdini_installations", lambda: [])
     monkeypatch.setattr(rpcfg, "rclone_bin", lambda *a, **k: str(tmp_path / "bin" / "rclone"))
 
-    rc = cli.main(["setup", "--non-interactive", "--api-key", "k", "--user", "u"])
+    rc = cli.main(["setup", "--non-interactive", "--api-key", "k", "--user", "u", "--sesinetd-host", "lic.example.com"])
     assert rc == 0
     cfg = rpcfg.load()
     assert cfg.volume_id == "newvol"
@@ -225,7 +226,7 @@ def test_setup_leaves_real_rpfarm_home_untouched(tmp_path, monkeypatch):
     monkeypatch.setattr(houdini_local, "find_houdini_installations", lambda: [])
     monkeypatch.setattr(rpcfg, "rclone_bin", lambda *a, **k: str(scoped_home / "bin" / "rclone"))
 
-    rc = cli.main(["setup", "--non-interactive", "--api-key", "k", "--user", "u"])
+    rc = cli.main(["setup", "--non-interactive", "--api-key", "k", "--user", "u", "--sesinetd-host", "lic.example.com"])
     assert rc == 0
     assert list(real_home.iterdir()) == []
     assert (scoped_home / "config.toml").exists()
@@ -265,6 +266,73 @@ def test_doctor_all_ok_with_no_sync_pod_running(tmp_path, monkeypatch, capsys):
     # real FAIL doctor should surface, not something this test should hide.
     assert rc == 1
     assert "[FAIL]" in out
+
+
+def test_doctor_names_the_unset_license_server_instead_of_probing_nothing(tmp_path, monkeypatch, capsys):
+    """There is no default license server, so "not configured" is its own
+    failure with its own fix -- not a socket error against an empty host."""
+    monkeypatch.setenv("RPFARM_HOME", str(tmp_path))
+    _write_cfg(tmp_path, sesinetd_host="", rclone_path="true",
+               ssh_key_path=str(tmp_path / "id_ed25519"))
+    (tmp_path / "id_ed25519").write_text("x")
+    (tmp_path / "id_ed25519.pub").write_text("x")
+
+    handlers = _setup_handlers()
+    handlers[("GET", "/networkvolumes/vol123")] = (
+        200, json.dumps({"id": "vol123", "size": 50, "dataCenterId": "EU-RO-1"}).encode()
+    )
+    handlers[("GET", "/templates")] = (200, json.dumps([{"id": "tpl123", "imageName": "img:latest"}]).encode())
+    monkeypatch.setattr(cli, "_transport", FakeTransport(handlers))
+    monkeypatch.setattr(houdini_local, "find_houdini_installations", lambda: [])
+
+    def _must_not_connect(*a, **k):
+        raise AssertionError("doctor must not open a socket to an unset host")
+
+    monkeypatch.setattr("socket.create_connection", _must_not_connect)
+
+    rc = cli.main(["doctor"])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "no license server configured" in out
+    assert "sesinetd_host" in out
+
+
+def test_setup_records_the_license_server_it_was_given(tmp_path, monkeypatch):
+    monkeypatch.setenv("RPFARM_HOME", str(tmp_path))
+    monkeypatch.setattr(cli, "_transport", FakeTransport(_setup_handlers()))
+    monkeypatch.setattr(houdini_local, "find_houdini_installations", lambda: [])
+    monkeypatch.setattr(rpcfg, "rclone_bin", lambda *a, **k: str(tmp_path / "bin" / "rclone"))
+
+    rc = cli.main(["setup", "--non-interactive", "--api-key", "k", "--user", "u",
+                   "--sesinetd-host", "lic.example.com", "--sesinetd-port", "1716"])
+    assert rc == 0
+    cfg = rpcfg.load()
+    assert cfg.sesinetd_host == "lic.example.com"
+    assert cfg.sesinetd_port == 1716
+
+
+def test_setup_asks_for_the_license_server_when_there_is_none(tmp_path, monkeypatch):
+    """No default means someone has to say it. Interactively that is a
+    question, and the answer is what lands in config.toml."""
+    monkeypatch.setenv("RPFARM_HOME", str(tmp_path))
+    monkeypatch.setattr(cli, "_transport", FakeTransport(_setup_handlers()))
+    monkeypatch.setattr(houdini_local, "find_houdini_installations", lambda: [])
+    monkeypatch.setattr(rpcfg, "rclone_bin", lambda *a, **k: str(tmp_path / "bin" / "rclone"))
+
+    asked = []
+
+    def fake_prompt(text):
+        asked.append(text)
+        return "lic.example.com"
+
+    rc = cli.cmd_setup(
+        SimpleNamespace(api_key="k", user="u", volume=None, template=None,
+                        sesinetd_host=None, sesinetd_port=None, non_interactive=False),
+        prompt=fake_prompt,
+    )
+    assert rc == 0
+    assert any("license server" in q for q in asked)
+    assert rpcfg.load().sesinetd_host == "lic.example.com"
 
 
 # -- storage --------------------------------------------------------------
@@ -1252,7 +1320,7 @@ def test_setup_records_the_adopted_volumes_region(tmp_path, monkeypatch, capsys)
     monkeypatch.setattr(houdini_local, "find_houdini_installations", lambda: [])
     monkeypatch.setattr(rpcfg, "rclone_bin", lambda *a, **k: str(tmp_path / "bin" / "rclone"))
 
-    assert cli.main(["setup", "--non-interactive", "--api-key", "k", "--user", "u"]) == 0
+    assert cli.main(["setup", "--non-interactive", "--api-key", "k", "--user", "u", "--sesinetd-host", "lic.example.com"]) == 0
     assert rpcfg.load().datacenter == "US-KS-2"
 
 

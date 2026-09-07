@@ -77,7 +77,15 @@ class Config:
     template_id: str
     datacenter: str = DEFAULT_DATACENTER
     houdini_version: str = "22.0.393"
-    sesinetd_host: str = "lic.example.invalid"
+    # No default, on purpose (Ruling R49). This is the artist's OWN SideFX
+    # license server: a real address baked in here would point every clone
+    # of this repo at one particular farm's sesinetd -- wrong for whoever
+    # deploys it, and an open invitation to draw licenses from somebody
+    # else's pool. Empty means "not configured"; require_sesinetd_host()
+    # turns that into one sentence saying what to set and where. The PORT
+    # keeps its default because 1715 is sesinetd's documented port, a
+    # protocol constant rather than anybody's address.
+    sesinetd_host: str = ""
     sesinetd_port: int = 1715
     # Sync pod lifecycle, in two steps: stop it when it has been unused this
     # long, then delete it when it has been stopped this long. Stopping is ~20x
@@ -230,6 +238,26 @@ def config_value(name: str, default: str = "") -> str:
         joined = ", ".join(str(v) for v in value if str(v))
         return joined or default
     return str(value)
+
+
+def require_sesinetd_host(cfg) -> str:
+    """The configured SideFX license server, or a ConfigError that says how
+    to configure one.
+
+    Called before anything that would spend money or time on a pod that
+    could not license ``hython`` anyway: creating a pod's environment
+    (:func:`rpfarm.pods.pod_env`) and creating the RunPod template.
+    """
+    host = (getattr(cfg, "sesinetd_host", "") or "").strip()
+    if not host:
+        raise ConfigError(
+            "no license server configured: set sesinetd_host in {} (and "
+            "sesinetd_port, if yours is not sesinetd's default 1715). It has "
+            "to be YOUR OWN SideFX license server, reachable from the render "
+            "pods -- without one, hython on a pod gets no license and every "
+            "task fails the same way.".format(home() / CONFIG_FILENAME)
+        )
+    return host
 
 
 def mask_secret(value: str | None) -> str:

@@ -67,7 +67,8 @@ class FakeClient:
 def cfg():
     from rpfarm.config import Config
 
-    return Config(api_key="k", user="may", volume_id="v", template_id="t", gpu_priority=["g"])
+    return Config(api_key="k", user="may", volume_id="v", template_id="t", gpu_priority=["g"],
+                  sesinetd_host="lic.example.com")
 
 
 def test_ensure_sync_pod_creates_once(tmp_path, monkeypatch):
@@ -138,7 +139,8 @@ def test_sync_pod_is_created_in_the_configured_datacenter(tmp_path, monkeypatch)
     from rpfarm.config import Config
 
     c = Config(api_key="k", user="may", volume_id="v", template_id="t",
-               gpu_priority=["g"], datacenter="US-KS-2")
+               gpu_priority=["g"], datacenter="US-KS-2",
+               sesinetd_host="lic.example.com")
     api = FakeAPI()
     pods.ensure_sync_pod(api, c, "tok", "ssh-ed25519 AAA",
                          client_factory=lambda pid: FakeClient(), sleep=lambda s: None)
@@ -291,7 +293,8 @@ class _CapacityAPI:
 
 
 def _cfg_for_capacity(tmp_path, wait_min=15, cloud="SECURE"):
-    cfg = rpcfg.Config(api_key="k", user="u", volume_id="v", template_id="t")
+    cfg = rpcfg.Config(api_key="k", user="u", volume_id="v", template_id="t",
+                       sesinetd_host="lic.example.com")
     cfg.datacenter = "EU-RO-1"
     cfg.capacity_wait_min = wait_min
     cfg.cloud_type = cloud
@@ -501,8 +504,20 @@ def test_a_pod_that_cannot_be_reached_is_left_alone():
         pod, "may", {"busy": 0, "ssh_sessions": 0, "transfers": 0})[0] == "unknown"
 
 
-def test_pod_env_carries_identity_readable_from_get_pods(tmp_path):
+def test_no_pod_is_created_without_a_license_server(tmp_path):
+    """A pod with an empty SESINETD_HOST boots, bills, and then fails every
+    task on a license error. Refuse while it is still free to refuse."""
     cfg = rpcfg.Config(api_key="k", user="may", volume_id="v", template_id="t")
+    cfg.ssh_key_path = str(tmp_path / "id")
+
+    with pytest.raises(rpcfg.ConfigError) as e:
+        rppods.pod_env(cfg, "gpu", "tok", 1, "ssh-ed25519 AAA")
+    assert "sesinetd_host" in str(e.value)
+
+
+def test_pod_env_carries_identity_readable_from_get_pods(tmp_path):
+    cfg = rpcfg.Config(api_key="k", user="may", volume_id="v", template_id="t",
+                       sesinetd_host="lic.example.com")
     cfg.ssh_key_path = str(tmp_path / "id")
 
     env = rppods.pod_env(cfg, "gpu", "tok", 1, "ssh-ed25519 AAA",

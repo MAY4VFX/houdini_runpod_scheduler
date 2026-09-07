@@ -17,6 +17,30 @@ def test_roundtrip(tmp_path, monkeypatch):
     assert back.api_key == "k" and back.gpu_priority == ["NVIDIA GeForce RTX 4090"] and back.datacenter == "EU-RO-1"
 
 
+def test_the_license_server_has_no_default(tmp_path, monkeypatch):
+    """A real address baked in here would point every clone of this repo at
+    one particular farm's license server. Empty is the only correct default,
+    and asking for it says where to put one."""
+    monkeypatch.setenv("RPFARM_HOME", str(tmp_path))
+    cfg = config.Config(api_key="k", user="may", volume_id="v", template_id="t")
+    assert cfg.sesinetd_host == ""
+    # The port keeps its default: 1715 is sesinetd's documented port, not
+    # anybody's address.
+    assert cfg.sesinetd_port == 1715
+
+    with pytest.raises(config.ConfigError) as e:
+        config.require_sesinetd_host(cfg)
+    msg = str(e.value)
+    assert "sesinetd_host" in msg
+    assert str(tmp_path / "config.toml") in msg
+
+
+def test_a_configured_license_server_comes_back_stripped():
+    cfg = config.Config(api_key="k", user="may", volume_id="v", template_id="t",
+                        sesinetd_host="  lic.example.com  ")
+    assert config.require_sesinetd_host(cfg) == "lic.example.com"
+
+
 def test_load_missing_file_raises_config_error(tmp_path, monkeypatch):
     monkeypatch.setenv("RPFARM_HOME", str(tmp_path))
     with pytest.raises(config.ConfigError):
