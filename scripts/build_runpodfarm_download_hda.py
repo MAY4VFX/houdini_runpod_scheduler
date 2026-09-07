@@ -34,6 +34,11 @@ import pathlib
 import sys
 
 import hou
+
+_REPO = pathlib.Path(__file__).resolve().parent.parent
+if str(_REPO) not in sys.path:
+    sys.path.insert(0, str(_REPO))
+from rpfarm import houdini_local as _hl  # noqa: E402
 import pdg
 
 OUT_HDA = sys.argv[1] if len(sys.argv) > 1 else "/tmp/runpodfarm_download.hda"
@@ -648,19 +653,25 @@ def main():
     # DEFINITION's own template group too, not just the live instance.
     definition.setParmTemplateGroup(ptg)
 
+    # NOTHING about the internal scheduler here. The expression is baked
+    # into the internal pythonprocessor's channel at build time (see
+    # pp.parm("topscheduler") above) and is verifiably present in the
+    # shipped asset, so re-asserting it on creation bought nothing -- and
+    # cost everything, because reaching inside a locked asset needs
+    # allowEditingOfContents(), which unlocks the instance PERMANENTLY. An
+    # unlocked instance reads as modified, stops following its definition,
+    # and saves its whole internal network into the .hip. Ruling R53.
     definition.addSection(
         "OnCreated",
         'node = kwargs["node"]\n'
-        + FAMILY_ONCREATED +
-        'pp = node.node("pythonprocessor1")\n'
-        'if pp is not None:\n'
-        '    try:\n'
-        '        node.allowEditingOfContents()\n'
-        '        pp.parm("topscheduler").setExpression(\n'
-        '            \'hou.pwd().parent().path() + "/localscheduler"\', language=hou.exprLanguage.Python)\n'
-        '    except hou.PermissionError:\n'
-        '        pass  # the baked-in default (set at build time) already has it right\n',
+        + FAMILY_ONCREATED,
     )
+
+    # Put this node in the TAB menu, in the one submenu all four assets and
+    # the setup tool share. Without this section a node is reachable only by
+    # typing its exact internal name -- which is why three of the four were
+    # missing from TAB while the fourth had a section of its own.
+    definition.addSection("Tools.shelf", _hl.asset_tools_shelf())
     definition.setExtraFileOption("OnCreated/IsPython", True)
     definition.setExtraFileOption("OnCreated/IsScript", True)
 

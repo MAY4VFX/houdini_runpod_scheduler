@@ -205,14 +205,14 @@ _ASSET_FINGERPRINT = {
     'deps.py': (38558, '2daae12f5770289a'),
     'dispatch.py': (22191, '1121a6505c88adb3'),
     'gpus.py': (8311, '7a28d5c2692b776e'),
-    'houdini_local.py': (34339, '93158f7fb7ec4dbc'),
+    'houdini_local.py': (35863, '6382f7ed7690f114'),
     'ledger.py': (17327, '70425e75fb216f01'),
     'package_runner.py': (8752, '96770e3879a6cb65'),
     'packages.py': (56224, '327c8debf6b236fc'),
     'pods.py': (27370, 'e7b4bfb9a4f8fc5e'),
     'preflight.py': (28605, '0f7b932002602fd9'),
     'runpod_api.py': (14539, 'b90960f9860c97fb'),
-    'scene_setup.py': (19066, 'a2874fb0ed3221ee'),
+    'scene_setup.py': (18467, '8838d55cbb131f99'),
     'smoke.py': (41503, 'd25dfbac9eddb12b'),
     'sync.py': (16104, '853b8d48734c88f9'),
     'tls.py': (3642, 'f3e50ea6ebd0308f'),
@@ -732,9 +732,8 @@ def onKillAllIncludingSync(kwargs):
 
             names = "\n".join("  {} -- {}".format(p.get("name", p["id"]), r)
                                for p, r in busy)
-            message = ("{} of your pods are not idle:\n\n{}\n\n"
-                       "Terminating them now loses whatever they are doing."
-                       .format(len(busy), names))
+            message = "{} of your pods are busy: {}. Terminate anyway?".format(
+                len(busy), names)
             if not hou.isUIAvailable():
                 _report(node, "rpfarm_status_text",
                         message + "\nRefusing without a UI to confirm.")
@@ -1051,6 +1050,11 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         # order in onStopCook) to tell the artist when the journal didn't
         # make it to the volume this cook.
         self._ledger_mirror_note = None
+        # Short lines the artist should see but must not be interrupted by:
+        # a low balance, somebody's orphan pods. They used to be modal
+        # dialogs in the middle of a cook. Ruling R54: a window is only for
+        # something the artist has to do RIGHT NOW or the work stops.
+        self._notes = []
 
     @classmethod
     def templateName(cls):
@@ -2141,7 +2145,16 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
             "" if max_cost in (0.0, float("inf")) else " of {:.2f} USD".format(max_cost)))
         if self._ledger_mirror_note:
             lines.append("ledger: {}".format(self._ledger_mirror_note))
+        for note in self._notes:
+            lines.append("note: {}".format(note))
         self._setStatusText("\n".join(lines))
+
+    def _note(self, text):
+        """Log it once, and keep it on the Status tab. Never a dialog."""
+        if text in self._notes:
+            return
+        self._log(text)
+        self._notes.append(text)
 
     def _setStatusText(self, text):
         """Write the Status tab's text field.
@@ -2357,13 +2370,10 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         if balance >= threshold:
             self._verboseLog("RunPod balance ${:.2f}".format(balance))
             return
-        message = "RunPod balance is ${:.2f}, below the ${:.2f} warning threshold.".format(
-            balance, threshold)
-        self._log(message)
-        import hou
-
-        if hou.isUIAvailable():
-            hou.ui.displayMessage(message, severity=hou.severityType.Warning)
+        # Not a dialog: the cook runs either way, so this is information,
+        # not a decision, and it goes where information goes.
+        self._note("RunPod balance {:.2f} USD, below the {:.2f} warning threshold".format(
+            balance, threshold))
 
     def _manageSyncPod(self):
         """Stop the sync pod when idle, delete it once it has been stopped a while.
@@ -2390,7 +2400,16 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
             self._verboseLog("sync pod housekeeping failed: {}".format(e))
 
     def _warnAboutOrphans(self):
-        """Offer to kill this user's leftover GPU pods from an earlier cook."""
+        """Say that leftover GPU pods from an earlier cook are still running.
+
+        This used to be a modal dialog offering to kill them, raised in the
+        middle of starting a cook. It is not a decision the artist has to
+        make right then -- the cook proceeds either way -- so under Ruling
+        R54 it is a note, not a window. Killing them stays a deliberate act:
+        the Kill All Pods button, or `rpfarm farm kill --all`. Nothing here
+        terminates anything on its own, which also keeps the old promise
+        never to end somebody else's cook unasked.
+        """
         try:
             orphans = rppods.find_orphans(self._api, self._cfg.user)
         except RunPodError as e:
@@ -2399,25 +2418,9 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         if not orphans:
             return
         names = ", ".join(p.get("name", p["id"]) for p in orphans)
-        self._log("{} orphan GPU pod(s) still running: {}".format(len(orphans), names))
-        import hou
-
-        if not hou.isUIAvailable():
-            # Never kill someone else's cook without being asked.
-            self._log("  (headless: leaving them alone -- use Kill All Pods or "
-                      "`rpfarm farm kill`)")
-            return
-        if hou.ui.displayMessage(
-            "{} RunPod GPU pod(s) from an earlier cook are still running:\n\n{}\n\n"
-            "They keep costing money until they are terminated.".format(
-                len(orphans), names),
-            buttons=("Kill them", "Keep them"),
-            default_choice=0,
-            close_choice=1,
-            severity=hou.severityType.Warning,
-        ) == 0:
-            rppods.terminate_all(self._api, [p["id"] for p in orphans])
-            self._log("terminated {} orphan pod(s)".format(len(orphans)))
+        self._note("{} GPU pod(s) from an earlier cook still running and still "
+                   "billing: {} -- Kill All Pods, or `rpfarm farm kill --all`".format(
+                       len(orphans), names))
 
     def onSetupCook(self):
         """[virtual] Called after onStartCook.

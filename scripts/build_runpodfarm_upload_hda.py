@@ -33,6 +33,11 @@ import sys
 
 import hou
 
+_REPO = pathlib.Path(__file__).resolve().parent.parent
+if str(_REPO) not in sys.path:
+    sys.path.insert(0, str(_REPO))
+from rpfarm import houdini_local as _hl  # noqa: E402
+
 OUT_HDA = sys.argv[1] if len(sys.argv) > 1 else "/tmp/runpodfarm_upload.hda"
 
 # -- the family look (Task 17) ------------------------------------------------
@@ -247,14 +252,14 @@ _ASSET_FINGERPRINT = {
     'deps.py': (38558, '2daae12f5770289a'),
     'dispatch.py': (22191, '1121a6505c88adb3'),
     'gpus.py': (8311, '7a28d5c2692b776e'),
-    'houdini_local.py': (34339, '93158f7fb7ec4dbc'),
+    'houdini_local.py': (35863, '6382f7ed7690f114'),
     'ledger.py': (17327, '70425e75fb216f01'),
     'package_runner.py': (8752, '96770e3879a6cb65'),
     'packages.py': (56224, '327c8debf6b236fc'),
     'pods.py': (27370, 'e7b4bfb9a4f8fc5e'),
     'preflight.py': (28605, '0f7b932002602fd9'),
     'runpod_api.py': (14539, 'b90960f9860c97fb'),
-    'scene_setup.py': (19066, 'a2874fb0ed3221ee'),
+    'scene_setup.py': (18467, '8838d55cbb131f99'),
     'smoke.py': (41503, 'd25dfbac9eddb12b'),
     'sync.py': (16104, '853b8d48734c88f9'),
     'tls.py': (3642, 'f3e50ea6ebd0308f'),
@@ -1272,28 +1277,25 @@ def main():
     # DialogScript with no parm{} blocks at all).
     definition.setParmTemplateGroup(ptg)
 
-    # Belt-and-suspenders for the scheduler override (see pp.parm
-    # "topscheduler" above): the baked-in Python expression already
-    # re-resolves the sibling localscheduler's absolute path on every
-    # cook, so this OnCreated re-asserts the *same* expression once more
-    # at instance-creation time rather than a static path (a static path
-    # would go stale if the node were ever renamed or moved). Belt AND
-    # suspenders because a silent wrong-scheduler fallback here means
-    # real recursion into runpodfarm_scheduler in production, not just a
-    # cosmetic bug -- see this node's Help.
+    # NOTHING about the internal scheduler here. The expression is baked
+    # into the internal pythonprocessor's channel at build time (see
+    # pp.parm("topscheduler") above) and is verifiably present in the
+    # shipped asset, so re-asserting it on creation bought nothing -- and
+    # cost everything, because reaching inside a locked asset needs
+    # allowEditingOfContents(), which unlocks the instance PERMANENTLY. An
+    # unlocked instance reads as modified, stops following its definition,
+    # and saves its whole internal network into the .hip. Ruling R53.
     definition.addSection(
         "OnCreated",
         'node = kwargs["node"]\n'
-        + FAMILY_ONCREATED +
-        'pp = node.node("pythonprocessor1")\n'
-        'if pp is not None:\n'
-        '    try:\n'
-        '        node.allowEditingOfContents()\n'
-        '        pp.parm("topscheduler").setExpression(\n'
-        '            \'hou.pwd().parent().path() + "/localscheduler"\', language=hou.exprLanguage.Python)\n'
-        '    except hou.PermissionError:\n'
-        '        pass  # the baked-in default (set at build time) already has it right\n',
+        + FAMILY_ONCREATED,
     )
+
+    # Put this node in the TAB menu, in the one submenu all four assets and
+    # the setup tool share. Without this section a node is reachable only by
+    # typing its exact internal name -- which is why three of the four were
+    # missing from TAB while the fourth had a section of its own.
+    definition.addSection("Tools.shelf", _hl.asset_tools_shelf())
     definition.setExtraFileOption("OnCreated/IsPython", True)
     definition.setExtraFileOption("OnCreated/IsScript", True)
 

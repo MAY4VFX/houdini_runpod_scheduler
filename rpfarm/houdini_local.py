@@ -457,9 +457,45 @@ def install_node_shape(install: HoudiniInstall, root: Path | None = None) -> dic
 SHELF_FILENAME = "rpfarm.shelf"
 SHELF_TOOL_NAME = "rpfarm_farm_setup"
 SHELF_TOOL_LABEL = "RunPod Farm Setup"
-#: TAB > this submenu > the label above, inside TOP networks only.
-SHELF_TOOL_SUBMENU = "RunPod Farm"
 SHELF_TOOL_ICON = "TOP/scheduler"
+
+#: THE TAB submenu. One name for the four assets and for the setup tool,
+#: defined once here and asserted by a test, because it was two: the assets'
+#: Tools.shelf said "RunPodFarm" and this tool said "RunPod Farm", so the
+#: artist got two sections in the TAB menu and neither held everything.
+#: The spelling follows the node labels ("RunPodFarm Upload").
+TAB_SUBMENU = "RunPodFarm"
+#: Kept as the name the installer code reads.
+SHELF_TOOL_SUBMENU = TAB_SUBMENU
+
+#: The Tools.shelf every one of the four assets carries, so all four appear
+#: in that one submenu. Houdini expands the $HDA_* placeholders per asset,
+#: which is why one document serves all of them.
+ASSET_TOOLS_SHELF = """<?xml version="1.0" encoding="UTF-8"?>
+<shelfDocument>
+  <!-- This file contains definitions of shelves, toolbars, and tools.
+ It should not be hand-edited when it is being used by the application.
+ Note, that two definitions of the same element are not allowed in
+ a single file. -->
+
+  <tool name="$HDA_DEFAULT_TOOL" label="$HDA_LABEL" icon="$HDA_ICON">
+    <toolMenuContext name="viewer">
+      <contextNetType>TOP</contextNetType>
+    </toolMenuContext>
+    <toolMenuContext name="network">
+      <contextOpType>$HDA_TABLE_AND_NAME</contextOpType>
+    </toolMenuContext>
+    <toolSubmenu>{submenu}</toolSubmenu>
+    <script scriptType="python"><![CDATA[import toptoolutils
+
+toptoolutils.genericTool(kwargs, '$HDA_NAME')]]></script>
+  </tool>
+</shelfDocument>""".format(submenu=TAB_SUBMENU)
+
+
+def asset_tools_shelf() -> str:
+    """The Tools.shelf document an asset ships so it lands in the TAB menu."""
+    return ASSET_TOOLS_SHELF
 
 #: The tool's script. Two jobs: put this checkout on sys.path the same way
 #: the HDAs do (RPFARM_ROOT, else the ~/.rpfarm/src symlink), and hand the

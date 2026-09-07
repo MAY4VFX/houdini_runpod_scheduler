@@ -357,47 +357,39 @@ def _call(node, method, *args):
 
 
 def report(result):
-    """The whole outcome as lines, so the log and the dialog say the same
-    thing and the tests can assert on it."""
+    """The outcome, in as few lines as it takes.
+
+    Ruling R54: no dialog, and no restating what the nodes already show. The
+    artist can read Project, Max Pods and Compression on the nodes; what they
+    cannot read anywhere is what this tool decided NOT to do. So the rule
+    here is one line for what happened, plus a line for each thing that still
+    needs them.
+    """
     lines = []
     if result.created:
-        lines.append("Created: " + ", ".join(
-            "{} ({})".format(path, role) for role, path in result.created))
-    if result.reused:
-        lines.append("Already there, reused: " + ", ".join(
-            "{} ({})".format(path, role) for role, path in result.reused))
-    if not result.created:
-        lines.append("Nothing to create -- this network already has the farm "
-                     "graph. Nothing was duplicated.")
+        lines.append("built the farm graph: " + ", ".join(
+            role for role, _ in result.created))
+    if result.reused and not result.created:
+        lines.append("already set up -- nothing added, nothing duplicated")
+    elif result.reused:
+        lines.append("reused: " + ", ".join(role for role, _ in result.reused))
 
-    lines.append("Project: {}".format(result.project or
-                                      "(scene not saved -- left on the node's own default)"))
-    lines.append("Max Pods: {} (never more machines than frames)".format(result.max_pods))
-    if result.rop:
-        lines.append("ROP Path: {}".format(result.rop))
-    elif result.rop_candidates:
-        lines.append("ROP Path: EMPTY -- the scene has {} renderable ROPs and this "
-                     "tool will not guess: {}".format(
-                         len(result.rop_candidates), ", ".join(result.rop_candidates[:8])))
-    else:
-        lines.append("ROP Path: EMPTY -- no renderable ROP found in this scene; "
-                     "fill it in on the render node.")
-    if result.scheduler_assigned:
-        lines.append("TOP Scheduler: set to the farm scheduler for this network.")
-
+    if not result.rop:
+        where = "{} renderable ROPs, pick one".format(len(result.rop_candidates)) \
+            if result.rop_candidates else "no renderable ROP in this scene"
+        lines.append("ROP Path is empty on the render node ({})".format(where))
     lines.extend(result.notes)
-    lines.append("Cook the BOTTOM node only, in one go. Cooking two nodes in two "
-                 "calls starts two PDG cooks and pays for a second GPU pod.")
-    lines.append("No download node on purpose: the scheduler's Download Outputs "
-                 "already brings frames home during the cook. Add a RunPodFarm "
-                 "Download by hand only to re-fetch a folder later.")
+    if result.created:
+        # The one mistake that costs real money, and the only thing here an
+        # artist cannot see by looking at the nodes.
+        lines.append("cook the bottom node only -- two cooks pay for two GPU pods")
     return lines
 
 
 # -- the entry point the shelf tool calls ------------------------------------
 
 
-def run(kwargs=None, ui=True):
+def run(kwargs=None):
     """Entry point for the TAB-menu tool. Needs Houdini."""
     import hou
 
@@ -417,11 +409,10 @@ def run(kwargs=None, ui=True):
         rop_candidates=rop_candidates(),
     )
 
-    lines = report(result)
-    for line in lines:
+    # Printed, never a dialog (Ruling R54). The graph it just built is the
+    # real report: every setting is on a parameter the artist can see.
+    for line in report(result):
         print("[rpfarm-setup] {}".format(line))
-    if ui and hasattr(hou, "ui") and hou.isUIAvailable():
-        hou.ui.displayMessage("\n".join(lines), title="RunPod Farm Setup")
     return result
 
 

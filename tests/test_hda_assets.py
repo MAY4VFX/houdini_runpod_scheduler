@@ -390,9 +390,25 @@ def test_prefirstcreate_explains_a_failed_module_instead_of_an_attributeerror():
            / "PreFirstCreate").read_text(encoding="utf-8")
 
     assert "except AttributeError:" in src
-    assert "ПЕРЕЗАПУСТИТЕ HOUDINI" in src
+    assert "Перезапустите Houdini" in src
     assert "from None" in src          # or the AttributeError comes back as context
     ast.parse(src)
+
+
+def test_prefirstcreate_says_one_line_not_a_paragraph():
+    """Ruling R54. The reasoning belongs in the comments around the raise --
+    the artist gets the one thing to do."""
+    src = (REPO / "hda" / "runpodfarm_scheduler.hda" / "Top_1runpodfarmscheduler"
+           / "PreFirstCreate").read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    messages = [n.value for n in ast.walk(tree)
+                if isinstance(n, ast.Constant) and isinstance(n.value, str)
+                and ("rpfarm" in n.value or "Houdini" in n.value)
+                and " " in n.value.strip()]
+    assert messages, "no artist-facing text found -- did the wording move?"
+    for message in messages:
+        assert "\n" not in message, message
+        assert len(message) <= 200, message
 
 
 def test_download_node_warns_when_the_scheduler_already_downloads_outputs():
@@ -569,10 +585,191 @@ def test_a_render_pod_is_not_told_to_restart_houdini():
     ast.parse(src)
 
     not_installed = src.index('find_spec("rpfarm") is None')
-    restart = src.index("ПЕРЕЗАПУСТИТЕ HOUDINI")
+    restart = src.index("Перезапустите Houdini")
     assert not_installed < restart, "check 'not installed' BEFORE blaming a stale session"
 
     pod_branch = src[not_installed:restart]
-    assert "РЕНДЕР-ПОДЕ ЭТО НОРМАЛЬНО" in pod_branch
-    assert "ПЕРЕЗАПУСТИТЕ" not in pod_branch, "wrong advice for a pod"
+    assert "На рендер-поде это" in pod_branch
+    assert "Перезапустите" not in pod_branch, "wrong advice for a pod"
     assert "rpfarm setup" in pod_branch, "and the right advice for a workstation"
+
+
+# -- one TAB submenu, and every node in it -----------------------------------
+
+
+@pytest.mark.parametrize("asset,subdir", sorted(ASSETS.items()))
+def test_every_asset_is_in_the_tab_menu_under_the_one_submenu(asset, subdir):
+    """The owner saw two RunPod sections in TAB and neither had everything:
+    the scheduler's Tools.shelf said "RunPodFarm", the setup tool said
+    "RunPod Farm", and the other three assets had no Tools.shelf at all, so
+    they were reachable only by typing their internal name. One constant,
+    one submenu, all four assets plus the tool -- checked here so the typo
+    cannot come back."""
+    import xml.etree.ElementTree as ET
+
+    from rpfarm import houdini_local as hl
+
+    shelf = REPO / "hda" / f"{asset}.hda" / subdir / "Tools.shelf"
+    assert shelf.is_file(), f"{asset} ships no Tools.shelf, so it is not in the TAB menu"
+    submenu = ET.fromstring(shelf.read_text()).find("tool/toolSubmenu").text
+    assert submenu == hl.TAB_SUBMENU
+    sections = (REPO / "hda" / f"{asset}.hda" / subdir / "Sections.list").read_text()
+    assert "Tools.shelf\tTools.shelf" in sections
+
+
+def test_the_setup_tool_shares_that_submenu():
+    import xml.etree.ElementTree as ET
+
+    from rpfarm import houdini_local as hl
+
+    submenu = ET.fromstring(hl.shelf_tool_source()).find("tool/toolSubmenu").text
+    assert submenu == hl.TAB_SUBMENU
+
+
+@pytest.mark.parametrize("builder", sorted(BUILDERS))
+def test_every_builder_emits_the_shared_tools_shelf(builder):
+    source = (REPO / "scripts" / builder).read_text()
+    assert 'definition.addSection("Tools.shelf", _hl.asset_tools_shelf())' in source
+
+
+# -- assets are created LOCKED (Ruling R53) ----------------------------------
+
+
+@pytest.mark.parametrize("asset,subdir", sorted(ASSETS.items()))
+def test_no_asset_unlocks_itself_on_creation(asset, subdir):
+    """An instance created unlocked reads as modified, stops following its
+    definition, and saves its whole internal network into the .hip -- which
+    is how a checked-in fixture went on running a generate script from the
+    day it was built. The unlock existed to re-assert one internal
+    expression that the definition already carries; see the next test."""
+    on_created = (REPO / "hda" / f"{asset}.hda" / subdir / "OnCreated").read_text()
+    assert "allowEditingOfContents" not in on_created
+
+
+@pytest.mark.parametrize("builder", sorted(BUILDERS))
+def test_no_builder_emits_an_unlock(builder):
+    for name, code in _string_constants(builder).items():
+        assert "allowEditingOfContents" not in code, name
+    tree = ast.parse((REPO / "scripts" / builder).read_text())
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            assert "node.allowEditingOfContents()" not in node.value, builder
+
+
+@pytest.mark.parametrize("asset,subdir", [
+    (a, s) for a, s in sorted(ASSETS.items()) if a != "runpodfarm_scheduler"])
+def test_the_internal_scheduler_override_is_baked_into_the_asset(asset, subdir):
+    """What made the unlock safe to delete: the expression is already in the
+    shipped asset's internal channel, so nothing has to reach inside a
+    locked instance at creation time to put it there."""
+    mime = (REPO / "hda" / f"{asset}.hda" / subdir / "Contents.dir" / "Contents.mime").read_text()
+    assert "channel topscheduler" in mime
+    assert 'hou.pwd().parent().path()' in mime
+    assert "/localscheduler" in mime
+
+
+# -- registering the scheduler type twice (Ruling R52) -----------------------
+
+
+class _FakeRegistry:
+    """A pdg.TypeRegistry that behaves like the real one: registering a name
+    that is already there raises, exactly as the owner saw."""
+
+    def __init__(self):
+        self.registered = []
+
+    def typeNames(self, kind, include_aliases=False):
+        return list(self.registered)
+
+    def registerScheduler(self, cls, label=None):
+        name = getattr(cls, "name", "runpodfarmscheduler")
+        if name in self.registered:
+            raise RuntimeError(
+                "A type already exists with the name {}".format(name))
+        self.registered.append(name)
+
+
+def _run_pre_first_create(registry, module):
+    """Execute the shipped PreFirstCreate with pdg and kwargs stubbed out."""
+    import sys
+    import types
+
+    source = (REPO / "hda" / "runpodfarm_scheduler.hda"
+              / "Top_1runpodfarmscheduler" / "PreFirstCreate").read_text()
+
+    fake_pdg = types.SimpleNamespace(
+        TypeRegistry=types.SimpleNamespace(types=lambda: registry),
+        registeredType=types.SimpleNamespace(Scheduler="Scheduler"),
+    )
+
+    class _Type:
+        def name(self):
+            return "runpodfarmscheduler"
+
+        def hdaModule(self):
+            return module
+
+    saved = sys.modules.get("pdg")
+    sys.modules["pdg"] = fake_pdg
+    try:
+        exec(compile(source, "PreFirstCreate", "exec"), {"kwargs": {"type": _Type()}})
+    finally:
+        if saved is None:
+            del sys.modules["pdg"]
+        else:
+            sys.modules["pdg"] = saved
+
+
+def test_registering_the_scheduler_twice_does_not_raise():
+    """Reinstalling the asset under a RUNNING Houdini re-runs
+    PreFirstCreate in the same session, and the type from the first run is
+    still registered. That is our normal update cycle, not an edge case:
+    the owner hit it on 2026-09-07 with "A type already exists with the
+    name runpodfarmscheduler"."""
+    import types
+
+    registry = _FakeRegistry()
+    scheduler_class = type("RunPodFarmScheduler", (), {"name": "runpodfarmscheduler"})
+    module = types.SimpleNamespace(RunPodFarmScheduler=scheduler_class)
+
+    _run_pre_first_create(registry, module)
+    assert registry.registered == ["runpodfarmscheduler"]
+
+    _run_pre_first_create(registry, module)  # must not raise
+    assert registry.registered == ["runpodfarmscheduler"]
+
+
+def test_a_broken_python_module_still_says_one_useful_line():
+    """And says it only when the type is NOT already registered -- a reinstall
+    must not turn into an ImportError about a symbol nobody has heard of."""
+    import types
+
+    class _NoClass:
+        def __getattr__(self, name):
+            raise AttributeError(name)
+
+    registry = _FakeRegistry()
+    with pytest.raises(ImportError) as e:
+        _run_pre_first_create(registry, _NoClass())
+    message = str(e.value)
+    assert len(message.splitlines()) == 1, message
+    assert "Houdini" in message
+
+    registry.registered.append("runpodfarmscheduler")
+    _run_pre_first_create(registry, _NoClass())  # already registered: no raise
+
+
+def test_the_rebuild_script_rebuilds_every_generated_asset():
+    """rebuild_assets.py is the one command that keeps the repository and the
+    artist's install in step. An asset missing from its list is silently
+    never rebuilt -- which is the exact failure mode it was written to end.
+    This map is the authority; the script must agree with it."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "rebuild_assets_probe", REPO / "scripts" / "rebuild_assets.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    expected = {asset[: -len(".hda")]: builder for builder, asset in BUILDERS.items()}
+    assert module.GENERATED == expected

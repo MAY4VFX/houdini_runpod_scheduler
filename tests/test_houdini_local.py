@@ -534,3 +534,33 @@ def test_installed_states_cover_every_hda(tmp_path):
     assert set(states) == set(hl.HDA_NAMES)
     assert states["runpodfarm_upload"]["present"] and not states["runpodfarm_upload"]["stale"]
     assert not states["runpodfarm_scheduler"]["present"]
+
+
+def test_installing_touches_only_the_installation_it_was_given(tmp_path, monkeypatch):
+    """It never fanned out on its own -- `rpfarm setup` and rebuild_assets.py
+    loop over every found Houdini deliberately, and ~/.rpfarm/otls is the
+    collapse cache they pass in, not a third install. What DID make "which
+    version got it" unpredictable was hython exporting
+    HOUDINI_USER_PREF_DIR, which HoudiniInstall honours: under hython every
+    install resolved to the running one's preferences. scripts/rebuild_assets
+    unpins it; this pins the other half of the claim."""
+    monkeypatch.delenv("HOUDINI_USER_PREF_DIR", raising=False)
+    root = tmp_path / "repo"
+    for name in hl.HDA_NAMES:
+        (root / "hda" / f"{name}.hda").mkdir(parents=True)
+
+    mine = hl.HoudiniInstall(_make_hfs(tmp_path / "a"))
+    mine.user_pref_dir = tmp_path / "prefs_22"
+    other = tmp_path / "prefs_21"
+    other.mkdir()
+
+    def fake_runner(cmd, check, capture_output, text):
+        with open(cmd[-1], "wb") as f:
+            f.write(b"x")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    hl.build_and_install_hdas(mine, tmp_path / "cache", root=root, runner=fake_runner)
+
+    assert sorted(p.name for p in (mine.user_pref_dir / "otls").iterdir()) == sorted(
+        f"{n}.hda" for n in hl.HDA_NAMES)
+    assert list(other.iterdir()) == [], "installed somewhere it was not asked to"

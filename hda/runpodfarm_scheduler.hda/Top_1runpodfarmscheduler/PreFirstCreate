@@ -1,41 +1,47 @@
 import pdg
 
-try:
-    _scheduler_class = kwargs['type'].hdaModule().RunPodFarmScheduler
-except AttributeError:
-    # The PythonModule did not finish importing, so its class never got
-    # defined. The real reason is in the error right above this one, and it
-    # re-raises here as a second, meaningless AttributeError about a name the
-    # artist has never heard of. Say the useful thing instead -- but say the
-    # RIGHT useful thing, because there are two very different causes.
-    import importlib.util
+_registry = pdg.TypeRegistry.types()
+_type_name = kwargs['type'].name()
 
-    if importlib.util.find_spec("rpfarm") is None:
-        # rpfarm is not installed in this Python at all. That is the normal
-        # state on a RENDER POD, where this scene is opened only to render a
-        # ROP: seen in a real render log (2026-09-05), where the old wording
-        # told a farm machine to "restart Houdini" -- advice that means
-        # nothing there and would send whoever reads that log next chasing
-        # the wrong thing.
+# Registering a scheduler type twice raises "A type already exists with the
+# name runpodfarmscheduler", and twice is not exotic -- it is our normal
+# cycle. Reinstalling this asset while Houdini is RUNNING makes Houdini load
+# the new definition, which runs PreFirstCreate a second time in the same
+# session, and the type from the first run is still in the registry. That is
+# how the owner hit it on 2026-09-07.
+#
+# There is no way to replace the registration: pdg.TypeRegistry has no
+# unregister, remove or replace method (checked in a live session -- the only
+# register* calls are one-way). So the existing registration stays, which
+# means the class in the registry is the one from the PREVIOUS definition.
+# That is not silently wrong: it is exactly the state the fingerprint guard
+# in this asset's PythonModule detects and reports, and the fix it names --
+# restart Houdini -- is the real one. Ruling R52.
+if _type_name not in _registry.typeNames(pdg.registeredType.Scheduler):
+    try:
+        _scheduler_class = kwargs['type'].hdaModule().RunPodFarmScheduler
+    except AttributeError:
+        # The PythonModule did not finish importing, so its class never got
+        # defined, and re-raising the AttributeError would name a symbol the
+        # artist has never heard of. Two different causes, one line each --
+        # the reasoning belongs here, not in a dialog the artist has to read
+        # while working.
+        import importlib.util
+
+        if importlib.util.find_spec("rpfarm") is None:
+            # Not installed in this Python at all. NORMAL on a render pod,
+            # where the scene is opened only to render a ROP and the tasks
+            # are scheduled by the artist's machine; seen in a real render
+            # log on 2026-09-05, where "restart Houdini" was useless advice.
+            raise ImportError(
+                "rpfarm не установлен в этом Python. На рендер-поде это "
+                "нормально. На рабочей машине: python3 -m rpfarm setup"
+            ) from None
+
+        # rpfarm imports fine, so the module broke on something inside it --
+        # nearly always a Houdini started before the code updated.
         raise ImportError(
-            "rpfarm не установлен в этом Python, поэтому нода фермы здесь не "
-            "работает.\n\nНА РЕНДЕР-ПОДЕ ЭТО НОРМАЛЬНО: сцена всё равно "
-            "загрузится и отрендерится, задачи планирует ваша машина, а не "
-            "под.\n\nНа рабочей машине это значит, что пакет не установлен:\n"
-            "    python3 -m rpfarm setup"
+            "Модуль ноды фермы не загрузился. Перезапустите Houdini."
         ) from None
 
-    # rpfarm IS importable, so the module broke on something inside it -- by
-    # far the most common cause is a Houdini started before the code updated.
-    raise ImportError(
-        "Модуль ноды фермы не загрузился — настоящая причина в сообщении "
-        "выше.\n\nЧаще всего это значит, что Houdini был запущен до "
-        "обновления кода: ПЕРЕЗАПУСТИТЕ HOUDINI."
-    # `from None`: without it Houdini prints "During handling of the above
-    # exception..." plus the AttributeError about RunPodFarmScheduler, which is
-    # the noise this whole branch exists to remove.
-    ) from None
-
-pdg.TypeRegistry.types().registerScheduler(
-    _scheduler_class,
-    label='RunPodFarm Scheduler')
+    _registry.registerScheduler(_scheduler_class, label='RunPodFarm Scheduler')

@@ -1,11 +1,3 @@
 node = kwargs["node"]
 node.setColor(hou.Color((0.549, 0.361, 0.882)))
 node.setUserData("nodeshape", "rpfarm")
-pp = node.node("pythonprocessor1")
-if pp is not None:
-    try:
-        node.allowEditingOfContents()
-        pp.parm("topscheduler").setExpression(
-            'hou.pwd().parent().path() + "/localscheduler"', language=hou.exprLanguage.Python)
-    except hou.PermissionError:
-        pass  # the baked-in default (set at build time) already has it right

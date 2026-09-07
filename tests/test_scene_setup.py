@@ -191,11 +191,11 @@ def test_a_scheduler_path_pointing_at_nothing_is_repaired():
 
 def test_no_download_node_is_created():
     """The scheduler downloads outputs during the cook; a second node in
-    Upstream Outputs mode walks the same files again."""
+    Upstream Outputs mode walks the same files again. Why is documented in
+    the README and this module -- not repeated to the artist at runtime."""
     net = FakeNetwork()
     ss.build(net)
     assert ss.DOWNLOAD_TYPE not in {n.type().name() for n in net.children()}
-    assert any("download" in line.lower() for line in ss.report(ss.build(FakeNetwork())))
 
 
 def test_the_scene_is_what_configures_the_nodes():
@@ -239,7 +239,7 @@ def test_a_second_run_adopts_instead_of_duplicating():
     assert len(net.children()) == before
     assert not again.created
     assert roles(again.reused) == {"scheduler", "upload", "gate", "render"}
-    assert any("already has the farm graph" in line for line in ss.report(again))
+    assert any("already set up" in line for line in ss.report(again))
 
 
 def test_a_renamed_scheduler_is_still_a_scheduler():
@@ -319,4 +319,24 @@ def test_the_report_names_the_field_to_fill_when_it_cannot_choose():
     net = FakeNetwork()
     result = ss.build(net, rop_candidates=["/out/karma1", "/out/mantra1"])
     text = "\n".join(ss.report(result))
-    assert "EMPTY" in text and "/out/karma1" in text and "/out/mantra1" in text
+    assert "ROP Path is empty" in text and "2 renderable ROPs" in text
+
+
+def test_the_report_says_nothing_the_nodes_already_show():
+    """Ruling R54. Project, Max Pods and Compression are on the parameters;
+    repeating them is the noise the owner asked us to stop making."""
+    net = FakeNetwork()
+    result = ss.build(net, project="airship", frames=48, rop_candidates=["/out/karma1"])
+    text = "\n".join(ss.report(result))
+    for noise in ("airship", "Max Pods", "Compression", "Project:", "Download"):
+        assert noise not in text, noise
+    assert len(ss.report(result)) <= 3
+
+
+def test_the_tool_never_opens_a_dialog():
+    """The whole point of the complaint: it built the graph, the graph is the
+    report. Asserted on the source because there is no hou here to open one."""
+    import inspect
+
+    source = inspect.getsource(ss)
+    assert "displayMessage" not in source
