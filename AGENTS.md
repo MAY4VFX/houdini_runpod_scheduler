@@ -33,7 +33,7 @@ Houdini (PDG)
   runpodfarm_download <──sftp─── sync-под (CPU) ─┤
   runpodfarm_stats                                │
                                                   ▼
-                              Network Volume `2ze7qdwkt3` (EU-RO-1, /workspace)
+                              Network Volume (id — в конфиге, /workspace)
                               зоны: houdini/ apps/ projects/ ledger/
 ```
 
@@ -114,9 +114,10 @@ RPFARM_ROOT=$PWD hython scripts/smoke_scheduler_headless.py --scheduler localsch
 
 - Конфиг артиста: `~/.rpfarm/config.toml` (chmod 600) — ключ RunPod, id тома и
   шаблона, датацентр, версия Houdini, лицензионный хост, список GPU. В репо его нет.
-- Том `2ze7qdwkt3` (EU-RO-1, 50 ГБ), зоны `/workspace/{houdini,apps,projects,ledger}`.
+- Том (50 ГБ), зоны `/workspace/{houdini,apps,projects,ledger}`. Его id и датацентр —
+  `volume_id`/`datacenter` в `~/.rpfarm/config.toml`; в репо их нет (R49).
   `houdini` и `ledger` защищены от `prune`/`rm`.
-- Шаблон RunPod `rpfarm-pod` = `3i1l2ufjts`, образ `ghcr.io/may4vfx/rpfarm-pod`.
+- Шаблон RunPod с именем `rpfarm-pod`, образ `ghcr.io/may4vfx/rpfarm-pod`; его id — `template_id` в конфиге.
   CI (`.github/workflows/docker-build.yml`) на пуш в `pod/**` собирает образ и
   двигает шаблон; id шаблона — переменная репо `RPFARM_TEMPLATE_ID`, ключ — секрет
   `RUNPOD_API_KEY`.

@@ -714,7 +714,7 @@ def test_stage_tar_from_sftp_url_builds_rclone_copyto_command(tmp_path):
         return _sp.CompletedProcess(cmd, 0, stdout="", stderr="")
 
     local = cli._stage_tar_from_sftp_url(
-        "sftp://may@workstation01/home/may/Downloads/houdini-22.0.393.tar.gz",
+        "sftp://builder@buildhost/srv/houdini/houdini-22.0.393.tar.gz",
         "rclone",
         str(tmp_path),
         run=fake_run,
@@ -725,8 +725,8 @@ def test_stage_tar_from_sftp_url_builds_rclone_copyto_command(tmp_path):
     cmd = calls[0]
     assert cmd[0] == "rclone" and cmd[1] == "copyto"
     assert cmd[2] == (
-        ":sftp,host=workstation01,user=may,key_file=/keys/id_rsa"
-        ":/home/may/Downloads/houdini-22.0.393.tar.gz"
+        ":sftp,host=buildhost,user=builder,key_file=/keys/id_rsa"
+        ":/srv/houdini/houdini-22.0.393.tar.gz"
     )
 
 

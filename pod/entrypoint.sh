@@ -65,7 +65,7 @@ if [ -d "$HFS" ] && [ -f "$HFS/houdini_setup_bash" ]; then
     # `hserver` ships inside $HFS/bin and is only on PATH once
     # houdini_setup_bash above has actually set up a real Houdini install.
     # Guard it explicitly instead of letting each call fail with "command
-    # not found" -- confirmed on workstation01 (see task-4-report.md) that a
+    # not found" -- confirmed on a Linux host (see task-4-report.md) that a
     # missing hserver does NOT crash the script under `set -uo pipefail`
     # (no `-e`), but the guard keeps the log clean and makes the "no
     # licensing attempted" case explicit rather than four separate

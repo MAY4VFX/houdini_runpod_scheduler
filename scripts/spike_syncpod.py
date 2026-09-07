@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Spike: CPU pod + network volume + public ports in EU-RO-1. Throwaway.
+"""Spike: CPU pod + network volume + public ports. Throwaway.
+
+Volume and region come from ~/.rpfarm/config.toml (or SPIKE_VOLUME_ID /
+SPIKE_DATACENTER); nothing about one particular account is baked in here.
 
 Confirmed against https://rest.runpod.io/v1/openapi.json (PodCreateInput / Pod
 schemas) before running:
@@ -19,9 +22,43 @@ and prints the exact curl command to terminate it yourself:
   curl -X DELETE -H "Authorization: Bearer $RUNPOD_API_KEY" https://rest.runpod.io/v1/pods/<id>
 """
 import json, os, sys, time, urllib.request, urllib.error
+from pathlib import Path
+
+_REPO = Path(__file__).resolve().parent.parent
+if str(_REPO) not in sys.path:
+    sys.path.insert(0, str(_REPO))
+from rpfarm import config as rpcfg  # noqa: E402
 
 API = "https://rest.runpod.io/v1"
 KEY = os.environ["RUNPOD_API_KEY"]
+
+
+def _volume_and_region():
+    """The volume to mount and the region to create in, from the config the
+    rest of the tool reads.
+
+    A hardcoded volume id belongs to exactly one account; anyone else
+    running this spike would mount nothing (or somebody else's storage).
+    The region comes along because a pod can only mount a network volume
+    that lives in its own region -- the two are one answer, not two.
+    """
+    vol = os.environ.get("SPIKE_VOLUME_ID")
+    dc = os.environ.get("SPIKE_DATACENTER")
+    if vol and dc:
+        return vol, dc
+    try:
+        cfg = rpcfg.load()
+    except rpcfg.ConfigError as e:
+        sys.exit(f"{e}; or set SPIKE_VOLUME_ID and SPIKE_DATACENTER by hand")
+    vol = vol or cfg.volume_id
+    dc = dc or cfg.datacenter
+    if not vol:
+        sys.exit("no volume_id in config.toml -- run `rpfarm setup`, or set "
+                 "SPIKE_VOLUME_ID")
+    return vol, dc
+
+
+VOLUME_ID, DATACENTER = _volume_and_region()
 
 
 def call(method, path, body=None):
@@ -82,8 +119,8 @@ pod = call(
         "cpuFlavorIds": ["cpu3c", "cpu5c"],
         "vcpuCount": 2,
         "cloudType": "SECURE",
-        "dataCenterIds": ["EU-RO-1"],
-        "networkVolumeId": "2ze7qdwkt3",
+        "dataCenterIds": [DATACENTER],
+        "networkVolumeId": VOLUME_ID,
         "volumeMountPath": "/workspace",
         "imageName": "runpod/base:1.0.2-ubuntu2204",
         "containerDiskInGb": 10,
