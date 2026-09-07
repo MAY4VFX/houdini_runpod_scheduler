@@ -56,7 +56,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     # libfontconfig.so.1 and libpci.so.3 "not found", and the artist's scene
     # died with "Bad node type found: opengl". All four were in the v1 image
     # list and were dropped as redundant when it was trimmed; they were not.
-    libxdamage1 libxtst6 libfontconfig1 libpci3 \
+    # libxkbfile1 is the fifth: it only surfaced once the first four were
+    # satisfied, because ldd reports one level at a time. Resolved to closure
+    # on a live pod by installing and re-running ldd until it came back clean,
+    # then verified by what actually matters: hou.nodeType(rop, "opengl") is
+    # not None, and the artist's scene loads instead of raising.
+    libxdamage1 libxtst6 libfontconfig1 libpci3 libxkbfile1 \
     && rm -rf /var/lib/apt/lists/* \
     && curl -fsSL https://rclone.org/install.sh -o /tmp/rclone-install.sh \
     && bash /tmp/rclone-install.sh \
