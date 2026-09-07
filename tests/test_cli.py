@@ -335,6 +335,127 @@ def test_setup_asks_for_the_license_server_when_there_is_none(tmp_path, monkeypa
     assert rpcfg.load().sesinetd_host == "lic.example.com"
 
 
+def _fake_install(tmp_path, version="22.0.393"):
+    """A HoudiniInstall whose prefs live under tmp_path -- never the real one."""
+    from rpfarm import houdini_local as hl
+
+    hfs = tmp_path / "hfs"
+    (hfs / "bin").mkdir(parents=True, exist_ok=True)
+    (hfs / "bin" / "hython").write_text("#!/bin/sh\n")
+    (hfs / "bin" / "hotl").write_text("#!/bin/sh\n")
+    inst = hl.HoudiniInstall.__new__(hl.HoudiniInstall)
+    inst.hfs = hfs
+    inst.version = version
+    inst.major_minor = ".".join(version.split(".")[:2])
+    inst.hython = hfs / "bin" / "hython"
+    inst.user_pref_dir = tmp_path / "prefs"
+    return inst
+
+
+def _doctor_handlers():
+    handlers = _setup_handlers()
+    handlers[("GET", "/networkvolumes/vol123")] = (
+        200, json.dumps({"id": "vol123", "size": 50, "dataCenterId": "EU-RO-1"}).encode())
+    handlers[("GET", "/templates")] = (
+        200, json.dumps([{"id": "tpl123", "imageName": "img:latest"}]).encode())
+    return handlers
+
+
+def test_doctor_catches_an_installed_asset_built_against_other_code(tmp_path, monkeypatch, capsys):
+    """The repository test cannot see the copy an artist cooks with. This is
+    the failure of 2026-09-07: assets rebuilt in the checkout, tests green,
+    and the artist still on the previous day's build."""
+    from rpfarm import houdini_local as hl
+
+    monkeypatch.setenv("RPFARM_HOME", str(tmp_path))
+    _write_cfg(tmp_path, rclone_path="true", ssh_key_path=str(tmp_path / "id_ed25519"))
+    (tmp_path / "id_ed25519").write_text("x")
+    (tmp_path / "id_ed25519.pub").write_text("x")
+
+    inst = _fake_install(tmp_path)
+    otls = inst.user_pref_dir / "otls"
+    otls.mkdir(parents=True)
+    stale_block = "\n".join([
+        hl.BAKE_BEGIN,
+        "_ASSET_BUILT_AGAINST_VERSION = '0.0.1'",
+        "_ASSET_FINGERPRINT = {",
+        "    'cli.py': (1, 'deadbeef'),",
+        "}",
+        hl.BAKE_END,
+    ])
+    for name in hl.HDA_NAMES:
+        (otls / f"{name}.hda").write_text(stale_block)
+    hl.install_shelf_tool(inst)
+    hl.install_node_shape(inst)
+
+    monkeypatch.setattr(cli, "_transport", FakeTransport(_doctor_handlers()))
+    monkeypatch.setattr(houdini_local, "find_houdini_installations", lambda: [inst])
+    monkeypatch.setattr("socket.create_connection", lambda *a, **k: (_ for _ in ()).throw(OSError("blocked")))
+
+    rc = cli.main(["doctor"])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "built against a different rpfarm" in out
+    assert "rebuild_assets.py" in out or "rpfarm setup" in out
+
+
+def test_doctor_is_happy_when_the_installed_assets_match(tmp_path, monkeypatch, capsys):
+    from rpfarm import houdini_local as hl
+
+    import rpfarm as pkg
+
+    monkeypatch.setenv("RPFARM_HOME", str(tmp_path))
+    _write_cfg(tmp_path, rclone_path="true", ssh_key_path=str(tmp_path / "id_ed25519"))
+    (tmp_path / "id_ed25519").write_text("x")
+    (tmp_path / "id_ed25519.pub").write_text("x")
+
+    inst = _fake_install(tmp_path)
+    otls = inst.user_pref_dir / "otls"
+    otls.mkdir(parents=True)
+    fp = pkg.fingerprint()
+    lines = [hl.BAKE_BEGIN, "_ASSET_BUILT_AGAINST_VERSION = {!r}".format(pkg.VERSION),
+             "_ASSET_FINGERPRINT = {"]
+    for name in sorted(fp):
+        lines.append("    {!r}: ({}, {!r}),".format(name, fp[name][0], fp[name][1]))
+    lines += ["}", hl.BAKE_END]
+    for name in hl.HDA_NAMES:
+        (otls / f"{name}.hda").write_text("\n".join(lines))
+    hl.install_shelf_tool(inst)
+    hl.install_node_shape(inst)
+
+    monkeypatch.setattr(cli, "_transport", FakeTransport(_doctor_handlers()))
+    monkeypatch.setattr(houdini_local, "find_houdini_installations", lambda: [inst])
+    monkeypatch.setattr("socket.create_connection", lambda *a, **k: (_ for _ in ()).throw(OSError("blocked")))
+
+    cli.main(["doctor"])
+    out = capsys.readouterr().out
+    assert "built against this rpfarm" in out
+    assert "TAB tool installed" in out
+
+
+def test_setup_installs_the_tab_tool_next_to_the_hdas(tmp_path, monkeypatch, capsys):
+    from rpfarm import houdini_local as hl
+
+    monkeypatch.setenv("RPFARM_HOME", str(tmp_path))
+    monkeypatch.setattr(cli, "_transport", FakeTransport(_setup_handlers()))
+    monkeypatch.setattr(rpcfg, "rclone_bin", lambda *a, **k: str(tmp_path / "bin" / "rclone"))
+
+    inst = _fake_install(tmp_path)
+    monkeypatch.setattr(houdini_local, "find_houdini_installations", lambda: [inst])
+    monkeypatch.setattr(houdini_local, "build_and_install_hdas",
+                        lambda *a, **k: [{"name": n, "ok": True, "installed_to": "x",
+                                          "error": None, "stale": False}
+                                         for n in hl.HDA_NAMES])
+
+    rc = cli.main(["setup", "--non-interactive", "--api-key", "k", "--user", "u",
+                   "--sesinetd-host", "lic.example.com"])
+    assert rc == 0
+    target = inst.user_pref_dir / "toolbar" / hl.SHELF_FILENAME
+    assert target.exists()
+    out = capsys.readouterr().out
+    assert hl.SHELF_TOOL_LABEL in out
+
+
 # -- storage --------------------------------------------------------------
 
 

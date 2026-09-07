@@ -23,6 +23,7 @@ empty archive).
 
 from __future__ import annotations
 
+import ast
 import glob
 import os
 import platform
@@ -259,36 +260,149 @@ def build_and_install_hdas(install: HoudiniInstall, otls_cache_dir: Path, root: 
     """Collapse and install all four :data:`HDA_NAMES` for one Houdini
     installation. Returns one status dict per HDA::
 
-        {"name": str, "ok": bool, "installed_to": str | None, "error": str | None}
+        {"name": str, "ok": bool, "installed_to": str | None,
+         "error": str | None, "stale": bool}
 
     If ``install.hotl`` is missing, every HDA is reported ``ok: False``
     with an explanatory error rather than raising -- ``setup``/``doctor``
     are expected to surface that per-item, not abort the whole run over
     one missing tool.
+
+    ``stale`` says the SOURCE in this checkout was built against a
+    different package than the one installing it, i.e. somebody changed
+    ``rpfarm/`` and did not rerun ``scripts/rebuild_assets.py``. Installing
+    it anyway is right -- a stale asset beats yesterday's asset -- but
+    saying nothing is how "rebuilt" and "installed" came apart in the first
+    place.
     """
+    import rpfarm
+
+    package_fingerprint = rpfarm.fingerprint(str((root or repo_root()) / "rpfarm"))
     results = []
     for name in HDA_NAMES:
         source = hda_source_dir(name, root)
         if install.hotl is None:
             results.append({
-                "name": name, "ok": False, "installed_to": None,
+                "name": name, "ok": False, "installed_to": None, "stale": False,
                 "error": f"hotl not found next to hython ({install.hython})",
             })
             continue
         if not source.is_dir():
             results.append({
-                "name": name, "ok": False, "installed_to": None,
+                "name": name, "ok": False, "installed_to": None, "stale": False,
                 "error": f"HDA source not found at {source}",
             })
             continue
         collapsed = otls_cache_dir / f"{name}.hda"
+        stale = asset_state(source, package_fingerprint)["stale"]
         try:
             collapse_hda(install.hotl, source, collapsed, runner=runner)
             target = install_hda_file(install, collapsed, name)
-            results.append({"name": name, "ok": True, "installed_to": str(target), "error": None})
+            results.append({"name": name, "ok": True, "installed_to": str(target),
+                            "error": None, "stale": stale})
         except (subprocess.CalledProcessError, OSError) as e:
-            results.append({"name": name, "ok": False, "installed_to": None, "error": str(e)})
+            results.append({"name": name, "ok": False, "installed_to": None,
+                            "error": str(e), "stale": stale})
     return results
+
+
+# ---------------------------------------------------------------------------
+# what an installed asset was built against
+# ---------------------------------------------------------------------------
+#
+# tests/test_hda_assets.py already refuses to let the REPOSITORY's assets
+# drift from the package. It cannot see the copy that is actually installed
+# in somebody's Houdini, and on 2026-09-07 that was the whole failure: the
+# assets were rebuilt in the checkout, the tests were green, and the artist
+# went on cooking with a build from the day before, because "rebuilt" and
+# "installed" are two steps and only the first one happened.
+#
+# So the same measurement is read back out of the installed file. The baked
+# block survives ``hotl -l`` as plain text inside the collapsed .hda
+# (verified), which makes this a fact about what the artist has rather than
+# a date on a file.
+
+#: Must stay identical to scripts/hda_guard.py's -- asserted by a test.
+BAKE_BEGIN = "# BEGIN baked by scripts/bake_asset_fingerprint.py -- do not edit"
+BAKE_END = "# END baked"
+
+_BAKED_RE = re.compile(
+    re.escape(BAKE_BEGIN) + r"(?P<body>.*?)" + re.escape(BAKE_END), re.S)
+
+
+def baked_fingerprint(data) -> dict | None:
+    """``{"version": str, "fingerprint": {...}}`` baked into an asset, or None.
+
+    Takes the bytes of a collapsed ``.hda`` or the text of an expanded
+    section -- both carry the block verbatim. Never raises: an asset from
+    before the block existed, or one this cannot parse, is "I cannot tell",
+    which the callers report as a warning rather than a failure.
+    """
+    if isinstance(data, bytes):
+        data = data.decode("utf-8", "replace")
+    match = _BAKED_RE.search(data or "")
+    if match is None:
+        return None
+    body = match.group("body")
+    version = re.search(r"_ASSET_BUILT_AGAINST_VERSION\s*=\s*['\"]([^'\"]*)['\"]", body)
+    fp = re.search(r"_ASSET_FINGERPRINT\s*=\s*(\{.*?\n\})", body, re.S)
+    if fp is None:
+        return None
+    try:
+        parsed = ast.literal_eval(fp.group(1))
+    except (ValueError, SyntaxError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    return {"version": version.group(1) if version else "", "fingerprint": parsed}
+
+
+def fingerprint_mismatch(package_fingerprint, baked) -> list[str]:
+    """Module files whose current content is not what the asset was built
+    against. Empty means they agree."""
+    if not baked:
+        return []
+    off = []
+    for name in sorted(set(package_fingerprint) | set(baked)):
+        if package_fingerprint.get(name) != baked.get(name):
+            off.append(name)
+    return off
+
+
+def asset_state(path: Path, package_fingerprint) -> dict:
+    """One asset (source directory or installed .hda) against the package::
+
+        {"present": bool, "baked": bool, "stale": bool, "off": [names]}
+
+    ``stale`` is only ever True when the asset actually carries a baked
+    block AND it disagrees -- "cannot tell" is never reported as "wrong".
+    """
+    state = {"present": False, "baked": False, "stale": False, "off": []}
+    try:
+        if path.is_dir():
+            data = "".join(
+                f.read_text(encoding="utf-8", errors="replace")
+                for f in sorted(path.rglob("PythonModule")))
+        else:
+            data = path.read_bytes()
+    except OSError:
+        return state
+    state["present"] = True
+    baked = baked_fingerprint(data)
+    if baked is None:
+        return state
+    state["baked"] = True
+    off = fingerprint_mismatch(package_fingerprint, baked["fingerprint"])
+    state["off"] = off
+    state["stale"] = bool(off)
+    return state
+
+
+def installed_asset_states(install: HoudiniInstall, package_fingerprint) -> dict:
+    """:func:`asset_state` for every HDA as it is INSTALLED for this artist."""
+    otls = install.user_pref_dir / "otls"
+    return {name: asset_state(otls / f"{name}.hda", package_fingerprint)
+            for name in HDA_NAMES}
 
 
 # ---------------------------------------------------------------------------
@@ -327,6 +441,119 @@ def install_node_shape(install: HoudiniInstall, root: Path | None = None) -> dic
         target = node_shape_target(install)
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source, target)
+    except OSError as e:
+        return {"ok": False, "installed_to": None, "error": str(e)}
+    return {"ok": True, "installed_to": str(target), "error": None}
+
+
+# ---------------------------------------------------------------------------
+# TAB-menu tool
+# ---------------------------------------------------------------------------
+
+#: Our own shelf file, never the artist's ``default.shelf``. Houdini loads
+#: every ``*.shelf`` under ``<prefs>/toolbar`` at startup (that is the
+#: default ``HOUDINI_TOOLBAR_PATH``), so one file of our own is enough and
+#: nothing of theirs is touched.
+SHELF_FILENAME = "rpfarm.shelf"
+SHELF_TOOL_NAME = "rpfarm_farm_setup"
+SHELF_TOOL_LABEL = "RunPod Farm Setup"
+#: TAB > this submenu > the label above, inside TOP networks only.
+SHELF_TOOL_SUBMENU = "RunPod Farm"
+SHELF_TOOL_ICON = "TOP/scheduler"
+
+#: The tool's script. Two jobs: put this checkout on sys.path the same way
+#: the HDAs do (RPFARM_ROOT, else the ~/.rpfarm/src symlink), and hand the
+#: TAB's own kwargs to the builder. Everything else lives in
+#: rpfarm.scene_setup, where it can be read and tested; a shelf file is a
+#: bad place to keep logic, because nothing recompiles or reviews it.
+SHELF_TOOL_SCRIPT = """\
+# RunPod Farm Setup -- written by `rpfarm setup`. Do not edit here; edit
+# rpfarm/scene_setup.py and rerun setup.
+import os
+import pathlib
+import sys
+
+_root = os.environ.get("RPFARM_ROOT") or str(pathlib.Path.home() / ".rpfarm" / "src")
+if _root not in sys.path:
+    sys.path.insert(0, _root)
+
+try:
+    from rpfarm import scene_setup
+except ImportError as exc:
+    raise ImportError(
+        "RunPod Farm Setup cannot import rpfarm from {}. Run "
+        "`python3 -m rpfarm setup` and restart Houdini.".format(_root)) from exc
+
+scene_setup.run(kwargs)
+"""
+
+SHELF_TOOL_HELP = (
+    "Build the RunPod farm graph in this TOP network: scheduler (set as the "
+    "network's TOP Scheduler), upload, a Wait For All gate and a ROP Fetch, "
+    "preconfigured from this scene. Creating the nodes rather than copying "
+    "them from another scene is the point -- a copied node brings the other "
+    "scene's cached work items and its old definition with it. Safe to run "
+    "twice: it adopts what is already there instead of duplicating it."
+)
+
+_SHELF_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
+<shelfDocument>
+  <!-- This file contains definitions of shelves, toolbars, and tools.
+ It should not be hand-edited when it is being used by the application.
+ Note, that two definitions of the same element are not allowed in
+ a single file. -->
+
+  <tool name="{name}" label="{label}" icon="{icon}">
+    <helpText><![CDATA[{help}]]></helpText>
+    <toolMenuContext name="network">
+      <contextNetType>TOP</contextNetType>
+    </toolMenuContext>
+    <toolSubmenu>{submenu}</toolSubmenu>
+    <script scriptType="python"><![CDATA[{script}]]></script>
+  </tool>
+</shelfDocument>
+"""
+
+
+def shelf_tool_source() -> str:
+    """The ``.shelf`` document, in the shape Houdini's own
+    ``hou.shelves.newTool`` writes.
+
+    Generated as text rather than through ``hou.shelves`` because
+    ``rpfarm setup`` runs on a plain ``python3`` with no Houdini in the
+    process -- launching hython just to write nine lines of XML would make
+    installation slower and more fragile than the thing being installed.
+    The format was taken from a file Houdini wrote, not invented.
+    """
+    for field in (SHELF_TOOL_HELP, SHELF_TOOL_SCRIPT):
+        # A CDATA section ends at the first "]]>", so one inside the payload
+        # would truncate the tool silently.
+        assert "]]>" not in field, "a shelf payload must not contain ']]>'"
+    return _SHELF_TEMPLATE.format(
+        name=SHELF_TOOL_NAME,
+        label=SHELF_TOOL_LABEL,
+        icon=SHELF_TOOL_ICON,
+        help=SHELF_TOOL_HELP,
+        submenu=SHELF_TOOL_SUBMENU,
+        script=SHELF_TOOL_SCRIPT,
+    )
+
+
+def shelf_tool_target(install: HoudiniInstall) -> Path:
+    return install.user_pref_dir / "toolbar" / SHELF_FILENAME
+
+
+def install_shelf_tool(install: HoudiniInstall) -> dict:
+    """Write the TAB-menu tool into ``<prefs>/toolbar/rpfarm.shelf``.
+
+    Same never-raise contract as the HDAs and the node shape: returns
+    ``{"ok", "installed_to", "error"}`` so a read-only prefs directory
+    costs a warning rather than the whole setup.
+    """
+    try:
+        target = shelf_tool_target(install)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(shelf_tool_source(), encoding="utf-8")
     except OSError as e:
         return {"ok": False, "installed_to": None, "error": str(e)}
     return {"ok": True, "installed_to": str(target), "error": None}

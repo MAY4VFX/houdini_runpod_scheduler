@@ -408,3 +408,129 @@ def test_the_resolved_interpreter_really_imports_tomllib_on_this_machine():
     assert out.returncode == 0, out.stderr
     assert tuple(int(x) for x in out.stdout.split()) >= hl.PACKAGE_PYTHON_MIN
     assert "bundled" in why, "expected Houdini's own python, got: " + why
+
+
+# -- the TAB-menu tool -------------------------------------------------------
+
+
+def test_the_shelf_document_registers_a_top_only_tab_tool():
+    import xml.etree.ElementTree as ET
+
+    root = ET.fromstring(hl.shelf_tool_source())
+    tool = root.find("tool")
+    assert tool.get("name") == hl.SHELF_TOOL_NAME
+    assert tool.get("label") == hl.SHELF_TOOL_LABEL
+    # Restricted to TOP networks, or it clutters every other network editor.
+    assert tool.find("toolMenuContext").get("name") == "network"
+    assert tool.find("toolMenuContext/contextNetType").text == "TOP"
+    # A submenu is what puts it in the TAB menu rather than only on a shelf.
+    assert tool.find("toolSubmenu").text == hl.SHELF_TOOL_SUBMENU
+    assert tool.find("script").get("scriptType") == "python"
+
+
+def test_the_shelf_scripts_payload_is_valid_python():
+    """It is stored as text in an XML file that nothing compiles until an
+    artist presses TAB, so it is compiled here instead."""
+    import ast
+
+    ast.parse(hl.SHELF_TOOL_SCRIPT)
+    assert "scene_setup.run(kwargs)" in hl.SHELF_TOOL_SCRIPT
+    # It must find the checkout the same way the HDAs do.
+    assert "RPFARM_ROOT" in hl.SHELF_TOOL_SCRIPT
+
+
+def test_installing_the_tool_writes_our_own_shelf_file_only(tmp_path):
+    hfs = _make_hfs(tmp_path)
+    inst = hl.HoudiniInstall(hfs)
+    inst.user_pref_dir = tmp_path / "prefs"
+    theirs = inst.user_pref_dir / "toolbar" / "default.shelf"
+    theirs.parent.mkdir(parents=True)
+    theirs.write_text("the artist's own shelves")
+
+    result = hl.install_shelf_tool(inst)
+    assert result["ok"]
+    target = inst.user_pref_dir / "toolbar" / hl.SHELF_FILENAME
+    assert target.read_text() == hl.shelf_tool_source()
+    # Never the artist's file.
+    assert theirs.read_text() == "the artist's own shelves"
+
+    # Idempotent: a rerun rewrites our file and nothing else appears.
+    hl.install_shelf_tool(inst)
+    assert sorted(p.name for p in target.parent.iterdir()) == [
+        "default.shelf", hl.SHELF_FILENAME]
+
+
+# -- what an installed asset was built against -------------------------------
+
+
+def test_the_bake_markers_match_the_guards():
+    """houdini_local reads a block scripts/hda_guard.py writes. Two copies of
+    a marker string are one typo away from a check that always says "cannot
+    tell"."""
+    import importlib.util
+
+    path = hl.repo_root() / "scripts" / "hda_guard.py"
+    spec = importlib.util.spec_from_file_location("hda_guard_probe", path)
+    guard = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(guard)
+    assert hl.BAKE_BEGIN == guard.BAKE_BEGIN
+    assert hl.BAKE_END == guard.BAKE_END
+
+
+def _baked_text(fingerprint, version="9.9.9"):
+    lines = [hl.BAKE_BEGIN,
+             "_ASSET_BUILT_AGAINST_VERSION = {!r}".format(version),
+             "_ASSET_FINGERPRINT = {"]
+    for name in sorted(fingerprint):
+        size, digest = fingerprint[name]
+        lines.append("    {!r}: ({}, {!r}),".format(name, size, digest))
+    lines.append("}")
+    lines.append(hl.BAKE_END)
+    return "\n".join(lines) + "\n"
+
+
+def test_the_baked_block_is_read_back_out_of_binary_and_text():
+    fp = {"cli.py": (10, "aaaa"), "config.py": (20, "bbbb")}
+    text = _baked_text(fp)
+    for payload in (text, ("\x00binary junk" + text + "more junk\x00").encode("utf-8")):
+        got = hl.baked_fingerprint(payload)
+        assert got["version"] == "9.9.9"
+        assert got["fingerprint"] == fp
+
+
+def test_an_asset_without_a_baked_block_is_cannot_tell_not_wrong(tmp_path):
+    asset = tmp_path / "old.hda"
+    asset.write_bytes(b"an asset from before the block existed")
+    state = hl.asset_state(asset, {"cli.py": (10, "aaaa")})
+    assert state == {"present": True, "baked": False, "stale": False, "off": []}
+
+
+def test_a_changed_module_makes_the_installed_asset_stale(tmp_path):
+    fp = {"cli.py": (10, "aaaa"), "config.py": (20, "bbbb")}
+    asset = tmp_path / "runpodfarm_upload.hda"
+    asset.write_text(_baked_text(fp))
+    assert hl.asset_state(asset, fp)["stale"] is False
+
+    moved = dict(fp, **{"config.py": (21, "cccc")})
+    state = hl.asset_state(asset, moved)
+    assert state["stale"] is True
+    assert state["off"] == ["config.py"]
+
+
+def test_a_missing_asset_is_reported_absent(tmp_path):
+    assert hl.asset_state(tmp_path / "nope.hda", {})["present"] is False
+
+
+def test_installed_states_cover_every_hda(tmp_path):
+    hfs = _make_hfs(tmp_path)
+    inst = hl.HoudiniInstall(hfs)
+    inst.user_pref_dir = tmp_path / "prefs"
+    otls = inst.user_pref_dir / "otls"
+    otls.mkdir(parents=True)
+    fp = {"cli.py": (10, "aaaa")}
+    (otls / "runpodfarm_upload.hda").write_text(_baked_text(fp))
+
+    states = hl.installed_asset_states(inst, fp)
+    assert set(states) == set(hl.HDA_NAMES)
+    assert states["runpodfarm_upload"]["present"] and not states["runpodfarm_upload"]["stale"]
+    assert not states["runpodfarm_scheduler"]["present"]

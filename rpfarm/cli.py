@@ -39,6 +39,7 @@ import sys
 import tempfile
 import time
 
+import rpfarm
 from . import config as rpcfg
 from . import houdini_local
 from . import ledger as rpledger
@@ -491,6 +492,12 @@ def cmd_setup(args, prompt=input):
         for r in results:
             if not r["ok"]:
                 print(f"    [WARN] {r['name']}: {r['error']}")
+        stale = [r["name"] for r in results if r.get("stale")]
+        if stale:
+            print(f"    [WARN] built against an older rpfarm: {', '.join(stale)}. "
+                  f"Installed anyway, but rebuild them with "
+                  f"`hython scripts/rebuild_assets.py` so the asset and the "
+                  f"package agree.")
         # The HDAs carry their own icons (an IconSVG section each), but a
         # node SHAPE can only live in a config directory Houdini searches,
         # so it ships beside them or the four nodes fall back to a plain
@@ -500,6 +507,15 @@ def cmd_setup(args, prompt=input):
             print(f"[OK] Houdini {inst.version}: node shape -> {shape['installed_to']}")
         else:
             print(f"    [WARN] node shape: {shape['error']}")
+        # The TAB-menu tool goes in with everything else: a farm you have to
+        # assemble by hand is a farm whose graph gets copied between scenes
+        # instead, which is what broke two of the artist's cooks.
+        tool = houdini_local.install_shelf_tool(inst)
+        if tool["ok"]:
+            print(f"[OK] Houdini {inst.version}: TAB > {houdini_local.SHELF_TOOL_SUBMENU} > "
+                  f"{houdini_local.SHELF_TOOL_LABEL} -> {tool['installed_to']}")
+        else:
+            print(f"    [WARN] TAB tool: {tool['error']}")
         houdini_local.write_rpfarm_root_env(inst)
 
     print()
@@ -509,6 +525,8 @@ def cmd_setup(args, prompt=input):
     print(f"  [x] repo symlink                   -> {home / 'src'}")
     if installs:
         print(f"  [x] HDAs installed for {len(installs)} local Houdini installation(s)")
+        print(f"  [x] TAB tool  -- press TAB in a TOP network: "
+              f"{houdini_local.SHELF_TOOL_SUBMENU} > {houdini_local.SHELF_TOOL_LABEL}")
     else:
         print("  [ ] HDAs -- install Houdini locally, then rerun `rpfarm setup`")
     print("  [ ] Houdini on the farm volume      -- `rpfarm houdini install --tar <path> --version <ver>`")
@@ -668,12 +686,39 @@ def cmd_doctor(args):
         warn("no local Houdini installation found -- HDAs not checked")
     for inst in installs:
         otls = inst.user_pref_dir / "otls"
-        missing = [n for n in houdini_local.HDA_NAMES if not (otls / f"{n}.hda").exists()]
+        states = houdini_local.installed_asset_states(inst, rpfarm.fingerprint())
+        missing = [n for n, st in states.items() if not st["present"]]
+        stale = [n for n, st in states.items() if st["stale"]]
         if missing:
             warn(f"Houdini {inst.version}: missing HDA(s) {', '.join(missing)} -- rerun `rpfarm setup`")
+        elif stale:
+            # The date used to be all this said, and a date cannot tell an
+            # artist that the asset in front of them was built against
+            # different code. This reads the fingerprint baked into the
+            # INSTALLED file -- the copy they actually cook with.
+            detail = "; ".join(
+                f"{n} ({', '.join(states[n]['off'][:4])})" for n in stale)
+            fail(f"Houdini {inst.version}: installed HDA(s) were built against a "
+                 f"different rpfarm -- {detail}. Rerun `rpfarm setup` (or "
+                 f"`hython scripts/rebuild_assets.py`); a restart of Houdini "
+                 f"is needed after either")
         else:
             newest = max((otls / f"{n}.hda").stat().st_mtime for n in houdini_local.HDA_NAMES)
-            ok(f"Houdini {inst.version}: all 4 HDAs installed (last updated {time.ctime(newest)})")
+            unbaked = [n for n, st in states.items() if not st["baked"]]
+            note = f", {len(unbaked)} without a baked fingerprint" if unbaked else ""
+            ok(f"Houdini {inst.version}: all 4 HDAs installed and built against this "
+               f"rpfarm{note} (last updated {time.ctime(newest)})")
+
+        tool_target = houdini_local.shelf_tool_target(inst)
+        if not tool_target.exists():
+            warn(f"Houdini {inst.version}: TAB tool missing at {tool_target} -- "
+                 f"rerun `rpfarm setup`")
+        elif tool_target.read_text(errors="replace") != houdini_local.shelf_tool_source():
+            warn(f"Houdini {inst.version}: TAB tool at {tool_target} is not the current "
+                 f"one -- rerun `rpfarm setup`")
+        else:
+            ok(f"Houdini {inst.version}: TAB tool installed "
+               f"({houdini_local.SHELF_TOOL_SUBMENU} > {houdini_local.SHELF_TOOL_LABEL})")
         shape_target = houdini_local.node_shape_target(inst)
         if shape_target.exists():
             ok(f"Houdini {inst.version}: node shape installed ({shape_target})")
