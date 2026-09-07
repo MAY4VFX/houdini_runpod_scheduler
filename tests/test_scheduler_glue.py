@@ -18,6 +18,7 @@ here: rename a collaborator and this fails.
 """
 
 import ast
+import shlex
 import json
 import pathlib
 import sys
@@ -1525,3 +1526,130 @@ def test_a_rop_that_reports_only_its_intermediate_still_brings_the_frame_home():
     assert local == "/Users/artist/BS/airship/render/shot0018/airship_0018_v003.acescg.0001.exr"
     assert farm == ("/workspace/projects/may/airship/BS/airship/render/shot0018/"
                     "airship_0018_v003.acescg.0001.exr")
+
+
+# -- auto-clean after a cook (Ruling R56) ------------------------------------
+
+
+class _Parm:
+    def __init__(self, value):
+        self.value = value
+
+    def evaluateString(self):
+        return str(self.value)
+
+    def evaluateInt(self):
+        return int(self.value)
+
+
+class _CleanScheduler:
+    """Enough scheduler for _autoCleanAfterCook, and nothing else."""
+
+    def __init__(self, mode="outputs", failed=0, queued=0, downloads=1,
+                 download_outputs=1, project="airship", user="may"):
+        self._parms = {"rpfarm_autoclean": _Parm(mode),
+                       "rpfarm_downloadoutputs": _Parm(download_outputs)}
+        self._dispatcher = types.SimpleNamespace(failed=list(range(failed)))
+        self._sync_queue = list(range(queued))
+        self._downloads_done = downloads
+        self._cfg = types.SimpleNamespace(user=user, measured_mbps=4.7)
+        self._project = project
+        self.logs = []
+        self.node = object()
+
+    def __getitem__(self, name):
+        return self._parms[name]
+
+    def _log(self, message):
+        self.logs.append(message)
+
+    def _verboseLog(self, message):
+        self.logs.append(message)
+
+    def _houNode(self):
+        return self.node
+
+
+def _clean_env(exec_result=None, calls=None):
+    calls = calls if calls is not None else []
+
+    def fake_exec(node, command, timeout_s=300):
+        calls.append(command)
+        return json.dumps(exec_result if exec_result is not None else {
+            "ok": True, "deleted": [{"path": "/workspace/projects/may/airship/render",
+                                     "bytes_freed": 6_000_000_000}],
+            "refused": [], "bytes_freed": 6_000_000_000})
+
+    ns = load_methods(["_autoCleanAfterCook"], {
+        "_volume_exec": fake_exec,
+        "json": json,
+        "shlex": shlex,
+        "_shquote": shlex.quote,
+        "_HOUSEKEEPING": _module_constant("_HOUSEKEEPING"),
+        "_VOLUME_ROOT": _module_constant("_VOLUME_ROOT"),
+        "_OUTPUT_DIR_NAMES": _module_constant("_OUTPUT_DIR_NAMES"),
+        "_human_bytes": lambda n: "{} B".format(n),
+        "_reupload_estimate": lambda cfg, n: "~90 min at 4.7 Mbps",
+    })
+    return ns["_autoCleanAfterCook"], calls
+
+
+@pytest.mark.parametrize("kwargs,because", [
+    ({"mode": "off"}, None),
+    ({"failed": 2}, "2 item(s) failed"),
+    ({"download_outputs": 0}, "Download Outputs is off"),
+    ({"queued": 1}, "1 download(s) never finished"),
+    ({"downloads": 0}, "no outputs were downloaded"),
+])
+def test_auto_clean_deletes_nothing_without_proven_delivery(kwargs, because):
+    """"Successful" cannot mean items_failed == 0. On 2026-09-06 every item
+    was CookedSuccess and not one frame came home; a cleaner keyed on that
+    would have deleted the lot."""
+    clean, calls = _clean_env()
+    sched = _CleanScheduler(**kwargs)
+    clean(sched, cancel=False)
+    assert calls == []
+    if because:
+        assert any(because in line for line in sched.logs), sched.logs
+
+
+def test_auto_clean_deletes_nothing_when_the_cook_was_cancelled():
+    clean, calls = _clean_env()
+    sched = _CleanScheduler()
+    clean(sched, cancel=True)
+    assert calls == []
+    assert any("cancelled" in line for line in sched.logs)
+
+
+def test_outputs_mode_removes_only_the_output_folders():
+    """The inputs stay, so the next cook uploads nothing -- which is the
+    whole reason this is the recommended mode."""
+    clean, calls = _clean_env()
+    sched = _CleanScheduler(mode="outputs")
+    clean(sched, cancel=False)
+    assert len(calls) == 1
+    assert "/workspace/projects/may/airship/render" in calls[0]
+    assert "/workspace/projects/may/airship/geo" in calls[0]
+    # Never the project itself.
+    assert " /workspace/projects/may/airship " not in " {} ".format(calls[0])
+    assert "--force" in calls[0]
+
+
+def test_project_mode_removes_the_project_and_says_what_that_costs():
+    clean, calls = _clean_env()
+    sched = _CleanScheduler(mode="project")
+    clean(sched, cancel=False)
+    assert "/workspace/projects/may/airship --force" in calls[0]
+    assert any("re-uploads the inputs" in line and "90 min" in line
+               for line in sched.logs), sched.logs
+
+
+def test_a_refusal_from_the_pod_is_reported_not_swallowed():
+    clean, _calls = _clean_env(exec_result={
+        "ok": False, "deleted": [], "bytes_freed": 0,
+        "refused": [{"path": "/workspace/projects/may/airship/render",
+                     "error": "outputs pending, not downloaded"}]})
+    sched = _CleanScheduler()
+    clean(sched, cancel=False)
+    assert any("outputs pending" in line for line in sched.logs), sched.logs
+    assert any("nothing to delete" in line for line in sched.logs), sched.logs

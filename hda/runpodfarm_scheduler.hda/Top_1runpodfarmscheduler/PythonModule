@@ -210,7 +210,7 @@ _ASSET_FINGERPRINT = {
     'package_runner.py': (8752, '96770e3879a6cb65'),
     'packages.py': (56224, '327c8debf6b236fc'),
     'pods.py': (27370, 'e7b4bfb9a4f8fc5e'),
-    'preflight.py': (28605, '0f7b932002602fd9'),
+    'preflight.py': (31237, '41ab9dff0a78fe91'),
     'runpod_api.py': (14539, 'b90960f9860c97fb'),
     'scene_setup.py': (18467, '8838d55cbb131f99'),
     'smoke.py': (41503, 'd25dfbac9eddb12b'),
@@ -218,6 +218,7 @@ _ASSET_FINGERPRINT = {
     'tls.py': (3642, 'f3e50ea6ebd0308f'),
     'tools.py': (4290, 'c5d3b026f125578f'),
     'usddeps.py': (9631, '3c7192d3bd94d07f'),
+    'volume.py': (10038, 'dc11b185a58c9262'),
     'worker_client.py': (9791, 'cf6b40b1e879c658'),
 }
 # END baked
@@ -859,8 +860,154 @@ def onVolumeRefresh(kwargs):
 
 # Accepted 'Target' shapes for onVolumeDelete, each routed through a guarded
 # housekeeping command instead of a raw `rm -rf` -- see that function.
+_VOLUME_ROOT = "/workspace"
+
+#: "user/project" for every cook running in THIS Houdini. The volume window
+#: refuses to delete these -- pulling a project out from under a running
+#: cook is the one destructive mistake the artist cannot undo by waiting.
+#: Only this session can be known; a colleague's cook on their own machine
+#: is covered instead by "another artist's project is never deletable".
+_ACTIVE_COOKS = set()
 _VOLUME_DELETE_PROJECT_PREFIX = "/workspace/projects/"
+
+#: The output directories auto-clean removes in "outputs" mode. The same
+#: names pod/housekeeping.py calls outputs, so "delete the outputs" and
+#: "are the outputs pending" can never mean two different sets of folders.
+_OUTPUT_DIR_NAMES = ("render", "geo")
+
+
+def _human_bytes(size):
+    from rpfarm import preflight as _pf
+
+    return _pf.human_bytes(size)
+
+
+def _reupload_estimate(cfg, size_bytes):
+    """"...which is about an hour and a half of uploading next time."
+
+    Only ever from a MEASURED uplink (`rpfarm doctor` writes it): a made-up
+    number attached to a delete button would be worse than no number.
+    """
+    from rpfarm import preflight as _pf
+
+    return _pf.eta_text(size_bytes, getattr(cfg, "measured_mbps", None))
 _VOLUME_DELETE_HOUDINI_PREFIX = "/workspace/houdini/"
+
+
+def onVolumeManage(kwargs):
+    """Open the volume as a tickable tree, then delete what was ticked.
+
+    The same window the upload uses (Ruling R55) -- the artist has already
+    learned this tree, and a second one would be a second place for the
+    tri-state logic to be wrong. What it does NOT do is decide anything:
+    every boundary (another artist, the Houdini install, the project
+    cooking right now) is enforced on the pod as well, in
+    housekeeping.cmd_rm_paths, so a bug in this window cannot delete
+    somebody else's work.
+    """
+    node = kwargs["node"]
+    from rpfarm import preflight as rppf
+    from rpfarm import volume as rpvol
+
+    reason = rppf.ui_unavailable_reason()
+    if reason:
+        _set_text(node, "rpfarm_volume_text", "Cannot open the window: {}".format(reason))
+        return
+
+    try:
+        cfg = rpcfg.load()
+    except rpcfg.ConfigError as e:
+        _set_text(node, "rpfarm_volume_text", str(e))
+        return
+
+    try:
+        # Sweep our own leftovers first, so the artist is never shown a
+        # decision about our smoke runs (Part 3).
+        swept = json.loads(_volume_exec(node, "{} rm-litter".format(_HOUSEKEEPING)) or "{}")
+        listing = json.loads(_volume_exec(node, "{} ls".format(_HOUSEKEEPING)) or "{}")
+    except Exception as e:
+        # A sync pod created from an older image has an older
+        # housekeeping.py, which does not know these commands. Say the fix
+        # rather than the argparse usage text: the pod is disposable and
+        # recreating it is seconds.
+        detail = str(e)
+        if "invalid choice" in detail:
+            detail = ("this sync pod is running an older worker. "
+                      "`rpfarm farm kill --sync` and try again -- the next "
+                      "one starts from the current image.")
+        _set_text(node, "rpfarm_volume_text", "Could not read the volume: {}".format(detail))
+        return
+
+    contents = {}
+    for project in listing.get("projects", []):
+        if project["user"] != cfg.user:
+            continue  # never opened, never deletable -- do not pay to list it
+        key = "{}/{}".format(project["user"], project["project"])
+        path = "{}/projects/{}".format(_VOLUME_ROOT, key)
+        try:
+            tree = json.loads(_volume_exec(
+                node, "{} tree {}".format(_HOUSEKEEPING, _shquote(path))) or "{}")
+        except Exception:
+            continue
+        if tree.get("ok") and not tree.get("truncated"):
+            contents[key] = [(e["path"], e["bytes"]) for e in tree.get("entries", [])]
+
+    cooking = _cookingProjects(cfg.user)
+    chosen = rpvol.browse(listing, cfg.user, cooking=cooking, contents=contents,
+                          parent=rppf.houdini_qt().mainWindow() if rppf.houdini_qt() else None)
+    if not chosen:
+        _set_text(node, "rpfarm_volume_text",
+                  "Nothing deleted." + _sweptNote(swept))
+        return
+
+    rows = rpvol.tree_rows(listing, cfg.user, cooking=cooking, contents=contents)
+    roots = rppf.build_tree([_localised(r, rpvol) for r in rows])
+    import hou
+
+    if hou.ui.displayMessage(
+        rpvol.confirm_text([rpvol.to_local(p) for p in chosen], roots, listing),
+        buttons=("Delete", "Cancel"), default_choice=1, close_choice=1,
+        severity=hou.severityType.Warning,
+    ):
+        _set_text(node, "rpfarm_volume_text", "Nothing deleted." + _sweptNote(swept))
+        return
+
+    try:
+        out = _volume_exec(node, "{} rm-paths {}".format(
+            _HOUSEKEEPING, " ".join(_shquote(c) for c in chosen)))
+        result = json.loads(out or "{}")
+    except Exception as e:
+        _set_text(node, "rpfarm_volume_text", "Delete failed: {}".format(e))
+        return
+
+    lines = ["Freed {} ({} item(s) deleted).".format(
+        _human_bytes(result.get("bytes_freed", 0)), len(result.get("deleted", [])))]
+    for entry in result.get("refused", []):
+        lines.append("  kept {}: {}".format(entry.get("path"), entry.get("error")))
+    note = _sweptNote(swept)
+    if note:
+        lines.append(note.strip())
+    _set_text(node, "rpfarm_volume_text", "\n".join(lines))
+
+
+def _localised(row, rpvol):
+    row.path = rpvol.to_local(row.path)
+    row.contents = [(rpvol.to_local(p), b) for p, b in row.contents]
+    return row
+
+
+def _sweptNote(swept):
+    """What our own housekeeping took away, mentioned but not dwelt on."""
+    removed = (swept or {}).get("removed") or []
+    if not removed:
+        return ""
+    return "  (also removed {} leftover(s) of ours, {})".format(
+        len(removed), _human_bytes((swept or {}).get("bytes_freed", 0)))
+
+
+def _cookingProjects(user):
+    """``user/project`` for every cook running in THIS Houdini right now."""
+    return set(_ACTIVE_COOKS)
 
 
 def onVolumeDelete(kwargs):
@@ -1005,6 +1152,8 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         self._reset_cook_state()
 
     def _reset_cook_state(self):
+        if self._cfg is not None and self._project:
+            _ACTIVE_COOKS.discard("{}/{}".format(self._cfg.user, self._project))
         self._cfg = None
         self._api = None
         self._token = ""
@@ -1021,6 +1170,9 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         self._sync_client = None
         self._sftp = None
         self._sync_queue = []
+        # Packages this cook actually put on local disk. Auto-clean
+        # keys on delivery, not on "no item failed".
+        self._downloads_done = 0
         self._ledger_path = ""
         self._pathmap = {}
         self._cost_tracker = {}
@@ -2013,6 +2165,7 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
                     entries, self._sftp, "down", self._cfg.rclone_path,
                     local_root=local_root, remote_root=remote_root,
                 )
+                self._downloads_done += 1
                 self._verboseLog("downloaded {} file(s) to {}".format(
                     len(entries), local_root))
                 if not block:
@@ -2246,6 +2399,7 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
             or "default"
         )
         self._cook_id = uuid.uuid4().hex[:8]
+        _ACTIVE_COOKS.add("{}/{}".format(self._cfg.user, self._project))
         self._remote_project = "/workspace/projects/{}/{}".format(
             self._cfg.user, self._project)
 
@@ -3119,6 +3273,8 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
             self._drain_sync_queue(
                 block=True, deadline=time.time() + _STOP_DRAIN_MAX_SECONDS)
 
+        self._autoCleanAfterCook(cancel)
+
         # The sync pod stays up for the next cook; stamp it so a later cook can
         # retire it once it has been idle long enough.
         self._touchSyncPod()
@@ -3151,6 +3307,92 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         self._update_status_text(force=True)
         self._reset_cook_state()
         return True
+
+    def _autoCleanAfterCook(self, cancel):
+        """Delete this cook's farm files, but only on proven delivery.
+
+        The owner asked for "clear the project folder after a successful
+        render". Two things had to be said back before building it.
+
+        First, "successful" cannot mean ``items_failed == 0``. A cook can
+        end with every item CookedSuccess and the frames still sitting on
+        the volume -- that is exactly the failure of 2026-09-06, where PDG
+        reported success and nothing came home. So the condition is
+        DELIVERY: no failed items, no download still queued, and at least
+        one package actually written to local disk. Anything less and this
+        deletes work nobody has.
+
+        Second, "the whole project folder" costs more than it saves. The
+        folder holds the INPUTS too, so deleting it means the next cook
+        re-uploads them -- at the owner's measured 4.7 Mbps that is about
+        an hour and a half for his 2.8 GB. Hence two modes: "outputs",
+        which frees the rendered frames he already has and leaves the
+        inputs where they are, and "project", which is offered but says
+        what the next cook will pay for it.
+        """
+        try:
+            mode = (self["rpfarm_autoclean"].evaluateString() or "off").strip()
+        except Exception:
+            return
+        if mode == "off":
+            return
+
+        why = None
+        if cancel:
+            why = "the cook was cancelled"
+        elif self._dispatcher.failed:
+            why = "{} item(s) failed".format(len(self._dispatcher.failed))
+        elif not self["rpfarm_downloadoutputs"].evaluateInt():
+            why = "Download Outputs is off, so nothing was delivered"
+        elif self._sync_queue:
+            why = "{} download(s) never finished".format(len(self._sync_queue))
+        elif not self._downloads_done:
+            why = "no outputs were downloaded this cook"
+        if why:
+            self._log("auto-clean skipped: {}. Nothing deleted.".format(why))
+            return
+
+        user = self._cfg.user if self._cfg else ""
+        project = self._project or ""
+        if not user or not project:
+            self._log("auto-clean skipped: this cook has no project name")
+            return
+
+        base = "{}/projects/{}/{}".format(_VOLUME_ROOT, user, project)
+        if mode == "project":
+            targets = [base]
+        else:
+            targets = ["{}/{}".format(base, name) for name in _OUTPUT_DIR_NAMES]
+
+        node = self._houNode()
+        if node is None:
+            self._log("auto-clean skipped: the scheduler node is gone")
+            return
+        try:
+            # --force is right here and only here: delivery was just
+            # proven, which is the very thing the flag exists to override.
+            out = _volume_exec(node, "{} rm-paths {} --force".format(
+                _HOUSEKEEPING, " ".join(_shquote(t) for t in targets)))
+            result = json.loads(out or "{}")
+        except Exception as e:
+            self._log("auto-clean failed: {}".format(e))
+            return
+
+        freed = result.get("bytes_freed", 0)
+        gone = [d["path"] for d in result.get("deleted", [])]
+        for entry in result.get("refused", []):
+            self._verboseLog("auto-clean left {}: {}".format(
+                entry.get("path"), entry.get("error")))
+        if not gone:
+            self._log("auto-clean: nothing to delete on the farm")
+            return
+        message = "auto-clean freed {} ({})".format(
+            _human_bytes(freed), ", ".join(gone))
+        if mode == "project":
+            eta = _reupload_estimate(self._cfg, freed)
+            if eta:
+                message += "; the next cook re-uploads the inputs, {}".format(eta)
+        self._log(message)
 
     # -------------------------------------------------------------------------
     # Submit as Job

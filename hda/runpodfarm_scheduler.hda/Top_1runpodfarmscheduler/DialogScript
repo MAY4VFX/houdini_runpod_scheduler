@@ -245,6 +245,28 @@
             help    "List zones, every project's size, and total usage. Starts the sync pod if it is not up."
         }
         parm {
+            name    "rpfarm_autoclean"
+            label   "After a Successful Cook"
+            type    ordinal
+            default { "off" }
+            menu {
+                "off"      "Keep everything on the farm"
+                "outputs"  "Delete outputs once they are downloaded"
+                "project"  "Delete the whole project (re-uploads next time)"
+            }
+            parmtag { "script_callback_language" "python" }
+            help    "Runs only when the cook succeeded AND every output was actually downloaded -- not merely when no item failed. 'Delete outputs' frees the rendered frames you already have and keeps the inputs, so the next cook uploads nothing. 'Delete the whole project' also removes the inputs, so the next cook re-uploads all of them; the log says how long that will take at your measured uplink before it does anything."
+        }
+        parm {
+            name    "rpfarm_volume_manage"
+            label   "Manage Volume..."
+            type    button
+            default { "0" }
+            parmtag { "script_callback" "hou.phm().onVolumeManage(kwargs)" }
+            parmtag { "script_callback_language" "python" }
+            help    "Open the volume as a tree and tick what to delete. Shows what is on the farm, what each project weighs and what the selection would free. Another artist's projects, the Houdini install and anything cooking right now cannot be ticked; a project whose outputs nobody has downloaded is marked and skipped by Check All."
+        }
+        parm {
             name    "rpfarm_volume_target"
             label   "Target"
             type    string

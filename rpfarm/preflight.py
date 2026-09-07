@@ -238,6 +238,12 @@ SOURCE_LABELS = {
     "usd": "USD",
     "env": "environment ($OCIO)",
     "output": "output (not a dependency)",
+    # The volume manager shares this window and this column (Ruling R55).
+    "mine": "",
+    "pending": "OUTPUTS NOT FETCHED",
+    "cooking": "cooking right now",
+    "other": "another artist",
+    "zone": "not a project",
 }
 
 
@@ -438,8 +444,24 @@ def houdini_qt():
         return None
 
 
-def build_dialog(roots, missing, checked, title="RunPodFarm", parent=None, mbps=None):
+def build_dialog(roots, missing, checked, title="RunPodFarm", parent=None, mbps=None,
+                 header=None, accept_label="Upload", columns=None,
+                 protected=None, locked=None):
     """Construct (but do not run) the confirmation window.
+
+    One window, two jobs (Ruling R55). The volume manager needs exactly this
+    tree -- hierarchy down to the file, one row per folder with aggregated
+    weight, tri-state boxes, only the top level open -- and differs only in
+    what the header says, what the accept button is called, and which rows
+    may be ticked. Those are parameters; a second window would be a second
+    place for the tri-state logic to be wrong.
+
+    ``header(roots, checked) -> str`` replaces the upload line.
+    ``protected(node) -> bool`` marks rows Check All must skip: in the
+    volume manager, a project whose outputs nobody has fetched yet.
+    ``locked(node) -> bool`` marks rows that cannot be ticked at all --
+    another artist's project, the Houdini install, the project cooking
+    right now. They are still SHOWN, because they are using the space.
 
     Built out of Houdini's own widgets where they exist: ``hou.qt.Dialog``
     (which applies ``hou.qt.styleSheet()`` itself -- the style lives on the
@@ -468,14 +490,20 @@ def build_dialog(roots, missing, checked, title="RunPodFarm", parent=None, mbps=
     dialog.setWindowTitle(title)
     dialog.setMinimumSize(980, 620)
 
+    if header is None:
+        def header(_roots, _checked):
+            return header_text(_roots, _checked, missing, mbps)
+
     layout = QtWidgets.QVBoxLayout(dialog)
-    head = QtWidgets.QLabel(header_text(roots, checked, missing, mbps))
+    head = QtWidgets.QLabel(header(roots, checked))
     head.setWordWrap(True)
     layout.addWidget(head)
 
     model = QtGui.QStandardItemModel()
-    model.setHorizontalHeaderLabels(["Reference", "Size", "Contains", "Found by"])
+    model.setHorizontalHeaderLabels(
+        list(columns or ["Reference", "Size", "Contains", "Found by"]))
     leaf_items = []
+    locked_paths = set()
 
     def add(node, parent_item):
         label = node.name if node.is_leaf else node.name.rstrip(os.sep) + os.sep
@@ -492,6 +520,10 @@ def build_dialog(roots, missing, checked, title="RunPodFarm", parent=None, mbps=
                QtGui.QStandardItem(SOURCE_LABELS.get(node.source, ""))]
         for cell in row[1:]:
             cell.setEditable(False)
+        if locked is not None and locked(node):
+            first.setCheckable(False)
+            first.setEnabled(False)
+            locked_paths.add(normalise(node.path))
         parent_item.appendRow(row)
         if node.is_leaf:
             leaf_items.append((first, node))
@@ -504,14 +536,23 @@ def build_dialog(roots, missing, checked, title="RunPodFarm", parent=None, mbps=
     def _refold(item):
         """Recompute a folder's box from its children.
 
+        A locked row has no box, so it neither takes a state nor votes on
+        its parent's -- otherwise one unticked, unticka-ble child would
+        hold a whole folder at PartiallyChecked forever.
+
         Qt derives it automatically only while signals flow; every bulk
         change here blocks them (300 dataChanged signals per Check All is
         not a refresh, it is a freeze), so the folds are recomputed once at
         the end instead.
         """
         if not item.hasChildren():
-            return item.checkState()
+            return item.checkState() if item.isCheckable() else None
         states = {_refold(item.child(row)) for row in range(item.rowCount())}
+        states.discard(None)
+        if not item.isCheckable():
+            return None
+        if not states:
+            return item.checkState()
         state = states.pop() if len(states) == 1 else QtCore.Qt.PartiallyChecked
         item.setCheckState(state)
         return state
@@ -559,23 +600,31 @@ def build_dialog(roots, missing, checked, title="RunPodFarm", parent=None, mbps=
     buttons.addWidget(check_none)
     buttons.addStretch(1)
     box = QtWidgets.QDialogButtonBox()
-    upload = box.addButton("Upload", QtWidgets.QDialogButtonBox.AcceptRole)
+    upload = box.addButton(accept_label, QtWidgets.QDialogButtonBox.AcceptRole)
     box.addButton("Cancel", QtWidgets.QDialogButtonBox.RejectRole)
     buttons.addWidget(box)
     layout.addLayout(buttons)
 
     def _checked():
         return {node.path for item, node in leaf_items
-                if item.checkState() == QtCore.Qt.Checked}
+                if item.isCheckable() and item.checkState() == QtCore.Qt.Checked}
 
     def _refresh(*_args):
         chosen = _checked()
-        head.setText(header_text(roots, chosen, missing, mbps))
+        head.setText(header(roots, chosen))
         upload.setEnabled(bool(chosen))
 
     def _set_all(state):
         model.blockSignals(True)
-        for item, _node in leaf_items:
+        for item, node in leaf_items:
+            if not item.isCheckable():
+                continue
+            # Check All never reaches for something the artist has to be
+            # deliberate about: in the volume manager that is a project
+            # whose rendered frames nobody has collected yet.
+            if state == QtCore.Qt.Checked and protected is not None and protected(node):
+                item.setCheckState(QtCore.Qt.Unchecked)
+                continue
             item.setCheckState(state)
         for item in root_items:  # blocked signals mean nothing folded itself
             _refold(item)
@@ -585,7 +634,8 @@ def build_dialog(roots, missing, checked, title="RunPodFarm", parent=None, mbps=
     def _cascade(item, state):
         for row in range(item.rowCount()):
             child = item.child(row)
-            child.setCheckState(state)
+            if child.isCheckable():
+                child.setCheckState(state)
             _cascade(child, state)
 
     busy = {"in_update": False}
@@ -631,7 +681,9 @@ def build_dialog(roots, missing, checked, title="RunPodFarm", parent=None, mbps=
     return dialog
 
 
-def confirm(roots, missing, checked, title="RunPodFarm", parent=None, mbps=None):
+def confirm(roots, missing, checked, title="RunPodFarm", parent=None, mbps=None,
+            header=None, accept_label="Upload", columns=None,
+            protected=None, locked=None):
     """Show the plan. Returns the checked paths, or None if cancelled.
 
     None means the artist said no -- the caller must stop the cook, and must
@@ -647,7 +699,9 @@ def confirm(roots, missing, checked, title="RunPodFarm", parent=None, mbps=None)
             parent = None
     if QtWidgets.QApplication.instance() is None:  # pragma: no cover - Houdini always has one
         QtWidgets.QApplication([])
-    dialog = build_dialog(roots, missing, checked, title=title, parent=parent, mbps=mbps)
+    dialog = build_dialog(roots, missing, checked, title=title, parent=parent, mbps=mbps,
+                          header=header, accept_label=accept_label, columns=columns,
+                          protected=protected, locked=locked)
     if not dialog.exec():
         return None
     return dialog.rpfarm_checked()

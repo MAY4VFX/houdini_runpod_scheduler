@@ -694,6 +694,164 @@ def cmd_rm(root: str, user_project: str, force: bool = False) -> dict:
     return {"ok": True, "path": project_dir, "bytes_freed": freed}
 
 
+#: What WE leave behind, in the two shapes the real volume actually has --
+#: found by listing it rather than by guessing (2026-09-07):
+#:
+#:   projects/may/smoke-upload-deps-1788447185   <- a litter PROJECT
+#:   projects/pdgtemp/41756                      <- a litter USER
+#:   projects/test_render/test1
+#:
+#: PDG and our own test runs write straight under projects/ with their own
+#: name in the user slot, so a rule that only looked at project names (the
+#: first version of this) swept none of them -- and the volume window then
+#: showed them to the artist as "another artist's projects", undeletable.
+_LITTER_USERS = ("pdgtemp", "test_render")
+_LITTER_PROJECT_PREFIXES = ("smoke-upload-", "rpfarm-smoke")
+
+
+def _is_litter(user: str, project: str) -> bool:
+    if user in _LITTER_USERS:
+        return True
+    return any(project.startswith(p) for p in _LITTER_PROJECT_PREFIXES)
+
+
+def cmd_tree(root: str, path: str, limit: int = 20000) -> dict:
+    """Every file under ``path``, with its size, for the volume window.
+
+    ``du`` only reports first-level children, which is the grain of a
+    terminal table; a window the artist ticks needs to open all the way to
+    the file. Capped, and it says when it capped: a project with 200k
+    frames should degrade to "here is the folder and what it weighs", not
+    push a megabyte of JSON through an exec.
+    """
+    if _is_protected(root, path):
+        return {"ok": False, "error": "protected path", "path": path}
+    entries = []
+    truncated = False
+    for dirpath, dirnames, filenames in os.walk(path, onerror=lambda e: None):
+        dirnames.sort()
+        for name in sorted(filenames):
+            if len(entries) >= limit:
+                truncated = True
+                break
+            full = os.path.join(dirpath, name)
+            try:
+                entries.append({"path": full, "bytes": os.path.getsize(full)})
+            except OSError:
+                continue
+        if truncated:
+            break
+    return {"ok": True, "path": path, "entries": entries, "truncated": truncated}
+
+
+def cmd_rm_litter(root: str, dry_run: bool = False) -> dict:
+    """Delete OUR leftovers under projects/. Never the artist's data.
+
+    Matched by name against :data:`_LITTER_PREFIXES` only -- a project is
+    never guessed to be rubbish because it is old, empty or unfamiliar.
+    Outputs-pending does not protect these: they are ours, nobody is
+    waiting on their frames, and leaving them is how 165 MB of test runs
+    ended up in the owner's volume listing.
+    """
+    projects_root = os.path.join(root, "projects")
+    removed, freed = [], 0
+    if os.path.isdir(projects_root):
+        for user in sorted(os.listdir(projects_root)):
+            user_dir = os.path.join(projects_root, user)
+            if not os.path.isdir(user_dir):
+                continue
+            for project in sorted(os.listdir(user_dir)):
+                if not _is_litter(user, project):
+                    continue
+                target = os.path.join(user_dir, project)
+                if not os.path.isdir(target):
+                    continue
+                size = _size(target) or 0
+                removed.append({"path": target, "bytes": size})
+                freed += size
+                if not dry_run:
+                    shutil.rmtree(target)
+                    _remove_index_entry(root, f"{user}/{project}")
+    if not dry_run:
+        # A litter user directory left standing empty is still ours.
+        for user in _LITTER_USERS:
+            user_dir = os.path.join(projects_root, user)
+            if os.path.isdir(user_dir) and not os.listdir(user_dir):
+                shutil.rmtree(user_dir, ignore_errors=True)
+    if removed and not dry_run:
+        _invalidate_size_cache(root, ["projects"])
+    return {"ok": True, "removed": removed, "bytes_freed": freed,
+            "dry_run": bool(dry_run)}
+
+
+def cmd_rm_paths(root: str, paths, force: bool = False) -> dict:
+    """Delete specific paths inside ``projects/``. Used by the volume window.
+
+    ``cmd_rm`` deletes a whole project, which is the wrong grain for an
+    artist who wants the render folder of one shot gone and the caches
+    kept. Every path is checked on its own and independently:
+
+    * it must live under ``projects/<user>/<project>/`` -- never a zone,
+      never a user directory, never the projects root itself. A caller
+      that gets this wrong deletes somebody's whole farm presence, so it
+      is refused here rather than trusted from the other side of an exec;
+    * protected zones are refused, exactly as ``cmd_rm`` refuses them;
+    * a path with outputs nobody has downloaded is refused unless
+      ``force``, same rule and same wording as ``cmd_rm``.
+
+    Returns ``{"ok", "deleted": [{path, bytes_freed}], "refused":
+    [{path, error}], "bytes_freed"}``. Refusing one path never stops the
+    others: a window full of checkboxes should delete what it can and say
+    what it would not.
+    """
+    index = _load_index(root)
+    projects_root = os.path.normpath(os.path.join(root, "projects"))
+    deleted, refused, freed_total = [], [], 0
+
+    for raw in paths:
+        target = os.path.normpath(raw)
+        rel = os.path.relpath(target, projects_root)
+        parts = [] if rel == "." else rel.split(os.sep)
+        if rel.startswith("..") or len(parts) < 2:
+            refused.append({"path": target,
+                            "error": "not inside a project directory"})
+            continue
+        if _is_protected(root, target):
+            refused.append({"path": target, "error": "protected path"})
+            continue
+        if not os.path.exists(target):
+            refused.append({"path": target, "error": "not found"})
+            continue
+
+        user, project = parts[0], parts[1]
+        key = f"{user}/{project}"
+        project_dir = os.path.join(projects_root, user, project)
+        pending = _outputs_pending(target if os.path.isdir(target) else project_dir,
+                                   index.get(key, {}).get("last_download"))
+        if pending and not force:
+            refused.append({"path": target, "outputs_pending": True,
+                            "error": "outputs pending, not downloaded -- "
+                                     "pass --force to delete anyway"})
+            continue
+
+        size = _size(target) or 0
+        if os.path.isdir(target):
+            shutil.rmtree(target)
+        else:
+            os.remove(target)
+        freed_total += size
+        deleted.append({"path": target, "bytes_freed": size})
+        # The whole project went: its index entry means nothing now.
+        if target == os.path.normpath(project_dir):
+            _remove_index_entry(root, key)
+        else:
+            _invalidate_size_cache(root, [key])
+
+    _invalidate_size_cache(root, ["projects"])
+    return {"ok": not refused, "deleted": deleted, "refused": refused,
+            "bytes_freed": freed_total}
+
+
 def cmd_prune(root: str, older_days: float = 30, dry_run: bool = True) -> dict:
     """Projects unused for ``older_days`` (never pending, never protected).
 
@@ -747,8 +905,13 @@ def cmd_prune(root: str, older_days: float = 30, dry_run: bool = True) -> dict:
             _remove_index_entry(root, f"{c['user']}/{c['project']}")
 
     boot_logs = _rotate_boot_logs(root, now, dry_run)
+    # Our own leavings go regardless of age: prune is the command that
+    # means "tidy the volume", and nobody is waiting on a smoke run.
+    litter = cmd_rm_litter(root, dry_run=dry_run)
 
-    return {"candidates": candidates, "deleted": not dry_run, "boot_logs_rotated": boot_logs}
+    return {"candidates": candidates, "deleted": not dry_run,
+            "boot_logs_rotated": boot_logs, "litter": litter["removed"],
+            "litter_bytes_freed": litter["bytes_freed"]}
 
 
 def _rotate_boot_logs(root: str, now: float, dry_run: bool) -> list[dict]:
@@ -1053,6 +1216,17 @@ def _build_parser() -> argparse.ArgumentParser:
     p_rm.add_argument("user_project")
     p_rm.add_argument("--force", action="store_true")
 
+    p_tree = sub.add_parser("tree")
+    p_tree.add_argument("path")
+    p_tree.add_argument("--limit", type=int, default=20000)
+
+    p_rm_litter = sub.add_parser("rm-litter")
+    p_rm_litter.add_argument("--dry-run", action="store_true")
+
+    p_rm_paths = sub.add_parser("rm-paths")
+    p_rm_paths.add_argument("paths", nargs="+")
+    p_rm_paths.add_argument("--force", action="store_true")
+
     p_prune = sub.add_parser("prune")
     p_prune.add_argument("--older-days", type=float, default=30)
     p_prune.add_argument("--dry-run", action="store_true")
@@ -1102,6 +1276,12 @@ def main(argv: list[str]) -> int:
             result = cmd_touch(DEFAULT_ROOT, args.user_project, args.event)
         elif args.command == "rm":
             result = cmd_rm(DEFAULT_ROOT, args.user_project, args.force)
+        elif args.command == "tree":
+            result = cmd_tree(DEFAULT_ROOT, args.path, args.limit)
+        elif args.command == "rm-litter":
+            result = cmd_rm_litter(DEFAULT_ROOT, args.dry_run)
+        elif args.command == "rm-paths":
+            result = cmd_rm_paths(DEFAULT_ROOT, args.paths, args.force)
         elif args.command == "prune":
             result = cmd_prune(DEFAULT_ROOT, args.older_days, args.dry_run)
         elif args.command == "houdini":

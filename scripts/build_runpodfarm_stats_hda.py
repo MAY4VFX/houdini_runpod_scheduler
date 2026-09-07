@@ -258,7 +258,7 @@ _ASSET_FINGERPRINT = {
     'package_runner.py': (8752, '96770e3879a6cb65'),
     'packages.py': (56224, '327c8debf6b236fc'),
     'pods.py': (27370, 'e7b4bfb9a4f8fc5e'),
-    'preflight.py': (28605, '0f7b932002602fd9'),
+    'preflight.py': (31237, '41ab9dff0a78fe91'),
     'runpod_api.py': (14539, 'b90960f9860c97fb'),
     'scene_setup.py': (18467, '8838d55cbb131f99'),
     'smoke.py': (41503, 'd25dfbac9eddb12b'),
@@ -266,6 +266,7 @@ _ASSET_FINGERPRINT = {
     'tls.py': (3642, 'f3e50ea6ebd0308f'),
     'tools.py': (4290, 'c5d3b026f125578f'),
     'usddeps.py': (9631, '3c7192d3bd94d07f'),
+    'volume.py': (10038, 'dc11b185a58c9262'),
     'worker_client.py': (9791, 'cf6b40b1e879c658'),
 }
 # END baked

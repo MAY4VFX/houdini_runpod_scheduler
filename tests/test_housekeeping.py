@@ -971,3 +971,119 @@ def test_main_invalidate_rejects_bad_zone(capsys):
 # its own `_SizeCache.flush()` -- the cache write is exactly the same
 # size-measurement bookkeeping a real `houdini ls` would do; --dry-run
 # only skips the deletion itself, not the (harmless, correct) caching.
+
+
+# -- path-level deletion and our own litter ----------------------------------
+
+
+def _project(tmp_path, user, name, files=(("render/a.exr", b"x" * 100),)):
+    root = tmp_path / "workspace"
+    target = root / "projects" / user / name
+    for rel, data in files:
+        f = target / rel
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_bytes(data)
+    return root, target
+
+
+def test_rm_paths_refuses_anything_that_is_not_inside_a_project(tmp_path):
+    """The window enforces this too, but a caller on the other side of an
+    exec is not something to trust: one wrong path here is somebody's whole
+    farm presence."""
+    root, _ = _project(tmp_path, "may", "airship")
+    (root / "houdini" / "22.0").mkdir(parents=True)
+    (root / "ledger").mkdir(parents=True)
+
+    result = hk.cmd_rm_paths(str(root), [
+        str(root / "projects"),
+        str(root / "projects" / "may"),
+        str(root / "houdini"),
+        str(root / "ledger"),
+        str(tmp_path / "elsewhere"),
+    ], force=True)
+
+    assert result["deleted"] == []
+    assert len(result["refused"]) == 5
+    assert (root / "projects" / "may" / "airship").is_dir()
+    assert (root / "houdini" / "22.0").is_dir()
+
+
+def test_rm_paths_deletes_a_folder_inside_a_project(tmp_path):
+    root, target = _project(tmp_path, "may", "airship", files=(
+        ("render/a.exr", b"x" * 100), ("scene.hip", b"y" * 50)))
+    result = hk.cmd_rm_paths(str(root), [str(target / "render")], force=True)
+    assert result["ok"] and len(result["deleted"]) == 1
+    assert not (target / "render").exists()
+    assert (target / "scene.hip").exists()   # the inputs stay
+
+
+def test_rm_paths_refuses_pending_outputs_without_force(tmp_path):
+    root, target = _project(tmp_path, "may", "airship")
+    result = hk.cmd_rm_paths(str(root), [str(target)])
+    assert not result["ok"]
+    assert result["refused"][0]["outputs_pending"] is True
+    assert target.is_dir()
+
+
+def test_rm_paths_keeps_going_after_a_refusal(tmp_path):
+    """A window full of checkboxes should delete what it can and say what it
+    would not, rather than stopping at the first no."""
+    root, mine = _project(tmp_path, "may", "airship", files=(("cache/a.bgeo", b"z" * 10),))
+    result = hk.cmd_rm_paths(str(root), [
+        str(root / "houdini"), str(mine / "cache")], force=True)
+    assert [d["path"] for d in result["deleted"]] == [str(mine / "cache")]
+    assert len(result["refused"]) == 1
+
+
+def test_litter_is_ours_and_goes_without_being_asked(tmp_path):
+    """Both shapes, taken from the real volume: a litter project under the
+    artist, and a litter USER directory of its own."""
+    root, _ = _project(tmp_path, "may", "airship")
+    _project(tmp_path, "may", "smoke-upload-deps-1788447185", files=(("x.txt", b"a" * 20),))
+    _project(tmp_path, "pdgtemp", "41756", files=(("y.txt", b"b" * 20),))
+    _project(tmp_path, "test_render", "test1", files=(("z.txt", b"c" * 20),))
+    _project(tmp_path, "may", "smoke", files=(("s.txt", b"d" * 20),))
+
+    dry = hk.cmd_rm_litter(str(root), dry_run=True)
+    assert {os.path.basename(r["path"]) for r in dry["removed"]} == {
+        "smoke-upload-deps-1788447185", "41756", "test1"}
+    assert (root / "projects" / "may" / "smoke-upload-deps-1788447185").is_dir()
+
+    hk.cmd_rm_litter(str(root))
+    assert not (root / "projects" / "may" / "smoke-upload-deps-1788447185").exists()
+    assert not (root / "projects" / "pdgtemp").exists()   # emptied, so it goes too
+    assert not (root / "projects" / "test_render").exists()
+    # Never the artist's own work, whatever its age or name.
+    assert (root / "projects" / "may" / "airship").is_dir()
+    assert (root / "projects" / "may" / "smoke").is_dir()
+
+
+def test_prune_sweeps_our_litter_too(tmp_path):
+    root, _ = _project(tmp_path, "may", "airship")
+    _project(tmp_path, "pdgtemp", "41756", files=(("t.txt", b"c" * 30),))
+    result = hk.cmd_prune(str(root), older_days=3650, dry_run=False)
+    assert [os.path.basename(r["path"]) for r in result["litter"]] == ["41756"]
+    assert not (root / "projects" / "pdgtemp").exists()
+
+
+def test_tree_opens_a_project_all_the_way_to_the_file(tmp_path):
+    root, target = _project(tmp_path, "may", "airship", files=(
+        ("render/a.exr", b"x" * 100), ("geo/b/c.bgeo", b"y" * 50)))
+    result = hk.cmd_tree(str(root), str(target))
+    assert result["ok"] and not result["truncated"]
+    got = {os.path.relpath(e["path"], str(target)): e["bytes"] for e in result["entries"]}
+    assert got == {"render/a.exr": 100, "geo/b/c.bgeo": 50}
+
+
+def test_tree_caps_itself_rather_than_returning_a_megabyte_of_json(tmp_path):
+    root, target = _project(tmp_path, "may", "airship", files=tuple(
+        ("render/f{}.exr".format(i), b"x") for i in range(20)))
+    result = hk.cmd_tree(str(root), str(target), limit=5)
+    assert result["truncated"] is True
+    assert len(result["entries"]) == 5
+
+
+def test_tree_refuses_a_protected_zone(tmp_path):
+    root, _ = _project(tmp_path, "may", "airship")
+    (root / "houdini").mkdir(parents=True, exist_ok=True)
+    assert hk.cmd_tree(str(root), str(root / "houdini"))["ok"] is False
