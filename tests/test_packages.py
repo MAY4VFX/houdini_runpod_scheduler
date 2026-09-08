@@ -1809,3 +1809,61 @@ def test_the_resolver_is_built_into_the_volume_not_the_image():
 
     assert "toolkit/samples/USD/USD_HoudiniPathMapArResolver" in post
     assert "build-essential" not in dockerfile, "the image must stay thin"
+
+
+# -- an output path that depends on the ITEM, not only the frame (R57) -------
+
+
+def _wedge(**attrs):
+    return attrs.get
+
+
+def test_a_wedge_attribute_in_the_filename_is_expanded():
+    """The owner's real scene and its three real work items (cook 7fae1540).
+    Evaluating this parm outside the item's context produced
+    'yoyo_loodev.v004..0001.exr' -- a file that exists nowhere -- so three
+    rendered frames stayed on the farm."""
+    raw = "$HIP/render/cams/$HIPNAME.`@cam`.$F4.exr"
+    for cam in ("TON00617", "TON00566", "TON00573"):
+        got, missing = rppkg.expand_item_attribs(raw, _wedge(cam=cam))
+        assert got == "$HIP/render/cams/$HIPNAME.{}.$F4.exr".format(cam)
+        assert missing == []
+
+
+def test_a_bare_attribute_reference_is_expanded_too():
+    got, missing = rppkg.expand_item_attribs("out/@cam/f.$F4.exr", _wedge(cam="A"))
+    assert got == "out/A/f.$F4.exr" and missing == []
+
+
+@pytest.mark.parametrize("value,expected", [
+    ("TON00617", "TON00617"),
+    (3, "3"),
+    (3.0, "3"),          # a wedge index must not read as "3.0" in a filename
+    (2.5, "2.5"),
+])
+def test_an_attribute_that_is_not_a_string_still_lands(value, expected):
+    got, _ = rppkg.expand_item_attribs("f.@wedge.exr", _wedge(wedge=value))
+    assert got == "f.{}.exr".format(expected)
+
+
+def test_an_unknown_attribute_is_left_alone_and_reported():
+    """Never a path with a hole in it: that looks like a real path, downloads
+    nothing, and says nothing."""
+    said = []
+    got, missing = rppkg.expand_item_attribs(
+        "f.`@nope`.$F4.exr", _wedge(cam="A"), log=said.append)
+    assert got == "f.`@nope`.$F4.exr"
+    assert missing == ["nope"]
+    assert said and "nope" in said[0]
+
+
+def test_a_path_with_no_attributes_is_untouched():
+    raw = "$HIP/render/smoke.$F4.exr"
+    assert rppkg.expand_item_attribs(raw, _wedge()) == (raw, [])
+
+
+def test_several_attributes_in_one_path():
+    got, missing = rppkg.expand_item_attribs(
+        "$HIP/@shot/`@cam`/$HIPNAME.@version.$F4.exr",
+        _wedge(shot="sh010", cam="camA", version=3))
+    assert got == "$HIP/sh010/camA/$HIPNAME.3.$F4.exr" and missing == []

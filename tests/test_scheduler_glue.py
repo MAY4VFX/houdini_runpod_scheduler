@@ -1498,14 +1498,16 @@ def test_a_rop_that_reports_only_its_intermediate_still_brings_the_frame_home():
     import types as _types
 
     pathmap = {"/Users/artist": "/workspace/projects/may/airship"}
+    raw = "/Users/artist/BS/airship/render/shot0018/airship_0018_v003.acescg.$F4.exr"
     rop = _types.SimpleNamespace(
-        parm=lambda name: _types.SimpleNamespace(
-            evalAsStringAtFrame=lambda f:
-                "/Users/artist/BS/airship/render/shot0018/airship_0018_v003.acescg.%04d.exr" % f
-        ) if name == "outputimage" else None)
+        parm=lambda name: _types.SimpleNamespace(rawValue=lambda: raw)
+        if name == "outputimage" else None)
     fetch = _types.SimpleNamespace(
         parm=lambda name: _types.SimpleNamespace(eval=lambda: "/stage/render_shot0018"))
-    hou_stub = _types.SimpleNamespace(node=lambda path: rop, frame=lambda: 1.0)
+    hou_stub = _types.SimpleNamespace(
+        node=lambda path: rop, frame=lambda: 1.0,
+        text=_types.SimpleNamespace(
+            expandStringAtFrame=lambda value, f: value.replace("$F4", "%04d" % f)))
 
     sched = FakeScheduler()
     sched._pathmap = pathmap
@@ -1514,9 +1516,11 @@ def test_a_rop_that_reports_only_its_intermediate_still_brings_the_frame_home():
     sched._ROP_OUTPUT_PARMS = ("outputimage",)
 
     item = _types.SimpleNamespace(
-        node=_types.SimpleNamespace(name="fetch_shot0018"), frame=1.0, hasFrame=True)
+        node=_types.SimpleNamespace(name="fetch_shot0018"), frame=1.0, hasFrame=True,
+        hasAttrib=lambda name: False)
 
-    ns = load_methods(["_ropOutputPair"], {"rppkg": rppkg})
+    ns = load_methods(["_ropOutputPair", "_itemAttrib"], {"rppkg": rppkg})
+    sched._itemAttrib = ns["_itemAttrib"]
     sys.modules["hou"] = hou_stub
     try:
         farm, local = ns["_ropOutputPair"](sched, item)
@@ -1653,3 +1657,50 @@ def test_a_refusal_from_the_pod_is_reported_not_swallowed():
     clean(sched, cancel=False)
     assert any("outputs pending" in line for line in sched.logs), sched.logs
     assert any("nothing to delete" in line for line in sched.logs), sched.logs
+
+
+def test_the_fallback_expands_the_items_own_attributes(monkeypatch):
+    """The owner's wedge scene (cook 7fae1540): the ROP writes one file per
+    camera, and the path says so. Evaluated outside the item, `@cam` became
+    nothing and the download had a name that exists nowhere."""
+    import types as _types
+
+    raw = "/Users/artist/BS/yoyo/render/cams/yoyo_loodev.v004.`@cam`.$F4.exr"
+    rop = _types.SimpleNamespace(
+        parm=lambda name: _types.SimpleNamespace(rawValue=lambda: raw)
+        if name == "picture" else None)
+    fetch = _types.SimpleNamespace(
+        parm=lambda name: _types.SimpleNamespace(eval=lambda: "/stage/render_cams"))
+    hou_stub = _types.SimpleNamespace(
+        node=lambda path: rop, frame=lambda: 1.0,
+        text=_types.SimpleNamespace(
+            expandStringAtFrame=lambda value, f: value.replace("$F4", "%04d" % f)))
+
+    sched = FakeScheduler()
+    sched._pathmap = {"/Users/artist": "/workspace/projects/may/airship"}
+    sched.topNode = lambda: _types.SimpleNamespace(
+        parent=lambda: _types.SimpleNamespace(node=lambda name: fetch))
+    sched._ROP_OUTPUT_PARMS = ("picture",)
+    sched._log = sched.logs.append
+
+    ns = load_methods(["_ropOutputPair", "_itemAttrib"], {"rppkg": rppkg})
+    sched._itemAttrib = ns["_itemAttrib"]
+
+    def _item(cam):
+        return _types.SimpleNamespace(
+            node=_types.SimpleNamespace(name="render_cams"), frame=1.0, hasFrame=True,
+            hasAttrib=lambda name: name == "cam" and cam is not None,
+            stringAttribValue=lambda name: cam)
+
+    sys.modules["hou"] = hou_stub
+    try:
+        for cam in ("TON00617", "TON00566", "TON00573"):
+            farm, local = ns["_ropOutputPair"](sched, _item(cam))
+            assert local.endswith("yoyo_loodev.v004.{}.0001.exr".format(cam))
+            assert farm.startswith("/workspace/projects/may/airship/")
+        # An item without the attribute must produce NO path at all, rather
+        # than one with a hole in it.
+        assert ns["_ropOutputPair"](sched, _item(None)) is None
+    finally:
+        sys.modules.pop("hou", None)
+    assert any("does not have" in line for line in sched.logs), sched.logs

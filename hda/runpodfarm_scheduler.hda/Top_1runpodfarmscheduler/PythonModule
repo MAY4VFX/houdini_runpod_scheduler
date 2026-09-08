@@ -208,7 +208,7 @@ _ASSET_FINGERPRINT = {
     'houdini_local.py': (35863, '6382f7ed7690f114'),
     'ledger.py': (17327, '70425e75fb216f01'),
     'package_runner.py': (8752, '96770e3879a6cb65'),
-    'packages.py': (56224, '327c8debf6b236fc'),
+    'packages.py': (58496, 'e06b2bbe69f3aa83'),
     'pods.py': (27370, 'e7b4bfb9a4f8fc5e'),
     'preflight.py': (31237, '41ab9dff0a78fe91'),
     'runpod_api.py': (14539, 'b90960f9860c97fb'),
@@ -2102,12 +2102,49 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
                 parm = rop.parm(name)
                 if parm is None:
                     continue
-                local = parm.evalAsStringAtFrame(frame)
+                # RAW, then the item's attributes, then Houdini's own
+                # expansion. Evaluating the parm straight (what this did) is
+                # evaluation OUTSIDE the item's context, where `@cam`
+                # collapses to nothing and the path names a file that does
+                # not exist -- Ruling R57.
+                raw, missing = rppkg.expand_item_attribs(
+                    parm.rawValue(), lambda a: self._itemAttrib(work_item, a),
+                    log=self._log)
+                if missing:
+                    # A path with a hole in it downloads nothing and looks
+                    # like it should have worked. Refuse the guess instead.
+                    return None
+                local = hou.text.expandStringAtFrame(raw, frame)
                 if not local or local.endswith("/"):
                     continue
                 return rppkg.map_output_pair(local, self._pathmap)
         except Exception as e:
             self._verboseLog("could not read the ROP's output path: {}".format(e))
+        return None
+
+    @staticmethod
+    def _itemAttrib(work_item, name):
+        """One attribute of a work item, whatever its type, or None.
+
+        ``stringAttribValue`` raises rather than returning None for an
+        attribute of another type, so the typed accessors are tried in turn
+        and "it has no such attribute" comes back as None -- which is what
+        tells the caller to refuse the path rather than paper over it.
+        """
+        try:
+            if not work_item.hasAttrib(name):
+                return None
+        except Exception:
+            return None
+        for accessor in ("stringAttribValue", "intAttribValue",
+                         "floatAttribValue", "attribValue"):
+            getter = getattr(work_item, accessor, None)
+            if getter is None:
+                continue
+            try:
+                return getter(name)
+            except Exception:
+                continue
         return None
 
     def _queueSettle(self, work_item_id, work_item, duration):

@@ -36,6 +36,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import posixpath
 import sys
 import tempfile
@@ -1013,6 +1014,56 @@ def delocalize_via_pathmap(local, path_map):
     local_prefix, farm_prefix = best
     rel = local[len(local_prefix):].lstrip("/")
     return posixpath.join(farm_prefix, rel) if rel else farm_prefix
+
+
+#: ``@cam`` and ``` `@cam` ``` in a ROP's output path. Houdini writes the
+#: backticked form inside a string parm (an hscript expression) and the bare
+#: form in a few places; a wedge scene has one or the other in the filename.
+_ITEM_ATTR = re.compile(r"`\s*@(\w+)\s*`|@(\w+)")
+
+
+def expand_item_attribs(raw, lookup, log=None):
+    """Substitute a work item's attributes into a raw parm value.
+
+    A ROP's output path can depend on the ITEM, not only on the frame:
+    ``$HIP/render/cams/$HIPNAME.`@cam`.$F4.exr`` is one file per wedge.
+    Evaluating that parm outside the item's context -- which is all
+    ``Parm.evalAsStringAtFrame`` can do -- collapses ``@cam`` to nothing and
+    produces ``yoyo_loodev.v004..0001.exr``, a name that exists nowhere, so
+    nothing is downloaded (measured on the owner's scene, cook 7fae1540).
+
+    PDG has no public way to evaluate a parm inside an item's context:
+    ``pdg.EvaluationContext`` has no constructor, and ``WorkItem`` has no
+    ``expand``. What it does have is the attributes themselves, so they are
+    substituted here and the rest of the string is left to
+    ``hou.text.expandStringAtFrame``.
+
+    ``lookup(name)`` returns the attribute's value or None. An attribute the
+    item does not have is LEFT AS IT IS and reported: a path with a hole in
+    it looks like a real path and silently downloads nothing, which is
+    exactly the failure this function exists to end.
+    """
+    say = log if log is not None else (lambda _m: None)
+    missing = []
+
+    def _sub(match):
+        name = match.group(1) or match.group(2)
+        value = lookup(name)
+        if value is None:
+            missing.append(name)
+            return match.group(0)
+        # Attributes are not always strings -- a wedge index is an int, and
+        # a float attribute in a filename has to read the way Houdini writes
+        # it rather than as "3.0".
+        if isinstance(value, float) and value.is_integer():
+            return str(int(value))
+        return str(value)
+
+    out = _ITEM_ATTR.sub(_sub, raw or "")
+    if missing:
+        say("output path names attribute(s) the work item does not have: {} -- "
+            "left unexpanded in {!r}".format(", ".join(sorted(set(missing))), raw))
+    return out, missing
 
 
 def map_output_pair(reported, path_map):
