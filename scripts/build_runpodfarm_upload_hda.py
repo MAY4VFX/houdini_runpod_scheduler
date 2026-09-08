@@ -256,7 +256,7 @@ _ASSET_FINGERPRINT = {
     'ledger.py': (17327, '70425e75fb216f01'),
     'package_runner.py': (8752, '96770e3879a6cb65'),
     'packages.py': (58496, 'e06b2bbe69f3aa83'),
-    'pods.py': (29058, '8955f898b999945e'),
+    'pods.py': (30823, 'fc9878f471863111'),
     'preflight.py': (31237, '41ab9dff0a78fe91'),
     'runpod_api.py': (14539, 'b90960f9860c97fb'),
     'scene_setup.py': (18467, '8838d55cbb131f99'),
