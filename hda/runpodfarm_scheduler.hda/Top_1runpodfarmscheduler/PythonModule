@@ -208,7 +208,7 @@ _ASSET_FINGERPRINT = {
     'houdini_local.py': (35863, '6382f7ed7690f114'),
     'ledger.py': (17327, '70425e75fb216f01'),
     'package_runner.py': (8752, '96770e3879a6cb65'),
-    'packages.py': (58496, 'e06b2bbe69f3aa83'),
+    'packages.py': (61657, '030b2d03028b9c47'),
     'pods.py': (30823, 'fc9878f471863111'),
     'preflight.py': (31237, '41ab9dff0a78fe91'),
     'runpod_api.py': (14539, 'b90960f9860c97fb'),
@@ -1220,6 +1220,18 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         # dialogs in the middle of a cook. Ruling R54: a window is only for
         # something the artist has to do RIGHT NOW or the work stops.
         self._notes = []
+        # One entry per work item that failed, {"node", "item", "error"},
+        # in the order this scheduler found out about them. Fed by every
+        # code path that can fail an item (_logTaskFailure, a vanished task,
+        # a capacity timeout) plus the graph-wide sweep _sweepGraphFailures
+        # runs at stop for upload/download items, which never touch this
+        # scheduler at all. Read by _update_status_text/onStopCook so a
+        # silent CookedFail is never the only thing the artist sees.
+        self._graph_failures = []
+        # PDG work item ids already in _graph_failures, so the same item is
+        # never listed twice regardless of which of the paths above sees it
+        # first.
+        self._known_failure_ids = set()
 
     @classmethod
     def templateName(cls):
@@ -1941,7 +1953,7 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
                 # dispatcher.failed; _reportFailures is the single place that
                 # tells PDG. Reporting it here as well made every pod-side
                 # failure arrive at workItemFailed twice.
-                self._logTaskFailure(task, status)
+                self._logTaskFailure(task, status, work_item)
 
     def _failUnaccountedTask(self, task):
         """Fail an item whose task the worker cannot account for.
@@ -1978,18 +1990,56 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
             "cancelled and restarted while this one was starting. Log, if the "
             "task got far enough to write one: {}".format(
                 task.work_item_id, task.pod_id, task.task_id, duration, task.log_path))
+        self._recordFailure(
+            task.work_item_id, self._itemNode(task.work_item_id),
+            self._itemName(task.work_item_id),
+            "pod {} lost track of the task, no log to read".format(task.pod_id))
 
     def _itemName(self, work_item_id):
         item = self._work_items.get(work_item_id)
         return item.name if item is not None else str(work_item_id)
 
-    def _logTaskFailure(self, task, status):
+    def _itemNode(self, work_item_id):
+        item = self._work_items.get(work_item_id)
+        try:
+            return item.node.name if item is not None else "farm"
+        except Exception:
+            return "farm"
+
+    def _recordFailure(self, item_id, node_name, item_name, error):
+        """Keep one human-readable line per work item that failed.
+
+        Every way an item can die funnels here -- a farm task the worker
+        reported (_logTaskFailure), one that vanished (_failUnaccountedTask),
+        one that gave up waiting for a machine (_expireWaitingItems via
+        _reportFailures), and upload/download items that run entirely on
+        localscheduler and never touch this scheduler at all
+        (_sweepGraphFailures, at stop). Keyed by PDG's own item id so
+        whichever of those sees an item first is the one that sticks, and
+        _update_status_text/onStopCook has one list to read instead of five.
+        """
+        if item_id in self._known_failure_ids:
+            return
+        self._known_failure_ids.add(item_id)
+        self._graph_failures.append(
+            {"node": node_name, "item": item_name, "error": error})
+
+    def _logTaskFailure(self, task, status, work_item=None):
         """Put the tail of a failed task's log where the artist will see it."""
         tail = status.get("tail") or []
         self._log("item {} failed on pod {} (exit {}), log {}".format(
             task.work_item_id, task.pod_id, status.get("exit_code"), task.log_path))
         for line in tail[-20:]:
             self._log("  | {}".format(line))
+        node_name = "farm"
+        item_name = str(task.work_item_id)
+        try:
+            node_name = work_item.node.name if work_item is not None else node_name
+            item_name = work_item.name if work_item is not None else item_name
+        except Exception:
+            pass
+        error = rppkg.first_error_line(tail) or "exit code {}".format(status.get("exit_code"))
+        self._recordFailure(task.work_item_id, node_name, item_name, error)
 
     def _reportFailures(self):
         """Tell PDG about tasks the dispatcher has given up retrying.
@@ -1998,11 +2048,19 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         before it calls here, so an item that died waiting for a machine says
         so in human words instead of leaving the artist with a bare failed
         badge and no idea that the answer is "try again in a few minutes, or
-        switch Cloud Type to Community".
+        switch Cloud Type to Community". Whatever the reason, _recordFailure
+        is a no-op for any item _logTaskFailure already explained better --
+        this only fills in the ones that never went through it (a capacity
+        timeout, or a pod that died after retries ran out).
         """
         reason = self._capacity_give_up_reason
         self._capacity_give_up_reason = ""
         for task in self._dispatcher.failed_since_last_call():
+            self._recordFailure(
+                task.work_item_id, self._itemNode(task.work_item_id),
+                self._itemName(task.work_item_id),
+                reason.splitlines()[0] if reason else
+                "failed after {} attempt(s), no log captured".format(task.attempts))
             if reason:
                 self._log("item {} failed: {}".format(task.work_item_id, reason))
             else:
@@ -2331,6 +2389,28 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         lines.insert(0, "РЕЖИМ: обычный кук — дирижирует этот Houdini. "
                         "НЕ ЗАКРЫВАЙТЕ его до конца: иначе кадры не приедут, "
                         "а машины останутся включёнными.")
+        # First thing after the mode line, not buried below the pod list:
+        # this is the whole reason the summary exists (2026-09-08, a sync
+        # pod that would not wake left "кук завершился, задач ноль, ошибок
+        # нет" on screen while the real cause sat in one work item's log).
+        # Grouped by node and capped at three, per the owner's own rule
+        # about not turning this into a wall of text (Ruling R54).
+        if self._graph_failures:
+            by_node = {}
+            order = []
+            for f in self._graph_failures:
+                if f["node"] not in by_node:
+                    by_node[f["node"]] = []
+                    order.append(f["node"])
+                by_node[f["node"]].append(f)
+            lines.append("ОШИБКИ: {} айтем(ов) провалилось на {} узле(ах)".format(
+                len(self._graph_failures), len(order)))
+            for node_name in order[:3]:
+                group = by_node[node_name]
+                lines.append("  {} ({} шт.): {}".format(
+                    node_name, len(group), group[0]["error"]))
+            if len(order) > 3:
+                lines.append("  ...и ещё {} узел(ов)".format(len(order) - 3))
         if self._sync_pod:
             lines.append("sync pod {}".format(self._sync_pod["id"]))
         for pod in sorted(self._dispatcher.pods.values(), key=lambda p: p.pod_id):
@@ -3172,6 +3252,49 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
             "output path/version, to render them again.".format(
                 cached, " (e.g. {})".format(example) if example else ""))
 
+    def _sweepGraphFailures(self):
+        """Catch the failures the dispatcher never saw.
+
+        upload/download (and anything else scheduled to localscheduler)
+        cook entirely inside their own subnet and never touch this
+        scheduler's dispatcher at all -- 2026-09-08, a sync pod that would
+        not wake in time failed upload_pythonprocessor1, and every node
+        downstream of it (gate, cams, render) went CookedFail right along
+        with it, with nothing on the Status tab and nothing in this
+        scheduler's log to say so: the ledger only ever knows about the
+        farm's own tasks. Same reasoning as _announceCachedItems for running
+        this once, at stop: PDG's states are only final once the cook has
+        actually ended.
+
+        Reads the real error out of each failed item's own log file via its
+        logURI -- the same mechanism rpfarm.smoke's live tests already use
+        to explain a failure. An item PDG failed by dependency alone, without
+        ever running it, has no log to read; that is said plainly rather
+        than guessed at.
+        """
+        try:
+            import pdg
+
+            for node in self.topNode().parent().children():
+                get_pdg = getattr(node, "getPDGNode", None)
+                pdg_node = get_pdg() if get_pdg else None
+                items = getattr(pdg_node, "workItems", None) if pdg_node else None
+                if items is None:
+                    continue
+                for item in items:
+                    if item.state != pdg.workItemState.CookedFail:
+                        continue
+                    if item.id in self._known_failure_ids:
+                        continue
+                    error = rppkg.read_item_log_tail(getattr(item, "logURI", "") or "")
+                    if not error:
+                        error = ("no log -- most likely never ran because a "
+                                 "dependency earlier in the graph failed first")
+                    self._recordFailure(item.id, node.name(), item.name, error)
+        except Exception as e:
+            # A courtesy summary must never break a cook.
+            self._verboseLog("could not sweep the graph for failures: {}".format(e))
+
     def _xpuRops(self):
         """ROPs this topnet is about to render that ask for Karma XPU.
 
@@ -3301,6 +3424,11 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         if not self._announced_cached:
             self._announced_cached = True
             self._announceCachedItems()
+
+        # Same reasoning, same moment: only now are every node's states
+        # final, including upload/download items that ran on localscheduler
+        # and never told this scheduler anything at all.
+        self._sweepGraphFailures()
 
         # Anything still waiting for its output files has to be reported now:
         # PDG must never be left waiting on an item this scheduler is holding.

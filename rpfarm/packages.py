@@ -1100,6 +1100,76 @@ def write_pathmap(job_dir, path_map):
     return path
 
 
+# -- failure reporting ------------------------------------------------------
+#
+# Shared by the scheduler's status text (Ruling R-silent-fail): a work item
+# failing silently costs the owner a cook every time, because he never opens
+# a log file -- so whatever surfaces the failure has to do the log-reading
+# for him and hand back one line in plain language.
+
+#: PDG's own subprocess wrapper (out-of-process work items, e.g. every
+#: pythonprocessor item this repo ships) appends exactly this as the last
+#: line of the log on a non-zero exit. It is boilerplate, not the cause --
+#: the line above it is (measured on a real failure, upload_pythonprocessor1
+#: item 9, 2026-09-08: a Python traceback whose last line, right before this
+#: marker, was ``TimeoutError: pod ... not ready in 300s``).
+_PDG_EXIT_MARKER_RE = re.compile(r"^\*\*\*\s*Failed with Exit Code")
+
+
+def first_error_line(text, max_len=200):
+    """The one line of a captured log worth showing an artist.
+
+    Not "the log" and not "the traceback" -- one line, because a screen full
+    of stack frames is exactly the kind of detail the owner asked us to stop
+    showing him (Ruling R54). The line chosen is the last non-blank one,
+    after dropping PDG's own ``*** Failed with Exit Code = N`` footer if
+    present: for a Python traceback that IS the exception's own message,
+    which is what "the real error" means here, not the frames above it. For
+    a plain shell failure it is whatever the command's last line of output
+    was, which is the next best thing to a traceback.
+
+    ``text`` may be the whole log as one string or an already-split
+    iterable of lines (a worker's in-memory tail is a list; a log file read
+    from disk is a string). Returns ``""`` when there is nothing usable --
+    callers decide what to say when a failed item left no log at all.
+    """
+    lines = text.splitlines() if isinstance(text, str) else list(text)
+    while lines and not lines[-1].strip():
+        lines.pop()
+    if lines and _PDG_EXIT_MARKER_RE.match(lines[-1].strip()):
+        lines.pop()
+        while lines and not lines[-1].strip():
+            lines.pop()
+    if not lines:
+        return ""
+    line = lines[-1].strip()
+    if len(line) > max_len:
+        line = line[:max_len - 1].rstrip() + "…"
+    return line
+
+
+def read_item_log_tail(log_uri, max_len=200):
+    """:func:`first_error_line` of the file behind a PDG work item's logURI.
+
+    ``logURI`` arrives as ``file://<path>`` for an out-of-process item that
+    actually ran; a downstream item PDG failed by dependency alone -- it was
+    never dispatched, so it never wrote one -- reports an empty URI, and
+    that has to come back as "" rather than raise, so the caller can say so
+    honestly instead of guessing. Never raises: a status-text courtesy must
+    not be able to break a cook.
+    """
+    if not log_uri:
+        return ""
+    path = log_uri[len("file://"):] if log_uri.startswith("file://") else log_uri
+    if not path:
+        return ""
+    try:
+        with open(path, "r", errors="replace") as f:
+            return first_error_line(f.read(), max_len=max_len)
+    except OSError:
+        return ""
+
+
 # -- execution ------------------------------------------------------------
 
 

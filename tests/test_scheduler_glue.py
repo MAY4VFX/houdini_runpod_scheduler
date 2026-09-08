@@ -96,6 +96,9 @@ class FakeScheduler:
         self.given_up = []
         self.promoted = []
         self.retired = []
+        self._work_items = {}
+        self._graph_failures = []
+        self._known_failure_ids = set()
 
     # collaborators the lifted methods call
     def _log(self, msg):
@@ -1388,17 +1391,24 @@ def _poll_scheduler(started_ago, ledger_path):
 def test_a_task_the_worker_never_heard_of_fails_the_item(tmp_path):
     ledger = tmp_path / "ledger.jsonl"
     sched = _poll_scheduler(started_ago=600, ledger_path=ledger)
-    ns = load_methods(["_poll_tasks", "_failUnaccountedTask", "_itemName"],
-                      {"time": time, "_ledger_append": _capture_ledger(ledger),
-                       "_TASK_POLL_INTERVAL": 2.0, "_TASK_UNKNOWN_GRACE": 60.0})
+    ns = load_methods(
+        ["_poll_tasks", "_failUnaccountedTask", "_itemName", "_itemNode", "_recordFailure"],
+        {"time": time, "_ledger_append": _capture_ledger(ledger),
+         "_TASK_POLL_INTERVAL": 2.0, "_TASK_UNKNOWN_GRACE": 60.0})
     sched._failUnaccountedTask = lambda task: ns["_failUnaccountedTask"](sched, task)
     sched._itemName = lambda wid: str(wid)
+    sched._itemNode = lambda wid: ns["_itemNode"](sched, wid)
+    sched._recordFailure = lambda *a: ns["_recordFailure"](sched, *a)
 
     ns["_poll_tasks"](sched)
 
     assert sched._dispatcher.running_tasks() == [], "the machine is free again"
     assert [t.work_item_id for t in sched._dispatcher.failed_since_last_call()] == [7]
     assert any("has no record of task" in m for m in sched.logs), sched.logs
+    # A vanished task has no log, but the artist still gets a plain reason
+    # on the Status tab instead of a bare CookedFail badge.
+    assert sched._graph_failures == [
+        {"node": "farm", "item": "7", "error": "pod pod1 lost track of the task, no log to read"}]
     assert ledger.read_text().strip(), "a cook that ends this way must leave a record"
 
 
@@ -1424,6 +1434,333 @@ def _capture_ledger(path):
         with open(path, "a") as f:
             f.write(json.dumps(row, default=str) + "\n")
     return append
+
+
+# ---------------------------------------------------------------------------
+# A cook that fails silently (2026-09-08)
+#
+# Cook 62564: upload_pythonprocessor1 item 9 died in package_runner.py with
+# TimeoutError: pod ... not ready in 300s, and every node downstream of it
+# (gate, cams, render) went CookedFail right along with it. None of that ever
+# touches this scheduler's dispatcher -- upload/download run entirely on
+# localscheduler -- so the artist saw "кук завершился, задач ноль, ошибок
+# нет" and the real cause sat in one work item's log file he never opened.
+# ---------------------------------------------------------------------------
+
+
+def _fake_work_item(node_name, item_name):
+    return types.SimpleNamespace(
+        node=types.SimpleNamespace(name=node_name), name=item_name)
+
+
+def test_a_farm_tasks_tail_becomes_one_readable_line():
+    sched = FakeScheduler()
+    ns = load_methods(["_logTaskFailure", "_recordFailure"], {"rppkg": rppkg})
+    sched._logTaskFailure = lambda *a: ns["_logTaskFailure"](sched, *a)
+    sched._recordFailure = lambda *a: ns["_recordFailure"](sched, *a)
+    task = rpdispatch.TaskState(task_id="t1", work_item_id=5, command="c", env={},
+                                log_path="/workspace/ledger/logs/c/render_5.log")
+    status = {"exit_code": 1, "tail": ["rendering frame 12",
+                                       "Error: Karma XPU delegate not supported on this machine"]}
+    work_item = _fake_work_item("render", "render_5")
+
+    sched._logTaskFailure(task, status, work_item)
+
+    assert sched._graph_failures == [{
+        "node": "render", "item": "render_5",
+        "error": "Error: Karma XPU delegate not supported on this machine"}]
+
+
+def test_a_farm_tasks_failure_with_no_tail_falls_back_to_the_exit_code():
+    sched = FakeScheduler()
+    ns = load_methods(["_logTaskFailure", "_recordFailure"], {"rppkg": rppkg})
+    sched._logTaskFailure = lambda *a: ns["_logTaskFailure"](sched, *a)
+    sched._recordFailure = lambda *a: ns["_recordFailure"](sched, *a)
+    task = rpdispatch.TaskState(task_id="t1", work_item_id=5, command="c", env={})
+
+    sched._logTaskFailure(task, {"exit_code": 137, "tail": []}, _fake_work_item("render", "render_5"))
+
+    assert sched._graph_failures[0]["error"] == "exit code 137"
+
+
+def test_a_failure_with_no_work_item_still_gets_a_readable_entry():
+    """work_item can be None -- popped from _work_items before this runs, or
+    an unassigned task -- and a report must never crash over that."""
+    sched = FakeScheduler()
+    ns = load_methods(["_logTaskFailure", "_recordFailure"], {"rppkg": rppkg})
+    sched._logTaskFailure = lambda *a: ns["_logTaskFailure"](sched, *a)
+    sched._recordFailure = lambda *a: ns["_recordFailure"](sched, *a)
+    task = rpdispatch.TaskState(task_id="t1", work_item_id=5, command="c", env={})
+
+    sched._logTaskFailure(task, {"exit_code": 1, "tail": ["boom"]}, None)
+
+    assert sched._graph_failures == [{"node": "farm", "item": "5", "error": "boom"}]
+
+
+def test_reportFailures_does_not_duplicate_what_logTaskFailure_already_said():
+    """_logTaskFailure already told the artist the real reason (a worker
+    tail read while the pod was still alive); _reportFailures must not
+    overwrite that with its own weaker fallback for the same item."""
+    sched = FakeScheduler()
+    sched.workItemFailed = lambda *a: sched.given_up.append(a)
+    ns = load_methods(["_reportFailures", "_recordFailure", "_itemNode", "_itemName"], {})
+    sched._recordFailure = lambda *a: ns["_recordFailure"](sched, *a)
+    sched._itemNode = lambda wid: ns["_itemNode"](sched, wid)
+    sched._itemName = lambda wid: ns["_itemName"](sched, wid)
+    sched._capacity_give_up_reason = ""
+    sched._work_items = {5: _fake_work_item("render", "render_5")}
+    sched._recordFailure(5, "render", "render_5", "Error: the real reason")
+    task = _queue(sched, "t1", work_item_id=5, queued_at=0.0)
+    sched._dispatcher.fail_pending(task.task_id)
+
+    ns["_reportFailures"](sched)
+
+    assert sched._graph_failures == [
+        {"node": "render", "item": "render_5", "error": "Error: the real reason"}]
+    assert sched.given_up == [(5, -1)]
+
+
+def test_reportFailures_gives_a_generic_reason_when_nothing_else_saw_it():
+    """A pod that died after retries ran out: no worker tail was ever read,
+    so the artist gets an honest 'no log captured' instead of nothing."""
+    sched = FakeScheduler()
+    sched.workItemFailed = lambda *a: sched.given_up.append(a)
+    ns = load_methods(["_reportFailures", "_recordFailure", "_itemNode", "_itemName"], {})
+    sched._recordFailure = lambda *a: ns["_recordFailure"](sched, *a)
+    sched._itemNode = lambda wid: ns["_itemNode"](sched, wid)
+    sched._itemName = lambda wid: ns["_itemName"](sched, wid)
+    sched._capacity_give_up_reason = ""
+    sched._work_items = {9: _fake_work_item("cams", "cams_9")}
+    task = _queue(sched, "t1", work_item_id=9, queued_at=0.0)
+    task.attempts = 3
+    sched._dispatcher.fail_pending(task.task_id)
+
+    ns["_reportFailures"](sched)
+
+    assert sched._graph_failures == [{
+        "node": "cams", "item": "cams_9",
+        "error": "failed after 3 attempt(s), no log captured"}]
+
+
+def test_reportFailures_records_only_the_first_line_of_a_capacity_reason():
+    sched = FakeScheduler()
+    sched.workItemFailed = lambda *a: sched.given_up.append(a)
+    ns = load_methods(["_reportFailures", "_recordFailure", "_itemNode", "_itemName"], {})
+    sched._recordFailure = lambda *a: ns["_recordFailure"](sched, *a)
+    sched._itemNode = lambda wid: ns["_itemNode"](sched, wid)
+    sched._itemName = lambda wid: ns["_itemName"](sched, wid)
+    sched._capacity_give_up_reason = (
+        "Waited 15 min for a free machine in EU-RO-1 (SECURE) and RunPod never had one.\n"
+        "Try again later, or add another card to GPUs To Use on the Farm tab.")
+    sched._work_items = {1: _fake_work_item("render", "render_1")}
+    task = _queue(sched, "t1", work_item_id=1, queued_at=0.0)
+    sched._dispatcher.fail_pending(task.task_id)
+
+    ns["_reportFailures"](sched)
+
+    assert sched._graph_failures[0]["error"] == (
+        "Waited 15 min for a free machine in EU-RO-1 (SECURE) and RunPod never had one.")
+
+
+class _FailItem:
+    def __init__(self, item_id, name, state, log_uri=""):
+        self.id = item_id
+        self.name = name
+        self.state = state
+        self.logURI = log_uri
+
+
+class _FailPdgNode:
+    def __init__(self, items):
+        self.workItems = items
+
+
+class _FailHouNode:
+    def __init__(self, node_name, items):
+        self._name = node_name
+        self._pdg = _FailPdgNode(items)
+
+    def name(self):
+        return self._name
+
+    def getPDGNode(self):
+        return self._pdg
+
+
+def _sweep_ns():
+    return load_methods(["_sweepGraphFailures", "_recordFailure"], {"rppkg": rppkg})
+
+
+def _stub_pdg(cooked_fail=object(), other=object()):
+    return types.SimpleNamespace(
+        workItemState=types.SimpleNamespace(CookedFail=cooked_fail))
+
+
+def test_sweep_reads_the_real_error_out_of_a_local_items_own_log(tmp_path):
+    """upload_pythonprocessor1 item 9, verbatim: this is the log the owner
+    would have had to open himself."""
+    log = tmp_path / "upload_pythonprocessor1_9.log"
+    log.write_text(
+        "[rpfarm-upload] pid=84588 starting upload_000.json\n"
+        "sync pod oktmp3uuaahm6k was EXITED; started it again\n"
+        "Traceback (most recent call last):\n"
+        '  File "rpfarm/pods.py", line 312, in wait_ready\n'
+        "    raise TimeoutError(f\"pod {pod_id} not ready in {timeout}s\")\n"
+        "TimeoutError: pod oktmp3uuaahm6k not ready in 300s\n"
+        "*** Failed with Exit Code = 1\n")
+    pdg_stub = _stub_pdg()
+    fail_state = pdg_stub.workItemState.CookedFail
+    item = _FailItem(9, "upload_pythonprocessor1_9", fail_state, "file://" + str(log))
+    node = _FailHouNode("upload", [item])
+    sched = FakeScheduler()
+    sched.topNode = lambda: types.SimpleNamespace(
+        parent=lambda: types.SimpleNamespace(children=lambda: [node]))
+    ns = _sweep_ns()
+    sched._recordFailure = lambda *a: ns["_recordFailure"](sched, *a)
+
+    sys.modules["pdg"] = pdg_stub
+    try:
+        ns["_sweepGraphFailures"](sched)
+    finally:
+        sys.modules.pop("pdg", None)
+
+    assert sched._graph_failures == [{
+        "node": "upload", "item": "upload_pythonprocessor1_9",
+        "error": "TimeoutError: pod oktmp3uuaahm6k not ready in 300s"}]
+
+
+def test_sweep_says_so_plainly_when_an_item_never_ran():
+    """A downstream item PDG failed by dependency alone never wrote a log --
+    logURI comes back empty. No log must not become no message."""
+    pdg_stub = _stub_pdg()
+    fail_state = pdg_stub.workItemState.CookedFail
+    item = _FailItem(10, "render_10", fail_state, log_uri="")
+    node = _FailHouNode("render", [item])
+    sched = FakeScheduler()
+    sched.topNode = lambda: types.SimpleNamespace(
+        parent=lambda: types.SimpleNamespace(children=lambda: [node]))
+    ns = _sweep_ns()
+    sched._recordFailure = lambda *a: ns["_recordFailure"](sched, *a)
+
+    sys.modules["pdg"] = pdg_stub
+    try:
+        ns["_sweepGraphFailures"](sched)
+    finally:
+        sys.modules.pop("pdg", None)
+
+    assert sched._graph_failures[0]["error"] == (
+        "no log -- most likely never ran because a dependency earlier in the graph failed first")
+
+
+def test_sweep_never_lists_an_item_the_dispatcher_already_explained():
+    pdg_stub = _stub_pdg()
+    fail_state = pdg_stub.workItemState.CookedFail
+    item = _FailItem(5, "render_5", fail_state, log_uri="")
+    node = _FailHouNode("render", [item])
+    sched = FakeScheduler()
+    sched.topNode = lambda: types.SimpleNamespace(
+        parent=lambda: types.SimpleNamespace(children=lambda: [node]))
+    ns = _sweep_ns()
+    sched._recordFailure = lambda *a: ns["_recordFailure"](sched, *a)
+    sched._known_failure_ids = {5}
+    sched._graph_failures = [{"node": "render", "item": "render_5", "error": "already known"}]
+
+    sys.modules["pdg"] = pdg_stub
+    try:
+        ns["_sweepGraphFailures"](sched)
+    finally:
+        sys.modules.pop("pdg", None)
+
+    assert sched._graph_failures == [{"node": "render", "item": "render_5", "error": "already known"}]
+
+
+def test_sweep_ignores_nodes_with_no_failures_and_never_raises_on_a_bad_node():
+    pdg_stub = _stub_pdg()
+    ok_item = _FailItem(1, "gen_1", object())  # not CookedFail
+    node = _FailHouNode("gen", [ok_item])
+    sched = FakeScheduler()
+    sched.topNode = lambda: types.SimpleNamespace(
+        parent=lambda: types.SimpleNamespace(children=lambda: [node]))
+    ns = _sweep_ns()
+    sched._recordFailure = lambda *a: ns["_recordFailure"](sched, *a)
+
+    sys.modules["pdg"] = pdg_stub
+    try:
+        ns["_sweepGraphFailures"](sched)
+    finally:
+        sys.modules.pop("pdg", None)
+
+    assert sched._graph_failures == []
+
+
+# -- _update_status_text: the failure summary the artist actually sees ------
+
+
+def _status_ns():
+    return load_methods(["_update_status_text"], {"_STATUS_REFRESH_SECONDS": 5.0})
+
+
+def _status_scheduler():
+    sched = FakeScheduler()
+    sched._cook_id = "62564"
+    sched._project = "yoyo_loodev"
+    sched._sync_pod = None
+    sched._sync_queue = []
+    sched._last_pod_error = None
+    sched._cost_tracker = {}
+    sched._ledger_mirror_note = None
+    sched._notes = []
+    sched.status_text = None
+    sched._setStatusText = lambda text: setattr(sched, "status_text", text)
+    return sched
+
+
+def test_status_text_names_the_node_the_count_and_the_real_error():
+    sched = _status_scheduler()
+    sched._graph_failures = [
+        {"node": "upload", "item": "upload_pythonprocessor1_9",
+         "error": "TimeoutError: pod oktmp3uuaahm6k not ready in 300s"}]
+
+    _status_ns()["_update_status_text"](sched, force=True)
+
+    assert "ОШИБКИ: 1 айтем(ов) провалилось на 1 узле(ах)" in sched.status_text
+    assert "upload (1 шт.): TimeoutError: pod oktmp3uuaahm6k not ready in 300s" in sched.status_text
+
+
+def test_status_text_groups_by_node_and_shows_one_example_each():
+    sched = _status_scheduler()
+    sched._graph_failures = [
+        {"node": "upload", "item": "upload_pythonprocessor1_9", "error": "TimeoutError: ..."},
+        {"node": "gate", "item": "gate_1", "error": "no log -- most likely never ran ..."},
+        {"node": "gate", "item": "gate_2", "error": "no log -- most likely never ran ..."},
+    ]
+
+    _status_ns()["_update_status_text"](sched, force=True)
+
+    assert "gate (2 шт.): no log -- most likely never ran ..." in sched.status_text
+    assert "gate_2" not in sched.status_text, "one example per node, not a wall of items"
+
+
+def test_status_text_caps_at_three_nodes_then_says_how_many_more():
+    sched = _status_scheduler()
+    sched._graph_failures = [
+        {"node": n, "item": n + "_1", "error": "e"} for n in ("upload", "gate", "cams", "render")]
+
+    _status_ns()["_update_status_text"](sched, force=True)
+
+    for n in ("upload", "gate", "cams"):
+        assert n + " (1 шт.)" in sched.status_text
+    assert "render" not in sched.status_text
+    assert "...и ещё 1 узел(ов)" in sched.status_text
+
+
+def test_status_text_says_nothing_about_errors_when_there_were_none():
+    sched = _status_scheduler()
+    sched._graph_failures = []
+
+    _status_ns()["_update_status_text"](sched, force=True)
+
+    assert "ОШИБКИ" not in sched.status_text
 
 
 def test_skipped_work_is_announced_with_a_path_to_look_at():

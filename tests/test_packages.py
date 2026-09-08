@@ -11,6 +11,7 @@ from rpfarm.packages import (
     build_download_items,
     build_upload_items,
     delocalize_via_pathmap,
+    first_error_line,
     get_volume_size_gb,
     group_download_pairs,
     houdini_install_preset,
@@ -18,6 +19,7 @@ from rpfarm.packages import (
     map_output_pair,
     maybe_grow_volume,
     parse_stat_sizes,
+    read_item_log_tail,
     resolve_compress_flag,
     result_data_path,
     run_download_item,
@@ -1867,3 +1869,72 @@ def test_several_attributes_in_one_path():
         "$HIP/@shot/`@cam`/$HIPNAME.@version.$F4.exr",
         _wedge(shot="sh010", cam="camA", version=3))
     assert got == "$HIP/sh010/camA/$HIPNAME.3.$F4.exr" and missing == []
+
+
+# -- first_error_line / read_item_log_tail -----------------------------------
+
+
+def test_the_line_before_pdgs_exit_marker_is_the_traceback_exception():
+    """Real log, upload_pythonprocessor1 item 9, 2026-09-08: a sync pod that
+    would not wake in time. This is the line the owner needs to see -- not
+    the four frames of traceback above it, and not "see the log"."""
+    log = (
+        "[rpfarm-upload] pid=84588 starting upload_000.json\n"
+        "sync pod oktmp3uuaahm6k was EXITED; started it again\n"
+        "Traceback (most recent call last):\n"
+        '  File "rpfarm/package_runner.py", line 153, in main\n'
+        "    pod = rppods.ensure_sync_pod(api, cfg, token, pubkey)\n"
+        '  File "rpfarm/pods.py", line 312, in wait_ready\n'
+        "    raise TimeoutError(f\"pod {pod_id} not ready in {timeout}s\")\n"
+        "TimeoutError: pod oktmp3uuaahm6k not ready in 300s\n"
+        "*** Failed with Exit Code = 1\n"
+    )
+    assert first_error_line(log) == "TimeoutError: pod oktmp3uuaahm6k not ready in 300s"
+
+
+def test_a_farm_tasks_in_memory_tail_has_no_pdg_marker_at_all():
+    """worker.py's tail is the raw stdout/stderr of a hython invocation on a
+    GPU pod -- PDG's out-of-process footer only ever appears in a LOCAL
+    item's log file, never in this list."""
+    tail = ["rendering frame 12", "Error: Karma XPU delegate not supported on this machine"]
+    assert first_error_line(tail) == "Error: Karma XPU delegate not supported on this machine"
+
+
+def test_trailing_blank_lines_are_not_the_error():
+    assert first_error_line("boom\n\n\n") == "boom"
+
+
+def test_nothing_usable_is_the_empty_string_not_a_guess():
+    assert first_error_line("") == ""
+    assert first_error_line("\n\n") == ""
+    assert first_error_line("*** Failed with Exit Code = 1\n") == ""
+
+
+def test_a_very_long_line_is_cut_not_wrapped():
+    line = "x" * 500
+    got = first_error_line(line, max_len=200)
+    assert len(got) == 200 and got.endswith("…")
+
+
+def test_read_item_log_tail_reads_the_files_last_real_line(tmp_path):
+    log = tmp_path / "gen1_1.log"
+    log.write_text("about to fail\nboom: something broke\n*** Failed with Exit Code = 1\n")
+    assert read_item_log_tail("file://" + str(log)) == "boom: something broke"
+
+
+def test_read_item_log_tail_accepts_a_bare_path_too(tmp_path):
+    log = tmp_path / "gen1_1.log"
+    log.write_text("nope\n")
+    assert read_item_log_tail(str(log)) == "nope"
+
+
+def test_read_item_log_tail_on_an_empty_uri_is_empty_not_an_error():
+    """A downstream item PDG failed by dependency, without ever running it,
+    reports an empty logURI -- there is nothing to open."""
+    assert read_item_log_tail("") == ""
+    assert read_item_log_tail(None) == ""
+
+
+def test_read_item_log_tail_never_raises_on_a_missing_file(tmp_path):
+    missing = tmp_path / "gone.log"
+    assert read_item_log_tail("file://" + str(missing)) == ""
