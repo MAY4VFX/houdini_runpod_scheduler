@@ -1746,6 +1746,14 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
             # this is and which cook it serves without any local state.
             env = rppods.pod_env(self._cfg, "gpu", self._token, slots, self._pubkey,
                                  cook=self._cook_id, project=self._project)
+            # Captured BEFORE the call, not after: create_gpu_pod is a
+            # blocking HTTP round trip that can take tens of seconds, long
+            # enough for this cook to end while it is in flight (2026-09-08,
+            # cook f7e0d426 -- its pod was created one second after
+            # cook_summary was written, and sat RUNNING at $0.57/h with
+            # nothing to do). Checking liveness BEFORE the call is not
+            # enough; the check that matters is the one right after.
+            cook_id_at_call = self._cook_id
             try:
                 pod = self._api.create_gpu_pod(
                     name, self._templateId(), self._gpu_list, self._volumeId(),
@@ -1763,6 +1771,16 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
                         ", ".join(self._gpu_list), e))
                 continue
             pod_id = pod["id"]
+            if self._cook_id != cook_id_at_call or getattr(self.context, "canceling", False):
+                # The cook this pod was meant for is already over -- onTick
+                # will not run again to notice it, and onStopCook's own
+                # sweep only ever looked at self._dispatcher.pods, which
+                # this pod was never added to. Kill it here, now, instead
+                # of admitting it to a pool nothing will ever drain.
+                self._log("cook ended while pod {} was still being created -- "
+                          "terminating it instead of admitting it".format(pod_id))
+                self._terminate_pod(pod_id)
+                break
             self._dispatcher.add_pod(pod_id, 0.0, status="CREATED", created_at=time.time())
             self._clients[pod_id] = WorkerClient(pod_id, self._token)
             self._last_pod_error = None
@@ -2362,6 +2380,43 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         started = pod.created_at or self._cost_tracker.get("start_time", time.time())
         self._cost_tracker["retired_cost"] = self._cost_tracker.get(
             "retired_cost", 0.0) + pod.cost_per_hr * (time.time() - started) / 3600.0
+
+    def _sweepOrphanPods(self):
+        """Terminate this cook's pods RunPod knows about that self._dispatcher
+        never learned of -- the counterpart to the guard in _scale_up, for
+        whatever slips past it anyway (an older cook's leftover, a retry,
+        anything not yet imagined). 2026-09-08: cook f7e0d426's pod was
+        created a second after the cook ended and sat RUNNING at $0.57/h,
+        because the only sweep that existed asked self._dispatcher.pods --
+        which this pod was never in -- instead of asking RunPod.
+
+        Matches THIS cook's id as a WHOLE NAME SEGMENT
+        (``rpfarm-<user>-<project>-<cook_id>-<n>``, split on ``-``), never a
+        prefix or substring: ending someone else's cook unasked is a worse
+        bug than the one this fixes (same rule as `farm kill`, Ruling R54's
+        neighbourhood). Idempotent -- onStopCook may run more than once,
+        and a pod already gone by the time this runs is simply not listed
+        by RunPod any more. Never raises into PDG: a failed sweep (API
+        unreachable, bad key) is a logged warning, nothing else -- the
+        artist still gets `rpfarm farm kill` as the manual backstop.
+        """
+        if not self._cook_id or self._api is None:
+            return
+        try:
+            candidates = self._api.list_pods("rpfarm-{}-".format(self._cfg.user))
+        except RunPodError as e:
+            self._verboseLog("orphan pod sweep failed: {}".format(e))
+            return
+        for pod in candidates:
+            pod_id = pod.get("id")
+            name = pod.get("name") or ""
+            if not pod_id or self._cook_id not in name.split("-"):
+                continue
+            if pod_id in self._dispatcher.pods:
+                continue  # the loop right after this one already has it
+            self._log("orphan pod {} ({}) from this cook was never "
+                      "registered here -- terminating it".format(pod_id, name))
+            self._terminate_pod(pod_id)
 
     def _terminate_pod(self, pod_id):
         pod = self._dispatcher.pods.get(pod_id)
@@ -3540,6 +3595,13 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
                 client = self._clients.get(task.pod_id)
                 if client is not None:
                     client.kill(task.task_id)
+
+        # Before the loop below, which only ever knew about pods THIS
+        # dispatcher registered: a pod born while create_gpu_pod was still
+        # in flight when the cook ended (see _scale_up's own guard against
+        # that) was never added to self._dispatcher.pods, so that loop
+        # walks straight past it. This asks RunPod itself instead.
+        self._sweepOrphanPods()
 
         for pod_id in list(self._dispatcher.pods):
             self._terminate_pod(pod_id)

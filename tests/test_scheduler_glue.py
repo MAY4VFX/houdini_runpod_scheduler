@@ -33,6 +33,7 @@ from rpfarm import houdini_local as rphl
 from rpfarm import packages as rppkg
 from rpfarm import pods as rppods
 from rpfarm.runpod_api import RunPodError
+from rpfarm.worker_client import WorkerClient
 
 MODULE = (
     pathlib.Path(__file__).resolve().parent.parent
@@ -335,6 +336,18 @@ def test_stop_cook_drains_and_then_names_what_is_still_billing():
     assert "self._retryTerminations(force=True)" in stop
     assert "STILL RUNNING AND BILLING" in stop
     assert stop.index("self._retryTerminations(force=True)") < stop.index("self._reset_cook_state()")
+
+
+def test_stop_cook_sweeps_for_orphan_pods_before_the_known_ones_loop():
+    """The sweep has to run BEFORE the self._dispatcher.pods loop so its own
+    'already known -- skip it' check means something; after that loop the
+    dict is empty and the check would be a no-op."""
+    src = MODULE.read_text()
+    stop = src[src.index("def onStopCook("):]
+    stop = stop[:stop.index("\n    def ", 1)]
+    sweep = stop.index("self._sweepOrphanPods()")
+    known_loop = stop.index("for pod_id in list(self._dispatcher.pods):")
+    assert sweep < known_loop
 
 
 def test_the_tick_drains_the_retry_list():
@@ -1028,6 +1041,244 @@ def test_a_bad_key_at_first_work_fails_the_cook_there_and_then():
 
     assert len(sched.cook_errors) == 1
     assert "not a temporary shortage" in sched.cook_errors[0]
+
+
+# ---------------------------------------------------------------------------
+# Orphaned GPU pods (2026-09-08) -- cook f7e0d426's pod was created a
+# second AFTER the cook ended (create_gpu_pod is a blocking HTTP call that
+# can take tens of seconds, long enough for the cook to end mid-call) and
+# sat RUNNING at $0.57/h: never admitted to self._dispatcher.pods with a
+# clean liveness check, and never found by onStopCook's own sweep, which
+# only ever asked self._dispatcher.pods -- something this pod was never in.
+# ---------------------------------------------------------------------------
+
+
+class _PodApi:
+    """Fakes create_gpu_pod/list_pods/terminate_pod for the two fixes."""
+
+    def __init__(self, existing_pods=()):
+        self._next_id = 1
+        self.created = []
+        self.terminated = []
+        self._listing = list(existing_pods)
+
+    def create_gpu_pod(self, name, template_id, gpu_list, volume_id, env, ports,
+                       datacenter=None, cloud_type=None):
+        pod_id = "pod{}".format(self._next_id)
+        self._next_id += 1
+        self.created.append((name, pod_id))
+        pod = {"id": pod_id, "name": name}
+        self._listing.append(pod)
+        return pod
+
+    def terminate_pod(self, pod_id):
+        self.terminated.append(pod_id)
+
+    def list_pods(self, prefix=""):
+        return [p for p in self._listing if p.get("name", "").startswith(prefix)]
+
+
+class _ScaleUpScheduler(FakeScheduler):
+    """Just enough of the scheduler for the lifted _scale_up/_sweepOrphanPods."""
+
+    def __init__(self, api, cook_id="f7e0d426", canceling_after=None):
+        super().__init__(api=api)
+        self._cfg = types.SimpleNamespace(
+            user="may", houdini_version="22.0.393",
+            sesinetd_host="lic.example.com", sesinetd_port=1715)
+        self._project = "airship"
+        self._cook_id = cook_id
+        self._token = "tok"
+        self._pubkey = "key"
+        self._gpu_list = ["NVIDIA RTX A4500"]
+        self._parms = {"rpfarm_maxpods": 4, "rpfarm_slots": 1}
+        # canceling_after: after this many create_gpu_pod calls, context.canceling
+        # flips True -- simulating the cook ending WHILE a create is in flight.
+        self._canceling_after = canceling_after
+        self._create_calls = 0
+        self.context = types.SimpleNamespace(canceling=False)
+
+    def __getitem__(self, name):
+        value = self._parms[name]
+        return types.SimpleNamespace(evaluateInt=lambda: int(value))
+
+    def _templateId(self):
+        return "tmpl"
+
+    def _volumeId(self):
+        return "vol"
+
+    def _datacenterId(self):
+        return "EU-RO-1"
+
+    def _cloudType(self):
+        return "SECURE"
+
+
+def _scale_up_ns(clock=lambda: 0.0):
+    return load_methods(
+        ["_scale_up", "_terminate_pod", "_sweepOrphanPods"],
+        {"time": types.SimpleNamespace(time=clock),
+         "rppods": rppods, "WorkerClient": WorkerClient,
+         "RunPodError": RunPodError,
+         "is_capacity_error": lambda e: False},
+    )
+
+
+def test_a_pod_born_after_the_cook_ended_is_terminated_not_admitted():
+    """The exact incident: create_gpu_pod is still in flight when the cook
+    ends. The pod that comes back must be killed, not added to the pool."""
+    api = _PodApi()
+    sched = _ScaleUpScheduler(api)
+    ns = _scale_up_ns()
+    sched._scale_up = lambda count: ns["_scale_up"](sched, count)
+    sched._terminate_pod = lambda pod_id: ns["_terminate_pod"](sched, pod_id)
+
+    def _create_gpu_pod(*a, **k):
+        # The cook ends WHILE this call is "in flight" -- flip it here,
+        # exactly what a concurrent onStopCook would have done by the time
+        # the real HTTP call returns.
+        sched.context.canceling = True
+        return _PodApi.create_gpu_pod(api, *a, **k)
+
+    api.create_gpu_pod = _create_gpu_pod
+
+    created = sched._scale_up(1)
+
+    assert created == 0, "a pod that must be killed was never usably created"
+    assert len(api.created) == 1, "the create call itself did happen"
+    assert api.terminated == [api.created[0][1]]
+    assert sched._dispatcher.pods == {}, "never admitted to the pool"
+    assert sched._clients == {}
+
+
+def test_a_pod_born_after_a_new_cook_started_is_also_terminated():
+    """Not just cancellation -- self._cook_id itself changing (a fresh
+    onStartCook already ran _reset_cook_state) is the same signal."""
+    api = _PodApi()
+    sched = _ScaleUpScheduler(api, cook_id="cook0001")
+    ns = _scale_up_ns()
+    sched._scale_up = lambda count: ns["_scale_up"](sched, count)
+    sched._terminate_pod = lambda pod_id: ns["_terminate_pod"](sched, pod_id)
+
+    def _create_gpu_pod(*a, **k):
+        sched._cook_id = "cook0002"  # a new cook started while we waited
+        return _PodApi.create_gpu_pod(api, *a, **k)
+
+    api.create_gpu_pod = _create_gpu_pod
+
+    created = sched._scale_up(1)
+
+    assert created == 0
+    assert api.terminated == [api.created[0][1]]
+
+
+def test_a_pod_born_while_the_cook_is_still_alive_is_admitted_normally():
+    api = _PodApi()
+    sched = _ScaleUpScheduler(api)
+    ns = _scale_up_ns()
+    sched._scale_up = lambda count: ns["_scale_up"](sched, count)
+    sched._terminate_pod = lambda pod_id: ns["_terminate_pod"](sched, pod_id)
+
+    created = sched._scale_up(1)
+
+    assert created == 1
+    assert api.terminated == []
+    assert len(sched._dispatcher.pods) == 1
+    assert len(sched._clients) == 1
+
+
+def test_orphan_sweep_finds_a_pod_the_dispatcher_never_knew_about():
+    """The other half: onStopCook's own loop only ever iterates
+    self._dispatcher.pods. A pod RunPod has, that this dispatcher was
+    never told about, is only found by asking RunPod."""
+    orphan = {"id": "orphan1", "name": "rpfarm-may-airship-f7e0d426-1"}
+    api = _PodApi(existing_pods=[orphan])
+    sched = _ScaleUpScheduler(api)
+    ns = _scale_up_ns()
+    sched._terminate_pod = lambda pod_id: ns["_terminate_pod"](sched, pod_id)
+    sched._sweepOrphanPods = lambda: ns["_sweepOrphanPods"](sched)
+
+    sched._sweepOrphanPods()
+
+    assert api.terminated == ["orphan1"]
+
+
+def test_orphan_sweep_never_touches_a_pod_already_known_to_the_dispatcher():
+    known = {"id": "pod1", "name": "rpfarm-may-airship-f7e0d426-1"}
+    api = _PodApi(existing_pods=[known])
+    sched = _ScaleUpScheduler(api)
+    sched._dispatcher.add_pod("pod1", cost_per_hr=0.57)
+    ns = _scale_up_ns()
+    sched._terminate_pod = lambda pod_id: ns["_terminate_pod"](sched, pod_id)
+    sched._sweepOrphanPods = lambda: ns["_sweepOrphanPods"](sched)
+
+    sched._sweepOrphanPods()
+
+    assert api.terminated == [], "the loop right after the sweep owns this one"
+
+
+def test_orphan_sweep_matches_the_cook_id_as_a_whole_segment_only():
+    """Never a prefix or substring -- ending someone else's cook unasked is
+    a worse bug than the one being fixed here."""
+    substring_match = {"id": "sneaky", "name": "rpfarm-may-airship-f7e0d426x-1"}
+    prefix_match = {"id": "sneaky2", "name": "rpfarm-may-airship-f7e0d4260-1"}
+    real_match = {"id": "real", "name": "rpfarm-may-airship-f7e0d426-1"}
+    api = _PodApi(existing_pods=[substring_match, prefix_match, real_match])
+    sched = _ScaleUpScheduler(api)
+    ns = _scale_up_ns()
+    sched._terminate_pod = lambda pod_id: ns["_terminate_pod"](sched, pod_id)
+    sched._sweepOrphanPods = lambda: ns["_sweepOrphanPods"](sched)
+
+    sched._sweepOrphanPods()
+
+    assert api.terminated == ["real"]
+
+
+def test_orphan_sweep_never_touches_another_users_pods():
+    other_user = {"id": "theirs", "name": "rpfarm-usha-airship-f7e0d426-1"}
+    api = _PodApi(existing_pods=[other_user])
+    sched = _ScaleUpScheduler(api)
+    ns = _scale_up_ns()
+    sched._terminate_pod = lambda pod_id: ns["_terminate_pod"](sched, pod_id)
+    sched._sweepOrphanPods = lambda: ns["_sweepOrphanPods"](sched)
+
+    sched._sweepOrphanPods()
+
+    assert api.terminated == []
+
+
+def test_orphan_sweep_is_idempotent_across_repeated_onstopcook_calls():
+    """onStopCook may be called more than once. A second sweep, run after
+    the first already terminated the orphan (so RunPod no longer lists
+    it), must not raise or re-terminate a name it cannot see any more."""
+    orphan = {"id": "orphan1", "name": "rpfarm-may-airship-f7e0d426-1"}
+    api = _PodApi(existing_pods=[orphan])
+    sched = _ScaleUpScheduler(api)
+    ns = _scale_up_ns()
+    sched._terminate_pod = lambda pod_id: ns["_terminate_pod"](sched, pod_id)
+    sched._sweepOrphanPods = lambda: ns["_sweepOrphanPods"](sched)
+
+    sched._sweepOrphanPods()
+    api._listing = []  # RunPod no longer lists the now-terminated pod
+    sched._sweepOrphanPods()  # must not raise
+
+    assert api.terminated == ["orphan1"]
+
+
+def test_orphan_sweep_logs_a_warning_and_never_raises_when_the_api_is_unreachable():
+    class _BrokenApi(_PodApi):
+        def list_pods(self, prefix=""):
+            raise RunPodError(0, "network down")
+
+    sched = _ScaleUpScheduler(_BrokenApi())
+    ns = _scale_up_ns()
+    sched._terminate_pod = lambda pod_id: ns["_terminate_pod"](sched, pod_id)
+    sched._sweepOrphanPods = lambda: ns["_sweepOrphanPods"](sched)
+
+    sched._sweepOrphanPods()  # must not raise
+
+    assert any("orphan pod sweep failed" in m for m in sched.logs)
 
 
 # ---------------------------------------------------------------------------
