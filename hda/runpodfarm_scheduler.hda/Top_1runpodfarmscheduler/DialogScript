@@ -192,6 +192,15 @@
         label   "Status"
 
         parm {
+            name    "rpfarm_modehelp"
+            label   "Как это работает"
+            type    string
+            default { "РЕЖИМ 1 — обычный кук (кнопка Cook на нижней ноде графа).\n    Houdini дирижирует: раздаёт задачи, забирает кадры, гасит машины.\n    HOUDINI ЗАКРЫВАТЬ НЕЛЬЗЯ. Закроете — задачи на машинах доработают,\n    но кадры никто не заберёт, а машины останутся включёнными и будут\n    тикать деньги, пока вы не откроете Houdini снова или не нажмёте\n    Stop Everything.\n\nРЕЖИМ 2 — отправить целиком (вкладка Submit As Job, кнопка Submit).\n    Сцена уезжает на ферму и кукается ТАМ, без вашего Houdini.\n    ЗАКРЫВАТЬ МОЖНО СРАЗУ. Кадры складываются на ферме; забрать их\n    потом — Manage Volume или нода RunPodFarm Download.\n\nКОГДА МАШИНЫ ГАСНУТ (только пока Houdini открыт):\n    рендер-машины — сразу после кука;\n    вспомогательная (sync) — через Sync Idle (Min) простоя, потом\n    удаляется через Sync Delete (Min). При закрытом Houdini не гаснет\n    никто: сторож живёт внутри Houdini." }
+            disablewhen "{ rpfarm_verbose >= 0 }"
+            parmtag { "editor" "1" }
+            parmtag { "editorlines" "18-22" }
+        }
+        parm {
             name    "rpfarm_killsync"
             label   "Stop Everything, Sync Pod Too"
             type    button
@@ -547,6 +556,15 @@
         name    "folder4"
         label   "Submit As Job"
 
+        parm {
+            name    "rpfarm_submithelp"
+            label   "Что делает Submit"
+            type    string
+            default { "Сцена целиком уезжает на ферму и кукается там. Ваш Houdini после нажатия ни за что не отвечает — можно закрывать сразу, машины погасит сама ферма.\n\nКадры остаются НА ФЕРМЕ: заберите их потом кнопкой Manage Volume или нодой RunPodFarm Download.\n\nОбычная кнопка Cook работает наоборот: дирижирует ваш Houdini, и закрывать его до конца кука нельзя." }
+            disablewhen "{ rpfarm_verbose >= 0 }"
+            parmtag { "editor" "1" }
+            parmtag { "editorlines" "7-9" }
+        }
         parm {
             name    "submitjob"
             label   "Submit"

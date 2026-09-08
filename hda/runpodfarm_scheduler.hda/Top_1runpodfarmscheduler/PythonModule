@@ -2324,6 +2324,13 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         self._last_status_update = now
 
         lines = ["cook {}  project {}".format(self._cook_id, self._project)]
+        # First line, every tick: which mode this cook is in and what that
+        # means for the window in front of the artist. The thresholds are on
+        # the parameters, but "they only apply while Houdini is open" was
+        # written down nowhere (Ruling R59).
+        lines.insert(0, "РЕЖИМ: обычный кук — дирижирует этот Houdini. "
+                        "НЕ ЗАКРЫВАЙТЕ его до конца: иначе кадры не приедут, "
+                        "а машины останутся включёнными.")
         if self._sync_pod:
             lines.append("sync pod {}".format(self._sync_pod["id"]))
         for pod in sorted(self._dispatcher.pods.values(), key=lambda p: p.pod_id):
