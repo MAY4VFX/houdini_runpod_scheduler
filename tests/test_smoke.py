@@ -13,6 +13,7 @@ session-wide fixture in ``conftest.py`` isolates ``HOUDINI_USER_PREF_DIR``.
 
 import json
 import os
+import pathlib
 import time
 
 import pytest
@@ -535,6 +536,7 @@ class FakeInstall:
         self.version = version
         self.hython = hython
         self.user_pref_dir = pref_dir
+        self.major_minor = ".".join(str(version).split(".")[:2])
 
 
 def test_pick_houdini_skips_an_install_without_hython(monkeypatch, tmp_path):
@@ -562,19 +564,45 @@ def test_check_hdas_lists_exactly_what_is_missing(tmp_path):
 # -- child process environment -------------------------------------------------
 
 
-def test_child_env_puts_the_checkout_first_on_pythonpath(monkeypatch):
+def test_child_env_puts_the_checkout_first_on_pythonpath(monkeypatch, tmp_path):
     monkeypatch.setenv("PYTHONPATH", "/somewhere/else")
-    env = smoke._child_env("/repo", "/run")
+    inst = FakeInstall("22.0.368", tmp_path / "hython", tmp_path / "real_prefs")
+    run_dir = str(tmp_path / "run")
+
+    env = smoke._child_env("/repo", run_dir, inst)
+
     assert env["PYTHONPATH"].split(os.pathsep)[0] == "/repo"
     assert "/somewhere/else" in env["PYTHONPATH"]
     assert env["RPFARM_ROOT"] == "/repo"
-    assert env["JOB"] == "/run"
+    assert env["JOB"] == run_dir
 
 
-def test_child_env_without_an_existing_pythonpath(monkeypatch):
+def test_child_env_without_an_existing_pythonpath(monkeypatch, tmp_path):
     monkeypatch.delenv("PYTHONPATH", raising=False)
-    env = smoke._child_env("/repo", "/run")
+    inst = FakeInstall("22.0.368", tmp_path / "hython", tmp_path / "real_prefs")
+
+    env = smoke._child_env("/repo", str(tmp_path / "run"), inst)
+
     assert env["PYTHONPATH"] == "/repo"
+
+
+def test_child_env_forces_rpfarm_root_regardless_of_a_real_houdini_env(tmp_path):
+    """Ruling R63: RPFARM_ROOT alone is not enough once houdini.env sets its
+    own -- rpfarm smoke's own child has to survive that, same as any other
+    child hython this project launches."""
+    real_prefs = tmp_path / "real_prefs"
+    real_prefs.mkdir()
+    (real_prefs / "houdini.env").write_text('RPFARM_ROOT = "/some/other/pkg"\n')
+    inst = FakeInstall("22.0.368", tmp_path / "hython", real_prefs)
+    run_dir = str(tmp_path / "run")
+
+    env = smoke._child_env("/repo", run_dir, inst)
+
+    scratch_env = pathlib.Path(env["HOUDINI_USER_PREF_DIR"].replace(
+        "__HVER__", inst.major_minor)) / "houdini.env"
+    text = scratch_env.read_text()
+    assert 'RPFARM_ROOT = "/repo"' in text
+    assert "/some/other/pkg" not in text
 
 
 def test_hython_command_uses_dash_m():

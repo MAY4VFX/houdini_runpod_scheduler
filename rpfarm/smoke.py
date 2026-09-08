@@ -675,15 +675,33 @@ def _hython_command(inst, repo, payload_path):
     return [str(inst.hython), "-m", "rpfarm.smoke", payload_path]
 
 
-def _child_env(repo, run_dir):
-    env = dict(os.environ)
-    env["RPFARM_ROOT"] = str(repo)
-    existing = env.get("PYTHONPATH")
-    env["PYTHONPATH"] = str(repo) + (os.pathsep + existing if existing else "")
-    env["JOB"] = run_dir
-    # Houdini's own "don't pop anything up / don't phone home" switches: this
-    # is a batch process on someone's workstation, not an interactive session.
-    env.setdefault("HOUDINI_DISABLE_CONSOLE", "1")
+def _child_env(repo, run_dir, inst):
+    """The env= for the hython child that actually cooks.
+
+    RPFARM_ROOT alone used to be enough here, and was not (Ruling R63):
+    houdini.env applies to the child's OWN environment after it starts, and
+    is documented to override existing entries -- on any machine whose
+    houdini.env sets RPFARM_ROOT (every artist's, since the R62 decoupling),
+    plain env=os.environ + RPFARM_ROOT silently read that instead of `repo`.
+    `rpfarm smoke` is this project's own canonical live proof, so this was
+    not a theoretical risk: it had been validating the wrong package.
+    houdini_local.isolated_child_env builds a scratch HOUDINI_USER_PREF_DIR
+    with no interfering houdini.env, real otls kept (symlinked) so the
+    HDAs `_check_hdas` already verified are still found.
+    """
+    existing_pythonpath = os.environ.get("PYTHONPATH")
+    pythonpath = str(repo) + (os.pathsep + existing_pythonpath if existing_pythonpath else "")
+    env = houdini_local.isolated_child_env(
+        repo, os.path.join(run_dir, "_prefs"), inst,
+        extra_env={
+            "RPFARM_ROOT": str(repo),
+            "PYTHONPATH": pythonpath,
+            "JOB": run_dir,
+            # Houdini's own "don't pop anything up / don't phone home"
+            # switches: this is a batch process on someone's workstation,
+            # not an interactive session.
+            "HOUDINI_DISABLE_CONSOLE": os.environ.get("HOUDINI_DISABLE_CONSOLE", "1"),
+        })
     return env
 
 
@@ -808,7 +826,7 @@ def _run_hython(inst, repo, run_dir, payload_path, timeout, log):
     cmd = _hython_command(inst, repo, payload_path)
     log("$ " + " ".join(cmd))
     proc = subprocess.Popen(
-        cmd, cwd=str(repo), env=_child_env(repo, run_dir),
+        cmd, cwd=str(repo), env=_child_env(repo, run_dir, inst),
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
         # Its own process group, so _kill_process can take out the whole tree
         # (hython plus every out-of-process package runner and pod-side poller

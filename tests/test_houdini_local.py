@@ -365,6 +365,82 @@ def test_setup_checks_for_a_running_cook_before_installing_anything():
     assert guard < refusal < install_call
 
 
+# ---------------------------------------------------------------------------
+# isolated_child_env (Ruling R63) -- forcing a child hython to read the
+# package it was explicitly asked for, on a machine whose houdini.env would
+# otherwise silently override RPFARM_ROOT after the process starts.
+# ---------------------------------------------------------------------------
+
+
+def _fake_real_install(tmp_path, with_houdini_env=True, with_otls=True):
+    real_prefs = tmp_path / "real_prefs"
+    real_prefs.mkdir(parents=True)
+    if with_otls:
+        (real_prefs / "otls").mkdir()
+        (real_prefs / "otls" / "runpodfarm_scheduler.hda").write_bytes(b"fake hda")
+    if with_houdini_env:
+        (real_prefs / "houdini.env").write_text(
+            'SOME_OTHER_VAR = "1"\nRPFARM_ROOT = "/some/other/pkg"\n')
+    install = hl.HoudiniInstall.__new__(hl.HoudiniInstall)
+    install.user_pref_dir = real_prefs
+    install.major_minor = "22.0"
+    return install
+
+
+def test_isolated_child_env_forces_root_over_a_copied_houdini_env(tmp_path):
+    install = _fake_real_install(tmp_path)
+    scratch = tmp_path / "scratch"
+    root = tmp_path / "checkout"
+
+    env = hl.isolated_child_env(root, scratch, install)
+
+    scratch_prefs = scratch / "prefs_v22.0"
+    env_text = (scratch_prefs / "houdini.env").read_text()
+    assert 'RPFARM_ROOT = "{}"'.format(root) in env_text
+    assert "/some/other/pkg" not in env_text
+    assert "SOME_OTHER_VAR" in env_text, "the rest of the real houdini.env is preserved"
+    assert env["HOUDINI_USER_PREF_DIR"] == str(scratch / "prefs_v__HVER__"), (
+        "the __HVER__ placeholder form -- a literal path is silently ignored by Houdini")
+
+
+def test_isolated_child_env_works_with_no_real_houdini_env_at_all(tmp_path):
+    install = _fake_real_install(tmp_path, with_houdini_env=False)
+    scratch = tmp_path / "scratch"
+    root = tmp_path / "checkout"
+
+    env = hl.isolated_child_env(root, scratch, install)
+
+    scratch_prefs = scratch / "prefs_v22.0"
+    assert 'RPFARM_ROOT = "{}"'.format(root) in (scratch_prefs / "houdini.env").read_text()
+
+
+def test_isolated_child_env_symlinks_the_real_otls_by_default(tmp_path):
+    install = _fake_real_install(tmp_path)
+    scratch = tmp_path / "scratch"
+
+    hl.isolated_child_env(tmp_path / "checkout", scratch, install)
+
+    scratch_otls = scratch / "prefs_v22.0" / "otls"
+    assert scratch_otls.is_symlink()
+    assert (scratch_otls / "runpodfarm_scheduler.hda").read_bytes() == b"fake hda"
+
+
+def test_isolated_child_env_skips_the_symlink_when_told_to(tmp_path):
+    install = _fake_real_install(tmp_path)
+    scratch = tmp_path / "scratch"
+
+    hl.isolated_child_env(tmp_path / "checkout", scratch, install, keep_real_otls=False)
+
+    assert not (scratch / "prefs_v22.0" / "otls").exists()
+
+
+def test_isolated_child_env_passes_through_extra_env(tmp_path):
+    install = _fake_real_install(tmp_path)
+    env = hl.isolated_child_env(tmp_path / "checkout", tmp_path / "scratch", install,
+                                extra_env={"RPFARM_TOKEN": "abc"})
+    assert env["RPFARM_TOKEN"] == "abc"
+
+
 def test_build_and_install_hdas_reports_per_hda_status(tmp_path):
     root = tmp_path / "repo"
     for name in hl.HDA_NAMES:

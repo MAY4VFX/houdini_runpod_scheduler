@@ -798,6 +798,14 @@ def write_rpfarm_root_env(install: HoudiniInstall, root: Path | None = None,
         if ln.strip() == _RPFARM_ROOT_MARKER:
             skip_next = True  # drop the line that follows the marker too
             continue
+        if _RPFARM_ROOT_LINE_RE.match(ln):
+            # A bare RPFARM_ROOT line with no marker above it -- someone's
+            # hand-written one, or a copy of a real houdini.env that had
+            # one (isolated_child_env does exactly this). Dropped here too:
+            # leaving it behind would put TWO RPFARM_ROOT lines in the file,
+            # and which one Houdini honours is not a question worth having
+            # an answer to.
+            continue
         out.append(ln)
 
     out.append(_RPFARM_ROOT_MARKER)
@@ -806,6 +814,84 @@ def write_rpfarm_root_env(install: HoudiniInstall, root: Path | None = None,
     install.user_pref_dir.mkdir(parents=True, exist_ok=True)
     env_file.write_text("\n".join(out) + "\n", encoding="utf-8")
     return env_file
+
+
+# ---------------------------------------------------------------------------
+# Forcing a child hython to read a SPECIFIC rpfarm package (Ruling R63)
+#
+# Passing RPFARM_ROOT through a child process's env= is not enough: Houdini
+# applies its own houdini.env to the environment AFTER the process starts,
+# and houdini.env is documented to override existing entries -- so on any
+# machine whose houdini.env sets RPFARM_ROOT (every artist's, after Ruling
+# R62), a plain env= override is silently discarded. Measured live,
+# 2026-09-08: rpfarm.smoke's own end-to-end proof, and
+# tests/test_node_creation.py, were both affected.
+#
+# The only thing that stops houdini.env from overriding anything is there
+# being no houdini.env to apply -- which means pointing
+# HOUDINI_USER_PREF_DIR somewhere else, which is ALSO where Houdini looks
+# for installed HDAs by default. Two live findings, not assumed:
+#   * a HOUDINI_USER_PREF_DIR value that does not carry Houdini's own
+#     "__HVER__" placeholder is silently ignored -- logged as "EnvControl:
+#     HOUDINI_USER_PREF_DIR missing __HVER__, ignored" -- and Houdini falls
+#     straight back to the real prefs dir, i.e. exactly the bug this exists
+#     to avoid;
+#   * licensing does not depend on HOUDINI_USER_PREF_DIR at all (verified:
+#     hou.licenseCategory() still reports Commercial under a brand new,
+#     otherwise empty prefs dir) -- so isolating this does not cost a
+#     licence.
+# ---------------------------------------------------------------------------
+
+
+def isolated_child_env(root: Path, scratch_dir: Path, install: HoudiniInstall,
+                       extra_env=None, keep_real_otls=True) -> dict:
+    """The env= to hand a child hython so it reads ``root``'s rpfarm package
+    no matter what any real ``houdini.env`` on this machine says.
+
+    Builds a fresh ``HOUDINI_USER_PREF_DIR`` under ``scratch_dir``:
+
+    * ``houdini.env`` is a COPY of ``install``'s real one (license server,
+      any HOUDINI_PATH extras, everything an artist's setup depends on),
+      with its ``RPFARM_ROOT`` line forced to ``root`` afterwards
+      (:func:`write_rpfarm_root_env` with an explicit ``root=`` -- always
+      wins, see that function's own docstring). No real one to copy is not
+      an error, just a fresh file with only the forced line.
+    * ``otls/`` is SYMLINKED to the real one when ``keep_real_otls`` (the
+      default): the assets a live caller like `rpfarm smoke` already
+      checked are installed (see its own ``_check_hdas``) stay found,
+      rather than silently vanishing because the prefs dir moved. Pass
+      ``keep_real_otls=False`` for a caller that installs (or has already
+      installed) its OWN copy into ``scratch_dir`` instead -- a fully
+      isolated unit test wants the checkout's own freshly built HDAs, not
+      whatever happens to be on this machine.
+
+    Returns the env dict (a copy of ``os.environ`` plus ``extra_env`` plus
+    the ``HOUDINI_USER_PREF_DIR`` override, in the ``__HVER__`` placeholder
+    form Houdini itself requires).
+    """
+    root = Path(root)
+    scratch_dir = Path(scratch_dir)
+    real_pref_dir = Path(install.user_pref_dir)
+    placeholder = str(scratch_dir / "prefs_v__HVER__")
+    user_pref_dir = Path(placeholder.replace("__HVER__", install.major_minor))
+    user_pref_dir.mkdir(parents=True, exist_ok=True)
+
+    if keep_real_otls:
+        real_otls = real_pref_dir / "otls"
+        scratch_otls = user_pref_dir / "otls"
+        if real_otls.is_dir() and not scratch_otls.exists():
+            scratch_otls.symlink_to(real_otls)
+
+    real_env_file = real_pref_dir / "houdini.env"
+    if real_env_file.is_file():
+        shutil.copyfile(real_env_file, user_pref_dir / "houdini.env")
+    fake_install = HoudiniInstall.__new__(HoudiniInstall)
+    fake_install.user_pref_dir = user_pref_dir
+    write_rpfarm_root_env(fake_install, root=root)  # explicit root always wins
+
+    env = dict(os.environ, **(extra_env or {}))
+    env["HOUDINI_USER_PREF_DIR"] = placeholder
+    return env
 
 
 # ---------------------------------------------------------------------------

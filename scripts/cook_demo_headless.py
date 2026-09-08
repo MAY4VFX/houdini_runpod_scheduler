@@ -337,22 +337,30 @@ def _ledger(cook_id, since, log):
     return tasks, cost
 
 
-def _run_hython(inst, payload_path, timeout, log, dock_env=False):
+def _run_hython(inst, payload_path, timeout, log, dock_env=False, scratch_dir=None):
     cmd = [str(inst.hython), os.path.abspath(__file__), "--hython", payload_path]
     if dock_env:
         # Deliberately NOT inheriting this shell: PATH is exactly the thing that
         # differed between every green headless run and the artist's first real
         # one. RPFARM_ROOT is left out too -- a Dock-launched Houdini gets it
         # from houdini.env, which `rpfarm setup` writes, so letting that supply
-        # it is the faithful path rather than a convenience.
+        # it is the faithful path rather than a convenience -- this mode is not
+        # trying to force any particular package, it is checking what the
+        # artist's own real setup actually does.
         env = {"PATH": "/usr/bin:/bin", "HOME": os.path.expanduser("~"),
                "PYTHONUNBUFFERED": "1"}
         cwd = "/"
         log("--dock-env: PATH={} cwd={}".format(env["PATH"], cwd))
     else:
-        env = dict(os.environ)
-        env["RPFARM_ROOT"] = REPO
-        env.setdefault("PYTHONUNBUFFERED", "1")
+        # Ruling R63: a plain env["RPFARM_ROOT"] = REPO is not enough -- it is
+        # exactly what a real houdini.env (every artist's, since the R62
+        # decoupling) silently overrides after this child starts. Unlike
+        # --dock-env above, THIS mode does want to force the checkout, so it
+        # needs the isolation houdini_local.isolated_child_env provides
+        # (real otls kept, only RPFARM_ROOT/houdini.env's line forced).
+        env = houdini_local.isolated_child_env(
+            REPO, scratch_dir or os.path.join(os.path.dirname(payload_path), ".demo_cook_prefs"),
+            inst, extra_env={"PYTHONUNBUFFERED": "1"})
         cwd = REPO
     log("$ " + " ".join(cmd))
     proc = subprocess.Popen(
