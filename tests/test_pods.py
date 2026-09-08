@@ -71,6 +71,64 @@ def cfg():
                   sesinetd_host="lic.example.com")
 
 
+# -- find_running_sync_pod: read-only, never creates/resumes/dedupes ------
+#
+# For a caller that wants to look at the farm (a preflight listing, the
+# pre-cook divergence check) without paying for a pod just to answer a
+# question nobody asked yet -- owner's own constraint, 2026-09-08:
+# "the listing must not be the thing that starts a sync pod".
+
+
+def test_find_running_sync_pod_finds_it():
+    api = FakeAPI()
+    api.pods["sync1"] = {"id": "sync1", "name": "rpfarm-sync-may", "desiredStatus": "RUNNING"}
+
+    pod = rppods.find_running_sync_pod(api, cfg())
+
+    assert pod["id"] == "sync1"
+
+
+def test_find_running_sync_pod_creates_nothing_when_none_is_up():
+    api = FakeAPI()
+
+    pod = rppods.find_running_sync_pod(api, cfg())
+
+    assert pod is None
+    assert api.created == []
+
+
+def test_find_running_sync_pod_ignores_a_stopped_one():
+    api = FakeAPI()
+    api.pods["sync1"] = {"id": "sync1", "name": "rpfarm-sync-may", "desiredStatus": "EXITED"}
+
+    pod = rppods.find_running_sync_pod(api, cfg())
+
+    assert pod is None
+    assert api.started == [], "must never resume one either"
+
+
+def test_find_running_sync_pod_never_adopts_a_prefix_match():
+    """rpfarm-sync-may is a prefix of rpfarm-sync-mayakovsky."""
+    api = FakeAPI()
+    api.pods["theirs"] = {"id": "theirs", "name": "rpfarm-sync-mayakovsky", "desiredStatus": "RUNNING"}
+
+    assert rppods.find_running_sync_pod(api, cfg()) is None
+
+
+def test_find_running_sync_pod_reports_an_api_failure_without_raising():
+    class BrokenApi(FakeAPI):
+        def list_pods(self, prefix=""):
+            from rpfarm.runpod_api import RunPodError
+
+            raise RunPodError(0, "network down")
+
+    said = []
+    pod = rppods.find_running_sync_pod(BrokenApi(), cfg(), log=said.append)
+
+    assert pod is None
+    assert said and "network down" in said[0]
+
+
 def test_ensure_sync_pod_creates_once(tmp_path, monkeypatch):
     # ensure_sync_pod takes a file lock under $RPFARM_HOME/locks (Ruling
     # R24) -- point it at a tmp dir so tests never touch the real

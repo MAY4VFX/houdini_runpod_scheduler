@@ -9,11 +9,13 @@ uploads lives in the pure helpers below, on purpose.
 import importlib.util
 import json
 import os
+import types
 
 import pytest
 
 from rpfarm import deps
 from rpfarm import preflight as pf
+from rpfarm import sync as rpsync
 from rpfarm.deps import PlanRow
 
 
@@ -132,6 +134,36 @@ def test_the_widget_tree_opens_one_level_and_folds_the_folder_state(tmp_path):
     folder.setCheckState(QtCore.Qt.Unchecked)
     assert folder.child(1).checkState() == QtCore.Qt.Unchecked
     assert app is not None
+
+
+@pytest.mark.skipif(
+    importlib.util.find_spec("PySide6") is None,
+    reason="PySide6 ships with Houdini's Python, not the system one",
+)
+def test_a_farm_column_appears_exactly_when_annotate_farm_state_ran(tmp_path):
+    """No extra parameter to build_dialog -- the column shows up because
+    annotate_farm_state actually set something, not because a caller asked
+    for a 5th column."""
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6 import QtWidgets
+
+    (tmp_path / "scene.hip").write_bytes(b"h")
+    rows, _ = deps.plan_refs([str(tmp_path / "scene.hip")], source="scene")
+    roots = pf.build_tree(rows)
+    checked = {n.path for n in pf.leaves(roots)}
+    QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+
+    plain = pf.build_dialog(roots, missing=[], checked=checked)
+    assert plain.rpfarm_model.columnCount() == 4
+
+    pairs = pf.farm_pairs([str(tmp_path / "scene.hip")], str(tmp_path), "/workspace/projects/may/p")
+    pf.annotate_farm_state(roots, pairs, {}, "/workspace/projects/may/p")  # {} -> everything MISSING
+    farm_aware = pf.build_dialog(roots, missing=[], checked=checked)
+    model = farm_aware.rpfarm_model
+
+    assert model.columnCount() == 5
+    assert model.horizontalHeaderItem(4).text() == "Farm"
+    assert model.item(0).child(0, 4).text() == pf.FARM_STATE_LABELS[rpsync.FARM_MISSING]
 
 
 # -- the flow the node runs ------------------------------------------------------
@@ -262,6 +294,54 @@ def test_batch_mode_asks_nothing_and_logs_the_directories(tmp_path):
 
     assert got == [hip, tex, usd], "outputs stay out until someone says otherwise"
     assert not any("pdgwork" in m for m in said), "an unchecked directory is not a warning"
+
+
+def test_choose_uploads_annotates_the_tree_when_given_enough_to(tmp_path, monkeypatch):
+    """job_dir/remote_project/cfg/api all given -> the tree the window sees
+    (via the `window` injection seam) carries real farm_state, read through
+    fetch_farm_index -- proven here with a fake cfg/api rather than a real
+    network call."""
+    hip, tex, usd, work = _files(tmp_path)
+    remote_project = "/workspace/projects/may/proj"
+    seen_roots = {}
+
+    def _fake_window(roots, missing, checked, **kw):
+        seen_roots["roots"] = roots
+        return checked
+
+    class RunningApi:
+        def list_pods(self, prefix=""):
+            return [{"id": "sync1", "name": prefix, "desiredStatus": "RUNNING",
+                     "portMappings": {"22": 2222}, "publicIp": "1.2.3.4"}]
+
+    cfg = types.SimpleNamespace(user="may", ssh_key_path="/x", rclone_path="/y")
+    monkeypatch.setattr(rpsync, "remote_index", lambda *a, **k: {
+        "scene.hip": (os.path.getsize(hip), os.path.getmtime(hip))})
+
+    pf.choose_uploads(_FakeNode(), _scan([hip, tex]), usd_paths=[usd], ask=True,
+                      log=lambda m: None, window=_fake_window,
+                      job_dir=str(tmp_path), remote_project=remote_project,
+                      cfg=cfg, api=RunningApi())
+
+    by_name = {leaf.name: leaf for leaf in pf.leaves(seen_roots["roots"])}
+    assert by_name["scene.hip"].farm_state == rpsync.FARM_SAME
+
+
+def test_choose_uploads_skips_farm_state_without_job_dir_or_remote_project(tmp_path):
+    """Backward compatible: a caller that gives none of the new params
+    (the volume manager, or any future caller of the pure helpers) gets
+    exactly the old behaviour -- no network touched, no crash."""
+    hip, tex, usd, work = _files(tmp_path)
+    seen_roots = {}
+
+    def _fake_window(roots, missing, checked, **kw):
+        seen_roots["roots"] = roots
+        return checked
+
+    pf.choose_uploads(_FakeNode(), _scan([hip, tex]), usd_paths=[usd], ask=True,
+                      log=lambda m: None, window=_fake_window)
+
+    assert all(leaf.farm_state == "" for leaf in pf.leaves(seen_roots["roots"]))
 
 
 def test_wants_window_says_which_condition_refused(monkeypatch):
@@ -627,4 +707,152 @@ def test_the_header_never_estimates_a_duration_any_more(tmp_path):
     text = pf.header_text(roots, checked=[str(big)], mbps=4.7)
 
     assert "Mbps" not in text and "min" not in text
-    assert "upload skips whatever the farm already has" in text
+
+
+# ---------------------------------------------------------------------------
+# Farm state, per row (owner's request, 2026-09-08)
+#
+# "он должен подсветить зелёным те файлы которые уже присутствуют на ферме
+# либо отдельным столбиком в котором будет однозначно видно что он на
+# ферме" -- a column. Built on rpfarm.sync.farm_state, the SAME rule
+# already_on_farm uses, so the dialog can never disagree with what upload
+# itself would skip.
+# ---------------------------------------------------------------------------
+
+
+def test_farm_pairs_matches_resolve_entries(tmp_path):
+    hip, tex, usd, work = _files(tmp_path)
+    pairs = pf.farm_pairs([hip, tex], str(tmp_path), "/workspace/projects/may/proj")
+
+    assert pairs[pf.normalise(hip)] == "/workspace/projects/may/proj/scene.hip"
+    assert pairs[pf.normalise(tex)] == "/workspace/projects/may/proj/tex.rat"
+
+
+def test_annotate_farm_state_reads_same_differs_missing(tmp_path):
+    hip, tex, usd, work = _files(tmp_path)
+    remote_project = "/workspace/projects/may/proj"
+    rows, _ = deps.plan_refs([hip, tex, usd], source="scene")
+    roots = pf.build_tree(rows)
+    pairs = pf.farm_pairs([hip, tex, usd], str(tmp_path), remote_project)
+
+    index = {
+        "scene.hip": (os.path.getsize(hip), os.path.getmtime(hip)),  # matches -> SAME
+        "tex.rat": (999999, 0.0),                                    # listed, wrong -> DIFFERS
+        # look.usdc not listed at all -> MISSING
+    }
+    pf.annotate_farm_state(roots, pairs, index, remote_project)
+
+    by_name = {leaf.name: leaf for leaf in pf.leaves(roots)}
+    assert by_name["scene.hip"].farm_state == rpsync.FARM_SAME
+    assert by_name["tex.rat"].farm_state == rpsync.FARM_DIFFERS
+    assert by_name["look.usdc"].farm_state == rpsync.FARM_MISSING
+
+
+def test_annotate_farm_state_with_no_index_is_unknown_everywhere(tmp_path):
+    hip, tex, usd, work = _files(tmp_path)
+    remote_project = "/workspace/projects/may/proj"
+    rows, _ = deps.plan_refs([hip], source="scene")
+    roots = pf.build_tree(rows)
+    pairs = pf.farm_pairs([hip], str(tmp_path), remote_project)
+
+    pf.annotate_farm_state(roots, pairs, None, remote_project)
+
+    assert all(leaf.farm_state == rpsync.FARM_UNKNOWN for leaf in pf.leaves(roots))
+
+
+def test_annotate_farm_state_rolls_up_a_uniform_folder(tmp_path):
+    a = tmp_path / "render" / "a.exr"
+    a.parent.mkdir()
+    a.write_bytes(b"1")
+    b = tmp_path / "render" / "b.exr"
+    b.write_bytes(b"2")
+    remote_project = "/workspace/projects/may/proj"
+    rows, _ = deps.plan_refs([str(tmp_path / "render")], source="output")
+    roots = pf.build_tree(rows)
+    pairs = pf.farm_pairs([str(a), str(b)], str(tmp_path), remote_project)
+    index = {
+        "render/a.exr": (os.path.getsize(a), os.path.getmtime(a)),
+        "render/b.exr": (os.path.getsize(b), os.path.getmtime(b)),
+    }
+
+    pf.annotate_farm_state(roots, pairs, index, remote_project)
+
+    folder = roots[0]
+    assert folder.kind == "dir"
+    assert folder.farm_state == rpsync.FARM_SAME
+
+
+def test_annotate_farm_state_marks_a_mixed_folder(tmp_path):
+    a = tmp_path / "render" / "a.exr"
+    a.parent.mkdir()
+    a.write_bytes(b"1")
+    b = tmp_path / "render" / "b.exr"
+    b.write_bytes(b"2")
+    remote_project = "/workspace/projects/may/proj"
+    rows, _ = deps.plan_refs([str(tmp_path / "render")], source="output")
+    roots = pf.build_tree(rows)
+    pairs = pf.farm_pairs([str(a), str(b)], str(tmp_path), remote_project)
+    index = {"render/a.exr": (os.path.getsize(a), os.path.getmtime(a))}  # b.exr missing
+
+    pf.annotate_farm_state(roots, pairs, index, remote_project)
+
+    assert roots[0].farm_state == "mixed"
+
+
+def test_fetch_farm_index_never_starts_a_sync_pod(monkeypatch):
+    """The owner's own constraint, verbatim: the listing must not be the
+    thing that starts a sync pod."""
+    class NoCreateApi:
+        def list_pods(self, prefix=""):
+            return []  # nothing running
+
+        def create_cpu_pod(self, *a, **k):
+            pytest.fail("fetch_farm_index must never create a pod")
+
+    said = []
+    result = pf.fetch_farm_index(cfg=types.SimpleNamespace(user="may"), api=NoCreateApi(),
+                                 remote_project="/workspace/projects/may/proj", log=said.append)
+
+    assert result is None
+    assert any("no sync pod running" in m for m in said)
+
+
+def test_fetch_farm_index_degrades_honestly_when_listing_fails(monkeypatch):
+    class RunningApi:
+        def list_pods(self, prefix=""):
+            return [{"id": "sync1", "name": prefix, "desiredStatus": "RUNNING"}]
+
+    def _boom(pod, port):
+        raise RuntimeError("no port mapping")
+
+    monkeypatch.setattr("rpfarm.runpod_api.pod_public_endpoint", _boom)
+    cfg = types.SimpleNamespace(user="may", ssh_key_path="/x", rclone_path="/y")
+
+    said = []
+    result = pf.fetch_farm_index(cfg, RunningApi(), "/workspace/projects/may/proj", log=said.append)
+
+    assert result is None
+    assert any("could not list the farm" in m for m in said)
+
+
+def test_fetch_farm_index_lists_when_a_pod_is_running(monkeypatch, tmp_path):
+    class RunningApi:
+        def list_pods(self, prefix=""):
+            return [{"id": "sync1", "name": prefix, "desiredStatus": "RUNNING",
+                     "portMappings": {"22": 2222}, "publicIp": "1.2.3.4"}]
+
+    seen = {}
+
+    def _fake_remote_index(target, rclone_bin, remote_root, run=None):
+        seen["target"] = target
+        seen["remote_root"] = remote_root
+        return {"scene.hip": (1, 2.0)}
+
+    monkeypatch.setattr(rpsync, "remote_index", _fake_remote_index)
+    cfg = types.SimpleNamespace(user="may", ssh_key_path="/x", rclone_path="/y")
+
+    result = pf.fetch_farm_index(cfg, RunningApi(), "/workspace/projects/may/proj")
+
+    assert result == {"scene.hip": (1, 2.0)}
+    assert seen["remote_root"] == "/workspace/projects/may/proj"
+    assert seen["target"].host == "1.2.3.4" and seen["target"].port == 2222

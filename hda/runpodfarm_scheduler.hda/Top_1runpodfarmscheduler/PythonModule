@@ -212,12 +212,12 @@ _ASSET_FINGERPRINT = {
     'ledger.py': (17327, '70425e75fb216f01'),
     'package_runner.py': (8752, '96770e3879a6cb65'),
     'packages.py': (61657, '030b2d03028b9c47'),
-    'pods.py': (30823, 'fc9878f471863111'),
-    'preflight.py': (36145, '60e8c9f3766232f6'),
+    'pods.py': (31759, 'c888660bb44e12db'),
+    'preflight.py': (42343, '21b2d999f2bc30c3'),
     'runpod_api.py': (14539, 'b90960f9860c97fb'),
     'scene_setup.py': (18467, '8838d55cbb131f99'),
     'smoke.py': (42548, 'ce0c8d36fe763314'),
-    'sync.py': (16104, '853b8d48734c88f9'),
+    'sync.py': (17350, '3c5e5eb3073469b3'),
     'tls.py': (3642, 'f3e50ea6ebd0308f'),
     'tools.py': (4290, 'c5d3b026f125578f'),
     'usddeps.py': (9631, '3c7192d3bd94d07f'),
@@ -2917,6 +2917,7 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         self._touchSyncPod()
         self._touchProjectIndex("cook")
         self._warmSizeCache()
+        self._checkSceneDivergence()
 
         # PDG's own job scripts and any serialized work item data.
         self._uploadPdgTemp()
@@ -3075,6 +3076,63 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
                 "{} disk-usage --budget-s 90".format(_HOUSEKEEPING), timeout_s=110)
         except Exception as e:  # noqa: BLE001 - a cache warm-up must never fail a cook
             self._verboseLog("size cache warm-up failed (continuing): {}".format(e))
+
+    def _checkSceneDivergence(self):
+        """Warn, once, if the .hip on the farm is not this session's .hip.
+
+        The owner's own trap, hit twice: he edits the scene, cooks only a
+        downstream node, and the upload item -- still CookedSuccess from an
+        earlier cook -- never re-runs, so nothing ever compares the scene
+        again. Three GPU pods then render whatever .hip the farm already
+        has, silently. His own words: "случай когда человек не сделал
+        дерти и версии расходятся думаю надо перед куком это проверить и
+        оповестить а дальше пользователь сам решит дертить или
+        продолжить" -- checked here, before a single GPU pod is rented
+        (onTick/`_scale_up` runs after this), and it is a note, never a
+        gate: his call, every time, same as every other warning on this
+        Status tab (Ruling R54).
+
+        Same rule the preflight column uses (rpfarm.sync.farm_state, built
+        on already_on_farm) -- one remote listing, one comparison,
+        answering both. The .hip's remote path comes from self._pathmap
+        (delocalize_via_pathmap), the SAME map the upload step itself
+        built and wrote (rpfarm.packages.write_pathmap) -- not a second,
+        possibly-drifting guess at where the upload put it.
+
+        Silent, not just quiet, when there is nothing to say: no .hip
+        (should not happen, but a diagnostic must never be the reason a
+        cook fails), a .hip this cook's own pathmap cannot place on the
+        farm at all, a .hip the farm has never seen (first cook of this
+        project -- nothing to compare against, not a divergence), or the
+        listing itself failing (same as the preflight column: "unknown"
+        is not "diverged").
+        """
+        try:
+            import hou
+
+            hip = hou.hipFile.path()
+        except Exception:
+            return
+        if not hip:
+            return
+        remote_hip = rppkg.delocalize_via_pathmap(hip, self._pathmap)
+        if not remote_hip:
+            return
+        try:
+            index = rpsync.remote_index(self._sftp, self._cfg.rclone_path, self._remote_project)
+        except (rpsync.SyncError, OSError) as e:
+            self._verboseLog("could not check the farm for a diverged scene: {}".format(e))
+            return
+        entry = rpsync.FileEntry(local=hip, remote=remote_hip, size=0)
+        state = rpsync.farm_state(entry, index, self._remote_project)
+        if state != rpsync.FARM_DIFFERS:
+            return  # FARM_SAME: nothing to say. FARM_MISSING: first cook here.
+        self._note(
+            "сцена на ферме отличается от текущей ({}) -- заливка помечена "
+            "выполненной и не перезапустится сама. Если нужен именно "
+            "текущий вид сцены, сделайте Dirty на ноде upload и кукните "
+            "снова; если и так сойдёт — можно продолжать.".format(
+                os.path.basename(hip)))
 
     def _mirror_ledger_to_volume(self):
         """Push this cook's local ledger .jsonl up to the volume (Ruling

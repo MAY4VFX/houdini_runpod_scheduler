@@ -28,6 +28,8 @@ import json
 import os
 from dataclasses import dataclass, field
 
+from . import sync as rpsync
+
 _UNITS = ("B", "KB", "MB", "GB", "TB")
 
 
@@ -69,6 +71,14 @@ class TreeNode:
     bytes: int = 0
     source: str = ""
     children: list = field(default_factory=list)
+    #: One of sync.FARM_SAME/FARM_DIFFERS/FARM_MISSING/FARM_UNKNOWN, or
+    #: "mixed" for a folder whose leaves disagree, or "" before
+    #: :func:`annotate_farm_state` has run at all (a caller with no job_dir/
+    #: remote_project never calls it -- the volume manager's own window
+    #: reuses this dataclass and has no farm concept). Set by
+    #: annotate_farm_state, never by build_tree itself: this needs a
+    #: remote listing build_tree has no way to get.
+    farm_state: str = ""
 
     @property
     def is_leaf(self):
@@ -316,6 +326,68 @@ def leaves(roots):
     return out
 
 
+# -- farm state, per row (owner's request, 2026-09-08) -----------------------
+#
+# "он должен подсветить зелёным те файлы которые уже присутствуют на ферме
+# либо отдельным столбиком в котором будет однозначно видно что он на
+# ферме" -- a column, his own preference over colour alone (unambiguous
+# without relying on whatever theme is active). One remote listing
+# (rpfarm.sync.remote_index) answers every row at once; this only ever
+# reads it, through rpfarm.sync.farm_state, the SAME rule already_on_farm
+# itself uses -- the dialog must never invent a second one that could
+# disagree with what the upload step actually skips.
+
+FARM_STATE_LABELS = {
+    rpsync.FARM_SAME: "on farm",
+    rpsync.FARM_DIFFERS: "on farm, differs",
+    rpsync.FARM_MISSING: "not on farm",
+    rpsync.FARM_UNKNOWN: "?",
+    "mixed": "mixed",
+}
+
+
+def farm_pairs(leaf_paths, job_dir, remote_project):
+    """``{local path: remote path}`` for every leaf, the same mapping
+    :func:`rpfarm.deps.resolve_entries` (and so ``build_upload_items``)
+    would produce -- imported lazily so this module's pure layer never
+    needs :mod:`rpfarm.deps` unless a caller actually asks for this.
+    """
+    from . import deps as _deps
+
+    entries, _pmap = _deps.resolve_entries(leaf_paths, job_dir, remote_project)
+    return {normalise(e.local): e.remote for e in entries}
+
+
+def annotate_farm_state(roots, pairs, index, remote_project):
+    """Set ``farm_state`` on every node, leaves from ``index`` (or
+    :data:`rpfarm.sync.FARM_UNKNOWN` for a leaf ``index`` cannot answer --
+    ``index is None`` for every leaf, or one this cook's own pair-mapping
+    never produced, e.g. a reference that does not exist on disk), folders
+    rolled up from their children (uniform state, or ``"mixed"``).
+
+    Pure -- ``index`` is already a plain ``{rel: (size, mtime)}`` dict by
+    the time it gets here (:func:`rpfarm.sync.remote_index`'s own return),
+    so this needs no network access itself and is fully unit-testable.
+    """
+    for leaf in leaves(roots):
+        remote = pairs.get(normalise(leaf.path))
+        if index is None or remote is None:
+            leaf.farm_state = rpsync.FARM_UNKNOWN
+        else:
+            entry = rpsync.FileEntry(local=leaf.path, remote=remote, size=leaf.bytes)
+            leaf.farm_state = rpsync.farm_state(entry, index, remote_project)
+
+    def roll_up(node):
+        if node.is_leaf:
+            return node.farm_state
+        states = {roll_up(c) for c in node.children}
+        node.farm_state = states.pop() if len(states) == 1 else "mixed"
+        return node.farm_state
+
+    for root in roots:
+        roll_up(root)
+
+
 def eta_text(size_bytes, mbps):
     """How long that many bytes take at a measured uplink, in words.
 
@@ -519,9 +591,19 @@ def build_dialog(roots, missing, checked, title="RunPodFarm", parent=None, mbps=
     head.setWordWrap(True)
     layout.addWidget(head)
 
+    # A "Farm" column appears exactly when there is something in it to show:
+    # annotate_farm_state is the only thing that ever sets farm_state on a
+    # node, and callers that never call it (the volume manager's own reuse
+    # of this dialog, Ruling R55) leave every node at its dataclass default
+    # ("") -- so this needs no extra parameter, just a look at what is
+    # already on the tree.
+    has_farm_state = any(n.farm_state for n in leaves(roots))
+
     model = QtGui.QStandardItemModel()
-    model.setHorizontalHeaderLabels(
-        list(columns or ["Reference", "Size", "Contains", "Found by"]))
+    default_columns = ["Reference", "Size", "Contains", "Found by"]
+    if has_farm_state:
+        default_columns.append("Farm")
+    model.setHorizontalHeaderLabels(list(columns or default_columns))
     leaf_items = []
     locked_paths = set()
 
@@ -538,6 +620,10 @@ def build_dialog(roots, missing, checked, title="RunPodFarm", parent=None, mbps=
         size.setTextAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
         row = [first, size, QtGui.QStandardItem(detail),
                QtGui.QStandardItem(SOURCE_LABELS.get(node.source, ""))]
+        if has_farm_state:
+            farm_cell = QtGui.QStandardItem(FARM_STATE_LABELS.get(node.farm_state, node.farm_state))
+            farm_cell.setTextAlignment(QtCore.Qt.AlignCenter)
+            row.append(farm_cell)
         for cell in row[1:]:
             cell.setEditable(False)
         if locked is not None and locked(node):
@@ -826,7 +912,38 @@ def wants_window(node, ask=None, log=None):
     return True
 
 
-def choose_uploads(node, scan, usd_paths=(), env_paths=(), ask=False, log=None, window=None):
+def fetch_farm_index(cfg, api, remote_project, log=None):
+    """The farm's own listing of ``remote_project``, or ``None`` when there
+    is no honest way to get one right now.
+
+    "The listing must not be the thing that starts a sync pod" (the
+    owner's own constraint): this only ever looks for one that is already
+    RUNNING (:func:`rpfarm.pods.find_running_sync_pod`, which creates and
+    resumes nothing) and gives up, quietly, the moment that is not true --
+    never "wait for one" or "start one to draw a dialog". A pod not being
+    up, or the listing itself failing, both come back as ``None``, and
+    every row renders :data:`rpfarm.sync.FARM_UNKNOWN` rather than a
+    confident wrong answer.
+    """
+    say = log if log is not None else (lambda _m: None)
+    from . import pods as rppods
+    from .runpod_api import pod_public_endpoint
+
+    pod = rppods.find_running_sync_pod(api, cfg, log=say)
+    if pod is None:
+        say("no sync pod running -- farm state unknown for this preflight")
+        return None
+    try:
+        ip, port = pod_public_endpoint(pod, 22)
+        target = rpsync.SftpTarget(host=ip, port=port, key_path=cfg.ssh_key_path)
+        return rpsync.remote_index(target, cfg.rclone_path, remote_project)
+    except Exception as e:  # noqa: BLE001 - a courtesy lookup must not break the cook
+        say("could not list the farm ({}) -- farm state unknown for this preflight".format(e))
+        return None
+
+
+def choose_uploads(node, scan, usd_paths=(), env_paths=(), ask=False, log=None, window=None,
+                   job_dir=None, remote_project=None, cfg=None, api=None):
     """The final list of local paths this cook uploads.
 
     One window, one tree, one stored answer. Every reference this cook could
@@ -869,6 +986,17 @@ def choose_uploads(node, scan, usd_paths=(), env_paths=(), ask=False, log=None, 
         missing.extend(gone)
 
     roots = build_tree(rows)
+
+    # Farm state per row: only attempted when the caller gave enough to do
+    # it honestly (job_dir/remote_project to map local->farm paths, cfg/api
+    # to look for an already-running sync pod). Never on its own account --
+    # see fetch_farm_index's own docstring for why a listing is never
+    # allowed to start a pod.
+    if job_dir and remote_project:
+        pairs = farm_pairs([leaf.path for leaf in leaves(roots)], job_dir, remote_project)
+        index = fetch_farm_index(cfg, api, remote_project, log=say) if cfg and api else None
+        annotate_farm_state(roots, pairs, index, remote_project)
+
     mbps = measured_uplink()
     off, on = load_choices(node.evalParm("rpfarm_exclude"))
 

@@ -238,6 +238,36 @@ def already_on_farm(entry, index, local_root, remote_root, tolerance=MTIME_TOLER
     return abs(local_mtime - mtime) <= tolerance
 
 
+# -- three-way farm state, for the preflight column and the pre-cook
+# divergence check (owner's request, 2026-09-08) -------------------------
+#
+# Both need to tell "not there yet" apart from "there, but not what
+# already_on_farm would skip" -- already_on_farm alone only ever says yes
+# or no. One rule, used by both: whatever this function says a file's
+# state is is exactly what the actual upload would do with it, because it
+# is built directly on already_on_farm rather than a second comparison
+# that could quietly drift from it.
+
+FARM_SAME = "same"
+FARM_DIFFERS = "differs"
+FARM_MISSING = "missing"
+FARM_UNKNOWN = "unknown"
+
+
+def farm_state(entry, index, remote_root):
+    """One of :data:`FARM_SAME`/:data:`FARM_DIFFERS`/:data:`FARM_MISSING`.
+
+    ``index=None`` ("could not ask the farm" -- no sync pod up, or asking
+    it failed) is not this function's problem to guess at: callers that
+    have no index render every row :data:`FARM_UNKNOWN` themselves,
+    instead of this function inventing a fourth meaning for ``None``.
+    """
+    rel = posixpath.relpath(entry.remote, remote_root)
+    if rel not in index:
+        return FARM_MISSING
+    return FARM_SAME if already_on_farm(entry, index, "", remote_root) else FARM_DIFFERS
+
+
 def build_rclone_args(package, target, direction, local_root, remote_root, tmp_dir):
     """Build args for an ``rclone copy --files-from`` of one package.
 

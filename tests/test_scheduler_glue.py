@@ -32,6 +32,7 @@ from rpfarm import dispatch as rpdispatch
 from rpfarm import houdini_local as rphl
 from rpfarm import packages as rppkg
 from rpfarm import pods as rppods
+from rpfarm import sync as rpsync
 from rpfarm.runpod_api import RunPodError
 from rpfarm.worker_client import WorkerClient
 
@@ -1279,6 +1280,160 @@ def test_orphan_sweep_logs_a_warning_and_never_raises_when_the_api_is_unreachabl
     sched._sweepOrphanPods()  # must not raise
 
     assert any("orphan pod sweep failed" in m for m in sched.logs)
+
+
+# ---------------------------------------------------------------------------
+# Pre-cook divergence check (owner's request, 2026-09-08) -- the upload
+# item is CookedSuccess/cached, PDG never re-cooks it, so nothing ever
+# compares the scene again after the first upload. Checked at onSetupCook,
+# before any GPU pod is rented -- a note, never a gate.
+# ---------------------------------------------------------------------------
+
+
+class _DivergenceScheduler(FakeScheduler):
+    def __init__(self, pathmap, remote_project, sftp="sftp", rclone_path="/rclone"):
+        super().__init__()
+        self._pathmap = pathmap
+        self._remote_project = remote_project
+        self._sftp = sftp
+        self._cfg = types.SimpleNamespace(rclone_path=rclone_path)
+        self._notes = []
+
+    def _note(self, text):
+        if text in self._notes:
+            return
+        self.logs.append(text)
+        self._notes.append(text)
+
+
+def _divergence_ns(index_or_raiser, hip_path):
+    hou_stub = types.SimpleNamespace(
+        hipFile=types.SimpleNamespace(path=lambda: hip_path))
+
+    def _fake_remote_index(target, rclone_bin, remote_root, run=None):
+        if isinstance(index_or_raiser, Exception):
+            raise index_or_raiser
+        return index_or_raiser
+
+    return load_methods(
+        ["_checkSceneDivergence"],
+        {"rppkg": rppkg,
+         "rpsync": types.SimpleNamespace(
+             remote_index=_fake_remote_index, farm_state=rpsync.farm_state,
+             FileEntry=rpsync.FileEntry, SyncError=rpsync.SyncError,
+             FARM_DIFFERS=rpsync.FARM_DIFFERS),
+         "os": __import__("os")},
+    ), hou_stub
+
+
+def test_scene_divergence_warns_when_the_farm_has_a_different_hip(tmp_path):
+    hip = tmp_path / "scene.hip"
+    hip.write_bytes(b"h" * 100)
+    remote_project = "/workspace/projects/may/proj"
+    pathmap = {str(tmp_path): remote_project}
+    index = {"scene.hip": (5, 0.0)}  # size 5 != 100 on disk -> DIFFERS
+    ns, hou_stub = _divergence_ns(index, str(hip))
+    sched = _DivergenceScheduler(pathmap, remote_project)
+    sched._checkSceneDivergence = lambda: ns["_checkSceneDivergence"](sched)
+
+    sys.modules["hou"] = hou_stub
+    try:
+        sched._checkSceneDivergence()
+    finally:
+        sys.modules.pop("hou", None)
+
+    assert any("сцена на ферме отличается" in n for n in sched._notes), sched._notes
+    assert any("scene.hip" in n for n in sched._notes)
+
+
+def test_scene_divergence_says_nothing_when_the_hip_matches(tmp_path):
+    hip = tmp_path / "scene.hip"
+    hip.write_bytes(b"h" * 100)
+    remote_project = "/workspace/projects/may/proj"
+    pathmap = {str(tmp_path): remote_project}
+    index = {"scene.hip": (100, hip.stat().st_mtime)}
+    ns, hou_stub = _divergence_ns(index, str(hip))
+    sched = _DivergenceScheduler(pathmap, remote_project)
+    sched._checkSceneDivergence = lambda: ns["_checkSceneDivergence"](sched)
+
+    sys.modules["hou"] = hou_stub
+    try:
+        sched._checkSceneDivergence()
+    finally:
+        sys.modules.pop("hou", None)
+
+    assert sched._notes == []
+
+
+def test_scene_divergence_says_nothing_on_the_first_cook_of_a_project(tmp_path):
+    """The farm has never seen this .hip -- that is the first cook of the
+    project, not a divergence."""
+    hip = tmp_path / "scene.hip"
+    hip.write_bytes(b"h")
+    remote_project = "/workspace/projects/may/proj"
+    pathmap = {str(tmp_path): remote_project}
+    ns, hou_stub = _divergence_ns({}, str(hip))  # nothing listed at all
+    sched = _DivergenceScheduler(pathmap, remote_project)
+    sched._checkSceneDivergence = lambda: ns["_checkSceneDivergence"](sched)
+
+    sys.modules["hou"] = hou_stub
+    try:
+        sched._checkSceneDivergence()
+    finally:
+        sys.modules.pop("hou", None)
+
+    assert sched._notes == []
+
+
+def test_scene_divergence_is_silent_when_the_hip_is_outside_any_pathmap(tmp_path):
+    hip = tmp_path / "scene.hip"
+    hip.write_bytes(b"h")
+    ns, hou_stub = _divergence_ns({}, str(hip))
+    sched = _DivergenceScheduler(pathmap={}, remote_project="/workspace/projects/may/proj")
+    sched._checkSceneDivergence = lambda: ns["_checkSceneDivergence"](sched)
+
+    sys.modules["hou"] = hou_stub
+    try:
+        sched._checkSceneDivergence()  # must not raise
+    finally:
+        sys.modules.pop("hou", None)
+
+    assert sched._notes == []
+
+
+def test_scene_divergence_logs_a_warning_and_never_raises_when_listing_fails(tmp_path):
+    hip = tmp_path / "scene.hip"
+    hip.write_bytes(b"h")
+    remote_project = "/workspace/projects/may/proj"
+    pathmap = {str(tmp_path): remote_project}
+    ns, hou_stub = _divergence_ns(rpsync.SyncError("network down"), str(hip))
+    sched = _DivergenceScheduler(pathmap, remote_project)
+    sched._checkSceneDivergence = lambda: ns["_checkSceneDivergence"](sched)
+
+    sys.modules["hou"] = hou_stub
+    try:
+        sched._checkSceneDivergence()  # must not raise
+    finally:
+        sys.modules.pop("hou", None)
+
+    assert sched._notes == []
+    assert any("could not check the farm" in m for m in sched.logs)
+
+
+def test_onsetupcook_checks_divergence_before_uploading_pdg_temp():
+    """onSetupCook itself never rents a GPU pod (that is onTick's job, once
+    PDG actually has work -- see its own comment on _raised_for_work); the
+    real ordering guarantee this checks is that the divergence check runs
+    with the sync connection established, and before the rest of setup
+    goes on to talk to the farm."""
+    src = MODULE.read_text()
+    setup = src[src.index("def onSetupCook(self):"):]
+    setup = setup[:setup.index("\n    def ", 1)]
+    assert "self._sftp = rpsync.SftpTarget(" in setup
+    sftp = setup.index("self._sftp = rpsync.SftpTarget(")
+    check = setup.index("self._checkSceneDivergence()")
+    upload = setup.index("self._uploadPdgTemp()")
+    assert sftp < check < upload
 
 
 # ---------------------------------------------------------------------------

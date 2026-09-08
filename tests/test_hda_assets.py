@@ -18,6 +18,7 @@ These tests read only tracked files -- no Houdini, no hython, no network.
 import ast
 import json
 import pathlib
+import types
 
 import pytest
 
@@ -491,6 +492,53 @@ def test_the_asset_pattern_default_matches_the_package():
     )
     shipped = _asset_text("runpodfarm_upload.hda")
     assert "rpfarm_assetregex" in shipped and "rpfarm_excludepattern" in shipped
+
+
+def test_remote_project_formula_matches_build_upload_items(tmp_path):
+    """The upload builder cannot import rpfarm.packages either (same reason
+    as ASSET_REGEX above), so it spells out remote_project's own formula
+    itself -- three times: the pathmap write already inside the generate
+    callback, plus (added for the farm-state column, 2026-09-08) the
+    generate callback's own farm lookup and the Preview Upload... button.
+    Every one of them has to compute the SAME string for the SAME (user,
+    project), or the column/divergence check would be comparing local
+    files against a farm path the actual upload never used.
+
+    Evaluated with sample values rather than compared as source text: one
+    side is an f-string (rpfarm.packages), the other a .format() call (the
+    builder cannot use an f-string inside its own triple-quoted template
+    without escaping every brace in the surrounding code) -- different
+    syntax, and the only thing that has to agree is the RESULT.
+    """
+    import re
+
+    packages_src = pathlib.Path("rpfarm/packages.py").read_text()
+    m = re.search(r'remote_project = (f".*")', packages_src)
+    assert m, "rpfarm.packages.build_upload_items's own formula line is gone"
+    # eval() here evaluates a small f-string literal read out of THIS repo's
+    # own tracked rpfarm/packages.py (not any external or user input), with
+    # an explicit empty builtins dict -- ast.literal_eval cannot evaluate an
+    # f-string, and this is the whole point of the test: run the two repo's
+    # own formulas and compare their RESULTS.
+    packages_result = eval(m.group(1), {"__builtins__": {}}, {"user": "may", "project": "airship"})
+
+    builder_src = (REPO / "scripts" / "build_runpodfarm_upload_hda.py").read_text()
+    formula_lines = [ln for ln in builder_src.splitlines() if "remote_project = " in ln
+                     and "workspace/projects" in ln]
+    assert len(formula_lines) >= 3, (
+        "expected at least three remote_project formula lines in the "
+        "builder (the existing pathmap write, the generate callback's "
+        "farm lookup, the Preview Upload... button), found {} -- if this "
+        "genuinely shrank, that is fine, just update the count".format(len(formula_lines)))
+    for line in formula_lines:
+        expr = line.strip().split("remote_project = ", 1)[1].rstrip(" \\")
+        # Same justification as packages_result above: a trusted line from
+        # this repo's own tracked builder script, empty builtins.
+        fake_cfg = types.SimpleNamespace(user="may")  # only ".user" is ever read
+        builder_result = eval(expr, {"__builtins__": {}},
+                              {"user": "may", "project": "airship", "cfg": fake_cfg})
+        assert builder_result == packages_result == "/workspace/projects/may/airship", (
+            "builder line {!r} disagrees with rpfarm.packages.build_upload_items".format(line))
 
 
 def test_the_upload_asset_checks_the_code_before_it_cooks():

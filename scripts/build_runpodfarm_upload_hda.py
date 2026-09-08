@@ -256,12 +256,12 @@ _ASSET_FINGERPRINT = {
     'ledger.py': (17327, '70425e75fb216f01'),
     'package_runner.py': (8752, '96770e3879a6cb65'),
     'packages.py': (61657, '030b2d03028b9c47'),
-    'pods.py': (30823, 'fc9878f471863111'),
-    'preflight.py': (36145, '60e8c9f3766232f6'),
+    'pods.py': (31759, 'c888660bb44e12db'),
+    'preflight.py': (42343, '21b2d999f2bc30c3'),
     'runpod_api.py': (14539, 'b90960f9860c97fb'),
     'scene_setup.py': (18467, '8838d55cbb131f99'),
     'smoke.py': (42548, 'ce0c8d36fe763314'),
-    'sync.py': (16104, '853b8d48734c88f9'),
+    'sync.py': (17350, '3c5e5eb3073469b3'),
     'tls.py': (3642, 'f3e50ea6ebd0308f'),
     'tools.py': (4290, 'c5d3b026f125578f'),
     'usddeps.py': (9631, '3c7192d3bd94d07f'),
@@ -351,9 +351,13 @@ def previewUpload(kwargs):
     set the selection for a batch cook that will never open a window.
     """
     node = kwargs["node"]
+    import hou
+
+    from rpfarm import config as rpcfg
     from rpfarm import deps as rpdeps
     from rpfarm import preflight as rppf
     from rpfarm import usddeps as rpusd
+    from rpfarm.runpod_api import RunPodAPI
 
     scope = node.evalParm("rpfarm_scope") or rpdeps.SCOPE_BRANCH
     asset_regex = node.evalParm("rpfarm_assetregex") or rpdeps.ASSET_REGEX
@@ -365,8 +369,24 @@ def previewUpload(kwargs):
         rops, log=_say, deep=bool(node.evalParm("rpfarm_usddeep")),
         asset_regex=asset_regex) if rops else []
     usd = rpdeps.remove_pattern(usd, exclude_pattern)
+
+    # Same farm-state lookup the generate callback makes -- best-effort,
+    # this button is exactly as entitled to a wrong-scene warning as a real
+    # cook is, and it is already on the main thread so there is no bridge
+    # to worry about here.
+    job_dir = hou.getenv("JOB") or hou.expandString("$HIP")
+    project = node.evalParm("rpfarm_project") or os.path.basename(os.path.normpath(job_dir))
     try:
-        paths = rppf.choose_uploads(node, scan, usd, ask=True, log=_say)
+        cfg = rpcfg.load()
+        api = RunPodAPI(cfg.api_key)
+    except Exception:
+        cfg = api = None
+    remote_project = "/workspace/projects/{}/{}".format(cfg.user, project) if cfg else None
+
+    try:
+        paths = rppf.choose_uploads(node, scan, usd, ask=True, log=_say,
+                                    job_dir=job_dir, remote_project=remote_project,
+                                    cfg=cfg, api=api)
     except rppf.UploadCancelled:
         _say("preview closed with Cancel -- nothing changed")
         return
@@ -431,6 +451,7 @@ from rpfarm import houdini_local as rphou
 from rpfarm import packages as rppkg
 from rpfarm import preflight as rppf
 from rpfarm import usddeps as rpusd
+from rpfarm.runpod_api import RunPodAPI
 
 
 def _say(message):
@@ -446,6 +467,13 @@ package_gb = node.evalParm("rpfarm_packagegb")
 
 cfg = rpcfg.load()
 user = cfg.user
+# Same formula build_upload_items itself uses (rpfarm/packages.py) -- kept
+# in sync by a test, not by hoping nobody edits one without the other.
+remote_project = "/workspace/projects/{}/{}".format(user, project)
+try:
+    api = RunPodAPI(cfg.api_key)
+except Exception:
+    api = None
 
 custom = []
 for i in range(1, node.evalParm("rpfarm_custom") + 1):
@@ -505,7 +533,9 @@ if mode == "deps":
         _say("WARNING: " + problem)
         _warn(problem)
     try:
-        refs = rppf.choose_uploads(node, scan, usd, env_refs, ask=ask, log=_say)
+        refs = rppf.choose_uploads(node, scan, usd, env_refs, ask=ask, log=_say,
+                                   job_dir=job_dir, remote_project=remote_project,
+                                   cfg=cfg, api=api)
     except rppf.UploadCancelled as e:
         # A deliberate no, not a failure -- but generation has to stop, and
         # a NodeError is the only way to stop it that PDG reports plainly.

@@ -413,6 +413,49 @@ def test_a_second_of_slack_is_not_a_change(tmp_path):
                                   str(tmp_path), "/remote/root")
 
 
+# -- farm_state: the three-way answer the preflight column and the
+# pre-cook divergence check share (owner's request, 2026-09-08) ----------
+
+
+def test_farm_state_is_same_when_already_on_farm(tmp_path):
+    src = tmp_path / "cache.bgeo"
+    src.write_bytes(b"g" * 4096)
+    entry = FileEntry(local=str(src), remote="/remote/root/cache.bgeo", size=4096)
+
+    assert rpsync.farm_state(entry, _index_from([entry]), "/remote/root") == rpsync.FARM_SAME
+
+
+def test_farm_state_is_differs_when_listed_but_not_matching(tmp_path):
+    src = tmp_path / "scene.hip"
+    src.write_bytes(b"h" * 100)
+    entry = FileEntry(local=str(src), remote="/remote/root/scene.hip", size=100)
+
+    got = rpsync.farm_state(entry, _index_from([entry], size_delta=-5), "/remote/root")
+    assert got == rpsync.FARM_DIFFERS
+
+
+def test_farm_state_is_missing_when_not_listed_at_all(tmp_path):
+    src = tmp_path / "tex.rat"
+    src.write_bytes(b"t")
+    entry = FileEntry(local=str(src), remote="/remote/root/tex.rat", size=1)
+
+    assert rpsync.farm_state(entry, {}, "/remote/root") == rpsync.FARM_MISSING
+
+
+def test_farm_state_never_disagrees_with_already_on_farm(tmp_path):
+    """The rule the owner asked for: the column/divergence check must not
+    invent a second rule that could disagree with what upload actually
+    skips. Same fixtures, both functions, every branch."""
+    src = tmp_path / "a.exr"
+    src.write_bytes(b"x")
+    entry = FileEntry(local=str(src), remote="/remote/root/a.exr", size=1)
+    for index in (_index_from([entry]), _index_from([entry], size_delta=-1),
+                 _index_from([entry], mtime_delta=600), {}):
+        same = rpsync.already_on_farm(entry, index, str(tmp_path), "/remote/root")
+        state = rpsync.farm_state(entry, index, "/remote/root")
+        assert same == (state == rpsync.FARM_SAME)
+
+
 def test_the_index_is_read_from_the_farm_itself(monkeypatch):
     seen = {}
 

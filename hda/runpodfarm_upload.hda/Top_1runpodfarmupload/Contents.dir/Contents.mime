@@ -256,6 +256,7 @@ from rpfarm import houdini_local as rphou
 from rpfarm import packages as rppkg
 from rpfarm import preflight as rppf
 from rpfarm import usddeps as rpusd
+from rpfarm.runpod_api import RunPodAPI
 
 
 def _say(message):
@@ -271,6 +272,13 @@ package_gb = node.evalParm(\"rpfarm_packagegb\")
 
 cfg = rpcfg.load()
 user = cfg.user
+# Same formula build_upload_items itself uses (rpfarm/packages.py) -- kept
+# in sync by a test, not by hoping nobody edits one without the other.
+remote_project = \"/workspace/projects/{}/{}\".format(user, project)
+try:
+    api = RunPodAPI(cfg.api_key)
+except Exception:
+    api = None
 
 custom = []
 for i in range(1, node.evalParm(\"rpfarm_custom\") + 1):
@@ -330,7 +338,9 @@ if mode == \"deps\":
         _say(\"WARNING: \" + problem)
         _warn(problem)
     try:
-        refs = rppf.choose_uploads(node, scan, usd, env_refs, ask=ask, log=_say)
+        refs = rppf.choose_uploads(node, scan, usd, env_refs, ask=ask, log=_say,
+                                   job_dir=job_dir, remote_project=remote_project,
+                                   cfg=cfg, api=api)
     except rppf.UploadCancelled as e:
         # A deliberate no, not a failure -- but generation has to stop, and
         # a NodeError is the only way to stop it that PDG reports plainly.

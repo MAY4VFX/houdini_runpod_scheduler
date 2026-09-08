@@ -457,6 +457,27 @@ def _dedupe_running(api, running, log):
     return [keep]
 
 
+def find_running_sync_pod(api, cfg, log=None):
+    """This user's sync pod, if one is already RUNNING -- read-only.
+
+    Never creates, resumes, dedupes or terminates anything: for a caller
+    that wants to look at the farm (a preflight listing, a pre-cook
+    divergence check) without paying for a pod just to answer a question
+    the artist has not asked yet, and without a side effect
+    (:func:`_dedupe_running`'s own terminate-the-duplicate behaviour) that
+    a UI dialog being drawn must never trigger.
+    """
+    say = log if log is not None else (lambda _m: None)
+    name = sync_pod_name(cfg.user)
+    try:
+        existing = [p for p in api.list_pods(name) if p.get("name") == name]
+    except RunPodError as e:
+        say("could not check for a running sync pod: {}".format(e))
+        return None
+    running = [p for p in existing if p.get("desiredStatus") == "RUNNING"]
+    return running[0] if running else None
+
+
 def _find_or_create_sync_pod(api, cfg, token, pubkey, log, cloud_type=None, woken=None):
     name = sync_pod_name(cfg.user)
     # list_pods is a prefix match, and sync_pod_name has no trailing
