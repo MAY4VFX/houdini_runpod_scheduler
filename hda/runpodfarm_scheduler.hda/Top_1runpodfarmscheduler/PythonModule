@@ -210,7 +210,7 @@ _ASSET_FINGERPRINT = {
     'package_runner.py': (8752, '96770e3879a6cb65'),
     'packages.py': (61657, '030b2d03028b9c47'),
     'pods.py': (30823, 'fc9878f471863111'),
-    'preflight.py': (31237, '41ab9dff0a78fe91'),
+    'preflight.py': (36145, '60e8c9f3766232f6'),
     'runpod_api.py': (14539, 'b90960f9860c97fb'),
     'scene_setup.py': (18467, '8838d55cbb131f99'),
     'smoke.py': (41503, 'd25dfbac9eddb12b'),
@@ -3135,6 +3135,19 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
     def onTick(self):
         """[virtual] Called during a cook: poll pods and tasks, scale, spend."""
         if not self.checkPollingClient():
+            # SimpleMQSchedulerMixin's own implementation already calls
+            # self.cookError(...) with the relay's error before returning
+            # False -- that message goes to PDG's own error reporting, which
+            # is not where the owner looks (2026-09-08: "ноль задач, ноль
+            # ошибок", verified in that cook's own log -- no message, no
+            # record, no trace there). Put it where onStopCook's final
+            # _update_status_text will show it, same as every other failure
+            # this scheduler reports on its own Status tab.
+            self._note(
+                "connection to the PDG message-queue server was lost -- the "
+                "cook is stopping. Nothing on the farm failed; this is the "
+                "relay between this Houdini and mqserver on the sync pod. "
+                "Cook again -- this has recovered on retry before.")
             return tickResult.SchedulerCancelCook
 
         self._dispatcher.release_full()

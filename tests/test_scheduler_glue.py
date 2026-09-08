@@ -341,6 +341,24 @@ def test_the_tick_drains_the_retry_list():
     assert "self._retryTerminations()" in tick
 
 
+def test_a_lost_mq_connection_is_said_out_loud_before_the_cook_is_cancelled():
+    """2026-09-08, the owner twice: 'ноль задач, ноль ошибок'. The only
+    branch that can silently cancel a cook is checkPollingClient() ==
+    False -- SimpleMQSchedulerMixin's own implementation reports it through
+    self.cookError(...), which goes to PDG's own error reporting and never
+    reached this scheduler's own Status tab or log in his cook. _note goes
+    through both (_log, and rpfarm_status_text via _update_status_text)."""
+    src = MODULE.read_text()
+    tick = src[src.index("def onTick("):]
+    tick = tick[:tick.index("\n    def ", 1)]
+
+    check = tick.index("if not self.checkPollingClient():")
+    note = tick.index("self._note(", check)
+    cancel = tick.index("return tickResult.SchedulerCancelCook", check)
+
+    assert check < note < cancel, "said before the cook actually stops"
+
+
 # -- the sync-touch the scheduler sends (Task 17, residual A) -----------------
 
 

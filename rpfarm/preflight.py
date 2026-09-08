@@ -354,17 +354,42 @@ def measured_uplink():
 
 
 def header_text(roots, checked, missing=(), mbps=None):
-    """The one line that has to be true before anyone reads the tree."""
+    """The one line that has to be true before anyone reads the tree.
+
+    ``mbps`` is still accepted (every caller still passes it) but no
+    longer used -- see below for why an estimate built from ``picked_bytes``
+    can never be an honest one. Kept rather than ripped out of three call
+    sites for a parameter that costs nothing sitting unused.
+
+    Weighs the SELECTED set as it sits on disk -- what upload would send if
+    none of it were already on the farm. Deliberately NOT "what will
+    actually move": that depends on comparing each file against the farm's
+    own listing (rpfarm.sync.already_on_farm), a live round trip this
+    function has no way to make (it is pure -- no Houdini, no network, see
+    the module docstring) and, at this point in a cook, no way to make
+    cheaply either: the sync pod may not even be up yet, and only the
+    upload transfer itself (out of process, per package) has that
+    connection open.
+
+    So this no longer estimates a duration. It did, once: cook 5157a9b2
+    (2026-09-08) said "63 of 106 files -- 336.5 MB of 360.8 MB (~9 min at
+    5.4 Mbps)" for an item whose real transfer was `files=0 bytes=0
+    seconds=8.2` -- everything was already on the farm, unchanged, and
+    nothing moved. The owner's own answer was the right one: "they were
+    already there, why would they upload again." A number computed from
+    the SELECTED set can never answer "how long will this take" honestly,
+    because it does not know what the farm already has -- so it stops
+    pretending to. The real count is what run_upload_item logs once the
+    farm has actually been asked ("N of M file(s) already on the farm and
+    unchanged -- not sent"), further down the same log.
+    """
     all_leaves = leaves(roots)
     picked = [n for n in all_leaves if normalise(n.path) in {normalise(p) for p in checked}]
     picked_bytes = sum(n.bytes for n in picked)
-    text = "{} of {} files -- {} of {}".format(
+    text = "{} of {} file(s) referenced -- {} of {} (upload skips whatever the farm already has)".format(
         len(picked), len(all_leaves), human_bytes(picked_bytes),
         human_bytes(sum(n.bytes for n in all_leaves)),
     )
-    eta = eta_text(picked_bytes, mbps)
-    if eta:
-        text += "  ({})".format(eta)
     by_source = []
     for source in ("scene", "usd", "env", "output"):
         count = len([n for n in all_leaves if n.source == source])
@@ -394,17 +419,17 @@ def row_detail(row):
 
 
 def ui_unavailable_reason():
-    """None when a modal Qt dialog is safe to open here; else why it is not.
+    """None when there is a Houdini UI to show a dialog in at all; else why not.
 
-    Two conditions, both required, and the artist deserves to know which
-    one refused. ``hou.isUIAvailable()`` is false under hython, so every
-    headless cook skips the window with no special case. The main-thread
-    check is the one that matters inside Houdini: PDG generation is not
-    guaranteed to run on the main thread, and Qt from another thread does
-    not raise politely -- it can take the session down. When that is what
-    happened, the artist has a working alternative (the Preview button is a
-    parameter callback, always on the main thread), so the reason says so
-    instead of the cook going quiet.
+    Only ``hou.isUIAvailable()`` -- false under hython, so every headless
+    cook skips the window with no special case, no bridge and nothing to
+    wait on. Being off the main thread used to refuse here too (PDG
+    generation is not guaranteed to run on it, and Qt from another thread
+    does not raise politely -- it can take the session down), which is
+    exactly why the window never once opened during a normal cook
+    (2026-09-08). It is not a reason to refuse any more: see
+    :func:`confirm_on_main_thread`, which hands the actual dialog-building
+    to the real main thread instead of calling Qt from here.
     """
     try:
         import hou
@@ -415,11 +440,6 @@ def ui_unavailable_reason():
             return "no UI (headless cook)"
     except Exception as exc:
         return "cannot tell whether a UI exists ({})".format(exc)
-    import threading
-
-    if threading.current_thread() is not threading.main_thread():
-        return ("generation is not running on Houdini's main thread -- "
-                "use the Preview Upload... button to choose")
     return None
 
 
@@ -707,6 +727,78 @@ def confirm(roots, missing, checked, title="RunPodFarm", parent=None, mbps=None,
     return dialog.rpfarm_checked()
 
 
+#: How long confirm_on_main_thread waits for the bridged dialog before
+#: giving up and falling back, same as a Cancel would. Generous: it is a
+#: human deciding, not a network call -- the number only has to be shorter
+#: than "the cook looks hung forever".
+_MAIN_THREAD_BRIDGE_TIMEOUT_S = 600
+
+
+def confirm_on_main_thread(roots, missing, checked, timeout_s=_MAIN_THREAD_BRIDGE_TIMEOUT_S, **kwargs):
+    """:func:`confirm`, bridged onto Houdini's main thread if this is not it.
+
+    2026-09-08: the window never opened during a normal cook because PDG
+    generation does not run on the main thread, and Qt from any other
+    thread does not raise politely -- it can take the session down, which
+    is exactly why :func:`ui_unavailable_reason` used to refuse outright
+    instead of trying. It does not have to refuse: ``hou.ui.
+    postEventCallback`` runs a zero-argument callback on the REAL main
+    thread, exactly once, "next in Houdini's event loop" -- confirmed
+    against this Houdini's own compiled ``_hou`` module, not guessed (its
+    sibling ``hou.ui.addEventLoopCallback``, which this project already
+    trusts for the sync-pod watch timer, fires repeatedly instead and would
+    need its own removal bookkeeping for a one-shot dialog). So the dialog
+    is built there instead, and this thread just waits for the result.
+
+    On the main thread already (the Preview Upload... button, a parameter
+    callback), this is exactly :func:`confirm` -- no bridge, no posted
+    callback, no behaviour change for the path that already worked.
+
+    Falls back the same way every other refusal here does -- the remembered
+    selection is used, never a hung cook -- if the callback does not fire
+    within ``timeout_s`` (a main thread that is itself stuck on something
+    else, however unlikely) or raises getting there.
+    """
+    import threading
+
+    if threading.current_thread() is threading.main_thread():
+        return confirm(roots, missing, checked, **kwargs)
+
+    import hou
+
+    outcome = {}
+    done = threading.Event()
+
+    def _run_on_main():
+        if done.is_set():
+            return  # belt and suspenders -- postEventCallback promises "only once"
+        try:
+            outcome["value"] = confirm(roots, missing, checked, **kwargs)
+        except Exception as exc:  # noqa: BLE001 - handed back to the waiting thread
+            outcome["error"] = exc
+        finally:
+            done.set()
+
+    try:
+        hou.ui.postEventCallback(_run_on_main)
+    except Exception as exc:
+        raise RuntimeError(
+            "could not hand the confirmation window to the main thread: {}".format(exc)) from exc
+
+    if not done.wait(timeout_s):
+        # removePostedEventCallback is documented to do nothing if the
+        # callback already ran or was never queued -- no race to guard here.
+        try:
+            hou.ui.removePostedEventCallback(_run_on_main)
+        except Exception:
+            pass
+        raise TimeoutError(
+            "confirmation window did not open on the main thread within {}s".format(timeout_s))
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome.get("value")
+
+
 class UploadCancelled(Exception):
     """The artist pressed Cancel in a confirmation window.
 
@@ -787,7 +879,12 @@ def choose_uploads(node, scan, usd_paths=(), env_paths=(), ask=False, log=None, 
                if not is_excluded(leaf.path, off, on, default_off(leaf))}
 
     if ask:
-        asker = window or confirm
+        # confirm_on_main_thread, not confirm: generation is not guaranteed
+        # to run on Houdini's main thread, and this is the one caller that
+        # cannot assume it does (unlike the Preview Upload... button, a
+        # parameter callback). On the main thread already it IS confirm,
+        # with nothing extra in between.
+        asker = window or confirm_on_main_thread
         try:
             chosen = asker(roots, missing, checked, title="RunPodFarm -- what will upload",
                            mbps=mbps)

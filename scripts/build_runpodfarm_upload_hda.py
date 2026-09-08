@@ -257,7 +257,7 @@ _ASSET_FINGERPRINT = {
     'package_runner.py': (8752, '96770e3879a6cb65'),
     'packages.py': (61657, '030b2d03028b9c47'),
     'pods.py': (30823, 'fc9878f471863111'),
-    'preflight.py': (31237, '41ab9dff0a78fe91'),
+    'preflight.py': (36145, '60e8c9f3766232f6'),
     'runpod_api.py': (14539, 'b90960f9860c97fb'),
     'scene_setup.py': (18467, '8838d55cbb131f99'),
     'smoke.py': (41503, 'd25dfbac9eddb12b'),
@@ -888,14 +888,16 @@ Confirm Before Upload:
     does not fall through to uploading what was there before.
 
     Turn it off for batch/headless work. A cook without a UI never shows a
-    window anyway (`hou.isUIAvailable()`), and a cook whose generation runs
-    off the main thread does not either -- Qt from another thread is not a
-    raised exception, it is a lost session; the log then says which
-    condition refused. With no window, the remembered answer is used and
-    every directory that will upload is logged with its full weight. If the
-    window FAILS to open, the upload proceeds with that same remembered
-    answer and the reason is logged: a confirmation window must never be
-    the reason a farm submission dies.
+    window anyway (`hou.isUIAvailable()`); the log then says so. PDG
+    generation does not run on Houdini's main thread, and Qt from another
+    thread is not a raised exception, it is a lost session -- so the window
+    is actually built there instead (`confirm_on_main_thread`, via
+    `hou.ui.postEventCallback`), and this thread waits for it. With no UI
+    at all, the remembered answer is used and every directory that will
+    upload is logged with its full weight. If the window FAILS to open, or
+    the main thread never gets to it, the upload proceeds with that same
+    remembered answer and the reason is logged: a confirmation window must
+    never be the reason a farm submission dies.
 
 Scan USD Layer Files Too:
     #id: rpfarm_usddeep

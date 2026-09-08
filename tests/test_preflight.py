@@ -49,7 +49,7 @@ def test_header_states_what_is_selected_against_what_was_offered(tmp_path):
 
     text = pf.header_text(roots, checked=[str(b)], missing=["/job/gone.exr"])
 
-    assert text.startswith("1 of 2 files")
+    assert text.startswith("1 of 2 file(s) referenced")
     assert "1.5 KB" in text  # the total offered
     assert "1 reference(s) name nothing on disk" in text
 
@@ -276,6 +276,170 @@ def test_wants_window_says_which_condition_refused(monkeypatch):
     assert pf.wants_window(_FakeNode(), ask=False) is False
 
 
+# ---------------------------------------------------------------------------
+# confirm_on_main_thread (2026-09-08)
+#
+# PDG generation is not guaranteed to run on Houdini's main thread, and the
+# window used to refuse outright the moment it was not -- which is exactly
+# why it never opened once during a normal cook (cook 5157a9b2's own log:
+# "confirmation window not shown: generation is not running on Houdini's
+# main thread"). hou.ui.postEventCallback runs a callback on the real main
+# thread, documented (checked against this Houdini's own compiled _hou
+# module, not guessed) to fire exactly once, "next in Houdini's event
+# loop" -- so the fix bridges through it instead of refusing. These tests
+# fake `hou` well enough to prove the bridging LOGIC -- one call, the right
+# thread, a timeout that falls back -- without touching real Qt.
+# ---------------------------------------------------------------------------
+
+
+class _FakeEventLoop:
+    """Stands in for hou.ui: postEventCallback queues the callback and runs
+    it only when the test tells it to, never automatically -- so a test can
+    prove the bridge waits for that, rather than racing a real thread
+    against it."""
+
+    def __init__(self):
+        self.registered = []
+        self.removed = []
+
+    def postEventCallback(self, callback):
+        self.registered.append(callback)
+
+    def removePostedEventCallback(self, callback):
+        # Real hou.ui.removePostedEventCallback: "does nothing if the
+        # callback is not present" -- never raises, unlike
+        # removeEventLoopCallback's sibling.
+        if callback in self.registered:
+            self.registered.remove(callback)
+            self.removed.append(callback)
+
+    def fire(self):
+        """Simulate the main event loop reaching the callback."""
+        for cb in list(self.registered):
+            cb()
+
+
+class _FakeHou:
+    def __init__(self, loop):
+        self.ui = loop
+
+
+def test_confirm_on_main_thread_is_plain_confirm_on_the_main_thread(monkeypatch):
+    """No bridge, no hou import, no behaviour change for the path that
+    already worked (the Preview Upload... button, a parameter callback)."""
+    calls = []
+    monkeypatch.setattr(pf, "confirm", lambda *a, **k: calls.append((a, k)) or "answer")
+
+    got = pf.confirm_on_main_thread(["roots"], [], {"a"}, title="t")
+
+    assert got == "answer" and len(calls) == 1
+
+
+def test_confirm_on_main_thread_bridges_from_a_background_thread(monkeypatch):
+    import threading
+
+    loop = _FakeEventLoop()
+    monkeypatch.setattr(pf, "confirm", lambda *a, **k: "the artist's answer")
+    import sys
+    monkeypatch.setitem(sys.modules, "hou", _FakeHou(loop))
+
+    result = {}
+
+    def _worker():
+        result["value"] = pf.confirm_on_main_thread(["roots"], [], {"a"}, timeout_s=5)
+
+    t = threading.Thread(target=_worker)
+    t.start()
+    # Give the worker a moment to register, then simulate the main loop --
+    # exactly what a real event loop iteration does, just not automatic.
+    import time
+    for _ in range(200):
+        if loop.registered:
+            break
+        time.sleep(0.01)
+    assert loop.registered, "the callback must be registered before this thread can answer it"
+    loop.fire()
+    t.join(timeout=5)
+
+    assert result.get("value") == "the artist's answer"
+    # No removal call on the success path: postEventCallback already
+    # promises "only once", so there is nothing to undo once it has fired.
+    assert loop.removed == []
+
+
+def test_confirm_on_main_thread_never_asks_twice(monkeypatch):
+    """postEventCallback is documented to fire exactly once, but the
+    done.is_set() guard is kept as belt and suspenders -- if it is ever
+    called again anyway (a fake loop, a future Houdini quirk), a second
+    dialog must still not open."""
+    import threading
+
+    loop = _FakeEventLoop()
+    calls = []
+    monkeypatch.setattr(pf, "confirm", lambda *a, **k: calls.append(1) or "answer")
+    import sys
+    monkeypatch.setitem(sys.modules, "hou", _FakeHou(loop))
+
+    result = {}
+
+    def _worker():
+        result["value"] = pf.confirm_on_main_thread(["roots"], [], {"a"}, timeout_s=5)
+
+    t = threading.Thread(target=_worker)
+    t.start()
+    import time
+    for _ in range(200):
+        if loop.registered:
+            break
+        time.sleep(0.01)
+    cb = loop.registered[0]
+    cb()
+    cb()  # a second, stale call to the SAME callback object
+    t.join(timeout=5)
+
+    assert len(calls) == 1, "confirm must run exactly once no matter how many times the loop fires"
+
+
+def test_confirm_on_main_thread_times_out_and_never_hangs_the_cook(monkeypatch):
+    """A main thread that never gets to the callback (however unlikely)
+    must not be a cook that waits forever -- same principle as every other
+    refusal here: fall back, do not stall."""
+    import threading
+
+    loop = _FakeEventLoop()  # fire() never called
+    monkeypatch.setattr(pf, "confirm", lambda *a, **k: pytest.fail("must not run"))
+    import sys
+    monkeypatch.setitem(sys.modules, "hou", _FakeHou(loop))
+
+    result = {}
+
+    def _worker():
+        try:
+            pf.confirm_on_main_thread(["roots"], [], {"a"}, timeout_s=0.05)
+        except TimeoutError as e:
+            result["error"] = e
+
+    t = threading.Thread(target=_worker)
+    t.start()
+    t.join(timeout=5)
+
+    assert isinstance(result.get("error"), TimeoutError)
+
+
+def test_choose_uploads_asks_through_the_bridge_by_default(tmp_path, monkeypatch):
+    """The exact defect: choose_uploads must reach for the thread-safe
+    asker on its own, not just when a caller happens to pass window=."""
+    hip, tex, _usd, _work = _files(tmp_path)
+    calls = []
+    monkeypatch.setattr(pf, "confirm_on_main_thread",
+                        lambda *a, **k: calls.append(1) or {hip, tex})
+
+    got = pf.choose_uploads(_FakeNode(), _scan([hip, tex]), ask=True, log=lambda m: None)
+
+    assert calls, "choose_uploads did not use confirm_on_main_thread"
+    assert set(got) == {hip, tex}
+
+
 # -- the tree the window shows ---------------------------------------------------
 #
 # The owner's requirement, verbatim: "должно быть дерево с возможностью
@@ -448,7 +612,13 @@ def test_no_measurement_means_no_guess():
     assert pf.eta_text(1000, "not a number") == ""
 
 
-def test_the_header_carries_the_estimate(tmp_path):
+def test_the_header_never_estimates_a_duration_any_more(tmp_path):
+    """Cook 5157a9b2 (2026-09-08): the header said '~9 min at 5.4 Mbps' for
+    an item whose real transfer was files=0 bytes=0 seconds=8.2 -- every
+    one of those "selected" files was already on the farm, unchanged, and
+    nothing moved. header_text has no way to know that (it never talks to
+    the farm), so it must never again turn picked_bytes into a promised
+    duration -- with or without a measured uplink."""
     big = tmp_path / "big.exr"
     big.write_bytes(b"x" * 5_000_000)
     rows, _ = deps.plan_refs([str(big)], source="scene")
@@ -456,5 +626,5 @@ def test_the_header_carries_the_estimate(tmp_path):
 
     text = pf.header_text(roots, checked=[str(big)], mbps=4.7)
 
-    assert "4.7 Mbps" in text and "min" in text
-    assert "Mbps" not in pf.header_text(roots, checked=[str(big)])
+    assert "Mbps" not in text and "min" not in text
+    assert "upload skips whatever the farm already has" in text
