@@ -2498,6 +2498,37 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         """
         import hou
 
+        # Before ANYTHING else, including _reset_cook_state: the module-scope
+        # guard only answers "is the code stale" once, when this HDA was last
+        # (re)imported into this Houdini session -- reinstalling the asset
+        # under an open Houdini re-runs that import, and a mismatch makes it
+        # raise ImportError before reaching `rpdispatch = ...` (or CookError's
+        # own import, both below the raise). PDG's type registry still holds
+        # the class from the LAST successful import, though, and calling any
+        # of its methods now runs them against that same, now half-emptied,
+        # module namespace. 2026-09-08: the owner got a raw
+        # `NameError: name 'rpdispatch' is not defined` out of
+        # _reset_cook_state instead of the instruction to restart Houdini --
+        # the guard existed, it just only ever asked the question once, here.
+        #
+        # So this asks again, on every cook, before touching anything that
+        # might itself be one of the casualties. That is also why this raises
+        # ImportError and not CookError: CookError is imported below the
+        # module-scope raise too, so on the exact path this exists to catch,
+        # it may not exist to raise. ImportError is a builtin -- it is always
+        # there, and it is the same exception type the module-scope guard
+        # itself raises, so the artist sees the same message either way.
+        _stale = _stale_module_message(
+            _MIN_RPFARM_VERSION,
+            getattr(_rpfarm_pkg, "VERSION", None),
+            _ASSET_BUILT_AGAINST_VERSION,
+            _RPFARM_ROOT,
+            _asset_mismatch(_rpfarm_pkg, _ASSET_FINGERPRINT),
+            bool(_ASSET_FINGERPRINT),
+        )
+        if _stale:
+            raise ImportError(_stale)
+
         self._reset_cook_state()
 
         self._verbose = max(
@@ -2668,26 +2699,40 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
             balance, threshold))
 
     def _manageSyncPod(self):
-        """Stop the sync pod when idle, delete it once it has been stopped a while.
+        """Delete a long-stopped sync pod; never STOP one from here.
 
-        The owner's policy, and Houdini is the only thing that can carry it
-        out: the pod holds no RunPod key and cannot retire itself. Which is
-        also this design's honest limit -- a closed or crashed Houdini leaves
-        the pod exactly as it was. That is why the same check runs on a timer
-        while Houdini is open (see startSyncPodWatch) and not only here, and
-        why Farm Status names the pod and its cost rather than leaving it to be
-        discovered in RunPod's panel.
+        Called from onStartCook, which means one thing is already certain:
+        onSetupCook, moments later in this same cook, is about to call
+        ensure_sync_pod and need this pod. Stopping a RUNNING pod here was
+        measured doing exactly that to itself (2026-09-08) -- "unused for 52
+        min -- stopping it" followed, seconds later, by "was EXITED; started
+        it again", on the SAME pod, in the SAME cook's own log. The idle
+        clock was correct (the owner really had not cooked in 52 minutes),
+        but evicting it right before use only manufactures an extra
+        stop/resume cycle -- exactly the operation whose reliability is in
+        question -- and buys nothing, since this cook needs the pod running
+        either way. Passing 0 for stop_after_s disables that half of
+        sync_pod_action for a RUNNING pod, and leaves it untouched.
 
-        Shared with the timer through rpfarm.pods.sync_pod_action so both
+        The delete half stays: a pod already STOPPED (not about to be
+        resumed by this call, since ensure_sync_pod resumes-or-creates on
+        its own) past `rpfarm_syncdelete` is still reclaimed here, same as
+        always -- deleting it first only means ensure_sync_pod creates a
+        fresh one instead of resuming a stale one, not a second pod.
+
+        Real idle-stop enforcement lives in the periodic timer instead (see
+        startSyncPodWatch, running independently of any cook since the scene
+        loaded) -- the only place actually safe to declare the pod unwanted,
+        because nothing there is about to need it in the next few seconds.
+        Shared with that timer through rpfarm.pods.sync_pod_action so both
         decide identically.
         """
-        stop_after = max(0, self["rpfarm_syncidle"].evaluateInt()) * 60
         delete_after = max(0, self["rpfarm_syncdelete"].evaluateInt()) * 60
-        if not stop_after and not delete_after:
+        if not delete_after:
             return
         try:
             _sync_pod_step(self._api, self._cfg, self._token,
-                           stop_after, delete_after, self._log)
+                           0, delete_after, self._log)
         except RunPodError as e:
             self._verboseLog("sync pod housekeeping failed: {}".format(e))
 

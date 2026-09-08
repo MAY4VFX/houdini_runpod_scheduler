@@ -1028,6 +1028,91 @@ def test_another_users_sync_pod_is_never_touched():
     assert api.stopped == ["mine"]
 
 
+class _ManageSyncPodScheduler:
+    """Just enough of the scheduler for the lifted _manageSyncPod."""
+
+    def __init__(self, parms, api, cfg, token="tok"):
+        self._parms = parms
+        self._api = api
+        self._cfg = cfg
+        self._token = token
+        self.logs = []
+
+    def __getitem__(self, name):
+        return types.SimpleNamespace(evaluateInt=lambda: int(self._parms[name]))
+
+    def _log(self, msg):
+        self.logs.append(msg)
+
+    def _verboseLog(self, msg):
+        self.logs.append(msg)
+
+
+def _manage_ns(now, stamp="0"):
+    return load_methods(
+        ["_manageSyncPod", "_sync_pod_step", "_seconds_since"],
+        extra_globals={
+            "time": types.SimpleNamespace(time=lambda: now),
+            "rppods": __import__("rpfarm.pods", fromlist=["pods"]),
+            "RunPodError": RunPodError,
+            "WorkerClient": lambda pid, tok: types.SimpleNamespace(
+                read_file=lambda path: stamp),
+            "_SYNC_LAST_USED": "/workspace/.rpfarm/sync_last_used",
+        },
+    )
+
+
+def test_a_cook_starting_never_stops_the_pod_it_is_about_to_need():
+    """2026-09-08, verbatim: 'sync pod ... unused for 52 min -- stopping it'
+    immediately followed by 'was EXITED; started it again' for the SAME pod,
+    seconds apart, in the SAME cook's own log. The idle clock was right (the
+    owner really had not cooked in 52 minutes) -- but onStartCook stopping
+    the pod its own onSetupCook is about to resume manufactures exactly the
+    stop/resume cycle whose reliability is in question, for nothing."""
+    api = _SyncAPI([{"id": "s1", "name": "rpfarm-sync-u", "desiredStatus": "RUNNING"}])
+    cfg = types.SimpleNamespace(user="u")
+    sched = _ManageSyncPodScheduler(
+        {"rpfarm_syncidle": 15, "rpfarm_syncdelete": 120}, api, cfg)
+    ns = _manage_ns(now=52 * 60.0, stamp="0")  # last used 52 minutes ago
+    sched._manageSyncPod = lambda: ns["_manageSyncPod"](sched)
+
+    sched._manageSyncPod()
+
+    assert api.stopped == [], "onStartCook must never stop the pod it is about to use"
+    assert api.terminated == []
+
+
+def test_a_cook_starting_still_reclaims_a_long_stopped_pod():
+    """The delete half is unaffected: a pod already stopped past
+    rpfarm_syncdelete is still not something this cook is about to resume as
+    it stands -- ensure_sync_pod creates a fresh one either way, so deleting
+    the stale one first is still correct, not a second self-eviction."""
+    api = _SyncAPI([{"id": "s1", "name": "rpfarm-sync-u", "desiredStatus": "EXITED",
+                     "lastStatusChange": "2020-01-01T00:00:00Z"}])
+    cfg = types.SimpleNamespace(user="u")
+    sched = _ManageSyncPodScheduler(
+        {"rpfarm_syncidle": 15, "rpfarm_syncdelete": 120}, api, cfg)
+    ns = _manage_ns(now=0.0)
+    sched._manageSyncPod = lambda: ns["_manageSyncPod"](sched)
+
+    sched._manageSyncPod()
+
+    assert api.terminated == ["s1"]
+    assert api.stopped == []
+
+
+def test_manage_sync_pod_does_nothing_when_delete_is_disabled():
+    api = _SyncAPI([{"id": "s1", "name": "rpfarm-sync-u", "desiredStatus": "RUNNING"}])
+    cfg = types.SimpleNamespace(user="u")
+    sched = _ManageSyncPodScheduler({"rpfarm_syncidle": 15, "rpfarm_syncdelete": 0}, api, cfg)
+    ns = _manage_ns(now=52 * 60.0, stamp="0")
+    sched._manageSyncPod = lambda: ns["_manageSyncPod"](sched)
+
+    sched._manageSyncPod()
+
+    assert api.stopped == [] and api.terminated == []
+
+
 def test_the_watch_runs_between_cooks_not_only_at_cook_start():
     """The check used to live only in onSetupCook, which is why a pod once sat
     for hours: finish a cook, start no other, and nothing looked again."""
@@ -1164,6 +1249,28 @@ def test_the_scheduler_checks_before_it_rents_anything():
 
     assert guard < first_pod, "the check must come before a machine is rented"
     assert "raise CookError(_stale)" in src[setup:first_pod]
+
+
+def test_start_cook_checks_before_touching_anything_the_guard_might_break():
+    """2026-09-08: the owner's Houdini had a stale rpfarm loaded and the
+    module-scope guard raised ImportError as designed -- but that only
+    happens once, on (re)import, and PDG kept running the scheduler class
+    from the LAST successful import against that now half-populated module
+    namespace. He got a raw `NameError: name 'rpdispatch' is not defined`
+    out of _reset_cook_state, not the restart instruction. This check has to
+    run first in onStartCook, before _reset_cook_state or anything else that
+    could itself be a casualty of the same stale import -- CookError
+    included, since it is imported below the module-scope raise too."""
+    src = MODULE.read_text()
+    start = src.index("def onStartCook(self, static, cook_set):")
+    setup = src.index("def onSetupCook(self):")
+    guard = src.index("_stale_module_message(", start)
+    reset = src.index("self._reset_cook_state()", start)
+
+    assert start < guard < reset < setup, "checked before _reset_cook_state, not after"
+    assert "raise ImportError(_stale)" in src[start:reset], (
+        "not CookError -- that import is itself below the module-scope guard's "
+        "own raise, so on the exact path this exists to catch it may not exist")
 
 
 # ---------------------------------------------------------------------------
