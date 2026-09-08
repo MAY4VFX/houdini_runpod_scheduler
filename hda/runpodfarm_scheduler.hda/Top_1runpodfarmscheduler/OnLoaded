@@ -1,0 +1,16 @@
+# The same watch OnCreated starts, for the case that actually happens.
+#
+# OnCreated fires when a node is MADE. An artist's normal day is "open
+# yesterday's scene", where the node already exists and that handler never
+# runs -- so the sync-pod watch was never started at all, and a pod sat
+# billing for 84 minutes past its own 15-minute threshold with Houdini open
+# in front of it (2026-09-08). OnLoaded is the other half: it fires when a
+# node arrives from a .hip.
+#
+# Safe to call from both, and from every farm node in the scene: the
+# function is a no-op after the first call in a session, and a no-op where
+# there is no UI event loop to hang a timer on (hython, a render pod).
+try:
+    kwargs["node"].hdaModule().startSyncPodWatch(kwargs)
+except Exception:
+    pass

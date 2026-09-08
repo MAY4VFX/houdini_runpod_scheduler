@@ -104,6 +104,48 @@ def pod_env(cfg, role, token, slots, pubkey, extra=None, cook="", project=""):
 COOK_ALIVE_GRACE_S = 180.0
 
 
+def idle_pods(api, user, threshold_s, now=None):
+    """This user's running pods that have been up longer than the threshold
+    with no cook driving them, as ``[(pod, minutes_up)]``.
+
+    Asked of the ACCOUNT, not of a Houdini session: the scheduler's timer is
+    the only thing that retires a pod, it runs only while Houdini is open,
+    and on 2026-09-08 it turned out not to be running at all -- the pod had
+    then been idle 84 minutes against a 15-minute threshold with nobody the
+    wiser. A check that needs the broken thing to be working cannot catch
+    the broken thing.
+
+    "Idle" is ``classify_for_kill`` saying "safe" -- the same judgement the
+    kill path uses -- so a pod in a live cook, or somebody else's, is never
+    reported however long it has been up.
+    """
+    now = now if now is not None else time.time()
+    out = []
+    for pod in api.list_pods():
+        if pod.get("desiredStatus") != "RUNNING" or pod_owner(pod) != user:
+            continue
+        verdict, _reason = classify_for_kill(pod, user)
+        if verdict != "safe":
+            continue   # busy, foreign or unknown: never called idle
+        started = _seconds_since_start(pod, now)
+        if started is not None and started > threshold_s:
+            out.append((pod, started / 60.0))
+    return out
+
+
+def _seconds_since_start(pod, now):
+    stamp = pod.get("lastStatusChange") or pod.get("createdAt")
+    if not stamp:
+        return None
+    try:
+        import datetime
+
+        when = datetime.datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
+        return (datetime.datetime.now(datetime.timezone.utc) - when).total_seconds()
+    except Exception:
+        return None
+
+
 def pod_owner(pod):
     """The user a pod belongs to: its env first, its name second.
 

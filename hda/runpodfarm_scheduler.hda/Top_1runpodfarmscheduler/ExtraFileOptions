@@ -15,6 +15,22 @@
 		"type": "string",
 		"value": ""
 	},
+	"OnLoaded/IsExpr": {
+		"type": "bool",
+		"value": false
+	},
+	"OnLoaded/IsPython": {
+		"type": "bool",
+		"value": true
+	},
+	"OnLoaded/IsScript": {
+		"type": "bool",
+		"value": true
+	},
+	"OnLoaded/Source": {
+		"type": "string",
+		"value": ""
+	},
 	"PreFirstCreate/Cursor": {
 		"type": "intarray",
 		"value": [

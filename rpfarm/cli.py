@@ -665,6 +665,26 @@ def cmd_doctor(args):
         except OSError as e:
             fail(f"{cfg.sesinetd_host}:{cfg.sesinetd_port} unreachable ({e}) -- check network/VPN")
 
+    # A machine nobody is watching (Ruling R58). The scheduler's own timer
+    # only runs while Houdini is open, and it took until 2026-09-08 to notice
+    # it was not running at all -- so doctor asks the account directly, where
+    # no Houdini has to be alive for the question to get an answer.
+    try:
+        idle = rppods.idle_pods(api, cfg.user, cfg.sync_idle_min * 60)
+    except (RunPodError, OSError):
+        idle = None
+    if idle is None:
+        warn("idle machines: could not ask RunPod")
+    elif idle:
+        fail("{} pod(s) running with nothing to do for longer than the {} min "
+             "threshold: {} -- `rpfarm farm kill --all`, or open Houdini and "
+             "let the scheduler retire them".format(
+                 len(idle), cfg.sync_idle_min,
+                 ", ".join("{} ({:.0f} min)".format(p["name"], mins)
+                           for p, mins in idle)))
+    else:
+        ok("no pod has been idle past the {} min threshold".format(cfg.sync_idle_min))
+
     try:
         proc = subprocess.run([cfg.rclone_path, "--version"], capture_output=True, text=True, timeout=10)
         if proc.returncode == 0:

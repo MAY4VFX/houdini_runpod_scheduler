@@ -16,6 +16,7 @@ These tests read only tracked files -- no Houdini, no hython, no network.
 """
 
 import ast
+import json
 import pathlib
 
 import pytest
@@ -773,3 +774,40 @@ def test_the_rebuild_script_rebuilds_every_generated_asset():
 
     expected = {asset[: -len(".hda")]: builder for builder, asset in BUILDERS.items()}
     assert module.GENERATED == expected
+
+
+# -- the watch has to start on LOAD, not only on create (Ruling R58) ---------
+
+
+def test_the_scheduler_starts_its_watch_when_a_scene_is_LOADED():
+    """OnCreated fires when a node is made. An artist's normal day is
+    "open yesterday's scene", where the node already exists -- so the
+    sync-pod watch never started at all and a pod billed for 84 minutes
+    past its own 15-minute threshold with Houdini open (2026-09-08).
+
+    Same coverage gap as the constructor bug: we test creation and never
+    loading."""
+    node_dir = REPO / "hda" / "runpodfarm_scheduler.hda" / "Top_1runpodfarmscheduler"
+    on_loaded = node_dir / "OnLoaded"
+    assert on_loaded.is_file(), "the asset has no OnLoaded, so a loaded scene starts no watch"
+    source = on_loaded.read_text()
+    ast.parse(source)
+    assert "startSyncPodWatch" in source
+
+    # Houdini only runs a section as Python if it is told to.
+    options = json.loads((node_dir / "ExtraFileOptions").read_text())
+    assert options["OnLoaded/IsPython"]["value"] is True
+    assert options["OnLoaded/IsScript"]["value"] is True
+    assert "OnLoaded\tOnLoaded" in (node_dir / "Sections.list").read_text()
+
+
+def test_both_entry_points_call_the_same_idempotent_starter():
+    """Two handlers, one timer: several farm nodes in a scene, or a reopen,
+    must not stack watches. The guard lives in startSyncPodWatch itself."""
+    node_dir = REPO / "hda" / "runpodfarm_scheduler.hda" / "Top_1runpodfarmscheduler"
+    for section in ("OnCreated", "OnLoaded"):
+        assert "startSyncPodWatch" in (node_dir / section).read_text()
+    module = (node_dir / "PythonModule").read_text()
+    starter = module[module.index("def startSyncPodWatch"):]
+    assert "_sync_watch_started" in starter[:800], "the once-per-session guard is gone"
+    assert "isUIAvailable" in starter[:1200], "it must stay a no-op without a UI"
