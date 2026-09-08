@@ -51,8 +51,11 @@ import time
 import uuid
 
 # The rpfarm package is not installed into Houdini's Python: it is found via
-# $RPFARM_ROOT (a checkout, used by tests and CI) or ~/.rpfarm/src (a symlink
-# to a checkout, created by `rpfarm setup`).
+# $RPFARM_ROOT (a developer's own checkout, set explicitly -- used by tests,
+# CI, and iteration) or ~/.rpfarm/src, a symlink `rpfarm setup` points at the
+# STABLE, COPIED package it installs (houdini_local.install_package_copy) --
+# not a live checkout, since 2026-09-08 (a mid-edit checkout, read straight
+# off disk by a running Houdini, is what this guard exists to catch).
 _RPFARM_ROOT = pathlib.Path(
     os.environ.get("RPFARM_ROOT", pathlib.Path.home() / ".rpfarm" / "src")
 )
@@ -199,13 +202,13 @@ _ASSET_BUILT_AGAINST_VERSION = '2.3.0'
 _ASSET_FINGERPRINT = {
     '__init__.py': (2490, 'c1250306daf5961f'),
     '__main__.py': (52, '13a1a5b340cdcfc1'),
-    'cli.py': (67230, 'bc24c50277fb8b37'),
+    'cli.py': (68921, '6c9ff6b09d34cd34'),
     'compression.py': (23234, 'bef2f19daebbc929'),
     'config.py': (14143, 'b402742b258541b7'),
     'deps.py': (38558, '2daae12f5770289a'),
     'dispatch.py': (22191, '1121a6505c88adb3'),
     'gpus.py': (8311, '7a28d5c2692b776e'),
-    'houdini_local.py': (37593, 'cb53054d104a9200'),
+    'houdini_local.py': (43280, 'f450988ebfe050fb'),
     'ledger.py': (17327, '70425e75fb216f01'),
     'package_runner.py': (8752, '96770e3879a6cb65'),
     'packages.py': (61657, '030b2d03028b9c47'),
@@ -1232,6 +1235,45 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         # never listed twice regardless of which of the paths above sees it
         # first.
         self._known_failure_ids = set()
+        # See _acquireCookLock: held for this cook's whole duration so
+        # `rpfarm setup` can tell one is running and refuse to swap the
+        # package underneath it.
+        self._cook_lock_fh = None
+
+    def _acquireCookLock(self):
+        """Hold an OS-level lock for this cook's duration.
+
+        `rpfarm setup` probes the same file (non-blocking) before it swaps
+        the installed rpfarm package -- see houdini_local.cook_is_running.
+        An flock releases itself the moment this process exits or dies, so
+        there is no stale-lock cleanup to get wrong, unlike a plain marker
+        file. Best-effort in both directions: failing to acquire it (or the
+        platform having neither fcntl nor msvcrt) must never fail a cook --
+        it only means the installer's safety net has one less signal.
+        """
+        try:
+            path = rpcfg.home() / "locks" / "cook.lock"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fh = open(path, "a+")
+            rppods._try_acquire(fh)
+            self._cook_lock_fh = fh
+        except Exception as e:
+            self._verboseLog("could not acquire the cook lock: {}".format(e))
+            self._cook_lock_fh = None
+
+    def _releaseCookLock(self):
+        fh = self._cook_lock_fh
+        if fh is None:
+            return
+        try:
+            rppods._release(fh)
+        except Exception:
+            pass
+        try:
+            fh.close()
+        except Exception:
+            pass
+        self._cook_lock_fh = None
 
     @classmethod
     def templateName(cls):
@@ -2530,6 +2572,7 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
             raise ImportError(_stale)
 
         self._reset_cook_state()
+        self._acquireCookLock()
 
         self._verbose = max(
             self["rpfarm_verbose"].evaluateInt(),
@@ -3549,6 +3592,10 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         self.stopPollingClient()
         self._clearPathMap()
         self._update_status_text(force=True)
+        # Before _reset_cook_state, which would drop the file handle to
+        # None without ever closing/unlocking it -- a leaked lock is a
+        # cook lock stuck "held" for the rest of this Houdini's life.
+        self._releaseCookLock()
         self._reset_cook_state()
         return True
 

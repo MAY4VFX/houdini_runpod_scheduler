@@ -31,6 +31,7 @@ import re
 import shutil
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -230,6 +231,130 @@ def repo_root() -> Path:
 
 def hda_source_dir(name: str, root: Path | None = None) -> Path:
     return (root or repo_root()) / "hda" / f"{name}.hda"
+
+
+# ---------------------------------------------------------------------------
+# The stable package copy (2026-09-08)
+#
+# An artist's Houdini used to read rpfarm/*.py straight out of a live git
+# checkout (RPFARM_ROOT/~/.rpfarm/src pointed at repo_root()) -- fine while
+# one person edits and tests sequentially, not while an agent is mid-edit on
+# the same files a running session imports live. A guard reinstall mid-edit
+# cost the owner three blocked dialogs in one session (2026-09-08) and,
+# separately, cost a rendered frame when a rebuild landed mid-cook.
+#
+# The fix mirrors how the .hda assets already work: a STABLE, COPIED
+# location (~/.rpfarm/pkg) an artist's Houdini points at by default, kept
+# apart from whatever a developer's checkout is doing. Updating it is then
+# a conscious act (`rpfarm setup`, or a future dedicated "publish" step) --
+# not a side effect of every asset rebuild during ordinary iteration.
+# ---------------------------------------------------------------------------
+
+
+def stable_package_root(home: Path) -> Path:
+    """Where the artist-facing copy of ``rpfarm/`` lives -- the value
+    ``RPFARM_ROOT``/the ``~/.rpfarm/src`` symlink point at by default.
+    Its own ``rpfarm/`` subdirectory is what actually gets imported, same
+    shape as a checkout (``repo_root()`` also directly contains ``rpfarm/``).
+    """
+    return home / "pkg"
+
+
+def install_package_copy(home: Path, root: Path | None = None, log=None) -> Path:
+    """Copy this checkout's ``rpfarm/`` package into :func:`stable_package_root`.
+
+    Atomic from the reader's side: staged in a sibling temp directory under
+    the same parent (so the swap-in rename is on one filesystem), then
+    swapped into place with plain renames -- the old copy is renamed out of
+    the way first, the new one renamed in, and only THEN deleted. A Houdini
+    process that imports mid-swap sees either the complete old copy or the
+    complete new one, never a partially written directory; that is the
+    entire point (the incident this fixes was exactly a half-updated
+    package caught live).
+
+    Rolls back (puts the old copy back) rather than leave the artist with
+    no package at all if the final rename fails.
+    """
+    say = log if log is not None else (lambda _m: None)
+    root = root or repo_root()
+    stable_root = stable_package_root(home)
+    stable_root.mkdir(parents=True, exist_ok=True)
+    dest = stable_root / "rpfarm"
+
+    tag = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    staging = stable_root / f".rpfarm.new-{tag}"
+    if staging.exists():
+        shutil.rmtree(staging)
+    shutil.copytree(root / "rpfarm", staging)
+
+    old = None
+    if dest.exists() or dest.is_symlink():
+        old = stable_root / f".rpfarm.old-{tag}"
+        os.replace(dest, old)
+    try:
+        os.replace(staging, dest)
+    except OSError:
+        if old is not None:
+            os.replace(old, dest)  # put it back -- never leave dest missing
+        raise
+    if old is not None:
+        shutil.rmtree(old, ignore_errors=True)
+
+    say(f"installed rpfarm package -> {dest}")
+    return stable_root
+
+
+#: Same path convention the scheduler's PythonModule holds an OS-level lock
+#: on for a cook's whole duration (see its _acquireCookLock/_releaseCookLock) --
+#: duplicated here rather than imported, since this setup-side module has no
+#: other reason to depend on the runtime scheduler code, and the path itself
+#: is the only thing the two sides need to agree on.
+def cook_lock_path(home: Path) -> Path:
+    return home / "locks" / "cook.lock"
+
+
+def cook_is_running(home: Path) -> bool:
+    """Best-effort: is some Houdini on this machine mid-cook right now?
+
+    A non-blocking probe of the scheduler's own cook lock -- held from
+    onStartCook to onStopCook, an OS-level flock that releases itself if
+    that Houdini crashes, so there is no staleness to reason about the way
+    a plain marker file would have. 2026-09-08: a package swap landing
+    mid-cook is exactly what made a live session's onTick fall over on a
+    NameError, and cost a rendered frame -- this is the installer's side of
+    not doing that again.
+
+    "Unknown" answers False (no cook detected) rather than True: the lock
+    file cannot be opened, or this platform has neither ``fcntl`` nor
+    ``msvcrt``. Refusing to install over a cook only helps when a cook is
+    actually known to be running; guessing wrong the other way would block
+    every install, forever, on a machine where the probe itself is broken.
+    """
+    path = cook_lock_path(home)
+    if not path.exists():
+        return False
+    try:
+        fh = open(path, "a+")
+    except OSError:
+        return False
+    try:
+        try:
+            if platform.system() == "Windows":
+                import msvcrt
+
+                fh.seek(0)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            return True  # someone else holds it -- a cook is running
+        return False
+    finally:
+        fh.close()
 
 
 def collapse_hda(hotl_bin: Path, source_dir: Path, dest_file: Path, runner=subprocess.run) -> None:
@@ -615,30 +740,37 @@ def _existing_rpfarm_root(text: str) -> str | None:
     return None
 
 
-def write_rpfarm_root_env(install: HoudiniInstall, root: Path | None = None, log=None) -> Path:
+def write_rpfarm_root_env(install: HoudiniInstall, root: Path | None = None,
+                          home: Path | None = None, log=None) -> Path:
     """Write/replace the ``RPFARM_ROOT`` line in ``<prefs>/houdini.env`` so
     HDAs (and out-of-process ``rpfarm.package_runner`` calls they spawn,
-    via the job environment) can find this checkout without depending on
-    the ``~/.rpfarm/src`` symlink alone.
+    via the job environment) can find rpfarm without depending on the
+    ``~/.rpfarm/src`` symlink alone.
 
     Idempotent: a previous ``rpfarm setup``'s marker+line pair is replaced
     in place rather than appended again.
 
-    ``root=None`` -- what every caller in this repo passes, wanting "point
-    at THIS checkout" -- no longer overwrites a DIFFERENT value the file
-    already has. 2026-09-08: an artist's session was pointed at a stable
-    installed copy of the package on purpose (not this checkout), and a
-    `rebuild_assets.py` run for an unrelated fix silently switched him back,
-    because this always rewrote the line to `repo_root()` regardless of
-    what -- or who -- put something else there. An explicit ``root=`` is a
-    deliberate instruction (a developer choosing a specific checkout, or a
-    future installer choosing its own stable copy) and always wins, exactly
+    ``root=None`` -- the default -- now points at :func:`stable_package_root`
+    (``~/.rpfarm/pkg``), NOT this checkout. Pointing an artist's session at
+    a live git checkout was the root cause of 2026-09-08's incidents: an
+    agent's mid-edit files, imported straight off disk, blocked his cook
+    with a stale-code guard three times in one session. ``rpfarm setup`` is
+    expected to have already run :func:`install_package_copy` so that
+    location actually has something in it.
+
+    On top of that, this no longer overwrites a DIFFERENT value the file
+    already has, whatever the default is: an artist's `houdini.env` pointed
+    somewhere else on purpose is left alone, because the SAME incident also
+    happened the other way -- a `rebuild_assets.py` run for an unrelated
+    fix silently switched a deliberately-set value back to this function's
+    own default, mid-session. An explicit ``root=`` (a developer choosing a
+    specific checkout) is a deliberate instruction and always wins, exactly
     as before; it is only the *default* that now defers to an existing,
     different, presumably intentional value instead of clobbering it.
     """
     say = log if log is not None else (lambda _m: None)
     explicit_root = root is not None
-    root = root or repo_root()
+    root = root or stable_package_root(home or (Path.home() / ".rpfarm"))
     env_file = install.user_pref_dir / "houdini.env"
     line = f'RPFARM_ROOT = "{root}"'
 

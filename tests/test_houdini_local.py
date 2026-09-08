@@ -4,6 +4,7 @@ import subprocess
 
 import pytest
 
+from rpfarm import cli
 from rpfarm import houdini_local as hl
 
 
@@ -145,15 +146,18 @@ def test_an_explicit_root_still_always_wins(tmp_path):
 
 def test_the_default_root_is_written_when_nothing_is_configured_yet(tmp_path):
     """First-time setup, or a file that never had the line: no existing
-    value to defer to, so the default (this checkout) is written."""
+    value to defer to, so the default -- the stable package copy, NOT this
+    checkout (2026-09-08) -- is written."""
     prefs = tmp_path / "prefs"
+    home = tmp_path / "home" / ".rpfarm"
     inst = hl.HoudiniInstall.__new__(hl.HoudiniInstall)
     inst.user_pref_dir = prefs
 
-    hl.write_rpfarm_root_env(inst)
+    hl.write_rpfarm_root_env(inst, home=home)
 
     text = (prefs / "houdini.env").read_text()
-    assert str(hl.repo_root()) in text
+    assert str(hl.stable_package_root(home)) in text
+    assert str(hl.repo_root()) not in text
 
 
 def test_a_hand_written_line_without_the_marker_is_still_recognised(tmp_path):
@@ -167,11 +171,198 @@ def test_a_hand_written_line_without_the_marker_is_still_recognised(tmp_path):
     inst = hl.HoudiniInstall.__new__(hl.HoudiniInstall)
     inst.user_pref_dir = prefs
 
-    hl.write_rpfarm_root_env(inst)
+    hl.write_rpfarm_root_env(inst, home=tmp_path / "home" / ".rpfarm")
 
     text = (prefs / "houdini.env").read_text()
     assert str(hand_set) in text
     assert str(hl.repo_root()) not in text
+
+
+# ---------------------------------------------------------------------------
+# install_package_copy / stable_package_root (2026-09-08)
+#
+# The other half of the fix: an artist's Houdini reading rpfarm/*.py live
+# out of a git checkout an agent might be mid-edit on. This copies the
+# package into a stable location instead, atomically.
+# ---------------------------------------------------------------------------
+
+
+def _fake_checkout(tmp_path, content="X = 1\n"):
+    root = tmp_path / "checkout"
+    pkg = root / "rpfarm"
+    pkg.mkdir(parents=True)
+    (pkg / "__init__.py").write_text(content)
+    (pkg / "config.py").write_text("Y = 2\n")
+    return root
+
+
+def test_install_package_copy_reproduces_the_package_exactly(tmp_path):
+    root = _fake_checkout(tmp_path)
+    home = tmp_path / "home" / ".rpfarm"
+
+    stable_root = hl.install_package_copy(home, root=root)
+
+    assert stable_root == hl.stable_package_root(home)
+    assert (stable_root / "rpfarm" / "__init__.py").read_text() == "X = 1\n"
+    assert (stable_root / "rpfarm" / "config.py").read_text() == "Y = 2\n"
+
+
+def test_install_package_copy_replaces_a_previous_copy_completely(tmp_path):
+    """A second install must not leave any file from the first version
+    behind -- a file removed from the package must actually disappear."""
+    root = _fake_checkout(tmp_path, content="X = 1\n")
+    (root / "rpfarm" / "old_module.py").write_text("stale\n")
+    home = tmp_path / "home" / ".rpfarm"
+    hl.install_package_copy(home, root=root)
+    assert (hl.stable_package_root(home) / "rpfarm" / "old_module.py").exists()
+
+    root2 = _fake_checkout(tmp_path / "v2", content="X = 2\n")
+    hl.install_package_copy(home, root=root2)
+
+    dest = hl.stable_package_root(home) / "rpfarm"
+    assert (dest / "__init__.py").read_text() == "X = 2\n"
+    assert not (dest / "old_module.py").exists()
+
+
+def test_install_package_copy_leaves_no_temp_directories_behind(tmp_path):
+    root = _fake_checkout(tmp_path)
+    home = tmp_path / "home" / ".rpfarm"
+
+    hl.install_package_copy(home, root=root)
+    hl.install_package_copy(home, root=root)  # a second, ordinary run
+
+    leftovers = [p.name for p in hl.stable_package_root(home).iterdir() if p.name != "rpfarm"]
+    assert leftovers == []
+
+
+def test_install_package_copy_rolls_back_on_a_failed_swap(tmp_path, monkeypatch):
+    """If the final rename fails, the artist must not be left with no
+    package at all -- the old copy goes back."""
+    root = _fake_checkout(tmp_path, content="X = 1\n")
+    home = tmp_path / "home" / ".rpfarm"
+    hl.install_package_copy(home, root=root)  # a first, real copy in place
+
+    root2 = _fake_checkout(tmp_path / "v2", content="X = 2\n")
+    real_replace = os.replace
+    calls = {"n": 0}
+
+    def _flaky_replace(src, dst):
+        calls["n"] += 1
+        if calls["n"] == 2:  # the swap-in of the NEW copy, after the old was moved aside
+            raise OSError("simulated failure")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(hl.os, "replace", _flaky_replace)
+
+    with pytest.raises(OSError):
+        hl.install_package_copy(home, root=root2)
+
+    dest = hl.stable_package_root(home) / "rpfarm"
+    assert dest.exists()
+    assert (dest / "__init__.py").read_text() == "X = 1\n", "the old copy must still be there"
+
+
+def test_ensure_package_symlink_installs_the_copy_and_points_at_it(tmp_path, monkeypatch):
+    root = _fake_checkout(tmp_path)
+    monkeypatch.setattr(cli.houdini_local, "repo_root", lambda: root)
+    home = tmp_path / "home" / ".rpfarm"
+    home.mkdir(parents=True)
+
+    cli._ensure_package_symlink(home, log=lambda m: None)
+
+    link = home / "src"
+    assert link.is_symlink()
+    assert link.resolve() == hl.stable_package_root(home).resolve()
+    assert (link / "rpfarm" / "__init__.py").read_text() == "X = 1\n"
+
+
+def test_ensure_package_symlink_migrates_the_old_checkout_default(tmp_path, monkeypatch):
+    """A symlink left over from before this fix -- pointing at repo_root(),
+    this function's own historical default -- gets moved to the stable
+    copy. That is a migration, not a customization to protect."""
+    root = _fake_checkout(tmp_path)
+    monkeypatch.setattr(cli.houdini_local, "repo_root", lambda: root)
+    home = tmp_path / "home" / ".rpfarm"
+    home.mkdir(parents=True)
+    (home / "src").symlink_to(root)
+
+    cli._ensure_package_symlink(home, log=lambda m: None)
+
+    assert (home / "src").resolve() == hl.stable_package_root(home).resolve()
+
+
+def test_ensure_package_symlink_leaves_a_real_customization_alone(tmp_path, monkeypatch):
+    root = _fake_checkout(tmp_path)
+    monkeypatch.setattr(cli.houdini_local, "repo_root", lambda: root)
+    home = tmp_path / "home" / ".rpfarm"
+    home.mkdir(parents=True)
+    custom = tmp_path / "someone_elses_checkout"
+    custom.mkdir()
+    (home / "src").symlink_to(custom)
+
+    cli._ensure_package_symlink(home, log=lambda m: None)
+
+    assert (home / "src").resolve() == custom.resolve()
+
+
+# ---------------------------------------------------------------------------
+# cook_is_running (2026-09-08) -- the installer's side of "do not swap the
+# package out from under a running cook". The scheduler holds an flock on
+# the same path for a cook's whole duration; this probes it non-blocking.
+# ---------------------------------------------------------------------------
+
+
+def test_cook_is_running_is_false_when_nothing_ever_cooked(tmp_path):
+    home = tmp_path / "home" / ".rpfarm"
+    assert hl.cook_is_running(home) is False
+
+
+@pytest.mark.skipif(platform.system() == "Windows", reason="fcntl is POSIX-only")
+def test_cook_is_running_is_true_while_the_lock_is_held(tmp_path):
+    import fcntl
+
+    home = tmp_path / "home" / ".rpfarm"
+    path = hl.cook_lock_path(home)
+    path.parent.mkdir(parents=True)
+    fh = open(path, "a+")
+    fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        assert hl.cook_is_running(home) is True
+    finally:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        fh.close()
+
+
+@pytest.mark.skipif(platform.system() == "Windows", reason="fcntl is POSIX-only")
+def test_cook_is_running_is_false_once_the_lock_is_released(tmp_path):
+    import fcntl
+
+    home = tmp_path / "home" / ".rpfarm"
+    path = hl.cook_lock_path(home)
+    path.parent.mkdir(parents=True)
+    fh = open(path, "a+")
+    fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+    fh.close()
+
+    assert hl.cook_is_running(home) is False
+
+
+def test_setup_checks_for_a_running_cook_before_installing_anything():
+    """2026-09-08: a reinstall mid-cook is what left a live session's
+    onTick raising NameError and cost a rendered frame. rpfarm setup must
+    see that and refuse before touching the package, not after -- `cmd_setup`
+    is expensive to run end to end (real RunPod calls, prompts), so this
+    checks the guard's own position the same way the scheduler's onStartCook/
+    onStopCook ordering is checked elsewhere in this repo."""
+    import inspect
+
+    src = inspect.getsource(cli)
+    setup_start = src.index("def cmd_setup(")
+    guard = src.index("cook_is_running(home)", setup_start)
+    refusal = src.index("return 1", guard)
+    install_call = src.index("_ensure_package_symlink(home)", setup_start)
+    assert guard < refusal < install_call
 
 
 def test_build_and_install_hdas_reports_per_hda_status(tmp_path):

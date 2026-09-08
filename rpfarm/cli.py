@@ -277,20 +277,40 @@ def _ensure_ssh_key(path, run=subprocess.run, log=print):
         return False
 
 
-def _ensure_src_symlink(home, log=print):
-    target = houdini_local.repo_root()
+def _ensure_package_symlink(home, log=print):
+    """Install the stable package copy, then point ``~/.rpfarm/src`` at it.
+
+    2026-09-08: this used to point straight at ``repo_root()`` -- a live
+    checkout -- which is exactly what let an agent's mid-edit files reach
+    an artist's running Houdini. ``rpfarm setup`` is the conscious act of
+    shipping a fresh copy to the artist (see :func:`install_package_copy`),
+    so the copy happens here, on every run, unconditionally; only the
+    SYMLINK's target is guarded, and only against a customization that
+    is not just this function's own historical default -- same principle
+    as :func:`houdini_local.write_rpfarm_root_env`, so the two do not
+    disagree about what "already configured on purpose" means.
+    """
+    stable_root = houdini_local.install_package_copy(home, log=log)
     link = home / "src"
-    if link.is_symlink() and link.resolve() == target.resolve():
-        log(f"[OK] {link} -> {target}")
+    old_default = houdini_local.repo_root()
+
+    if link.is_symlink() and link.resolve() == stable_root.resolve():
+        log(f"[OK] {link} -> {stable_root}")
         return
     if link.is_symlink() or link.exists():
-        if link.is_symlink() or link.is_file():
+        if link.is_symlink():
+            current = link.resolve()
+            if current != old_default.resolve():
+                log(f"[OK] {link} already points at {current} -- leaving it")
+                return
+            link.unlink()
+        elif link.is_file():
             link.unlink()
         else:
             log(f"[WARN] {link} exists and is not a symlink -- leaving it alone")
             return
-    link.symlink_to(target)
-    log(f"[OK] {link} -> {target}")
+    link.symlink_to(stable_root)
+    log(f"[OK] {link} -> {stable_root}")
 
 
 def _resolve_volume_id(api, args, existing, user, log=print, prompt=input):
@@ -479,7 +499,18 @@ def cmd_setup(args, prompt=input):
     rclone_path = rpcfg.rclone_bin()
     print(f"[OK] rclone ready ({rclone_path})")
 
-    _ensure_src_symlink(home)
+    # Swapping the package an artist's Houdini reads while it is mid-cook is
+    # exactly what cost 2026-09-08's rendered frame -- refuse rather than
+    # pretend everything is fine. Best-effort (see cook_is_running's own
+    # docstring): "unknown" is never treated as "a cook is running".
+    if houdini_local.cook_is_running(home):
+        print(f"[FAIL] a cook looks like it is running on this machine "
+              f"({houdini_local.cook_lock_path(home)} is held) -- rerun "
+              f"`rpfarm setup` once it finishes. Nothing was installed.",
+              file=sys.stderr)
+        return 1
+
+    _ensure_package_symlink(home)
 
     installs = houdini_local.find_houdini_installations()
     if not installs:
@@ -516,13 +547,13 @@ def cmd_setup(args, prompt=input):
                   f"{houdini_local.SHELF_TOOL_LABEL} -> {tool['installed_to']}")
         else:
             print(f"    [WARN] TAB tool: {tool['error']}")
-        houdini_local.write_rpfarm_root_env(inst, log=print)
+        houdini_local.write_rpfarm_root_env(inst, home=home, log=print)
 
     print()
     print("Setup checklist:")
     print(f"  [x] config.toml, token, ssh key    -> {home}")
     print(f"  [x] rclone                         -> {rclone_path}")
-    print(f"  [x] repo symlink                   -> {home / 'src'}")
+    print(f"  [x] rpfarm package copy            -> {home / 'src'} -> {home / 'pkg'}")
     if installs:
         print(f"  [x] HDAs installed for {len(installs)} local Houdini installation(s)")
         print(f"  [x] TAB tool  -- press TAB in a TOP network: "

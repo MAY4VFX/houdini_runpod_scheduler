@@ -20,6 +20,13 @@ the gap is also *detectable* from the artist's side.
 
 Needs hython: the two generated HDAs are built by scripts that create real
 nodes.
+
+Installs the four ``.hda`` files, the node shape and the TAB tool -- it does
+NOT touch ``houdini.env``'s ``RPFARM_ROOT`` (2026-09-08, see
+``houdini_local.write_rpfarm_root_env``'s docstring): that is what let a
+routine developer rebuild silently switch an artist's session back to a
+live checkout mid-testing. Shipping a fresh copy of the ``rpfarm`` package
+itself to an artist is ``rpfarm setup``'s job, a conscious separate step.
 """
 
 from __future__ import annotations
@@ -162,7 +169,14 @@ def main(argv=None):
             print(f"  FAILED {r['name']}: {r['error']}")
         houdini_local.install_node_shape(install)
         houdini_local.install_shelf_tool(install)
-        houdini_local.write_rpfarm_root_env(install, log=print)
+        # Deliberately NOT write_rpfarm_root_env here any more (2026-09-08):
+        # this script is a developer's rebuild-and-install loop, run often
+        # and casually while iterating, and touching houdini.env's
+        # RPFARM_ROOT is what let an ordinary rebuild silently switch an
+        # artist's session back to a live checkout mid-testing. Shipping a
+        # fresh package to the artist is `rpfarm setup`'s job now (see
+        # houdini_local.install_package_copy) -- a conscious, separate step,
+        # not a side effect of every asset rebuild.
 
         # The point of the whole script: prove the installed copy agrees with
         # the package, rather than assuming the copy step did what it said.

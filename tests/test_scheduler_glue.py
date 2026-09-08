@@ -27,8 +27,11 @@ import types
 
 import pytest
 
+from rpfarm import config as rpcfg
 from rpfarm import dispatch as rpdispatch
+from rpfarm import houdini_local as rphl
 from rpfarm import packages as rppkg
+from rpfarm import pods as rppods
 from rpfarm.runpod_api import RunPodError
 
 MODULE = (
@@ -339,6 +342,81 @@ def test_the_tick_drains_the_retry_list():
     tick = src[src.index("def onTick("):]
     tick = tick[:tick.index("\n    def ", 1)]
     assert "self._retryTerminations()" in tick
+
+
+# ---------------------------------------------------------------------------
+# The cook lock (2026-09-08) -- so `rpfarm setup` can tell a cook is running
+# and refuse to swap the installed package underneath it.
+# ---------------------------------------------------------------------------
+
+
+def test_start_cook_acquires_the_lock_right_after_reset_cook_state():
+    src = MODULE.read_text()
+    start = src.index("def onStartCook(")
+    start = src[:src.index("\n    def ", start + 10)]
+    reset = src.index("self._reset_cook_state()")
+    lock = src.index("self._acquireCookLock()")
+    assert reset < lock, "the lock must be taken as part of starting the cook"
+
+
+def test_stop_cook_releases_the_lock_before_resetting_state():
+    """_reset_cook_state drops self._cook_lock_fh to None WITHOUT closing
+    or unlocking it -- release has to happen first, or the lock leaks for
+    the rest of this Houdini's life."""
+    src = MODULE.read_text()
+    stop = src[src.index("def onStopCook("):]
+    stop = stop[:stop.index("\n    def ", 1)]
+    release = stop.index("self._releaseCookLock()")
+    reset = stop.index("self._reset_cook_state()")
+    assert release < reset
+
+
+def test_acquire_and_release_cook_lock_round_trip(tmp_path):
+    ns = load_methods(
+        ["_acquireCookLock", "_releaseCookLock"],
+        {"rpcfg": types.SimpleNamespace(home=lambda: tmp_path / ".rpfarm"),
+         "rppods": rppods},
+    )
+    sched = FakeScheduler()
+    sched._acquireCookLock = lambda: ns["_acquireCookLock"](sched)
+    sched._releaseCookLock = lambda: ns["_releaseCookLock"](sched)
+    home = tmp_path / ".rpfarm"
+
+    sched._acquireCookLock()
+    assert sched._cook_lock_fh is not None
+    assert rphl.cook_is_running(home) is True, "the installer's probe must see it held"
+
+    sched._releaseCookLock()
+    assert sched._cook_lock_fh is None
+    assert rphl.cook_is_running(home) is False
+
+
+def test_releasing_a_lock_that_was_never_acquired_is_harmless():
+    sched = FakeScheduler()
+    sched._cook_lock_fh = None
+    ns = load_methods(["_releaseCookLock"], {})
+    sched._releaseCookLock = lambda: ns["_releaseCookLock"](sched)
+
+    sched._releaseCookLock()  # must not raise
+
+    assert sched._cook_lock_fh is None
+
+
+def test_a_lock_that_cannot_be_acquired_does_not_fail_the_cook(tmp_path, monkeypatch):
+    """The platform primitive can be missing, the dir unwritable, whatever
+    -- a cook must run either way. This is a courtesy signal, never a gate."""
+    ns = load_methods(
+        ["_acquireCookLock"],
+        {"rpcfg": types.SimpleNamespace(home=lambda: tmp_path / ".rpfarm"),
+         "rppods": types.SimpleNamespace(
+             _try_acquire=lambda fh: (_ for _ in ()).throw(OSError("no fcntl here")))},
+    )
+    sched = FakeScheduler()
+    sched._acquireCookLock = lambda: ns["_acquireCookLock"](sched)
+
+    sched._acquireCookLock()  # must not raise
+
+    assert sched._cook_lock_fh is None
 
 
 def test_a_lost_mq_connection_is_said_out_loud_before_the_cook_is_cancelled():
