@@ -924,10 +924,24 @@ def fetch_farm_index(cfg, api, remote_project, log=None):
     up, or the listing itself failing, both come back as ``None``, and
     every row renders :data:`rpfarm.sync.FARM_UNKNOWN` rather than a
     confident wrong answer.
+
+    Checks :func:`rpfarm.sync.take_shared_remote_index` first: the
+    scheduler's pre-cook divergence check (``onSetupCook``, before this
+    node ever generates) already took this exact listing for this exact
+    ``remote_project`` this cook, and a second, identical
+    ``rpsync.remote_index`` call here measured ~8.4s on the owner's real
+    project (Ruling R64) for no new information -- on top of the one the
+    divergence check already paid. Only a cache miss (no divergence check
+    ran, or it was for a different root) falls through to fetching fresh.
     """
     say = log if log is not None else (lambda _m: None)
     from . import pods as rppods
     from .runpod_api import pod_public_endpoint
+
+    shared = rpsync.take_shared_remote_index(remote_project)
+    if shared is not None:
+        say("reusing the listing the pre-cook divergence check already took")
+        return shared
 
     pod = rppods.find_running_sync_pod(api, cfg, log=say)
     if pod is None:

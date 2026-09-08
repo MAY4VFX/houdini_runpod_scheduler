@@ -835,6 +835,42 @@ def test_fetch_farm_index_degrades_honestly_when_listing_fails(monkeypatch):
     assert any("could not list the farm" in m for m in said)
 
 
+def test_fetch_farm_index_reuses_a_listing_the_divergence_check_already_took(monkeypatch):
+    """Ruling R64: the scheduler's _checkSceneDivergence and this dialog's
+    preflight must share one remote_index call within a cook, not pay for
+    it twice (~8.4s measured on the owner's real project). Never touches
+    the API at all when a shared listing is there to take."""
+    class ApiThatMustNotBeCalled:
+        def list_pods(self, prefix=""):
+            pytest.fail("fetch_farm_index must not look for a pod when a "
+                        "shared listing already answers the question")
+
+    shared_index = {"scene.hip": (1, 2.0)}
+    rpsync.share_remote_index("/workspace/projects/may/airship", shared_index)
+
+    said = []
+    result = pf.fetch_farm_index(cfg=types.SimpleNamespace(user="may"),
+                                 api=ApiThatMustNotBeCalled(),
+                                 remote_project="/workspace/projects/may/airship",
+                                 log=said.append)
+
+    assert result is shared_index
+    assert any("reusing" in m for m in said)
+
+
+def test_fetch_farm_index_ignores_a_shared_listing_for_a_different_root(monkeypatch):
+    rpsync.share_remote_index("/workspace/projects/may/airship", {"a": (1, 2.0)})
+
+    class NoCreateApi:
+        def list_pods(self, prefix=""):
+            return []
+
+    result = pf.fetch_farm_index(cfg=types.SimpleNamespace(user="may"), api=NoCreateApi(),
+                                 remote_project="/workspace/projects/may/yoyo_loodev")
+
+    assert result is None  # fell through to the real (empty) pod lookup
+
+
 def test_fetch_farm_index_lists_when_a_pod_is_running(monkeypatch, tmp_path):
     class RunningApi:
         def list_pods(self, prefix=""):

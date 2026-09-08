@@ -21,3 +21,19 @@ def _isolate_houdini_user_pref_dir(tmp_path_factory, monkeypatch):
     prefs = tmp_path_factory.mktemp("houdini-prefs")
     monkeypatch.setenv("HOUDINI_USER_PREF_DIR", str(prefs))
     return prefs
+
+
+@pytest.fixture(autouse=True)
+def _clear_shared_remote_index():
+    """`rpfarm.sync` keeps one already-fetched listing in module-level
+    state (`share_remote_index`/`take_shared_remote_index`, Ruling R64) so
+    the scheduler's divergence check and the upload dialog's preflight can
+    share one remote_index call within a cook. That state is process-wide,
+    not per-test -- without this, a test that shares an index (or a
+    fetch_farm_index test that consumes one) could leak into the next test
+    that happens to ask about the same remote_project string.
+    """
+    from rpfarm import sync as rpsync
+    rpsync.clear_shared_remote_index()
+    yield
+    rpsync.clear_shared_remote_index()

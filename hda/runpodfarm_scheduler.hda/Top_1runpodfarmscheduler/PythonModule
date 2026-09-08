@@ -213,11 +213,11 @@ _ASSET_FINGERPRINT = {
     'package_runner.py': (8752, '96770e3879a6cb65'),
     'packages.py': (61657, '030b2d03028b9c47'),
     'pods.py': (31759, 'c888660bb44e12db'),
-    'preflight.py': (42343, '21b2d999f2bc30c3'),
+    'preflight.py': (43096, '2c918d033e5ef268'),
     'runpod_api.py': (14539, 'b90960f9860c97fb'),
     'scene_setup.py': (18467, '8838d55cbb131f99'),
     'smoke.py': (42548, 'ce0c8d36fe763314'),
-    'sync.py': (17350, '3c5e5eb3073469b3'),
+    'sync.py': (20016, '96b1ccb1a9c2846e'),
     'tls.py': (3642, 'f3e50ea6ebd0308f'),
     'tools.py': (4290, 'c5d3b026f125578f'),
     'usddeps.py': (9631, '3c7192d3bd94d07f'),
@@ -1186,6 +1186,7 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         self._sync_client = None
         self._sftp = None
         self._sync_queue = []
+        rpsync.clear_shared_remote_index()
         # Packages this cook actually put on local disk. Auto-clean
         # keys on delivery, not on "no item failed".
         self._downloads_done = 0
@@ -2880,6 +2881,12 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         if _stale:
             raise CookError(_stale)
 
+        # A previous cook's divergence check may have offered a listing
+        # that nothing ever consumed (the artist cancelled before the
+        # upload node generated) -- drop it before this cook can write or
+        # read anything, so it can never be handed to the wrong cook.
+        rpsync.clear_shared_remote_index()
+
         self._initWorkingDir()
         self._copyJobSupportFiles()
 
@@ -3099,6 +3106,16 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         built and wrote (rpfarm.packages.write_pathmap) -- not a second,
         possibly-drifting guess at where the upload put it.
 
+        The listing fetched here is also OFFERED (rpsync.share_remote_index)
+        to the upload node's own preflight dialog, which runs later in this
+        same cook (generate happens after onSetupCook) and would otherwise
+        pay for a second, identical rpsync.remote_index call -- measured at
+        ~8.4s on the owner's real project (Ruling R64), and he has already
+        complained about how long this stage takes. The upload's post-
+        transfer skip logic keeps its own always-fresh call; see
+        rpsync.share_remote_index's docstring for why that one must never
+        share this cache.
+
         Silent, not just quiet, when there is nothing to say: no .hip
         (should not happen, but a diagnostic must never be the reason a
         cook fails), a .hip this cook's own pathmap cannot place on the
@@ -3123,6 +3140,7 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         except (rpsync.SyncError, OSError) as e:
             self._verboseLog("could not check the farm for a diverged scene: {}".format(e))
             return
+        rpsync.share_remote_index(self._remote_project, index)
         entry = rpsync.FileEntry(local=hip, remote=remote_hip, size=0)
         state = rpsync.farm_state(entry, index, self._remote_project)
         if state != rpsync.FARM_DIFFERS:

@@ -1306,7 +1306,7 @@ class _DivergenceScheduler(FakeScheduler):
         self._notes.append(text)
 
 
-def _divergence_ns(index_or_raiser, hip_path):
+def _divergence_ns(index_or_raiser, hip_path, shared=None):
     hou_stub = types.SimpleNamespace(
         hipFile=types.SimpleNamespace(path=lambda: hip_path))
 
@@ -1315,13 +1315,16 @@ def _divergence_ns(index_or_raiser, hip_path):
             raise index_or_raiser
         return index_or_raiser
 
+    def _fake_share(remote_root, index):
+        (shared if shared is not None else []).append((remote_root, index))
+
     return load_methods(
         ["_checkSceneDivergence"],
         {"rppkg": rppkg,
          "rpsync": types.SimpleNamespace(
              remote_index=_fake_remote_index, farm_state=rpsync.farm_state,
              FileEntry=rpsync.FileEntry, SyncError=rpsync.SyncError,
-             FARM_DIFFERS=rpsync.FARM_DIFFERS),
+             FARM_DIFFERS=rpsync.FARM_DIFFERS, share_remote_index=_fake_share),
          "os": __import__("os")},
     ), hou_stub
 
@@ -1420,6 +1423,49 @@ def test_scene_divergence_logs_a_warning_and_never_raises_when_listing_fails(tmp
     assert any("could not check the farm" in m for m in sched.logs)
 
 
+def test_scene_divergence_shares_the_listing_it_took_even_when_nothing_diverged(tmp_path):
+    """Ruling R64: the divergence check's own remote_index call is the one
+    the upload dialog's preflight reuses, so it must be offered whether or
+    not this cook actually diverged -- the dialog benefits either way."""
+    hip = tmp_path / "scene.hip"
+    hip.write_bytes(b"h" * 100)
+    remote_project = "/workspace/projects/may/proj"
+    pathmap = {str(tmp_path): remote_project}
+    index = {"scene.hip": (100, hip.stat().st_mtime)}  # matches -> FARM_SAME
+    shared = []
+    ns, hou_stub = _divergence_ns(index, str(hip), shared=shared)
+    sched = _DivergenceScheduler(pathmap, remote_project)
+    sched._checkSceneDivergence = lambda: ns["_checkSceneDivergence"](sched)
+
+    sys.modules["hou"] = hou_stub
+    try:
+        sched._checkSceneDivergence()
+    finally:
+        sys.modules.pop("hou", None)
+
+    assert sched._notes == []  # nothing diverged -- no note
+    assert shared == [(remote_project, index)]  # still shared
+
+
+def test_scene_divergence_shares_nothing_when_the_listing_fails(tmp_path):
+    hip = tmp_path / "scene.hip"
+    hip.write_bytes(b"h")
+    remote_project = "/workspace/projects/may/proj"
+    pathmap = {str(tmp_path): remote_project}
+    shared = []
+    ns, hou_stub = _divergence_ns(rpsync.SyncError("network down"), str(hip), shared=shared)
+    sched = _DivergenceScheduler(pathmap, remote_project)
+    sched._checkSceneDivergence = lambda: ns["_checkSceneDivergence"](sched)
+
+    sys.modules["hou"] = hou_stub
+    try:
+        sched._checkSceneDivergence()
+    finally:
+        sys.modules.pop("hou", None)
+
+    assert shared == []  # nothing fetched -- nothing to offer the dialog
+
+
 def test_onsetupcook_checks_divergence_before_uploading_pdg_temp():
     """onSetupCook itself never rents a GPU pod (that is onTick's job, once
     PDG actually has work -- see its own comment on _raised_for_work); the
@@ -1434,6 +1480,30 @@ def test_onsetupcook_checks_divergence_before_uploading_pdg_temp():
     check = setup.index("self._checkSceneDivergence()")
     upload = setup.index("self._uploadPdgTemp()")
     assert sftp < check < upload
+
+
+def test_onsetupcook_clears_any_shared_index_before_the_divergence_check():
+    """A previous cook may have shared a listing nothing ever consumed (the
+    artist cancelled before the upload node generated) -- onSetupCook must
+    drop it before this cook's own divergence check can write or read
+    anything, so it is never handed to the wrong cook."""
+    src = MODULE.read_text()
+    setup = src[src.index("def onSetupCook(self):"):]
+    setup = setup[:setup.index("\n    def ", 1)]
+    assert "rpsync.clear_shared_remote_index()" in setup
+    clear = setup.index("rpsync.clear_shared_remote_index()")
+    check = setup.index("self._checkSceneDivergence()")
+    assert clear < check
+
+
+def test_reset_cook_state_clears_any_shared_index():
+    """The other half of Ruling R64's cook-scoping: a listing shared this
+    cook must not survive into the next one. _reset_cook_state runs at
+    every cook's end (and once from __init__)."""
+    src = MODULE.read_text()
+    reset = src[src.index("def _reset_cook_state(self):"):]
+    reset = reset[:reset.index("\n    def ", 1)]
+    assert "rpsync.clear_shared_remote_index()" in reset
 
 
 # ---------------------------------------------------------------------------

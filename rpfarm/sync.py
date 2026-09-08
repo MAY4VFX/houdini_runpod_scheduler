@@ -268,6 +268,65 @@ def farm_state(entry, index, remote_root):
     return FARM_SAME if already_on_farm(entry, index, "", remote_root) else FARM_DIFFERS
 
 
+#: One already-fetched :func:`remote_index` result, offered to the next
+#: pre-upload caller that asks for the same remote root -- see
+#: :func:`share_remote_index`. Module-level, not per-caller state: the
+#: scheduler's divergence check and the upload node's preflight dialog are
+#: two different HDAs with no reference to each other, but they run in the
+#: same Houdini process, so ``rpfarm.sync`` (imported once) is the one
+#: place both can already reach.
+_shared_index = None  # (remote_root, index) | None
+
+
+def share_remote_index(remote_root, index):
+    """Offer an already-fetched listing to whichever pre-upload caller asks
+    next for this same ``remote_root`` (:func:`take_shared_remote_index`).
+
+    Called once, right after :func:`remote_index`, by whichever of the
+    scheduler's divergence check or the upload dialog's preflight runs
+    first in a given cook -- currently the divergence check, since
+    ``onSetupCook`` runs before any node generates. The upload's own
+    post-transfer skip logic (``rpfarm.packages.run_upload_item``) must
+    NEVER read or write this: it runs after files have already moved, and
+    a stale skip decision there silently fails to re-upload a changed
+    file -- it keeps its own always-fresh call to :func:`remote_index`.
+    """
+    global _shared_index
+    _shared_index = (remote_root, index)
+
+
+def take_shared_remote_index(remote_root):
+    """Consume the listing :func:`share_remote_index` left for this exact
+    ``remote_root``, or ``None`` if there is nothing to reuse.
+
+    One-shot (cleared on read) and root-checked, so a second, unrelated
+    caller never gets handed the wrong project's listing. Cook-scoping is
+    structural rather than an id comparison: the scheduler is the only
+    writer, it writes at most once per cook (in ``onSetupCook``, before
+    anything else touches this slot), and :func:`clear_shared_remote_index`
+    is called both at the start of every ``onSetupCook`` and at cook end --
+    so nothing here can outlive the cook that wrote it.
+    """
+    global _shared_index
+    if _shared_index is None:
+        return None
+    cached_root, index = _shared_index
+    if cached_root != remote_root:
+        return None
+    _shared_index = None
+    return index
+
+
+def clear_shared_remote_index():
+    """Drop any offered listing, unconditionally. Called at the start of
+    every ``onSetupCook`` (a previous cook's divergence check may have
+    written one that nothing ever consumed -- the artist cancelled before
+    the upload node generated) and at cook end, so a stale listing can
+    never survive into the next cook."""
+    global _shared_index
+    _shared_index = None
+
+
 def build_rclone_args(package, target, direction, local_root, remote_root, tmp_dir):
     """Build args for an ``rclone copy --files-from`` of one package.
 

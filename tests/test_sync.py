@@ -456,6 +456,33 @@ def test_farm_state_never_disagrees_with_already_on_farm(tmp_path):
         assert same == (state == rpsync.FARM_SAME)
 
 
+def test_a_shared_index_is_taken_exactly_once():
+    index = {"a.exr": (1, 2.0)}
+    rpsync.share_remote_index("/workspace/projects/may/airship", index)
+    assert rpsync.take_shared_remote_index("/workspace/projects/may/airship") is index
+    # One-shot: a second taker for the same root gets nothing, not a
+    # stale second reuse of a listing already handed out once.
+    assert rpsync.take_shared_remote_index("/workspace/projects/may/airship") is None
+
+
+def test_a_shared_index_is_never_handed_to_a_different_root():
+    rpsync.share_remote_index("/workspace/projects/may/airship", {"a.exr": (1, 2.0)})
+    assert rpsync.take_shared_remote_index("/workspace/projects/may/yoyo_loodev") is None
+    # Still there for the root it was actually taken for -- a miss for the
+    # wrong root must not have consumed it.
+    assert rpsync.take_shared_remote_index("/workspace/projects/may/airship") is not None
+
+
+def test_nothing_shared_is_nothing_to_take():
+    assert rpsync.take_shared_remote_index("/workspace/projects/may/airship") is None
+
+
+def test_clear_shared_remote_index_drops_an_unconsumed_offer():
+    rpsync.share_remote_index("/workspace/projects/may/airship", {"a.exr": (1, 2.0)})
+    rpsync.clear_shared_remote_index()
+    assert rpsync.take_shared_remote_index("/workspace/projects/may/airship") is None
+
+
 def test_the_index_is_read_from_the_farm_itself(monkeypatch):
     seen = {}
 
