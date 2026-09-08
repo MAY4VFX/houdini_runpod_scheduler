@@ -103,6 +103,11 @@ def pod_env(cfg, role, token, slots, pubkey, extra=None, cook="", project=""):
 # somebody's render.
 COOK_ALIVE_GRACE_S = 180.0
 
+#: How long a RESUMED pod gets before we give up on it and make a new one.
+#: A freshly created sync pod was ready in 33 seconds (measured); a resumed
+#: one that has not answered in twice that is not slow, it is stuck.
+WOKEN_POD_TIMEOUT_S = 75.0
+
 
 def idle_pods(api, user, threshold_s, now=None):
     """This user's running pods that have been up longer than the threshold
@@ -452,7 +457,7 @@ def _dedupe_running(api, running, log):
     return [keep]
 
 
-def _find_or_create_sync_pod(api, cfg, token, pubkey, log, cloud_type=None):
+def _find_or_create_sync_pod(api, cfg, token, pubkey, log, cloud_type=None, woken=None):
     name = sync_pod_name(cfg.user)
     # list_pods is a prefix match, and sync_pod_name has no trailing
     # delimiter, so "rpfarm-sync-may" would also match another user's
@@ -477,6 +482,8 @@ def _find_or_create_sync_pod(api, cfg, token, pubkey, log, cloud_type=None):
         try:
             api.start_pod(p["id"])
             log(f"sync pod {p['id']} was {state}; started it again")
+            if woken is not None:
+                woken.add(p["id"])
             return p
         except RunPodError as e:
             log(f"sync pod {p['id']} ({state}) would not start ({e}); replacing it")
@@ -543,17 +550,42 @@ def ensure_sync_pod(
     # inside the same capacity deadline, exactly like being told there is no
     # capacity in the first place.
     deadline = None if capacity_wait_s <= 0 else clock() + capacity_wait_s
+    #: Pods this call resumed rather than created. Only these get the short
+    #: leash and the delete-and-retry, because only a resume is the operation
+    #: that was measured to be unreliable.
+    woken = set()
     while True:
         remaining = None if deadline is None else max(0.0, deadline - clock())
         pod = _acquire_sync_pod(
             api, cfg, token, pubkey, log,
+            woken=woken,
             cloud_type=cloud_type,
             capacity_wait_s=0 if remaining is None else remaining,
             sleep=sleep, cancel=cancel, clock=clock, rand=rand,
         )
+        # A pod we WOKE gets a short leash. RunPod accepts /start, reports
+        # lastStartedAt, and then does not bring the machine up: no ports, no
+        # address, back to EXITED -- and the artist's cook died five minutes
+        # later on a TimeoutError (2026-09-08). A freshly created pod is ready
+        # in about 33 seconds, so waiting 300 for a resumed one buys nothing
+        # and costs the render. Ruling R60: an obstacle that can be fixed by
+        # doing something is not a failure -- delete it and make a new one.
+        wake_timeout = min(timeout, WOKEN_POD_TIMEOUT_S) if pod["id"] in woken else timeout
         try:
             return wait_ready(api, client_factory(pod["id"]), pod["id"],
-                              timeout=timeout, cancel=cancel, sleep=sleep, log=log)
+                              timeout=wake_timeout, cancel=cancel, sleep=sleep, log=log)
+        except TimeoutError:
+            if pod["id"] not in woken:
+                raise
+            log("sync pod {} did not come back up within {}s after being "
+                "resumed -- deleting it and creating a fresh one".format(
+                    pod["id"], wake_timeout))
+            woken.discard(pod["id"])
+            try:
+                api.terminate_pod(pod["id"])
+            except (RunPodError, OSError) as e:
+                log("could not delete the stuck pod {}: {}".format(pod["id"], e))
+            continue
         except PodGoneError as e:
             if deadline is not None and clock() >= deadline:
                 raise SyncPodCapacityError(
@@ -564,7 +596,7 @@ def ensure_sync_pod(
 
 
 def _acquire_sync_pod(api, cfg, token, pubkey, log, cloud_type, capacity_wait_s,
-                      sleep, cancel, clock, rand):
+                      sleep, cancel, clock, rand, woken=None):
     """Find or create the sync pod, waiting out a shortage of CPU machines.
 
     The same rule the GPU side follows (Ruling R32): no machine is a *wait*,
@@ -592,7 +624,7 @@ def _acquire_sync_pod(api, cfg, token, pubkey, log, cloud_type, capacity_wait_s,
         try:
             try:
                 with _file_lock(_sync_pod_lock_path(), timeout=_SYNC_POD_LOCK_TIMEOUT_S, sleep=sleep):
-                    return _find_or_create_sync_pod(api, cfg, token, pubkey, log, cloud_type)
+                    return _find_or_create_sync_pod(api, cfg, token, pubkey, log, cloud_type, woken=woken)
             except TimeoutError as e:
                 log(f"sync pod lock not acquired ({e}); proceeding unlocked")
                 return _find_or_create_sync_pod(api, cfg, token, pubkey, log, cloud_type)

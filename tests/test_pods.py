@@ -792,3 +792,81 @@ def test_resume_does_not_depend_on_what_runpod_calls_the_stopped_state(tmp_path)
             api, _cfg_for_capacity(tmp_path), "tok", "pub", lambda m: None)
         assert api.started == ["sync1"], state
         assert pod["id"] == "sync1", state
+
+
+def test_a_pod_that_will_not_wake_is_replaced_instead_of_failing_the_cook(tmp_path, monkeypatch):
+    """Ruling R60. RunPod accepted /start, reported lastStartedAt, and never
+    brought the machine up -- no ports, no address, back to EXITED. The cook
+    died 300 seconds later on a TimeoutError, taking upload, gate and render
+    with it, and the artist saw "finished, nothing happened". A fresh pod is
+    ready in 33 seconds, so waiting is not the answer: delete and rebuild.
+    """
+    monkeypatch.setenv("RPFARM_HOME", str(tmp_path))
+    c = rpcfg.Config(api_key="k", user="may", volume_id="v", template_id="t",
+                     sesinetd_host="lic.example.com")
+
+    class StuckThenFine:
+        """Only what ensure_sync_pod asks of an API, so the stuck pod's
+        behaviour is the only thing under test."""
+
+        def __init__(self):
+            self.rows = [{"id": "stuck", "name": rppods.sync_pod_name("may"),
+                          "desiredStatus": "EXITED"}]
+            self.started, self.terminated = [], []
+
+        def list_pods(self, name=None):
+            return [p for p in self.rows if name is None or p.get("name") == name]
+
+        def start_pod(self, pod_id):
+            self.started.append(pod_id)
+            return {"id": pod_id}
+
+        def terminate_pod(self, pod_id):
+            self.terminated.append(pod_id)
+            self.rows = [p for p in self.rows if p["id"] != pod_id]
+
+        def create_cpu_pod(self, name, *a, **kw):
+            row = {"id": "fresh", "name": name, "desiredStatus": "RUNNING"}
+            self.rows.append(row)
+            return row
+
+    api = StuckThenFine()
+    ready = {"fresh"}
+
+    def waiter(api_, client, pod_id, timeout=300, **kw):
+        if pod_id in ready:
+            return {"id": pod_id, "name": rppods.sync_pod_name("may"),
+                    "desiredStatus": "RUNNING"}
+        # The measured behaviour: it simply never becomes ready.
+        raise TimeoutError("pod {} not ready in {}s".format(pod_id, timeout))
+
+    monkeypatch.setattr(rppods, "wait_ready", waiter)
+    said = []
+    pod = rppods.ensure_sync_pod(api, c, "tok", "ssh-ed25519 AAA",
+                                 client_factory=lambda pid: FakeClient(),
+                                 sleep=lambda s: None, log=said.append)
+
+    assert pod["id"] == "fresh", "the cook should have got a working pod"
+    assert api.started == ["stuck"], "it should have tried to resume first"
+    assert api.terminated == ["stuck"], "and deleted the one that would not wake"
+    assert any("deleting it and creating a fresh one" in line for line in said), said
+
+
+def test_a_pod_we_created_still_gets_the_full_timeout(tmp_path, monkeypatch):
+    """Only a RESUME was measured to be unreliable. A pod we just created and
+    that is merely slow must not be thrown away and recreated in a loop."""
+    monkeypatch.setenv("RPFARM_HOME", str(tmp_path))
+    c = rpcfg.Config(api_key="k", user="may", volume_id="v", template_id="t",
+                     sesinetd_host="lic.example.com")
+    seen = {}
+
+    def waiter(api_, client, pod_id, timeout=300, **kw):
+        seen["timeout"] = timeout
+        return {"id": pod_id, "name": rppods.sync_pod_name("may"),
+                "desiredStatus": "RUNNING"}
+
+    monkeypatch.setattr(rppods, "wait_ready", waiter)
+    rppods.ensure_sync_pod(FakeAPI(), c, "tok", "ssh-ed25519 AAA",
+                           client_factory=lambda pid: FakeClient(),
+                           sleep=lambda s: None, log=lambda m: None)
+    assert seen["timeout"] == 300, "a created pod keeps the full patience"
