@@ -85,6 +85,95 @@ def test_write_rpfarm_root_env_is_idempotent(tmp_path):
     assert text2.count("RPFARM_ROOT") == 1
 
 
+# ---------------------------------------------------------------------------
+# The default root must not clobber a deliberately different value
+# (2026-09-08). rebuild_assets.py and `rpfarm setup` both call
+# write_rpfarm_root_env(install) with no `root=` -- so a run for a completely
+# unrelated fix used to silently switch the artist's houdini.env back to
+# this checkout, out from under a stable installed copy someone had pointed
+# it at on purpose, mid-session.
+# ---------------------------------------------------------------------------
+
+
+def test_the_default_root_never_overwrites_a_deliberately_different_value(tmp_path):
+    prefs = tmp_path / "prefs"
+    inst = hl.HoudiniInstall.__new__(hl.HoudiniInstall)
+    inst.user_pref_dir = prefs
+
+    stable_copy = tmp_path / "stable" / "pkg"
+    hl.write_rpfarm_root_env(inst, root=stable_copy)  # someone's deliberate choice
+
+    hl.write_rpfarm_root_env(inst)  # the default every real caller uses
+
+    text = (prefs / "houdini.env").read_text()
+    assert str(stable_copy) in text
+    assert str(hl.repo_root()) not in text
+    assert text.count("RPFARM_ROOT") == 1
+
+
+def test_the_default_root_reports_that_it_left_an_existing_value_alone(tmp_path):
+    prefs = tmp_path / "prefs"
+    inst = hl.HoudiniInstall.__new__(hl.HoudiniInstall)
+    inst.user_pref_dir = prefs
+    stable_copy = tmp_path / "stable" / "pkg"
+    hl.write_rpfarm_root_env(inst, root=stable_copy)
+
+    said = []
+    hl.write_rpfarm_root_env(inst, log=said.append)
+
+    assert said and str(stable_copy) in said[0]
+
+
+def test_an_explicit_root_still_always_wins(tmp_path):
+    """The escape hatch: a developer (or a future installer) choosing a
+    SPECIFIC checkout on purpose is not "the default", and must still be
+    able to override whatever is already there -- this is what makes an
+    explicit RPFARM_ROOT= a real switch and not a one-way ratchet."""
+    prefs = tmp_path / "prefs"
+    inst = hl.HoudiniInstall.__new__(hl.HoudiniInstall)
+    inst.user_pref_dir = prefs
+    stable_copy = tmp_path / "stable" / "pkg"
+    hl.write_rpfarm_root_env(inst, root=stable_copy)
+
+    dev_checkout = tmp_path / "dev" / "checkout"
+    hl.write_rpfarm_root_env(inst, root=dev_checkout)
+
+    text = (prefs / "houdini.env").read_text()
+    assert str(dev_checkout) in text
+    assert str(stable_copy) not in text
+
+
+def test_the_default_root_is_written_when_nothing_is_configured_yet(tmp_path):
+    """First-time setup, or a file that never had the line: no existing
+    value to defer to, so the default (this checkout) is written."""
+    prefs = tmp_path / "prefs"
+    inst = hl.HoudiniInstall.__new__(hl.HoudiniInstall)
+    inst.user_pref_dir = prefs
+
+    hl.write_rpfarm_root_env(inst)
+
+    text = (prefs / "houdini.env").read_text()
+    assert str(hl.repo_root()) in text
+
+
+def test_a_hand_written_line_without_the_marker_is_still_recognised(tmp_path):
+    """Someone (or a future installer) may set RPFARM_ROOT by hand, without
+    ever having gone through this function -- it still must not be
+    clobbered by a later default call."""
+    prefs = tmp_path / "prefs"
+    prefs.mkdir(parents=True)
+    hand_set = tmp_path / "hand" / "set"
+    (prefs / "houdini.env").write_text('RPFARM_ROOT = "{}"\n'.format(hand_set))
+    inst = hl.HoudiniInstall.__new__(hl.HoudiniInstall)
+    inst.user_pref_dir = prefs
+
+    hl.write_rpfarm_root_env(inst)
+
+    text = (prefs / "houdini.env").read_text()
+    assert str(hand_set) in text
+    assert str(hl.repo_root()) not in text
+
+
 def test_build_and_install_hdas_reports_per_hda_status(tmp_path):
     root = tmp_path / "repo"
     for name in hl.HDA_NAMES:

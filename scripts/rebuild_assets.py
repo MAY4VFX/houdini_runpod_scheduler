@@ -162,7 +162,7 @@ def main(argv=None):
             print(f"  FAILED {r['name']}: {r['error']}")
         houdini_local.install_node_shape(install)
         houdini_local.install_shelf_tool(install)
-        houdini_local.write_rpfarm_root_env(install)
+        houdini_local.write_rpfarm_root_env(install, log=print)
 
         # The point of the whole script: prove the installed copy agrees with
         # the package, rather than assuming the copy step did what it said.

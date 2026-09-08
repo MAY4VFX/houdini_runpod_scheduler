@@ -516,7 +516,7 @@ def cmd_setup(args, prompt=input):
                   f"{houdini_local.SHELF_TOOL_LABEL} -> {tool['installed_to']}")
         else:
             print(f"    [WARN] TAB tool: {tool['error']}")
-        houdini_local.write_rpfarm_root_env(inst)
+        houdini_local.write_rpfarm_root_env(inst, log=print)
 
     print()
     print("Setup checklist:")

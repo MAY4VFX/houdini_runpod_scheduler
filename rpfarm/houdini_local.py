@@ -600,9 +600,22 @@ def install_shelf_tool(install: HoudiniInstall) -> dict:
 # ---------------------------------------------------------------------------
 
 _RPFARM_ROOT_MARKER = "# rpfarm setup"
+_RPFARM_ROOT_LINE_RE = re.compile(r'^\s*RPFARM_ROOT\s*=\s*"(.*)"\s*$')
 
 
-def write_rpfarm_root_env(install: HoudiniInstall, root: Path | None = None) -> Path:
+def _existing_rpfarm_root(text: str) -> str | None:
+    """The value of an ``RPFARM_ROOT = "..."`` line already in ``text``, if
+    any -- with or without this project's own marker comment above it, so a
+    value someone set by hand is recognised exactly like one this function
+    wrote itself."""
+    for ln in text.splitlines():
+        m = _RPFARM_ROOT_LINE_RE.match(ln)
+        if m:
+            return m.group(1)
+    return None
+
+
+def write_rpfarm_root_env(install: HoudiniInstall, root: Path | None = None, log=None) -> Path:
     """Write/replace the ``RPFARM_ROOT`` line in ``<prefs>/houdini.env`` so
     HDAs (and out-of-process ``rpfarm.package_runner`` calls they spawn,
     via the job environment) can find this checkout without depending on
@@ -610,7 +623,21 @@ def write_rpfarm_root_env(install: HoudiniInstall, root: Path | None = None) -> 
 
     Idempotent: a previous ``rpfarm setup``'s marker+line pair is replaced
     in place rather than appended again.
+
+    ``root=None`` -- what every caller in this repo passes, wanting "point
+    at THIS checkout" -- no longer overwrites a DIFFERENT value the file
+    already has. 2026-09-08: an artist's session was pointed at a stable
+    installed copy of the package on purpose (not this checkout), and a
+    `rebuild_assets.py` run for an unrelated fix silently switched him back,
+    because this always rewrote the line to `repo_root()` regardless of
+    what -- or who -- put something else there. An explicit ``root=`` is a
+    deliberate instruction (a developer choosing a specific checkout, or a
+    future installer choosing its own stable copy) and always wins, exactly
+    as before; it is only the *default* that now defers to an existing,
+    different, presumably intentional value instead of clobbering it.
     """
+    say = log if log is not None else (lambda _m: None)
+    explicit_root = root is not None
     root = root or repo_root()
     env_file = install.user_pref_dir / "houdini.env"
     line = f'RPFARM_ROOT = "{root}"'
@@ -621,6 +648,13 @@ def write_rpfarm_root_env(install: HoudiniInstall, root: Path | None = None) -> 
             existing = env_file.read_text(encoding="utf-8")
         except OSError:
             existing = ""
+
+    if not explicit_root:
+        current = _existing_rpfarm_root(existing)
+        if current is not None and current != str(root):
+            say(f"RPFARM_ROOT already set to {current!r} in {env_file} -- "
+                f"leaving it (pass root= to override deliberately)")
+            return env_file
 
     lines = existing.splitlines()
     out = []
