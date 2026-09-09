@@ -61,7 +61,7 @@ if [ -d "$HFS" ] && [ -f "$HFS/houdini_setup_bash" ]; then
   set -u
   echo "houdini: houdini_setup_bash rc=$_setup_rc, hython=$(command -v hython || echo 'not on PATH')"
 
-  if [ -n "${SESINETD_HOST:-}" ] && ! command -v hserver >/dev/null 2>&1; then
+  if { [ -n "${SESINETD_URL:-}" ] || [ -n "${SESINETD_HOST:-}" ]; } && ! command -v hserver >/dev/null 2>&1; then
     # `hserver` ships inside $HFS/bin and is only on PATH once
     # houdini_setup_bash above has actually set up a real Houdini install.
     # Guard it explicitly instead of letting each call fail with "command
@@ -71,7 +71,7 @@ if [ -d "$HFS" ] && [ -f "$HFS/houdini_setup_bash" ]; then
     # licensing attempted" case explicit rather than four separate
     # not-found lines.
     echo "License: hserver not found on PATH (HFS=$HFS has no working Houdini install) -- skipping license setup"
-  elif [ -n "${SESINETD_HOST:-}" ]; then
+  elif [ -n "${SESINETD_URL:-}" ] || [ -n "${SESINETD_HOST:-}" ]; then
     # v1 (docker/entrypoint.sh:34) pointed the local hserver at the remote
     # license server with `hserver --host "$SESINETD_HOST"`, silently
     # dropping SESINETD_PORT. That flag is documented (hserver --help,
@@ -91,6 +91,15 @@ if [ -d "$HFS" ] && [ -f "$HFS/houdini_setup_bash" ]; then
     # error and `hserver -l` afterwards reports the exact host:port pair
     # back as "License Server: http://<host>:<port>".
     #
+    # `-S` also takes a full connection URL -- the same form
+    # `.sesi_licenses.pref` itself stores -- which matters now that
+    # sesinetd sits behind an nginx reverse proxy carrying a secret path
+    # (Ruling R69, 2026-09-09: sesinetd has no client authentication of
+    # its own, only IP masks, so the raw port cannot be exposed to the
+    # internet again). SESINETD_URL, when set, is used INSTEAD of
+    # SESINETD_HOST/SESINETD_PORT -- never both, so there is exactly one
+    # answer to "which server did this pod use" in the log.
+    #
     # `-S` is a *client* option: it talks to an already-running local
     # hserver daemon. On a fresh pod there is no daemon yet, and relying on
     # `-S`'s own "Unable to connect to hserver. Attempting to restart
@@ -107,13 +116,26 @@ if [ -d "$HFS" ] && [ -f "$HFS/houdini_setup_bash" ]; then
     hserver >/tmp/hserver_start.log 2>&1
     echo "hserver start: $(cat /tmp/hserver_start.log 2>/dev/null || echo '(no output)')"
     sleep 1
-    hserver -S "${SESINETD_HOST}:${SESINETD_PORT:-1715}"
+    if [ -n "${SESINETD_URL:-}" ]; then
+      echo "License: connecting via SESINETD_URL"
+      hserver -S "${SESINETD_URL}"
+    else
+      echo "License: connecting via SESINETD_HOST ${SESINETD_HOST}:${SESINETD_PORT:-1715}"
+      hserver -S "${SESINETD_HOST}:${SESINETD_PORT:-1715}"
+    fi
     sleep 2
-    _hserver_l="$(hserver -l 2>&1)"
+    # hserver -l echoes back whatever server string it was given, secret
+    # path included when SESINETD_URL was used -- masked here UNCONDITIONALLY,
+    # before either branch below prints anything, so there is one place
+    # this can leak from instead of one per branch. Never skip this: the
+    # owner-infra guard test catches a real hostname landing in a tracked
+    # file, it does not and cannot catch a secret in a runtime log line.
+    _hserver_l_raw="$(hserver -l 2>&1)"
+    _hserver_l="$(printf '%s' "$_hserver_l_raw" | sed -E 's#(https?://[^/[:space:]]+)/[^[:space:]]*#\1/***#g')"
     if echo "$_hserver_l" | grep -q 'Connected To'; then
       echo "License: $(echo "$_hserver_l" | grep -m1 'Connected To')"
     else
-      echo "License: not connected -- raw 'hserver -l' output:"
+      echo "License: not connected -- raw 'hserver -l' output (masked):"
       echo "$_hserver_l"
     fi
   fi

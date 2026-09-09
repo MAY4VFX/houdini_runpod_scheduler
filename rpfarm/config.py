@@ -18,6 +18,7 @@ import platform
 import secrets
 import sys
 import tempfile
+import urllib.parse
 import urllib.request
 import zipfile
 from dataclasses import dataclass, field, fields
@@ -87,6 +88,16 @@ class Config:
     # protocol constant rather than anybody's address.
     sesinetd_host: str = ""
     sesinetd_port: int = 1715
+    # A licence server reachable only through a reverse proxy carrying a
+    # secret in the URL path (Ruling R69, 2026-09-09): sesinetd itself has
+    # NO client authentication -- no key, no password, only IP masks -- so
+    # a raw host:port forward to the internet let anyone who knew the
+    # hostname draw a licence. When set, this is used INSTEAD of
+    # sesinetd_host/sesinetd_port: hserver's -S/--server takes a full
+    # connection URL, not just host:port (the same form .sesi_licenses.pref
+    # itself stores), and the secret rides inside TLS as the bearer token.
+    # Never logged in full -- see mask_sesinetd_url.
+    sesinetd_url: str = ""
     # Sync pod lifecycle, in two steps: stop it when it has been unused this
     # long, then delete it when it has been stopped this long. Stopping is ~20x
     # cheaper than running but is NOT free -- RunPod bills the container disk at
@@ -258,6 +269,48 @@ def require_sesinetd_host(cfg) -> str:
             "task fails the same way.".format(home() / CONFIG_FILENAME)
         )
     return host
+
+
+def require_sesinetd(cfg) -> None:
+    """Raises :class:`ConfigError` unless a license server is configured,
+    either way -- ``sesinetd_url`` (a reverse-proxied URL, secret path
+    included) or ``sesinetd_host``/``sesinetd_port`` (talking to sesinetd
+    directly). Same call site as :func:`require_sesinetd_host` used to
+    cover alone (:func:`rpfarm.pods.pod_env`, the RunPod template) --
+    extended rather than replaced, since pod_env still needs to know
+    which of the two it got to build the right env var.
+    """
+    if (getattr(cfg, "sesinetd_url", "") or "").strip():
+        return
+    if (getattr(cfg, "sesinetd_host", "") or "").strip():
+        return
+    raise ConfigError(
+        "no license server configured: set sesinetd_url (a full URL, if "
+        "yours sits behind a reverse proxy) or sesinetd_host (and "
+        "sesinetd_port, if not sesinetd's default 1715) in {}. It has to "
+        "be YOUR OWN SideFX license server, reachable from the render "
+        "pods -- without one, hython on a pod gets no license and every "
+        "task fails the same way.".format(home() / CONFIG_FILENAME))
+
+
+def mask_sesinetd_url(url: str | None) -> str:
+    """``https://licence.example.com/***`` -- the scheme and host of a
+    license server URL, with the path (the bearer secret, Ruling R69)
+    always replaced. Enough to see which server is configured; never
+    enough to reach it. Used everywhere ``sesinetd_url`` could otherwise
+    reach a log, a ledger, an error message or a printed environment --
+    the guard test that catches a real hostname in a tracked file does
+    NOT catch a secret in a log line, so this has to be the actual habit,
+    not a backstop.
+    """
+    if not url:
+        return ""
+    try:
+        parsed = urllib.parse.urlsplit(url)
+    except ValueError:
+        return "(unparseable)"
+    netloc = parsed.netloc or (parsed.path.split("/", 1)[0] if parsed.path else "")
+    return "{}://{}/***".format(parsed.scheme or "https", netloc or "?")
 
 
 def mask_secret(value: str | None) -> str:

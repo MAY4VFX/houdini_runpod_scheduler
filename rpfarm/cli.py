@@ -34,6 +34,7 @@ import posixpath
 import re
 import shlex
 import socket
+import urllib.parse
 import subprocess
 import sys
 import tempfile
@@ -369,14 +370,20 @@ def _pick_template(api, args, cfg_stub, log=print):
     if existing:
         log(f"[OK] using existing template {existing['id']} (rpfarm-pod, image {existing.get('imageName')})")
         return existing["id"]
-    env = {
-        # No license server -> no template. A template carries the license
-        # host into every pod created from it, so baking an empty one in is
-        # a farm that boots and fails.
-        "SESINETD_HOST": rpcfg.require_sesinetd_host(cfg_stub),
-        "SESINETD_PORT": str(cfg_stub.sesinetd_port),
-        "HOUDINI_VERSION": cfg_stub.houdini_version,
-    }
+    # No license server -> no template. A template carries the license
+    # server into every pod created from it, so baking in none is a farm
+    # that boots and fails. Every real pod's own create call overlays this
+    # with pod_env()'s own value anyway; this is only the template's
+    # baked-in default. sesinetd_url (Ruling R69) wins when set, same as
+    # pod_env().
+    rpcfg.require_sesinetd(cfg_stub)
+    env = {"HOUDINI_VERSION": cfg_stub.houdini_version}
+    _url = (getattr(cfg_stub, "sesinetd_url", "") or "").strip()
+    if _url:
+        env["SESINETD_URL"] = _url
+    else:
+        env["SESINETD_HOST"] = cfg_stub.sesinetd_host
+        env["SESINETD_PORT"] = str(cfg_stub.sesinetd_port)
     tpl = api.save_template("rpfarm-pod", "ghcr.io/may4vfx/rpfarm-pod:latest", rppods.PORTS, env)
     log(f"[OK] created template {tpl['id']} (rpfarm-pod)")
     return tpl["id"]
@@ -467,20 +474,29 @@ def cmd_setup(args, prompt=input):
     # the artist's own, so setup asks rather than guessing. Asked here --
     # before a template or a pod exists -- because a farm configured
     # without one boots, bills, and fails every task on a license error.
+    # sesinetd_url (Ruling R69) wins over sesinetd_host when both are set --
+    # never asked for interactively (it carries a secret path, and a
+    # prompt's own echo/terminal history is exactly the kind of place this
+    # must not land); --sesinetd-url or an existing config.toml value only.
+    url = (getattr(args, "sesinetd_url", None) or cfg.sesinetd_url or "").strip()
+    cfg.sesinetd_url = url
     lic = (getattr(args, "sesinetd_host", None) or cfg.sesinetd_host or "").strip()
-    if not lic and not args.non_interactive:
+    if not lic and not url and not args.non_interactive:
         lic = prompt(
-            "SideFX license server -- host of YOUR sesinetd, e.g. lic.example.com: "
+            "SideFX license server -- host of YOUR sesinetd, e.g. lic.example.com "
+            "(leave empty if you have a sesinetd_url instead): "
         ).strip()
     cfg.sesinetd_host = lic
     if getattr(args, "sesinetd_port", None):
         cfg.sesinetd_port = args.sesinetd_port
-    if lic:
+    if url:
+        print(f"[OK] license server {rpcfg.mask_sesinetd_url(url)}")
+    elif lic:
         print(f"[OK] license server {cfg.sesinetd_host}:{cfg.sesinetd_port}")
     else:
         print("[WARN] no license server set -- pods cannot be created until "
-              "sesinetd_host is in "
-              f"{home / rpcfg.CONFIG_FILENAME} (or rerun with --sesinetd-host)")
+              "sesinetd_url or sesinetd_host is in "
+              f"{home / rpcfg.CONFIG_FILENAME} (or rerun with --sesinetd-url/--sesinetd-host)")
 
     try:
         cfg.template_id = _resolve_template_id(api, args, existing, cfg)
@@ -684,8 +700,26 @@ def cmd_doctor(args):
     except RunPodError as e:
         fail(f"could not list templates: {e}")
 
-    if not (cfg.sesinetd_host or "").strip():
-        fail(f"no license server configured -- set sesinetd_host in "
+    _sesinetd_url = (getattr(cfg, "sesinetd_url", "") or "").strip()
+    if _sesinetd_url:
+        # A TCP connect to the URL's host only proves the reverse proxy is
+        # up, not that the secret path is correct or that it reaches
+        # sesinetd through it -- that needs an actual hserver -S against
+        # this exact URL, which only a real pod can do (Ruling R69: proven
+        # live, not from this machine). This is a shallower "is the proxy
+        # even there" check, and says so.
+        try:
+            parsed = urllib.parse.urlsplit(_sesinetd_url)
+            port = parsed.port or (443 if parsed.scheme == "https" else 80)
+            with socket.create_connection((parsed.hostname, port), timeout=5):
+                ok(f"{rpcfg.mask_sesinetd_url(_sesinetd_url)} reachable (license server "
+                   f"proxy -- does not confirm the secret path or sesinetd itself; "
+                   f"verified on a real pod, not here)")
+        except (OSError, ValueError) as e:
+            fail(f"{rpcfg.mask_sesinetd_url(_sesinetd_url)} unreachable ({e}) -- "
+                 f"check network/VPN")
+    elif not (cfg.sesinetd_host or "").strip():
+        fail(f"no license server configured -- set sesinetd_url or sesinetd_host in "
              f"{rpcfg.home() / rpcfg.CONFIG_FILENAME} (or rerun `rpfarm setup`). "
              f"It must be your own SideFX sesinetd, reachable from the pods; "
              f"there is no default, and pods cannot be created without it")
@@ -1440,6 +1474,9 @@ def build_parser():
     p_setup.add_argument("--template", help="use this pod template id instead of discovering/keeping one")
     p_setup.add_argument("--sesinetd-host", help="your SideFX license server (no default: it is yours, not ours)")
     p_setup.add_argument("--sesinetd-port", type=int, help="license server port (default: sesinetd's own 1715)")
+    p_setup.add_argument("--sesinetd-url",
+                         help="full license server URL (secret path included) if sesinetd sits "
+                              "behind a reverse proxy -- wins over --sesinetd-host when both are set")
     p_setup.add_argument("--non-interactive", action="store_true", help="never prompt; fail instead of asking")
 
     p_doctor = sub.add_parser(

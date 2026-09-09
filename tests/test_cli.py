@@ -297,6 +297,39 @@ def test_doctor_names_the_unset_license_server_instead_of_probing_nothing(tmp_pa
     assert "sesinetd_host" in out
 
 
+def test_doctor_probes_the_sesinetd_url_host_and_never_prints_the_secret(tmp_path, monkeypatch, capsys):
+    """Ruling R69: doctor still has to say SOMETHING useful when sesinetd_url
+    is configured -- a TCP connect to the URL's own host, never the raw URL
+    in any [OK]/[FAIL] line."""
+    monkeypatch.setenv("RPFARM_HOME", str(tmp_path))
+    _write_cfg(tmp_path, sesinetd_host="", sesinetd_url="https://lic.example.com/topsecretpath/",
+              rclone_path="true", ssh_key_path=str(tmp_path / "id_ed25519"))
+    (tmp_path / "id_ed25519").write_text("x")
+    (tmp_path / "id_ed25519.pub").write_text("x")
+
+    handlers = _setup_handlers()
+    handlers[("GET", "/networkvolumes/vol123")] = (
+        200, json.dumps({"id": "vol123", "size": 50, "dataCenterId": "EU-RO-1"}).encode()
+    )
+    handlers[("GET", "/templates")] = (200, json.dumps([{"id": "tpl123", "imageName": "img:latest"}]).encode())
+    monkeypatch.setattr(cli, "_transport", FakeTransport(handlers))
+    monkeypatch.setattr(houdini_local, "find_houdini_installations", lambda: [])
+
+    seen = []
+
+    def _fake_connect(addr, timeout=None):
+        seen.append(addr)
+        raise OSError("blocked in test")
+
+    monkeypatch.setattr("socket.create_connection", _fake_connect)
+
+    rc = cli.main(["doctor"])
+    out = capsys.readouterr().out
+    assert seen == [("lic.example.com", 443)]  # connected to the URL's own host, not a bare hostname string
+    assert "topsecretpath" not in out
+    assert "https://lic.example.com/***" in out
+
+
 def test_setup_records_the_license_server_it_was_given(tmp_path, monkeypatch):
     monkeypatch.setenv("RPFARM_HOME", str(tmp_path))
     monkeypatch.setattr(cli, "_transport", FakeTransport(_setup_handlers()))
@@ -309,6 +342,45 @@ def test_setup_records_the_license_server_it_was_given(tmp_path, monkeypatch):
     cfg = rpcfg.load()
     assert cfg.sesinetd_host == "lic.example.com"
     assert cfg.sesinetd_port == 1716
+
+
+def test_setup_records_a_sesinetd_url_and_never_prints_the_secret(tmp_path, monkeypatch, capsys):
+    """Ruling R69: the URL carries a secret path -- the [OK] line must show
+    only the masked form, never the value that was actually saved."""
+    monkeypatch.setenv("RPFARM_HOME", str(tmp_path))
+    monkeypatch.setattr(cli, "_transport", FakeTransport(_setup_handlers()))
+    monkeypatch.setattr(houdini_local, "find_houdini_installations", lambda: [])
+    monkeypatch.setattr(rpcfg, "rclone_bin", lambda *a, **k: str(tmp_path / "bin" / "rclone"))
+
+    rc = cli.main(["setup", "--non-interactive", "--api-key", "k", "--user", "u",
+                   "--sesinetd-url", "https://lic.example.com/topsecretpath/"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    cfg = rpcfg.load()
+    assert cfg.sesinetd_url == "https://lic.example.com/topsecretpath/"
+    assert "topsecretpath" not in out
+    assert "https://lic.example.com/***" in out
+
+
+def test_setup_never_prompts_for_the_license_server_when_a_url_is_already_configured(tmp_path, monkeypatch):
+    """A prompt's own terminal history is exactly the kind of place a
+    secret must not land -- the URL is never asked for interactively
+    (there is no --sesinetd-url-equivalent prompt at all), and an
+    already-configured URL must not trigger the sesinetd_host prompt
+    either."""
+    monkeypatch.setenv("RPFARM_HOME", str(tmp_path))
+    _write_cfg(tmp_path, sesinetd_host="", sesinetd_url="https://lic.example.com/secretpath/")
+    monkeypatch.setattr(cli, "_transport", FakeTransport(_setup_handlers()))
+    monkeypatch.setattr(houdini_local, "find_houdini_installations", lambda: [])
+    monkeypatch.setattr(rpcfg, "rclone_bin", lambda *a, **k: str(tmp_path / "bin" / "rclone"))
+
+    def _must_not_prompt(_text):
+        raise AssertionError("must not prompt when sesinetd_url is already configured")
+
+    args = cli.build_parser().parse_args(["setup", "--api-key", "k", "--user", "u"])
+    rc = cli.cmd_setup(args, prompt=_must_not_prompt)
+    assert rc == 0
+    assert rpcfg.load().sesinetd_url == "https://lic.example.com/secretpath/"
 
 
 def test_setup_asks_for_the_license_server_when_there_is_none(tmp_path, monkeypatch):

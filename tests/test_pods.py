@@ -255,6 +255,41 @@ def test_pod_env_without_extra():
     }
 
 
+def test_pod_env_uses_sesinetd_url_when_configured():
+    """Ruling R69: sesinetd_url wins over sesinetd_host/port -- never both,
+    so there is exactly one answer to "which server did this pod use"."""
+    from rpfarm.config import Config
+
+    c = Config(api_key="k", user="may", volume_id="v", template_id="t", gpu_priority=["g"],
+              sesinetd_host="lic.example.com",
+              sesinetd_url="https://lic.example.com/topsecretpath123/")
+
+    env = pods.pod_env(c, "gpu", "tok", 1, "ssh-ed25519 AAA")
+
+    assert env["SESINETD_URL"] == "https://lic.example.com/topsecretpath123/"
+    assert "SESINETD_HOST" not in env
+    assert "SESINETD_PORT" not in env
+
+
+def test_pod_env_falls_back_to_sesinetd_host_when_url_not_set():
+    c = cfg()  # sesinetd_host only, no sesinetd_url
+
+    env = pods.pod_env(c, "gpu", "tok", 1, "ssh-ed25519 AAA")
+
+    assert env["SESINETD_HOST"] == c.sesinetd_host
+    assert env["SESINETD_PORT"] == str(c.sesinetd_port)
+    assert "SESINETD_URL" not in env
+
+
+def test_pod_env_raises_when_neither_sesinetd_url_nor_host_is_set():
+    from rpfarm.config import Config, ConfigError
+
+    c = Config(api_key="k", user="may", volume_id="v", template_id="t", gpu_priority=["g"])
+
+    with pytest.raises(ConfigError):
+        pods.pod_env(c, "gpu", "tok", 1, "ssh-ed25519 AAA")
+
+
 def test_wait_ready_returns_pod_when_healthy():
     api = FakeAPI()
     pod = api.create_cpu_pod("rpfarm-x", "t", "v", {}, [])

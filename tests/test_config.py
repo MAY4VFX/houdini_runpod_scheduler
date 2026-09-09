@@ -41,6 +41,50 @@ def test_a_configured_license_server_comes_back_stripped():
     assert config.require_sesinetd_host(cfg) == "lic.example.com"
 
 
+def test_require_sesinetd_passes_with_a_url_and_no_host():
+    """Ruling R69: sesinetd_url alone is enough -- it is used INSTEAD of
+    sesinetd_host, not in addition to it."""
+    cfg = config.Config(api_key="k", user="may", volume_id="v", template_id="t",
+                        sesinetd_url="https://lic.example.com/secretpath/")
+    config.require_sesinetd(cfg)  # must not raise
+
+
+def test_require_sesinetd_passes_with_only_a_host():
+    cfg = config.Config(api_key="k", user="may", volume_id="v", template_id="t",
+                        sesinetd_host="lic.example.com")
+    config.require_sesinetd(cfg)  # must not raise
+
+
+def test_require_sesinetd_raises_with_neither():
+    cfg = config.Config(api_key="k", user="may", volume_id="v", template_id="t")
+    with pytest.raises(config.ConfigError) as e:
+        config.require_sesinetd(cfg)
+    msg = str(e.value)
+    assert "sesinetd_url" in msg
+    assert "sesinetd_host" in msg
+
+
+def test_mask_sesinetd_url_hides_the_secret_path():
+    """The path IS the bearer token (Ruling R69) -- never shown, not even
+    partially the way mask_secret shows a few characters of an API key."""
+    masked = config.mask_sesinetd_url("https://lic.example.com/topsecretpath123456789/")
+    assert masked == "https://lic.example.com/***"
+    assert "topsecretpath123456789" not in masked
+
+
+def test_mask_sesinetd_url_handles_no_path():
+    assert config.mask_sesinetd_url("https://lic.example.com") == "https://lic.example.com/***"
+
+
+def test_mask_sesinetd_url_empty_is_empty():
+    assert config.mask_sesinetd_url("") == ""
+    assert config.mask_sesinetd_url(None) == ""
+
+
+def test_mask_sesinetd_url_never_raises_on_garbage():
+    assert config.mask_sesinetd_url("not a url at all") is not None
+
+
 def test_load_missing_file_raises_config_error(tmp_path, monkeypatch):
     monkeypatch.setenv("RPFARM_HOME", str(tmp_path))
     with pytest.raises(config.ConfigError):
@@ -65,6 +109,15 @@ def test_save_preserves_non_default_fields(tmp_path, monkeypatch):
     assert back.sesinetd_port == 1716
     assert back.sync_idle_min == 30
     assert back.gpu_priority == ["NVIDIA GeForce RTX 4090", "NVIDIA A40"]
+
+
+def test_sesinetd_url_round_trips_through_config_toml(tmp_path, monkeypatch):
+    monkeypatch.setenv("RPFARM_HOME", str(tmp_path))
+    cfg = config.Config(api_key="k", user="may", volume_id="v", template_id="t",
+                        sesinetd_url="https://lic.example.com/secretpath/")
+    config.save(cfg)
+    back = config.load()
+    assert back.sesinetd_url == "https://lic.example.com/secretpath/"
 
 
 # -- session_token -------------------------------------------------------------

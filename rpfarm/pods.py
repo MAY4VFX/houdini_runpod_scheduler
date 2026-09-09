@@ -85,11 +85,19 @@ def pod_env(cfg, role, token, slots, pubkey, extra=None, cook="", project=""):
         "RPFARM_PROJECT": project,
         "PUBLIC_KEY": pubkey,
         "HOUDINI_VERSION": cfg.houdini_version,
-        # Raises rather than starting a pod with an empty SESINETD_HOST:
-        # such a pod boots, bills, and fails every task on a license error.
-        "SESINETD_HOST": rpcfg.require_sesinetd_host(cfg),
-        "SESINETD_PORT": str(cfg.sesinetd_port),
     }
+    # Raises rather than starting a pod with no license server configured
+    # at all: such a pod boots, bills, and fails every task on a license
+    # error. sesinetd_url (Ruling R69) wins when set -- entrypoint.sh reads
+    # it and never logs it in full; SESINETD_HOST/PORT is the fallback for
+    # a machine not yet migrated off talking to sesinetd directly.
+    rpcfg.require_sesinetd(cfg)
+    sesinetd_url = (getattr(cfg, "sesinetd_url", "") or "").strip()
+    if sesinetd_url:
+        env["SESINETD_URL"] = sesinetd_url
+    else:
+        env["SESINETD_HOST"] = cfg.sesinetd_host
+        env["SESINETD_PORT"] = str(cfg.sesinetd_port)
     if extra:
         env.update(extra)
     return env
