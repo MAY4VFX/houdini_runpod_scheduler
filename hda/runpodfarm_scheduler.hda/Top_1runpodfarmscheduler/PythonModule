@@ -1436,30 +1436,33 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         # platform-specific.
         task_env = self.resolveBaseEnvironment(self.parmprefix, node, work_item)
 
+        # Ruling R67: this used to hand-roll a SUBSET of what the base
+        # class's addCommonJobEnvVars already provides (PDG_RESULT_SERVER,
+        # PDG_PYATTRIB_LOADER, PDG_ITEM_*, PDG_INDEX) while silently
+        # dropping the rest -- PDG_RPC_RETRIES/TIMEOUT/MAX_BACKOFF,
+        # PDG_BATCH_POLL_DELAY, PDG_RELEASE_SLOT_ON_POLL (hardcoded "0"
+        # here instead of reading the node's own pdg_rpcrelease parm) and
+        # PDG_RPC_IGNORE_ERRORS. pdgjob/rop.py needs those to report each
+        # sub-frame of a BATCH work item back over RPC; without them a
+        # batched ROP Fetch cook had no working retry/poll config at all.
+        # Both of SideFX's own farm scheduler plugins (tbdeadline.py,
+        # prtractor.py) call this exact base method rather than
+        # re-deriving it -- do it the way Houdini does it, not our way.
+        self.addCommonJobEnvVars(task_env, work_item, self._verbose)
+
         task_env.update({
-            "PDG_RESULT_SERVER": self.workItemResultServerAddr(),
             "PDG_DIR": self.workingDir(False),
             "PDG_TEMP": self.tempDir(False),
             "PDG_SCRIPTDIR": self.scriptDir(False),
-            "PDG_PYATTRIB_LOADER": TypeRegistry.types().pySerializationModule,
-            "PDG_RELEASE_SLOT_ON_POLL": "0",
         })
 
         if work_item:
             task_env.update({
-                "PDG_ITEM_NAME": work_item.name,
-                "PDG_ITEM_LABEL": work_item.label,
-                "PDG_ITEM_ID": str(work_item.id),
-                "PDG_ITEM_DATA_SOURCE": str(int(self.workItemDataSource)),
-                "PDG_INDEX": str(work_item.index),
-                # PDGNET configuration
+                # PDGNET configuration -- ours, not part of the base method
                 "PDG_HTTP_PORT": str(self.mqinfo.mq_httpport),
                 "PDG_JOBUSE_PDGNET": "1",
                 "PDG_RESULT_CLIENT_ID": self.mqinfo.client_id,
             })
-
-        if self._verbose:
-            task_env["PDG_VERBOSE"] = "1"
 
         # The user can override this behavior by explicitly setting the env var
         # in a pdg::scheduler or item environment

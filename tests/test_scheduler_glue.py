@@ -1492,6 +1492,109 @@ def test_scene_divergence_shares_nothing_when_the_listing_fails(tmp_path):
     assert shared == []  # nothing fetched -- nothing to offer the dialog
 
 
+# ---------------------------------------------------------------------------
+# PDG batch work items (owner's request, 2026-09-08): pdgjob/rop.py cooks a
+# batch item's whole frame range in one process and reports each sub-frame
+# back over RPC using PDG_RPC_RETRIES/TIMEOUT/MAX_BACKOFF, PDG_BATCH_POLL_
+# DELAY, PDG_RELEASE_SLOT_ON_POLL and PDG_RPC_IGNORE_ERRORS -- all of which
+# _prepareTaskEnv used to never set (it hand-rolled a subset of what the
+# base class's own addCommonJobEnvVars already provides, the same method
+# SideFX's own tbdeadline.py/prtractor.py schedulers call). Ruling R67.
+# ---------------------------------------------------------------------------
+
+class _TaskEnvScheduler:
+    """Just enough of the scheduler for the lifted _prepareTaskEnv -- every
+    collaborator it calls, stubbed to a recognisable fake value so the test
+    can tell which pieces of the final task_env came from where."""
+
+    def __init__(self):
+        self.parmprefix = "rpfarm"
+        self._verbose = 1
+        self.mqinfo = types.SimpleNamespace(mq_httpport=4442, client_id="cid")
+        self.common_calls = []
+
+    def resolveBaseEnvironment(self, parmprefix, node, work_item):
+        return {"PATH": "/usr/bin"}
+
+    def addCommonJobEnvVars(self, job_env, work_item, verbosity):
+        # The real base method sets PDG_RPC_*/PDG_BATCH_POLL_DELAY/
+        # PDG_RELEASE_SLOT_ON_POLL/PDG_RPC_IGNORE_ERRORS from the node's own
+        # pdg_rpc* parms. A distinctive marker is enough here: the point of
+        # this test is that _prepareTaskEnv calls this at all, with the
+        # right work_item, not that it re-derives PDG's own parm reading.
+        self.common_calls.append((work_item, verbosity))
+        job_env["PDG_RPC_IGNORE_ERRORS"] = "from-addCommonJobEnvVars"
+        job_env["PDG_RELEASE_SLOT_ON_POLL"] = "from-addCommonJobEnvVars"
+
+    def workingDir(self, local):
+        return "/workspace/dir"
+
+    def tempDir(self, local):
+        return "/workspace/temp"
+
+    def scriptDir(self, local):
+        return "/workspace/scripts"
+
+    def initHoudiniMaxThreads(self, work_item, parmprefix, default):
+        return None
+
+    def resolvePathMapping(self, task_env):
+        pass
+
+    def _ensurePathMapEnv(self, task_env):
+        pass
+
+    def _ensureHoudiniPathmapEnv(self, task_env):
+        pass
+
+    def _ensureOcioEnv(self, task_env):
+        pass
+
+    def resolveEnvParams(self, parmprefix, work_item, flag):
+        return {}, []
+
+
+def _task_env_ns():
+    return load_methods(["_prepareTaskEnv"], {})
+
+
+def test_prepare_task_env_calls_the_base_classs_batch_rpc_setup():
+    ns = _task_env_ns()
+    sched = _TaskEnvScheduler()
+    sched._prepareTaskEnv = lambda node, wi: ns["_prepareTaskEnv"](sched, node, wi)
+    work_item = types.SimpleNamespace(
+        name="render/0", label="render", id=7, index=0, environment={})
+
+    task_env = sched._prepareTaskEnv(None, work_item)
+
+    assert sched.common_calls == [(work_item, 1)]
+    # The batch RPC config came from addCommonJobEnvVars, not a hardcoded
+    # value re-derived here.
+    assert task_env["PDG_RPC_IGNORE_ERRORS"] == "from-addCommonJobEnvVars"
+    assert task_env["PDG_RELEASE_SLOT_ON_POLL"] == "from-addCommonJobEnvVars"
+    # Farm-specific env this method still owns, untouched by the change.
+    assert task_env["PDG_DIR"] == "/workspace/dir"
+    assert task_env["PDG_TEMP"] == "/workspace/temp"
+    assert task_env["PDG_SCRIPTDIR"] == "/workspace/scripts"
+    assert task_env["PDG_HTTP_PORT"] == "4442"
+    assert task_env["PDG_JOBUSE_PDGNET"] == "1"
+    assert task_env["PDG_RESULT_CLIENT_ID"] == "cid"
+
+
+def test_prepare_task_env_calls_addcommonjobenvvars_even_with_no_work_item():
+    """Called with work_item=None too (onStopCook's own pretask env) --
+    addCommonJobEnvVars must still run so PDG_RESULT_SERVER etc. are set
+    for that call, same as the batched case."""
+    ns = _task_env_ns()
+    sched = _TaskEnvScheduler()
+    sched._prepareTaskEnv = lambda node, wi: ns["_prepareTaskEnv"](sched, node, wi)
+
+    task_env = sched._prepareTaskEnv(None, None)
+
+    assert sched.common_calls == [(None, 1)]
+    assert "PDG_HTTP_PORT" not in task_env  # PDGNET config is per-item only
+
+
 def test_onsetupcook_checks_divergence_before_uploading_pdg_temp():
     """onSetupCook itself never rents a GPU pod (that is onTick's job, once
     PDG actually has work -- see its own comment on _raised_for_work); the
