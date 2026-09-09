@@ -53,17 +53,37 @@ def _tracked_text_files():
 # Each is (name, compiled regex, what to do about it). The regex runs per
 # line, so the report can name the line.
 
-# The owner's own domain. Nothing in this repository has a reason to name
-# it: the license server, the relay and every service behind it are the
-# deployer's, not the project's.
-OWNER_DOMAIN = re.compile(r"\bexample\.invalid\b")
+# The deployer's own identifying strings -- domain, machine names, home
+# directory, LAN addresses. Ruling R66: these are NOT written here. This
+# file is tracked in a PUBLIC repository, and a guard that spells out the
+# very strings it guards against is itself the leak -- which is what it
+# was, until the history had to be rewritten to get them back out. They
+# live in a file outside the repository instead, one pattern per line,
+# '#' comments ignored:
+#
+#     ~/.rpfarm/owner_infra.txt   (or $RPFARM_OWNER_INFRA)
+#
+# Absent, the owner-specific checks are skipped and the structural ones
+# below still run -- so a fresh clone and CI are not broken by a file
+# only the deployer has. Skipping is announced, never silent.
+OWNER_INFRA_FILE = "owner_infra.txt"
 
-# Personal machines by name. Meaningless to anyone else who clones this,
-# and in tests they read as noise rather than as an example.
-PERSONAL_HOSTS = re.compile(r"\b(?:workstation01|hypervisor01|oracl)\b")
 
-# The owner's home directory. Examples use /Users/artist.
-PERSONAL_HOME = re.compile(r"(?:/Users/artist|/home/may)(?:/|\b)")
+def _owner_patterns():
+    """Compiled patterns from the local file, or [] if there is none."""
+    import os
+    raw = os.environ.get("RPFARM_OWNER_INFRA")
+    path = Path(raw) if raw else Path.home() / ".rpfarm" / OWNER_INFRA_FILE
+    try:
+        text = path.read_text()
+    except OSError:
+        return []
+    out = []
+    for line in text.splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            out.append(re.compile(line))
+    return out
 
 # A public IPv4 given as a LOGIN TARGET -- "user@1.2.3.4" on a line that
 # also runs ssh/scp/rsync/sftp. That is a machine plus the command to get
@@ -90,20 +110,17 @@ RUNPOD_ID_SHAPE = re.compile(r"^(?=[a-z0-9]{10}$)(?=.*[a-z])(?=.*\d)")
 
 
 def _findings():
+    owner = _owner_patterns()
     for rel, text in _tracked_text_files():
         for n, line in enumerate(text.splitlines(), 1):
             where = f"{rel}:{n}"
-            if OWNER_DOMAIN.search(line):
-                yield (where, line.strip(),
-                       "the deployer's own domain -- use example.com, and keep the "
-                       "real name in the hub's departments/infra/map.md")
-            if PERSONAL_HOSTS.search(line):
-                yield (where, line.strip(),
-                       "a personal machine by name -- use a neutral stub "
-                       "(buildhost, and so on)")
-            if PERSONAL_HOME.search(line):
-                yield (where, line.strip(),
-                       "somebody's home directory -- examples use /Users/artist")
+            for pat in owner:
+                if pat.search(line):
+                    yield (where, line.strip(),
+                           "the deployer's own infrastructure -- use a placeholder, "
+                           "and keep the real value in ~/.rpfarm/config.toml or the "
+                           "hub's departments/infra/map.md")
+                    break
             m = LOGIN_AT_IP.search(line) if SSH_COMMAND.search(line) else None
             if m and not PRIVATE_IP.match(m.group("ip")):
                 yield (where, line.strip(),
@@ -129,8 +146,16 @@ def test_no_owner_infrastructure_in_tracked_files():
 # -- the guard's own teeth --------------------------------------------------
 
 
+# Synthetic stand-ins for the deployer's real strings, which no longer
+# live in this file (see _owner_patterns above). They only have to be
+# shaped like the real thing -- the code path does not care what they say.
+_PROBE_OWNER = [re.compile(r"\bowner-example\.invalid\b"),
+                re.compile(r"\bownerbox01\b"),
+                re.compile(r"/Users/someowner(?:/|\b)")]
+
+
 @pytest.mark.parametrize("line,expected", [
-    ('sesinetd_host: str = "lic.example.invalid"', True),
+    ('sesinetd_host: str = "lic.owner-example.invalid"', True),
     ('sesinetd_host: str = "lic.example.com"', False),
     ("- ssh opc@89.168.89.3: kill the socat duplicates", True),
     ("ssh -o StrictHostKeyChecking=no root@10.0.0.10", False),
@@ -138,13 +163,28 @@ def test_no_owner_infrastructure_in_tracked_files():
     ('"networkVolumeId": "2ze7qdwkt3",', True),
     ('"networkVolumeId": "<volume id>",', False),
     ('volume_id="vol123", template_id="tpl123"', False),
-    ("tar is on workstation01 under /home/may/Downloads", True),
+    ("tar is on ownerbox01 under /srv/Downloads", True),
+    ("OCIO=/Users/someowner/color/config.ocio", True),
     ("OCIO=/Users/artist/color/config.ocio", False),
 ])
 def test_the_guard_catches_what_it_claims_to(line, expected, tmp_path, monkeypatch):
     # Patch the module object itself: pytest may import this file as
     # "tests.<name>" or as "<name>", depending on rootdir, and a string
     # target that does not resolve silently patches nothing.
-    monkeypatch.setattr(sys.modules[__name__], "_tracked_text_files",
-                        lambda: [("probe.txt", line)])
+    mod = sys.modules[__name__]
+    monkeypatch.setattr(mod, "_tracked_text_files", lambda: [("probe.txt", line)])
+    monkeypatch.setattr(mod, "_owner_patterns", lambda: list(_PROBE_OWNER))
     assert bool(list(_findings())) is expected
+
+
+def test_owner_patterns_come_from_outside_the_repo(tmp_path, monkeypatch):
+    """Ruling R66. The real strings must be loadable without being written
+    into a tracked file -- and their absence must degrade to "skip the
+    owner-specific checks", never to a failure that stops a fresh clone."""
+    f = tmp_path / "owner_infra.txt"
+    f.write_text("# a comment\n\n\\bownerbox01\\b\n")
+    monkeypatch.setenv("RPFARM_OWNER_INFRA", str(f))
+    assert [p.pattern for p in _owner_patterns()] == [r"\bownerbox01\b"]
+
+    monkeypatch.setenv("RPFARM_OWNER_INFRA", str(tmp_path / "nope.txt"))
+    assert _owner_patterns() == []
