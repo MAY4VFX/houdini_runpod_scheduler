@@ -105,6 +105,7 @@ class FakeScheduler:
         self._work_items = {}
         self._graph_failures = []
         self._known_failure_ids = set()
+        self._submit_as_job = False
 
     # collaborators the lifted methods call
     def _log(self, msg):

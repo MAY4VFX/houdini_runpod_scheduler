@@ -250,7 +250,7 @@ _ASSET_FINGERPRINT = {
     'background_cook.py': (5780, 'e3b1839f4958d88a'),
     'cli.py': (71248, '1b7ef63474487e6d'),
     'compression.py': (23234, 'bef2f19daebbc929'),
-    'config.py': (16827, '8cf094b31ba6c0b4'),
+    'config.py': (17872, 'e71aaf77c29362f2'),
     'deps.py': (38558, '2daae12f5770289a'),
     'dispatch.py': (22191, '1121a6505c88adb3'),
     'gpus.py': (8311, '7a28d5c2692b776e'),

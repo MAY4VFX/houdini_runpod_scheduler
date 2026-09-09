@@ -177,6 +177,24 @@ def save(cfg: Config) -> None:
     os.chmod(path, 0o600)
 
 
+#: Env vars that override one field of the loaded config, for the ONE
+#: caller that has no config.toml of its own to put a real value in: the
+#: Submit As Job host pod (Ruling R71). It gets a config.toml shipped with
+#: the job -- but never one carrying api_key (never written to the shared
+#: volume, Ruling R71's own hard constraint) or a local file path that
+#: only means something on the artist's own machine (ssh_key_path,
+#: rclone_path -- Mac paths, meaningless on a Linux pod). host_cook.py
+#: sets these three from what actually exists on THAT pod before it ever
+#: imports rpfarm; nothing else in this codebase reads or sets them, so a
+#: normal artist machine with none of these set loads config.toml exactly
+#: as it always has.
+_LOAD_OVERRIDE_ENV = {
+    "api_key": "RUNPOD_API_KEY",
+    "ssh_key_path": "RPFARM_SSH_KEY_PATH",
+    "rclone_path": "RPFARM_RCLONE_PATH",
+}
+
+
 def load() -> Config:
     """Read ``$RPFARM_HOME/config.toml``. Raises ConfigError if missing."""
     path = home() / CONFIG_FILENAME
@@ -186,6 +204,10 @@ def load() -> Config:
         data = tomllib.load(f)
     known = {f.name for f in fields(Config)}
     kwargs = {k: v for k, v in data.items() if k in known}
+    for field_name, env_name in _LOAD_OVERRIDE_ENV.items():
+        value = os.environ.get(env_name)
+        if value:
+            kwargs[field_name] = value
     return Config(**kwargs)
 
 

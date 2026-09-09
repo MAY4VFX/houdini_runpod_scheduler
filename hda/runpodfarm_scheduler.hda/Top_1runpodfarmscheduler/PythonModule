@@ -46,7 +46,9 @@ import hashlib
 import pathlib
 import posixpath
 import shlex
+import shutil
 import sys
+import tempfile
 import time
 import secrets
 import uuid
@@ -206,7 +208,7 @@ _ASSET_FINGERPRINT = {
     'background_cook.py': (5780, 'e3b1839f4958d88a'),
     'cli.py': (71248, '1b7ef63474487e6d'),
     'compression.py': (23234, 'bef2f19daebbc929'),
-    'config.py': (16827, '8cf094b31ba6c0b4'),
+    'config.py': (17872, 'e71aaf77c29362f2'),
     'deps.py': (38558, '2daae12f5770289a'),
     'dispatch.py': (22191, '1121a6505c88adb3'),
     'gpus.py': (8311, '7a28d5c2692b776e'),
@@ -1178,6 +1180,7 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         self._api = None
         self._token = ""
         self._cook_token = ""
+        self._submit_as_job = False
         self._pubkey = ""
         self._project = ""
         self._cook_id = ""
@@ -2497,9 +2500,15 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         # means for the window in front of the artist. The thresholds are on
         # the parameters, but "they only apply while Houdini is open" was
         # written down nowhere (Ruling R59).
-        lines.insert(0, "РЕЖИМ: обычный кук — дирижирует этот Houdini. "
-                        "НЕ ЗАКРЫВАЙТЕ его до конца: иначе кадры не приедут, "
-                        "а машины останутся включёнными.")
+        if self._submit_as_job:
+            lines.insert(0, "РЕЖИМ: Submit As Job — сцена уехала на отдельный под, "
+                            "который сам себя ведёт и сам себя погасит (вместе со "
+                            "своими подами рендера) по завершении. Houdini уже "
+                            "можно закрывать.")
+        else:
+            lines.insert(0, "РЕЖИМ: обычный кук — дирижирует этот Houdini. "
+                            "НЕ ЗАКРЫВАЙТЕ его до конца: иначе кадры не приедут, "
+                            "а машины останутся включёнными.")
         # First thing after the mode line, not buried below the pod list:
         # this is the whole reason the summary exists (2026-09-08, a sync
         # pod that would not wake left "кук завершился, задач ноль, ошибок
@@ -3850,40 +3859,171 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
     # -------------------------------------------------------------------------
 
     def submitAsJob(self, graph_file, node_name):
-        """Cook the whole TOP graph in one hython task on a farm pod."""
+        """Cook the whole TOP graph on one dedicated CPU pod that drives
+        its own cook and shuts itself down when done -- Submit As Job,
+        mode 3 of three cook modes (Ruling R71). Unlike mode 1 (this
+        Houdini stays open and drives the cook) and mode 2 (a detached
+        local hython drives it, Ruling R68), THIS pod is its own
+        scheduler for its own nested cook: Houdini can close the moment
+        this method returns.
+
+        Never functional before this: the original body called
+        ``self.transferFile(...)``, a method that does not exist on
+        ``PyScheduler`` or anywhere in this class -- confirmed live, it
+        raises ``AttributeError`` on the very first real line. It also
+        enqueued its "submit" task onto the SAME dispatcher/pod pool
+        regular render items use, which cannot give one dedicated pod the
+        isolation hardening item 2 requires (a render item could land on
+        the same pod). Rewritten rather than patched.
+
+        Ships everything the pod needs to cook the SAME graph the artist
+        is running, because nothing else guarantees that stays true: the
+        four HDAs -- via ``hou.nodeType(...).definition().
+        libraryFilePath()``, the files actually loaded in THIS session,
+        not a guessed install path -- and this checkout's own ``rpfarm``
+        package, staged locally and uploaded in one ``rclone_copy_dir``
+        call alongside the .hip. Considered and rejected: baking them
+        into the pod image (couples the scheduler's version to an image
+        rebuild -- the HDAs were rebuilt ~6 times on 2026-09-09 alone) and
+        staging them onto the shared volume as a separate publish step
+        (its own update cadence, which eventually goes stale silently).
+        Shipping with the job has no cadence to get wrong: the pod gets,
+        by construction, exactly the version that was submitted.
+
+        Two secrets ship with the job that no other pod ever receives
+        (hardening item 2): ``RUNPOD_API_KEY`` (so the host pod can rent
+        and, critically, terminate its own render pods and itself) and
+        an SSH private key (so its own nested scheduler can reach the
+        sync pod over SFTP the same way this session does -- Mac-only
+        local key/rclone paths in the shipped config.toml mean nothing on
+        a Linux pod, so ``rpcfg.load()``'s env overrides replace them
+        on that pod only, see ``rpfarm.config._LOAD_OVERRIDE_ENV``).
+        ``host_cook.py`` (the pod's own entrypoint for
+        ``RPFARM_ROLE=host``) never logs either, writes the ssh key to a
+        LOCAL container path only, and owns the pod's self-termination
+        and its watchdog -- see that module's own docstring.
+
+        This local session's own bookkeeping for this pseudo-cook is
+        reset directly (``_reset_cook_state``), not via ``onStopCook``:
+        that method terminates every pod ``_sweepOrphanPods`` finds
+        sharing this cook id, which would include the host pod just
+        created and still supposed to be running.
+        """
         self.onStartCook(False, None)
-        self.onSetupCook()
+        self._submit_as_job = True
+        try:
+            self.onSetupCook()
+            return self._submitAsJobInner(node_name)
+        except Exception as e:
+            # Whatever failed, this session's OWN bookkeeping for the
+            # pseudo-cook must not linger (a stuck _active_cook_key, a sync
+            # connection nothing will ever close) -- reset it here rather
+            # than leaving that to the artist's next real cook to trip
+            # over. The host pod itself, if create_cpu_pod is what failed,
+            # was never created; if something AFTER that failed, the pod
+            # is orphaned on the farm -- said plainly, not hidden in a
+            # console traceback (a button callback's own exception is NOT
+            # on PDG's normal cook-error path, so nothing else shows this).
+            msg = "Submit As Job failed: {}".format(e)
+            self._log(msg)
+            try:
+                if hou.isUIAvailable():
+                    hou.ui.displayMessage(msg, severity=hou.severityType.Error)
+            except Exception:
+                pass
+            self._reset_cook_state()
+            raise
 
-        self.transferFile(os.path.expandvars("$HHP/pdgjob/topcook.py"))
-        hip_local = os.path.expandvars("$HIPFILE")
-        hip_remote = "__PDG_DIR__/" + os.path.basename(hip_local)
-        self.transferFile(hip_local)
-        self._copyJobSupportFiles()
-        self._uploadPdgTemp()
+    def _submitAsJobInner(self, node_name):
+        hip_local = hou.hipFile.path()
+        node_types = ("runpodfarmscheduler", "runpodfarmupload",
+                     "runpodfarmdownload", "runpodfarmstats")
+        staging = tempfile.mkdtemp(prefix="rpfarm-hostpkg-")
+        try:
+            hda_dir = os.path.join(staging, "hda")
+            os.makedirs(hda_dir)
+            for type_name in node_types:
+                nt = hou.nodeType(hou.topNodeTypeCategory(), type_name)
+                if nt is None or nt.definition() is None:
+                    raise CookError(
+                        "Submit As Job needs the {} node type's own .hda file, "
+                        "and could not find it loaded in this session.".format(type_name))
+                shutil.copy(nt.definition().libraryFilePath(),
+                           os.path.join(hda_dir, type_name + ".hda"))
+            shutil.copytree(str(_RPFARM_ROOT / "rpfarm"), os.path.join(staging, "rpfarm"))
+            shutil.copy(hip_local, os.path.join(staging, os.path.basename(hip_local)))
 
-        cmd = (
-            '"__PDG_HYTHON__" --pdg "__PDG_SCRIPTDIR__/topcook.py" '
-            '--report none --hip "{}" --verbosity 2 '
-            "--toppath {} ".format(hip_remote, node_name)
+            remote_pkg_dir = self.workingDir(False) + "/host_pkg"
+            try:
+                rpsync.rclone_copy_dir(
+                    staging, self._sftp, "up", self._cfg.rclone_path,
+                    remote_root=remote_pkg_dir)
+            except (rpsync.SyncError, OSError) as e:
+                raise CookError("Could not upload the host pod package to {}: {}".format(
+                    remote_pkg_dir, e)) from e
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+
+        try:
+            with open(self._cfg.ssh_key_path) as f:
+                ssh_key_pem = f.read()
+        except OSError as e:
+            raise CookError("Could not read the SSH private key at {}: {}".format(
+                self._cfg.ssh_key_path, e)) from e
+
+        host_token = secrets.token_hex(16)
+        hip_remote = remote_pkg_dir + "/" + os.path.basename(hip_local)
+        env = rppods.pod_env(
+            self._cfg, "host", host_token, 1, self._pubkey,
+            cook=self._cook_id, project=self._project,
+            extra={
+                "RUNPOD_API_KEY": self._cfg.api_key,
+                "RPFARM_HOST_SSH_KEY": ssh_key_pem,
+                "RPFARM_HOST_HIP": hip_remote,
+                "RPFARM_HOST_TOPPATH": node_name,
+                "RPFARM_HOST_PKGDIR": remote_pkg_dir,
+            },
         )
-        cmd = self.expandCommandTokens(cmd)
-        if self["submitjobfile"].evaluateBool():
-            cmd += '--taskgraphout "__PDG_DIR__/{}.post.py"'.format(graph_file)
+        name = "rpfarm-{}-{}-{}-host".format(self._cfg.user, self._project, self._cook_id)
+        try:
+            pod = self._api.create_cpu_pod(
+                name, self._templateId(), self._volumeId(), env, rppods.PORTS,
+                datacenter=self._datacenterId(), cloud_type=self._cloudType(),
+            )
+        except RunPodError as e:
+            raise CookError("Could not create the Submit As Job host pod: {}".format(e)) from e
+        pod_id = pod["id"]
+        self._log("host pod created {} {} -- Houdini can close now, it will "
+                  "shut itself down (and its own render pods) when the "
+                  "cook ends".format(name, pod_id))
+        status_url = "https://www.runpod.io/console/pods/{}".format(pod_id)
 
-        task_env = self._prepareTaskEnv(None, None)
-        task_env["PDG_SUBMIT_AS_JOB"] = "True"
-
-        task = rpdispatch.TaskState(
-            task_id=uuid.uuid4().hex,
-            work_item_id=-1,
-            command=cmd,
-            env=task_env,
-            log_path="/workspace/ledger/logs/{}/submitasjob.log".format(self._cook_id),
+        # Close out THIS session's own bookkeeping for the pseudo-cook
+        # submitAsJob just ran -- deliberately NOT onStopCook, which would
+        # call _sweepOrphanPods and terminate the host pod just created
+        # (it is not, and must not be, in self._dispatcher.pods). Same
+        # tail onStopCook itself runs, minus everything pod-related --
+        # nothing here ever created a locally-tracked pod or task.
+        _ledger_append(
+            self._ledger_path,
+            record="cook_summary",
+            cook_id=self._cook_id,
+            user=self._cfg.user,
+            project=self._project,
+            started=self._cost_tracker.get("start_time"),
+            ended=time.time(),
+            canceled=False,
+            items_failed=0,
+            cost_est=0.0,
+            submitted_as_job=True,
         )
-        self._dispatcher.enqueue(task)
-        self._dispatch_pending()
-        pod_id = task.pod_id or next(iter(self._dispatcher.pods), None)
-        return pod_id, None
+        self._mirror_ledger_to_volume()
+        self.stopPollingClient()
+        self._clearPathMap()
+        self._update_status_text(force=True)
+        self._releaseCookLock()
+        self._reset_cook_state()
+        return status_url, pod_id
 
     def getLogURI(self, work_item):
         """[virtual] Log URL for the task corresponding to the given work item."""

@@ -177,9 +177,25 @@ else
   echo "WARNING: no Houdini at $HFS (need $HFS/houdini_setup_bash; install with the runpodfarm_upload preset or 'rpfarm houdini install')"
 fi
 
-# 4. Worker: RPFARM_TOKEN / RPFARM_ROLE / RPFARM_SLOTS / RPFARM_PORT / HFS /
-#    RUNPOD_POD_ID are all read directly from the environment by worker.py
-#    (RunPod sets RUNPOD_POD_ID; RPFARM_PORT defaults to 8000 and
-#    RPFARM_SLOTS defaults to 1 inside worker.py itself).
-echo "worker: exec python3 /opt/rpfarm/worker.py"
-exec python3 /opt/rpfarm/worker.py
+# 4. Worker, or host-cook: RPFARM_ROLE selects which.
+#
+#    RPFARM_ROLE=host (Submit As Job, Ruling R71) is not a task an
+#    external scheduler submits to worker.py -- this pod IS the scheduler
+#    for its own cook, driving $HHP/pdgjob/topcook.py directly and
+#    terminating itself when done (host_cook.py's own docstring has the
+#    detail, including why it -- not this script -- owns the watchdog and
+#    the self-terminate). No worker.py HTTP server is started for it:
+#    nothing outside this pod is meant to talk to it.
+#
+#    Every other role: RPFARM_TOKEN / RPFARM_ROLE / RPFARM_SLOTS /
+#    RPFARM_PORT / HFS / RUNPOD_POD_ID are all read directly from the
+#    environment by worker.py (RunPod sets RUNPOD_POD_ID; RPFARM_PORT
+#    defaults to 8000 and RPFARM_SLOTS defaults to 1 inside worker.py
+#    itself).
+if [ "${RPFARM_ROLE:-}" = "host" ]; then
+  echo "host-cook: exec python3 /opt/rpfarm/host_cook.py"
+  exec python3 /opt/rpfarm/host_cook.py
+else
+  echo "worker: exec python3 /opt/rpfarm/worker.py"
+  exec python3 /opt/rpfarm/worker.py
+fi

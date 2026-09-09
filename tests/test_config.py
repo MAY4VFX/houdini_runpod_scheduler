@@ -91,6 +91,48 @@ def test_load_missing_file_raises_config_error(tmp_path, monkeypatch):
         config.load()
 
 
+def test_load_overrides_api_key_ssh_key_path_and_rclone_path_from_env(tmp_path, monkeypatch):
+    """Ruling R71: the Submit As Job host pod ships a config.toml with
+    none of these three (no api_key on the volume, no Mac-only local
+    paths) and sets them from its own pod-local env instead."""
+    monkeypatch.setenv("RPFARM_HOME", str(tmp_path))
+    local_ssh_key = str(tmp_path / "artist_machine" / "id_ed25519")
+    local_rclone = str(tmp_path / "artist_machine" / "bin" / "rclone")
+    cfg = config.Config(api_key="local-key", user="tester", volume_id="v", template_id="t",
+                        ssh_key_path=local_ssh_key, rclone_path=local_rclone)
+    config.save(cfg)
+
+    pod_ssh_key = str(tmp_path / "pod" / "rpfarm_host_key")
+    pod_rclone = str(tmp_path / "pod" / "usr_bin_rclone")
+    monkeypatch.setenv("RUNPOD_API_KEY", "pod-only-key")
+    monkeypatch.setenv("RPFARM_SSH_KEY_PATH", pod_ssh_key)
+    monkeypatch.setenv("RPFARM_RCLONE_PATH", pod_rclone)
+
+    back = config.load()
+
+    assert back.api_key == "pod-only-key"
+    assert back.ssh_key_path == pod_ssh_key
+    assert back.rclone_path == pod_rclone
+
+
+def test_load_uses_the_file_values_when_no_override_env_is_set(tmp_path, monkeypatch):
+    """The normal case (an artist's own machine) must not change at all."""
+    monkeypatch.setenv("RPFARM_HOME", str(tmp_path))
+    local_ssh_key = str(tmp_path / "artist_machine" / "id_ed25519")
+    local_rclone = str(tmp_path / "artist_machine" / "bin" / "rclone")
+    cfg = config.Config(api_key="local-key", user="tester", volume_id="v", template_id="t",
+                        ssh_key_path=local_ssh_key, rclone_path=local_rclone)
+    config.save(cfg)
+    for var in ("RUNPOD_API_KEY", "RPFARM_SSH_KEY_PATH", "RPFARM_RCLONE_PATH"):
+        monkeypatch.delenv(var, raising=False)
+
+    back = config.load()
+
+    assert back.api_key == "local-key"
+    assert back.ssh_key_path == local_ssh_key
+    assert back.rclone_path == local_rclone
+
+
 def test_save_preserves_non_default_fields(tmp_path, monkeypatch):
     monkeypatch.setenv("RPFARM_HOME", str(tmp_path))
     cfg = config.Config(

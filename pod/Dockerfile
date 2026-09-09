@@ -69,7 +69,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN sed -i 's/#PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config
 
-COPY pod/worker.py pod/housekeeping.py pod/entrypoint.sh /opt/rpfarm/
+COPY pod/worker.py pod/housekeeping.py pod/host_cook.py pod/entrypoint.sh /opt/rpfarm/
 RUN chmod +x /opt/rpfarm/entrypoint.sh
 
 EXPOSE 22 4440 4442 8000
