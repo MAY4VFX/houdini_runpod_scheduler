@@ -602,6 +602,37 @@
     }
 
     group {
+        name    "folder_bgcook"
+        label   "Background Cook"
+
+        parm {
+            name    "rpfarm_bgcookhelp"
+            label   "Что делает Background Cook"
+            type    string
+            default { "Кук идёт как обычно (ваш компьютер, ваш ключ RunPod, ваши деньги) -- но отдельным процессом hython, который переживёт закрытие Houdini. Сцена сохраняется автоматически перед запуском.\n\nСледить не в Houdini: путь к файлу лога печатается сразу после нажатия и в диалоге, который появится один раз.\n\nЭто НЕ Submit As Job -- тот уезжает на ферму и не может сам погасить поды без ключа RunPod там." }
+            disablewhen "{ rpfarm_verbose >= 0 }"
+            parmtag { "editor" "1" }
+            parmtag { "editorlines" "6-8" }
+        }
+        parm {
+            name    "rpfarm_bgcookenable"
+            label   "Разрешить фоновый кук"
+            type    toggle
+            default { "0" }
+            parmtag { "script_callback_language" "python" }
+        }
+        parm {
+            name    "rpfarm_bgcooklaunch"
+            label   "Запустить в фоне"
+            type    button
+            default { "0" }
+            disablewhen "{ rpfarm_bgcookenable == 0 }"
+            parmtag { "script_callback" "hou.pwd().hm().onBackgroundCook(kwargs, hou.pwd())" }
+            parmtag { "script_callback_language" "python" }
+        }
+    }
+
+    group {
         name    "folder5"
         label   "Message Queue"
 

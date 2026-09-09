@@ -246,6 +246,7 @@ _ASSET_BUILT_AGAINST_VERSION = '2.3.0'
 _ASSET_FINGERPRINT = {
     '__init__.py': (2490, 'c1250306daf5961f'),
     '__main__.py': (52, '13a1a5b340cdcfc1'),
+    'background_cook.py': (5780, 'e3b1839f4958d88a'),
     'cli.py': (68921, '6c9ff6b09d34cd34'),
     'compression.py': (23234, 'bef2f19daebbc929'),
     'config.py': (14143, 'b402742b258541b7'),

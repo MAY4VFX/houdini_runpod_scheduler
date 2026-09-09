@@ -202,6 +202,7 @@ _ASSET_BUILT_AGAINST_VERSION = '2.3.0'
 _ASSET_FINGERPRINT = {
     '__init__.py': (2490, 'c1250306daf5961f'),
     '__main__.py': (52, '13a1a5b340cdcfc1'),
+    'background_cook.py': (5780, 'e3b1839f4958d88a'),
     'cli.py': (68921, '6c9ff6b09d34cd34'),
     'compression.py': (23234, 'bef2f19daebbc929'),
     'config.py': (14143, 'b402742b258541b7'),
@@ -242,10 +243,12 @@ if _stale:
     # open -- with the instruction as the first line the artist reads.
     raise ImportError(_stale)
 
+from rpfarm import background_cook as rpbgcook
 from rpfarm import config as rpcfg
 from rpfarm import deps as rpdeps
 from rpfarm import dispatch as rpdispatch
 from rpfarm import gpus as rpgpus
+from rpfarm import houdini_local as rphl
 from rpfarm import packages as rppkg
 from rpfarm import pods as rppods
 from rpfarm import sync as rpsync
@@ -3890,3 +3893,100 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
 def submitGraphAsJob(kwargs, node):
     from pdg.scheduler import submitGraphAsJob
     submitGraphAsJob(kwargs, node, 'RunPod Farm')
+
+
+def _parentTopNet(node):
+    """Walk up from ``node`` to the ``topnet``/``topnetmgr`` that contains
+    it -- the same helper ``pdg.scheduler.submitGraphAsJob`` uses to find
+    "the graph this scheduler node belongs to" from the scheduler node
+    itself. Reimplemented rather than imported: it is a nested function
+    inside SideFX's own module, not a name that module exports.
+    """
+    type_name = node.type().name()
+    if type_name in ("topnet", "topnetmgr"):
+        return node
+    parent = node.parent()
+    if not parent:
+        return None
+    return _parentTopNet(parent)
+
+
+def onBackgroundCook(kwargs, node):
+    """[button, Background Cook tab] Mode 2 of three cook modes (Ruling
+    R68): cook this topnet in a DETACHED background hython on the
+    artist's own machine, so closing Houdini does not stop the cook.
+
+    Gated by the ``rpfarm_bgcookenable`` toggle (disablewhen on this
+    button) -- the artist's own words: "если человеку надо автономно,
+    чтобы этот процесс шел, то он галку поставил". Off by default;
+    turning it back off returns to today's behaviour exactly, nothing
+    here runs unless both the toggle is checked AND this button pressed.
+
+    Not Submit As Job (mode 3, ``submitjob`` above): that transfers the
+    whole job to a rented pod and needs the RunPod key up there to ever
+    shut itself down, which the owner refuses. This runs the SAME cook
+    the artist would get from pressing Cook, just driven by
+    ``$HHP/pdgjob/topcook.py`` -- Houdini's own mechanism, the exact
+    script ``submitAsJob`` above already ships to a pod, run locally
+    instead -- so the RunPod key never leaves this machine and the pods
+    still get shut down normally when the cook ends.
+    """
+    try:
+        topnet = _parentTopNet(node.parent())
+        if not topnet or not topnet.displayNode():
+            hou.ui.displayMessage(
+                "Не нашёл topnet с выходной нодой над этим шедулером -- "
+                "фоновый кук запускать нечего.", severity=hou.severityType.Error)
+            return
+
+        try:
+            hou.hipFile.save()
+        except hou.OperationFailed as e:
+            hou.ui.displayMessage(
+                "Не смог сохранить сцену перед запуском ({}) -- фоновый "
+                "кук грузит .hip с диска, несохранённое он не увидит. "
+                "Сохраните сцену вручную и попробуйте снова.".format(e),
+                severity=hou.severityType.Error)
+            return
+        hip_path = hou.hipFile.path()
+
+        install = rphl.HoudiniInstall(pathlib.Path(hou.expandString("$HFS")))
+        if install.hython is None:
+            hou.ui.displayMessage(
+                "Не нашёл hython рядом с этим Houdini ({}) -- фоновый кук "
+                "запустить нечем.".format(install.hfs),
+                severity=hou.severityType.Error)
+            return
+        try:
+            topcook = rpbgcook.find_topcook(hou.expandString("$HHP"))
+        except rpbgcook.BackgroundCookError as e:
+            hou.ui.displayMessage(str(e), severity=hou.severityType.Error)
+            return
+
+        top_path = topnet.path()
+        command = rpbgcook.build_command(install.hython, topcook, hip_path, top_path)
+        log_file = rpbgcook.default_log_path(rpcfg.home(), top_path)
+        try:
+            pid = rpbgcook.launch(command, log_file)
+        except OSError as e:
+            hou.ui.displayMessage(
+                "Не смог запустить фоновый процесс: {}".format(e),
+                severity=hou.severityType.Error)
+            return
+
+        message = (
+            "Фоновый кук запущен (PID {}). Houdini можно закрывать -- "
+            "поды фермы погасит сам процесс, как обычно.\n\n"
+            "Смотреть прогресс: {}".format(pid, log_file))
+        if hou.isUIAvailable():
+            hou.ui.displayMessage(message, severity=hou.severityType.Message,
+                                  title="Background Cook")
+        else:
+            print(message)
+    except Exception as e:  # noqa: BLE001 - a button callback must not raise into Houdini's UI
+        try:
+            hou.ui.displayMessage(
+                "Фоновый кук не запустился: {}".format(e),
+                severity=hou.severityType.Error)
+        except Exception:
+            print("background cook failed to start: {}".format(e))

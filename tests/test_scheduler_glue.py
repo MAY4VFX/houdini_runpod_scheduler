@@ -29,6 +29,7 @@ import pytest
 
 from rpfarm import config as rpcfg
 from rpfarm import dispatch as rpdispatch
+from rpfarm import background_cook as rpbgcook
 from rpfarm import houdini_local as rphl
 from rpfarm import packages as rppkg
 from rpfarm import pods as rppods
@@ -2849,3 +2850,241 @@ def test_the_fallback_expands_the_items_own_attributes(monkeypatch):
     finally:
         sys.modules.pop("hou", None)
     assert any("does not have" in line for line in sched.logs), sched.logs
+
+
+# ---------------------------------------------------------------------------
+# Background Cook (Ruling R68, owner's request 2026-09-09): mode 2 of three
+# cook modes -- a detached local hython running $HHP/pdgjob/topcook.py, so
+# closing Houdini does not stop the cook. Gated by rpfarm_bgcookenable
+# (disablewhen on the launch button in the DialogScript -- the artist's own
+# words, "он галку поставил"). Never touches mode 3 (Submit As Job).
+# ---------------------------------------------------------------------------
+
+def test_parent_topnet_walks_up_to_the_enclosing_topnet():
+    ns = load_methods(["_parentTopNet"])
+
+    def _node(type_name, parent=None):
+        return types.SimpleNamespace(
+            type=lambda: types.SimpleNamespace(name=lambda: type_name),
+            parent=lambda: parent)
+
+    topnet = _node("topnet")
+    scheduler = _node("runpodfarmscheduler", parent=topnet)
+
+    assert ns["_parentTopNet"](scheduler) is scheduler.parent()
+    assert ns["_parentTopNet"](topnet) is topnet
+
+
+def test_parent_topnet_accepts_topnetmgr_too():
+    ns = load_methods(["_parentTopNet"])
+    mgr = types.SimpleNamespace(
+        type=lambda: types.SimpleNamespace(name=lambda: "topnetmgr"),
+        parent=lambda: None)
+
+    assert ns["_parentTopNet"](mgr) is mgr
+
+
+def test_parent_topnet_returns_none_when_nothing_is_enclosed_in_a_topnet():
+    ns = load_methods(["_parentTopNet"])
+
+    def _node(type_name, parent=None):
+        return types.SimpleNamespace(
+            type=lambda: types.SimpleNamespace(name=lambda: type_name),
+            parent=lambda: parent)
+
+    orphan = _node("subnet", parent=None)
+
+    assert ns["_parentTopNet"](orphan) is None
+
+
+class _FakeHouUi:
+    def __init__(self):
+        self.messages = []
+
+    def displayMessage(self, text, severity=None, title=None):
+        self.messages.append((text, severity, title))
+
+
+def _bgcook_ns(topnet, save_error=None, find_topcook_error=None,
+              launch_error=None, ui_available=True):
+    """A fake ``hou`` module and a fake ``rpbgcook`` collaborator, wired for
+    one scenario each. Records what would have run without ever touching a
+    real filesystem/process -- see test_background_cook.py for that half.
+    """
+    hip_state = {"path": "/tmp/some_project/scene_v001.hip", "saved": False}
+
+    def _save():
+        if save_error:
+            raise save_error
+        hip_state["saved"] = True
+
+    hou_stub = types.SimpleNamespace(
+        expandString=lambda s: {"$HFS": "/opt/houdini", "$HHP": "/opt/houdini/houdini/python3.13libs"}.get(s, s),
+        hipFile=types.SimpleNamespace(save=_save, path=lambda: hip_state["path"]),
+        OperationFailed=RuntimeError,
+        isUIAvailable=lambda: ui_available,
+        ui=_FakeHouUi(),
+        severityType=types.SimpleNamespace(Error="Error", Message="Message"),
+    )
+
+    launch_calls = []
+
+    def _find_topcook(hhp):
+        if find_topcook_error:
+            raise find_topcook_error
+        return "/opt/houdini/houdini/python3.13libs/pdgjob/topcook.py"
+
+    def _launch(command, log_file, **kw):
+        if launch_error:
+            raise launch_error
+        launch_calls.append((command, log_file))
+        return 4242
+
+    rpbgcook_fake = types.SimpleNamespace(
+        find_topcook=_find_topcook,
+        build_command=lambda hython, topcook, hip, top, verbosity=2: [
+            str(hython), "--pdg", str(topcook), "--report", "none",
+            "--hip", hip, "--verbosity", str(verbosity), "--logs", "--toppath", top],
+        default_log_path=lambda ledger_dir, top, clock=None: pathlib.Path(
+            str(ledger_dir), "bgcook", "run.log"),
+        launch=_launch,
+        BackgroundCookError=RuntimeError,
+    )
+
+    class _Install:
+        def __init__(self, hfs):
+            self.hfs = hfs
+            self.hython = "/opt/houdini/bin/hython"
+
+    rphl_fake = types.SimpleNamespace(HoudiniInstall=_Install)
+    rpcfg_fake = types.SimpleNamespace(home=lambda: pathlib.Path("/home/.rpfarm"))
+
+    ns = load_methods(
+        ["onBackgroundCook", "_parentTopNet"],
+        {"rpbgcook": rpbgcook_fake, "rphl": rphl_fake, "rpcfg": rpcfg_fake,
+         "pathlib": pathlib, "hou": hou_stub},
+    )
+    return ns, hou_stub, launch_calls, hip_state
+
+
+def test_background_cook_refuses_when_there_is_no_topnet_to_cook():
+    node = types.SimpleNamespace(
+        type=lambda: types.SimpleNamespace(name=lambda: "runpodfarmscheduler"),
+        parent=lambda: types.SimpleNamespace(
+            type=lambda: types.SimpleNamespace(name=lambda: "subnet"),
+            parent=lambda: None))
+    ns, hou_stub, launch_calls, hip_state = _bgcook_ns(topnet=None)
+
+    ns["onBackgroundCook"]({}, node)
+
+    assert launch_calls == []
+    assert hip_state["saved"] is False
+    assert any("не нашёл" in m[0].lower() for m in hou_stub.ui.messages)
+
+
+def _node_with_topnet(display_node=object()):
+    topnet = types.SimpleNamespace(
+        type=lambda: types.SimpleNamespace(name=lambda: "topnet"),
+        parent=lambda: None,
+        displayNode=lambda: display_node,
+        path=lambda: "/obj/topnet1")
+    node = types.SimpleNamespace(
+        type=lambda: types.SimpleNamespace(name=lambda: "runpodfarmscheduler"),
+        parent=lambda: topnet)
+    return node, topnet
+
+
+def test_background_cook_refuses_when_the_topnet_has_no_output_node():
+    node, topnet = _node_with_topnet(display_node=None)
+    ns, hou_stub, launch_calls, hip_state = _bgcook_ns(topnet=topnet)
+
+    ns["onBackgroundCook"]({}, node)
+
+    assert launch_calls == []
+    assert any("не нашёл" in m[0].lower() for m in hou_stub.ui.messages)
+
+
+def test_background_cook_saves_and_launches_the_detached_process():
+    node, topnet = _node_with_topnet()
+    ns, hou_stub, launch_calls, hip_state = _bgcook_ns(topnet=topnet)
+
+    ns["onBackgroundCook"]({}, node)
+
+    assert hip_state["saved"] is True
+    assert len(launch_calls) == 1
+    command, log_file = launch_calls[0]
+    assert command[0] == "/opt/houdini/bin/hython"
+    assert "--pdg" in command
+    assert command[command.index("--hip") + 1] == hip_state["path"]
+    assert command[command.index("--toppath") + 1] == "/obj/topnet1"
+    # The artist was told where to watch -- there is no other UI.
+    assert any(str(log_file) in m[0] for m in hou_stub.ui.messages)
+    assert any("4242" in m[0] for m in hou_stub.ui.messages)
+
+
+def test_background_cook_prints_instead_of_a_dialog_when_there_is_no_ui():
+    """Belt and braces: if this were ever triggered headlessly, it must not
+    try to pop a dialog hython has no window system for."""
+    node, topnet = _node_with_topnet()
+    ns, hou_stub, launch_calls, hip_state = _bgcook_ns(topnet=topnet, ui_available=False)
+
+    ns["onBackgroundCook"]({}, node)  # must not raise
+
+    assert len(launch_calls) == 1
+    assert hou_stub.ui.messages == []  # nothing shown -- printed instead
+
+
+def test_background_cook_reports_a_save_failure_without_launching():
+    node, topnet = _node_with_topnet()
+    ns, hou_stub, launch_calls, hip_state = _bgcook_ns(
+        topnet=topnet, save_error=RuntimeError("disk full"))
+
+    ns["onBackgroundCook"]({}, node)
+
+    assert launch_calls == []
+    assert any("сохран" in m[0].lower() for m in hou_stub.ui.messages)
+
+
+def test_background_cook_reports_a_missing_topcook_without_launching():
+    node, topnet = _node_with_topnet()
+    ns, hou_stub, launch_calls, hip_state = _bgcook_ns(
+        topnet=topnet, find_topcook_error=RuntimeError("topcook.py not found"))
+
+    ns["onBackgroundCook"]({}, node)
+
+    assert launch_calls == []
+    assert hip_state["saved"] is True  # saved before the topcook lookup
+    assert any("topcook.py not found" in m[0] for m in hou_stub.ui.messages)
+
+
+def test_background_cook_reports_a_launch_failure_without_raising():
+    node, topnet = _node_with_topnet()
+    ns, hou_stub, launch_calls, hip_state = _bgcook_ns(
+        topnet=topnet, launch_error=OSError("no such file: hython"))
+
+    ns["onBackgroundCook"]({}, node)  # must not raise
+
+    assert any("не смог запустить" in m[0].lower() for m in hou_stub.ui.messages)
+
+
+def test_background_cook_never_raises_into_the_button_callback():
+    """Whatever goes wrong, a button callback must not throw an unhandled
+    exception into Houdini's UI -- caught, reported, done."""
+    node = types.SimpleNamespace(parent=lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+    ns, hou_stub, launch_calls, hip_state = _bgcook_ns(topnet=None)
+
+    ns["onBackgroundCook"]({}, node)  # must not raise
+
+    assert any("boom" in m[0] for m in hou_stub.ui.messages)
+
+
+def test_disablewhen_gates_the_background_cook_button_on_its_own_toggle():
+    """The opt-in gate lives in the DialogScript, not in Python -- the
+    button must be declared disablewhen the toggle is off, matching the
+    file's own existing pattern (submitjobnode/usesubmitjobnode)."""
+    text = (pathlib.Path(__file__).resolve().parent.parent
+           / "hda" / "runpodfarm_scheduler.hda" / "Top_1runpodfarmscheduler"
+           / "DialogScript").read_text()
+    launch_parm = text[text.index('name    "rpfarm_bgcooklaunch"'):]
+    launch_parm = launch_parm[:launch_parm.index("}\n    }")]
+    assert 'disablewhen "{ rpfarm_bgcookenable == 0 }"' in launch_parm
