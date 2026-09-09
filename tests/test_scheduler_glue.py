@@ -1069,6 +1069,8 @@ class _PodApi:
         pod_id = "pod{}".format(self._next_id)
         self._next_id += 1
         self.created.append((name, pod_id))
+        self.created_envs = getattr(self, "created_envs", {})
+        self.created_envs[pod_id] = env
         pod = {"id": pod_id, "name": name}
         self._listing.append(pod)
         return pod
@@ -1091,6 +1093,7 @@ class _ScaleUpScheduler(FakeScheduler):
         self._project = "airship"
         self._cook_id = cook_id
         self._token = "tok"
+        self._cook_token = "cook_tok"
         self._pubkey = "key"
         self._gpu_list = ["NVIDIA RTX A4500"]
         self._parms = {"rpfarm_maxpods": 4, "rpfarm_slots": 1}
@@ -1152,6 +1155,28 @@ def test_a_pod_born_after_the_cook_ended_is_terminated_not_admitted():
     assert api.terminated == [api.created[0][1]]
     assert sched._dispatcher.pods == {}, "never admitted to the pool"
     assert sched._clients == {}
+
+
+def test_gpu_pods_get_the_per_cook_token_never_the_shared_one():
+    """Ruling R70: a fresh, in-memory-only token per cook -- a leak of it
+    is bounded to this cook's own GPU pods, unlike the shared
+    rpfarm.session_token() every pod used to carry. self._token (the
+    shared one, used for the sync pod) must never reach a GPU pod's env
+    or WorkerClient."""
+    api = _PodApi()
+    sched = _ScaleUpScheduler(api)
+    assert sched._token != sched._cook_token, "fixture must exercise two distinct values"
+    ns = _scale_up_ns()
+    sched._scale_up = lambda count: ns["_scale_up"](sched, count)
+    sched._terminate_pod = lambda pod_id: ns["_terminate_pod"](sched, pod_id)
+
+    created = sched._scale_up(1)
+
+    assert created == 1
+    pod_id = api.created[0][1]
+    assert api.created_envs[pod_id]["RPFARM_TOKEN"] == sched._cook_token
+    assert api.created_envs[pod_id]["RPFARM_TOKEN"] != sched._token
+    assert sched._clients[pod_id].token == sched._cook_token
 
 
 def test_a_pod_born_after_a_new_cook_started_is_also_terminated():

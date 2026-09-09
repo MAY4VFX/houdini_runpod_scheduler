@@ -22,6 +22,7 @@ tasks against ``RPFARM_SLOTS``.
 from __future__ import annotations
 
 import collections
+import hmac
 import json
 import logging
 import os
@@ -777,7 +778,13 @@ def make_server(host, port, log_dir="/workspace/ledger/logs"):
                 self.rfile.read(length)
 
         def _authorized(self):
-            return self.headers.get("X-RPFarm-Token") == token
+            # hmac.compare_digest instead of == (Ruling R70, review finding):
+            # a plain string compare short-circuits on the first mismatched
+            # byte, which leaks how many leading characters of a guess were
+            # right through response timing. compare_digest runs in
+            # constant time regardless. Both sides must be str (or both
+            # bytes) -- header value is always str here, and token always is.
+            return hmac.compare_digest(self.headers.get("X-RPFarm-Token") or "", token)
 
         def _require_auth(self):
             if not self._authorized():

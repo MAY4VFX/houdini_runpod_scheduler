@@ -44,6 +44,18 @@ def test_auth_required(srv):
     assert req(srv, "GET", "/health", token="wrong")[0] == 401
 
 
+def test_auth_required_with_no_token_header_at_all(srv):
+    """hmac.compare_digest (Ruling R70) needs a str on both sides -- a
+    missing header must not raise a TypeError instead of a clean 401."""
+    c = http.client.HTTPConnection("127.0.0.1", srv, timeout=10)
+    c.request("GET", "/health", None, {})  # no X-RPFarm-Token header
+    r = c.getresponse()
+    status = r.status
+    r.read()
+    c.close()
+    assert status == 401
+
+
 def test_health(srv):
     st, h = req(srv, "GET", "/health")
     assert st == 200 and h["role"] == "sync" and h["slots"] == 1 and h["busy"] == 0

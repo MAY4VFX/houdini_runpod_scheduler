@@ -48,6 +48,7 @@ import posixpath
 import shlex
 import sys
 import time
+import secrets
 import uuid
 
 # The rpfarm package is not installed into Houdini's Python: it is found via
@@ -1176,6 +1177,7 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         self._cfg = None
         self._api = None
         self._token = ""
+        self._cook_token = ""
         self._pubkey = ""
         self._project = ""
         self._cook_id = ""
@@ -1751,7 +1753,7 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
             )
             # cook + project on the pod itself, so `farm kill` can tell whose
             # this is and which cook it serves without any local state.
-            env = rppods.pod_env(self._cfg, "gpu", self._token, slots, self._pubkey,
+            env = rppods.pod_env(self._cfg, "gpu", self._cook_token, slots, self._pubkey,
                                  cook=self._cook_id, project=self._project)
             # Captured BEFORE the call, not after: create_gpu_pod is a
             # blocking HTTP round trip that can take tens of seconds, long
@@ -1789,7 +1791,7 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
                 self._terminate_pod(pod_id)
                 break
             self._dispatcher.add_pod(pod_id, 0.0, status="CREATED", created_at=time.time())
-            self._clients[pod_id] = WorkerClient(pod_id, self._token)
+            self._clients[pod_id] = WorkerClient(pod_id, self._cook_token)
             self._last_pod_error = None
             created += 1
             self._log("pod created {} {}".format(name, pod_id))
@@ -2667,6 +2669,15 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         self._checkDatacenter()
 
         self._token = rpcfg.session_token()
+        # Ruling R70: self._token is the SHARED per-user token (the sync pod
+        # is long-lived and reused across cooks -- rpfarm farm status/kill
+        # and every other standalone CLI command need a stable way to reach
+        # it, so it keeps the shared value). GPU pods are always created
+        # fresh, only ever by this one cook, and nothing outside it needs to
+        # know their token -- so they get their own, generated here and
+        # never written to disk, so a leak of THIS one is bounded to this
+        # cook instead of exposing every pod on the account.
+        self._cook_token = secrets.token_hex(16)
         self._pubkey = _read_pubkey(self._cfg)
 
         job_dir = hou.getenv("JOB") or hou.getenv("HIP") or os.getcwd()
