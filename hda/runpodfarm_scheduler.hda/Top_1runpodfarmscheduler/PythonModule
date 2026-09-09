@@ -2401,7 +2401,12 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         unreachable, bad key) is a logged warning, nothing else -- the
         artist still gets `rpfarm farm kill` as the manual backstop.
         """
-        if not self._cook_id or self._api is None:
+        # self._cfg is read below (self._cfg.user) -- guarded explicitly
+        # here rather than relying on _api being None whenever _cfg is
+        # (true today because onStartCook sets _cfg before _api and
+        # _reset_cook_state nulls both together, but that is an ordering
+        # invariant elsewhere in this file, not a fact this method can see).
+        if not self._cook_id or self._api is None or self._cfg is None:
             return
         try:
             candidates = self._api.list_pods("rpfarm-{}-".format(self._cfg.user))

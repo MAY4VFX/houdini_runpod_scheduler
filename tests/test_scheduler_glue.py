@@ -1267,6 +1267,32 @@ def test_orphan_sweep_is_idempotent_across_repeated_onstopcook_calls():
     assert api.terminated == ["orphan1"]
 
 
+def test_orphan_sweep_does_nothing_when_cfg_is_none():
+    """self._cfg.user is read inside the sweep -- guarded explicitly,
+    not by relying on the (currently true elsewhere) invariant that
+    _api is always None whenever _cfg is. A cook_id/api present with no
+    cfg should not happen today, but this method must not assume it."""
+    class _CountingApi(_PodApi):
+        def __init__(self):
+            super().__init__()
+            self.list_pods_calls = 0
+
+        def list_pods(self, prefix=""):
+            self.list_pods_calls += 1
+            return []
+
+    api = _CountingApi()
+    sched = _ScaleUpScheduler(api)
+    sched._cfg = None
+    ns = _scale_up_ns()
+    sched._terminate_pod = lambda pod_id: ns["_terminate_pod"](sched, pod_id)
+    sched._sweepOrphanPods = lambda: ns["_sweepOrphanPods"](sched)
+
+    sched._sweepOrphanPods()  # must not raise on self._cfg.user
+
+    assert api.list_pods_calls == 0
+
+
 def test_orphan_sweep_logs_a_warning_and_never_raises_when_the_api_is_unreachable():
     class _BrokenApi(_PodApi):
         def list_pods(self, prefix=""):
