@@ -40,6 +40,7 @@ from __future__ import print_function
 #
 
 import ast
+import dataclasses
 import json
 import os
 import hashlib
@@ -208,7 +209,7 @@ _ASSET_FINGERPRINT = {
     'background_cook.py': (5780, 'e3b1839f4958d88a'),
     'cli.py': (71248, '1b7ef63474487e6d'),
     'compression.py': (23234, 'bef2f19daebbc929'),
-    'config.py': (17872, 'e71aaf77c29362f2'),
+    'config.py': (18411, '13b98663b9fcf255'),
     'deps.py': (38558, '2daae12f5770289a'),
     'dispatch.py': (22191, '1121a6505c88adb3'),
     'gpus.py': (8311, '7a28d5c2692b776e'),
@@ -3952,6 +3953,21 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
                            os.path.join(hda_dir, type_name + ".hda"))
             shutil.copytree(str(_RPFARM_ROOT / "rpfarm"), os.path.join(staging, "rpfarm"))
             shutil.copy(hip_local, os.path.join(staging, os.path.basename(hip_local)))
+
+            # rpcfg.load() raises ConfigError -- and onStartCook turns that
+            # into CookError -- if $RPFARM_HOME/config.toml does not exist
+            # at all, which is exactly what "nothing shipped here" meant on
+            # the pod: no config, no scheduler start, no traceback PDG's
+            # own "Failed to start scheduler" wrapper shows. Ships one,
+            # redacted of the two secrets that must never reach the shared
+            # volume (api_key, hardening item 2) and the two local paths
+            # that mean nothing on a Linux pod (ssh_key_path, rclone_path)
+            # -- all three arrive via rpcfg.load()'s own env overrides
+            # instead, set by host_cook.py from what actually exists on
+            # THAT machine (Ruling R71's _LOAD_OVERRIDE_ENV).
+            shipped_cfg = dataclasses.replace(
+                self._cfg, api_key="", ssh_key_path="", rclone_path="")
+            rpcfg.save_to(shipped_cfg, os.path.join(staging, "config.toml"))
 
             remote_pkg_dir = self.workingDir(False) + "/host_pkg"
             try:

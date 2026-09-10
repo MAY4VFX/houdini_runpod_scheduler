@@ -1622,6 +1622,29 @@ def test_prepare_task_env_calls_addcommonjobenvvars_even_with_no_work_item():
     assert "PDG_HTTP_PORT" not in task_env  # PDGNET config is per-item only
 
 
+def test_submit_as_job_ships_a_redacted_config_toml_into_the_staging_dir():
+    """Ruling R71 fix: rpcfg.load() raises ConfigError -- and onStartCook
+    turns that into CookError, which PDG shows only as "Failed to start
+    scheduler" -- when $RPFARM_HOME/config.toml does not exist at all.
+    The very first live run shipped no config.toml whatsoever. Checked
+    at the source level (this method is too hou-heavy to fully execute
+    here): the shipped copy must redact api_key/ssh_key_path/rclone_path
+    (the two secrets and the two Mac-only local paths) and land inside
+    the staging directory that gets uploaded, not $RPFARM_HOME."""
+    src = MODULE.read_text()
+    inner = src[src.index("def _submitAsJobInner(self, node_name):"):]
+    inner = inner[:inner.index("\n    def ", 1)]
+    assert 'api_key=""' in inner
+    assert 'ssh_key_path=""' in inner
+    assert 'rclone_path=""' in inner
+    assert "rpcfg.save_to(shipped_cfg, os.path.join(staging, \"config.toml\"))" in inner
+    # Shipped alongside the hda/ dir and the rpfarm/ package, before the
+    # one rclone_copy_dir call that uploads the whole staging tree.
+    config_write = inner.index("rpcfg.save_to(")
+    upload_call = inner.index("rpsync.rclone_copy_dir(")
+    assert config_write < upload_call
+
+
 def test_onsetupcook_checks_divergence_before_uploading_pdg_temp():
     """onSetupCook itself never rents a GPU pod (that is onTick's job, once
     PDG actually has work -- see its own comment on _raised_for_work); the

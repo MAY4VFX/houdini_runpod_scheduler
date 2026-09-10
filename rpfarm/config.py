@@ -144,8 +144,15 @@ def _toml_value(v):
     return json.dumps(str(v))
 
 
-def save(cfg: Config) -> None:
-    """Write ``cfg`` to ``$RPFARM_HOME/config.toml``, chmod 600, atomically.
+def save_to(cfg: Config, path) -> None:
+    """Write ``cfg`` as TOML to an EXPLICIT path, chmod 600, atomically.
+
+    :func:`save` (below) is this with ``path`` fixed to
+    ``$RPFARM_HOME/config.toml`` -- the normal case. This is the one
+    other callers reach for directly: the Submit As Job host pod (Ruling
+    R71) ships a config.toml alongside the .hip and the HDAs, and must
+    write it into the STAGING directory being uploaded, never touching
+    this machine's own ``$RPFARM_HOME``.
 
     A field whose value is ``None`` (currently only ``measured_mbps``
     before ``rpfarm doctor`` has ever run with a sync pod up) is omitted
@@ -153,9 +160,8 @@ def save(cfg: Config) -> None:
     no null literal, and ``load()`` already falls back to the dataclass
     default for any key missing from the file.
     """
-    h = home()
-    h.mkdir(parents=True, exist_ok=True)
-    path = h / CONFIG_FILENAME
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
 
     lines = [
         f"{f.name} = {_toml_value(getattr(cfg, f.name))}"
@@ -164,7 +170,7 @@ def save(cfg: Config) -> None:
     ]
     text = "\n".join(lines) + "\n"
 
-    fd, tmp_path = tempfile.mkstemp(dir=str(h), prefix=".config-", suffix=".tmp")
+    fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), prefix=".config-", suffix=".tmp")
     try:
         with os.fdopen(fd, "w") as f:
             f.write(text)
@@ -175,6 +181,11 @@ def save(cfg: Config) -> None:
             os.remove(tmp_path)
         raise
     os.chmod(path, 0o600)
+
+
+def save(cfg: Config) -> None:
+    """Write ``cfg`` to ``$RPFARM_HOME/config.toml`` -- see :func:`save_to`."""
+    save_to(cfg, home() / CONFIG_FILENAME)
 
 
 #: Env vars that override one field of the loaded config, for the ONE

@@ -17,6 +17,30 @@ def test_roundtrip(tmp_path, monkeypatch):
     assert back.api_key == "k" and back.gpu_priority == ["NVIDIA GeForce RTX 4090"] and back.datacenter == "EU-RO-1"
 
 
+def test_save_to_writes_to_an_explicit_path_not_rpfarm_home(tmp_path, monkeypatch):
+    """Ruling R71: the Submit As Job host pod ships a config.toml into its
+    OWN staging directory, never touching this machine's real
+    $RPFARM_HOME -- point RPFARM_HOME somewhere this test controls and
+    prove save_to never wrote there."""
+    home_dir = tmp_path / "would_be_rpfarm_home"
+    monkeypatch.setenv("RPFARM_HOME", str(home_dir))
+    dest = tmp_path / "staging" / "config.toml"
+    cfg = config.Config(api_key="k", user="may", volume_id="v", template_id="t")
+
+    config.save_to(cfg, dest)
+
+    assert dest.exists()
+    assert stat.S_IMODE(os.stat(dest).st_mode) == 0o600
+    assert not home_dir.exists()  # save_to never touched $RPFARM_HOME at all
+
+
+def test_save_uses_save_to_with_home_config_toml(tmp_path, monkeypatch):
+    monkeypatch.setenv("RPFARM_HOME", str(tmp_path))
+    cfg = config.Config(api_key="k", user="may", volume_id="v", template_id="t")
+    config.save(cfg)
+    assert (tmp_path / "config.toml").exists()
+
+
 def test_the_license_server_has_no_default(tmp_path, monkeypatch):
     """A real address baked in here would point every clone of this repo at
     one particular farm's license server. Empty is the only correct default,
