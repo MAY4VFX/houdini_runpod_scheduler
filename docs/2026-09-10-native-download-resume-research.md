@@ -72,7 +72,7 @@ Example invocation (run the last two commands as separate processes):
 ```sh
 probe_dir=$(mktemp -d /tmp/rpfarm-resume.XXXXXX)
 export HOUDINI_USER_PREF_DIR="$probe_dir/prefs__HVER__"
-export RPFARM_ROOT=/Users/may/Github/houdini_runpod_scheduler-ux
+export RPFARM_ROOT=/path/to/houdini_runpod_scheduler
 probe_hython=/Applications/Houdini/Houdini22.0.368/Frameworks/Houdini.framework/Versions/22.0/Resources/bin/hython
 "$probe_hython" docs/research-resume/switch_probe.py first "$probe_dir"
 "$probe_hython" docs/research-resume/switch_probe.py second "$probe_dir"
