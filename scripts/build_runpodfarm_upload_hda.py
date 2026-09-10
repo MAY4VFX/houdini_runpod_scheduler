@@ -346,6 +346,15 @@ def _warn(message):
         pass
 
 
+def effectiveContext():
+    try:
+        import hou
+        from rpfarm import context
+        return context.resolve(hou.pwd()).description()
+    except Exception as exc:
+        return str(exc)
+
+
 def previewUpload(kwargs):
     """Show the upload plan without cooking anything.
 
@@ -380,7 +389,9 @@ def previewUpload(kwargs):
     job_dir = hou.getenv("JOB") or hou.expandString("$HIP")
     project = node.evalParm("rpfarm_project") or os.path.basename(os.path.normpath(job_dir))
     try:
-        cfg = rpcfg.load()
+        from rpfarm import context as rpcontext
+        farm_context = rpcontext.resolve(node, job_dir)
+        cfg, project = farm_context.cfg, farm_context.project
         api = RunPodAPI(cfg.api_key)
     except Exception:
         cfg = api = None
@@ -474,7 +485,10 @@ project = node.evalParm("rpfarm_project") or os.path.basename(os.path.normpath(j
 package_gb = node.evalParm("rpfarm_packagegb")
 grouping = node.evalParm("rpfarm_grouping") or "packages"
 
-cfg = rpcfg.load()
+from rpfarm import context as rpcontext
+farm_context = rpcontext.resolve(node, job_dir)
+cfg, project = farm_context.cfg, farm_context.project
+context_path = rpcontext.snapshot(cfg)
 user = cfg.user
 # Same formula build_upload_items itself uses (rpfarm/packages.py) -- kept
 # in sync by a test, not by hoping nobody edits one without the other.
@@ -633,7 +647,7 @@ def _make_command(item_json_path):
 def _write_item_payload(name, it, compress_flag):
     path = os.path.join(items_dir, "{}.json".format(name))
     with open(path, "w") as f:
-        json.dump({"item": it, "compress": compress_flag}, f)
+        json.dump({"item": it, "compress": compress_flag, "context_path": context_path}, f)
     return path
 
 
@@ -738,7 +752,8 @@ from rpfarm import sync as rpsync
 from rpfarm.runpod_api import RunPodAPI, pod_public_endpoint
 from rpfarm.worker_client import WorkerClient
 
-cfg = rpcfg.load()
+from rpfarm import context as rpcontext
+cfg = rpcontext.resolve(self.topNode().parent()).cfg
 api = RunPodAPI(cfg.api_key)
 token = rpcfg.session_token()
 with open(cfg.ssh_key_path + ".pub") as f:
@@ -1227,6 +1242,12 @@ def main():
         "Project folder on the network volume: /workspace/projects/<user>/<project>. "
         "Shows the name of the $JOB directory until you type your own."
     )
+    project_override_pt = hou.ToggleParmTemplate('rpfarm_projectoverride', 'Override Project', default_value=False)
+    project_pt.setConditional(hou.parmCondType.HideWhen, '{ rpfarm_projectoverride == 0 }')
+    context_pt = hou.StringParmTemplate('rpfarm_context', 'Farm Context', 1,
+        default_expression=('hou.phm().effectiveContext()',),
+        default_expression_language=(hou.scriptLanguage.Python,))
+    context_pt.setConditional(hou.parmCondType.DisableWhen, '{ rpfarm_inprocess >= 0 }')
     packagegb_pt = hou.FloatParmTemplate(
         "rpfarm_packagegb", "Package Size (GB)", 1, default_value=(1.5,), min=0.1, max=16, max_is_strict=False
     )
@@ -1296,7 +1317,7 @@ def main():
     )
 
     for pt in (
-        mode_pt, scope_pt, project_pt, grouping_pt, packagegb_pt, compress_pt,
+        mode_pt, scope_pt, context_pt, project_override_pt, project_pt, grouping_pt, packagegb_pt, compress_pt,
         confirm_pt, usddeep_pt, assetregex_pt, excludepattern_pt,
         preview_pt, clearexclude_pt, exclude_pt,
         custom_pt, postcmd_pt, preset_pt, houtar_pt, houver_pt, inprocess_pt,

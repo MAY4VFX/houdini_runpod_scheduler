@@ -683,10 +683,9 @@ def _node_config(node):
     The node's API Key parm wins over config.toml when it is set, so a user can
     drive a second account without editing the config file.
     """
-    cfg = rpcfg.load()
-    parm = node.parm("rpfarm_apikey")
-    api_key = (parm.evalAsString() if parm else "") or cfg.api_key
-    return cfg, RunPodAPI(api_key)
+    from rpfarm.context import config_for_scheduler
+    cfg = config_for_scheduler(node)
+    return cfg, RunPodAPI(cfg.api_key)
 
 
 def _set_text(node, parm_name, text):
@@ -938,7 +937,7 @@ def onVolumeManage(kwargs):
         return
 
     try:
-        cfg = rpcfg.load()
+        cfg, _api = _node_config(node)
     except rpcfg.ConfigError as e:
         _set_text(node, "rpfarm_volume_text", str(e))
         return
@@ -2689,7 +2688,8 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         )
 
         try:
-            self._cfg = rpcfg.load()
+            from rpfarm.context import config_for_scheduler
+            self._cfg = config_for_scheduler(self._houNode(), rpcfg.load())
         except rpcfg.ConfigError as e:
             raise CookError(
                 "{}\nRunPodFarm reads its settings from {}.".format(

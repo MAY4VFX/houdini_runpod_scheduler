@@ -198,7 +198,10 @@ def build_dialog(review, missing, checked, parent=None, mbps=None):
     remote_view.setUniformRowHeights(True)
     model = QtGui.QStandardItemModel(remote_view)
     remote_view.setModel(model)
-    panel('FARM\n' + review.remote_project, remote_view)
+    farm_title = 'FARM\n' + review.remote_project
+    if review.cfg:
+        farm_title += '\n{} · volume {}'.format(review.cfg.datacenter, review.cfg.volume_id)
+    panel(farm_title, remote_view)
     layout.insertWidget(1, splitter, 1)
     splitter.setSizes([550, 550])
     legend = QtWidgets.QLabel('Green: identical size / modification time · Amber: different · '

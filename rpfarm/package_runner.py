@@ -139,7 +139,8 @@ def main(argv):
         progress_cb = TransferProgress(pdgcmd)
         progress_cb.phase('Preparing')
 
-        cfg = rpcfg.load()
+        from .context import load_snapshot
+        cfg = load_snapshot(payload.get('context_path'))
         api = RunPodAPI(cfg.api_key)
         token = rpcfg.session_token()
         with open(cfg.ssh_key_path + ".pub") as f:

@@ -484,6 +484,11 @@ def _dedupe_running(api, running, log):
     return [keep]
 
 
+def _sync_volume_matches(pod, cfg):
+    volume = pod.get('networkVolumeId') or (pod.get('networkVolume') or {}).get('id')
+    return not volume or volume == cfg.volume_id
+
+
 def find_running_sync_pod(api, cfg, log=None):
     """This user's sync pod, if one is already RUNNING -- read-only.
 
@@ -501,7 +506,7 @@ def find_running_sync_pod(api, cfg, log=None):
     except RunPodError as e:
         say("could not check for a running sync pod: {}".format(e))
         return None
-    running = [p for p in existing if p.get("desiredStatus") == "RUNNING"]
+    running = [p for p in existing if p.get("desiredStatus") == "RUNNING" and _sync_volume_matches(p, cfg)]
     return running[0] if running else None
 
 
@@ -511,6 +516,11 @@ def _find_or_create_sync_pod(api, cfg, token, pubkey, log, cloud_type=None, woke
     # delimiter, so "rpfarm-sync-may" would also match another user's
     # "rpfarm-sync-mayakovsky" pod -- filter down to an exact name match.
     existing = [p for p in api.list_pods(name) if p.get("name") == name]
+    wrong = [p for p in existing if not _sync_volume_matches(p, cfg)]
+    if wrong:
+        raise rpcfg.ConfigError(
+            'Sync pod {} belongs to a different volume. Select that volume or finish '
+            'using that sync pod before switching volumes; nothing was changed.'.format(wrong[0]['id']))
     running = _dedupe_running(api, [p for p in existing if p.get("desiredStatus") == "RUNNING"], log)
     if running:
         return running[0]

@@ -134,7 +134,9 @@ mode = node.evalParm("rpfarm_mode")
 package_gb = node.evalParm("rpfarm_packagegb")
 overwrite = node.evalParm("rpfarm_overwrite")
 
-cfg = rpcfg.load()
+from rpfarm import context as rpcontext
+cfg = rpcontext.resolve(node).cfg
+context_path = rpcontext.snapshot(cfg)
 api = RunPodAPI(cfg.api_key)
 token = rpcfg.session_token()
 with open(cfg.ssh_key_path + ".pub") as f:
@@ -349,7 +351,8 @@ def _make_command(item_json_path):
 def _write_item_payload(name, it):
     path = os.path.join(items_dir, "{}.json".format(name))
     with open(path, "w") as f:
-        json.dump({"kind": "download", "item": it, "overwrite": overwrite}, f)
+        json.dump({"kind": "download", "item": it, "overwrite": overwrite,
+                   "context_path": context_path}, f)
     return path
 
 
@@ -416,7 +419,8 @@ from rpfarm import sync as rpsync
 from rpfarm.runpod_api import RunPodAPI, pod_public_endpoint
 from rpfarm.worker_client import WorkerClient
 
-cfg = rpcfg.load()
+from rpfarm import context as rpcontext
+cfg = rpcontext.resolve(self.topNode().parent()).cfg
 api = RunPodAPI(cfg.api_key)
 token = rpcfg.session_token()
 with open(cfg.ssh_key_path + ".pub") as f:

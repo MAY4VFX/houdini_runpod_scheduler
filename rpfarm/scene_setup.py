@@ -243,6 +243,7 @@ def build(parent, project="", frames=1, rop_candidates=(), max_pods=DEFAULT_MAX_
     if project:
         _set(scheduler, "rpfarm_project", project)
         _set(upload, "rpfarm_project", project)
+    _set(upload, "rpfarm_projectoverride", 0)
     _set(scheduler, "rpfarm_maxpods", result.max_pods)
 
     # The asset's defaults are already the right answer for these two

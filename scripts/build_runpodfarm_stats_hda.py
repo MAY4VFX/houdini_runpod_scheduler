@@ -364,7 +364,8 @@ def _storage_snapshot(cfg, node):
     quiet = cfg is None
     try:
         if cfg is None:
-            cfg = rpcfg.load()
+            from rpfarm.context import resolve
+            cfg = resolve(node).cfg
         token = rpcfg.session_token()
         pubkey = _read_pubkey(cfg)
         api = RunPodAPI(cfg.api_key)
@@ -436,7 +437,8 @@ def compute(node):
     cfg = None
     if usebilling:
         try:
-            cfg = rpcfg.load()
+            from rpfarm.context import resolve
+            cfg = resolve(node).cfg
             api = RunPodAPI(cfg.api_key)
             since_iso = _iso(since_epoch, fallback_days_ago=90)
             until_iso = _iso(until_epoch)
@@ -581,7 +583,8 @@ def onRefresh(kwargs):
     (which does the billing pull) runs again with fresh data."""
     node = kwargs["node"]
     try:
-        cfg = rpcfg.load()
+        from rpfarm.context import resolve
+        cfg = resolve(node).cfg
         token = rpcfg.session_token()
         pubkey = _read_pubkey(cfg)
         api = RunPodAPI(cfg.api_key)
