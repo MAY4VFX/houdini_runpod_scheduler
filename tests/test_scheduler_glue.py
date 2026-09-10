@@ -23,6 +23,7 @@ import json
 import pathlib
 import sys
 import time
+import traceback
 import types
 
 import pytest
@@ -1622,6 +1623,75 @@ def test_prepare_task_env_calls_addcommonjobenvvars_even_with_no_work_item():
     assert "PDG_HTTP_PORT" not in task_env  # PDGNET config is per-item only
 
 
+def test_onstartcook_logs_the_real_exception_before_reraising():
+    """Ruling R71: inside a Submit As Job host pod, PDG shows nothing but
+    "Failed to start scheduler 'rpfarm'" for whatever onStartCook raises
+    -- no Status tab, no interactive session. The wrapper must log type,
+    message and a traceback (reaching stdout via self._log, which
+    host_cook.py captures into the pod's own boot log) and still raise
+    the SAME exception unchanged, so mode 1/2 behaviour is untouched."""
+    ns = load_methods(["onStartCook"], {"traceback": traceback})
+
+    class _Sched:
+        def __init__(self):
+            self.logs = []
+
+        def _log(self, msg):
+            self.logs.append(msg)
+
+        def _onStartCookInner(self, static, cook_set):
+            raise ValueError("no config at /root/.rpfarm/config.toml")
+
+    sched = _Sched()
+    with pytest.raises(ValueError, match="no config at"):
+        ns["onStartCook"](sched, False, None)
+
+    assert len(sched.logs) == 1
+    assert "ValueError" in sched.logs[0]
+    assert "no config at /root/.rpfarm/config.toml" in sched.logs[0]
+    assert "Traceback" in sched.logs[0]
+
+
+def test_onsetupcook_logs_the_real_exception_before_reraising():
+    ns = load_methods(["onSetupCook"], {"traceback": traceback})
+
+    class _Sched:
+        def __init__(self):
+            self.logs = []
+
+        def _log(self, msg):
+            self.logs.append(msg)
+
+        def _onSetupCookInner(self):
+            raise rpsync.SyncError("no such host")
+
+    sched = _Sched()
+    with pytest.raises(rpsync.SyncError, match="no such host"):
+        ns["onSetupCook"](sched)
+
+    assert len(sched.logs) == 1
+    assert "SyncError" in sched.logs[0]
+    assert "no such host" in sched.logs[0]
+
+
+def test_onstartcook_does_not_log_or_swallow_on_success():
+    ns = load_methods(["onStartCook"], {"traceback": traceback})
+
+    class _Sched:
+        def __init__(self):
+            self.logs = []
+
+        def _log(self, msg):
+            self.logs.append(msg)
+
+        def _onStartCookInner(self, static, cook_set):
+            return "ok"
+
+    sched = _Sched()
+    assert ns["onStartCook"](sched, True, None) == "ok"
+    assert sched.logs == []
+
+
 def test_submit_as_job_ships_a_redacted_config_toml_into_the_staging_dir():
     """Ruling R71 fix: rpcfg.load() raises ConfigError -- and onStartCook
     turns that into CookError, which PDG shows only as "Failed to start
@@ -1650,9 +1720,11 @@ def test_onsetupcook_checks_divergence_before_uploading_pdg_temp():
     PDG actually has work -- see its own comment on _raised_for_work); the
     real ordering guarantee this checks is that the divergence check runs
     with the sync connection established, and before the rest of setup
-    goes on to talk to the farm."""
+    goes on to talk to the farm. Checked against _onSetupCookInner -- the
+    real body -- not the onSetupCook wrapper (Ruling R71) that only logs
+    and re-raises whatever this raises."""
     src = MODULE.read_text()
-    setup = src[src.index("def onSetupCook(self):"):]
+    setup = src[src.index("def _onSetupCookInner(self):"):]
     setup = setup[:setup.index("\n    def ", 1)]
     assert "self._sftp = rpsync.SftpTarget(" in setup
     sftp = setup.index("self._sftp = rpsync.SftpTarget(")
@@ -1665,9 +1737,10 @@ def test_onsetupcook_clears_any_shared_index_before_the_divergence_check():
     """A previous cook may have shared a listing nothing ever consumed (the
     artist cancelled before the upload node generated) -- onSetupCook must
     drop it before this cook's own divergence check can write or read
-    anything, so it is never handed to the wrong cook."""
+    anything, so it is never handed to the wrong cook. Checked against
+    _onSetupCookInner, not the onSetupCook wrapper (Ruling R71)."""
     src = MODULE.read_text()
-    setup = src[src.index("def onSetupCook(self):"):]
+    setup = src[src.index("def _onSetupCookInner(self):"):]
     setup = setup[:setup.index("\n    def ", 1)]
     assert "rpsync.clear_shared_remote_index()" in setup
     clear = setup.index("rpsync.clear_shared_remote_index()")

@@ -51,6 +51,7 @@ import shutil
 import sys
 import tempfile
 import time
+import traceback
 import secrets
 import uuid
 
@@ -2611,12 +2612,29 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         return True
 
     def onStartCook(self, static, cook_set):
-        """[virtual] Cook start callback.
-
-        Loads ~/.rpfarm/config.toml, builds the RunPod client, names the cook,
-        registers the path map and checks for money and orphan pods. No pod is
-        created here -- that is onSetupCook's job.
+        """[virtual] Cook start callback -- see _onStartCookInner for what it
+        actually does. This wrapper exists for exactly one reason (Ruling
+        R71): when this scheduler starts inside a Submit As Job host pod
+        (topcook.py driving PDG's own cook lifecycle, no interactive
+        session, no Status tab), whatever this raises reaches the artist
+        only as PDG's own generic "Failed to start scheduler 'rpfarm'" --
+        the exception itself, type/message/traceback, is otherwise never
+        seen. Logged here (self._log already reaches stdout, which
+        host_cook.py captures into the pod's own boot log) before
+        re-raising unchanged, so mode 1/2 behaviour -- the raise itself,
+        and whatever normally handles it -- is untouched.
         """
+        try:
+            return self._onStartCookInner(static, cook_set)
+        except Exception as e:
+            self._log("onStartCook raised {}: {}\n{}".format(
+                type(e).__name__, e, traceback.format_exc()))
+            raise
+
+    def _onStartCookInner(self, static, cook_set):
+        """Loads ~/.rpfarm/config.toml, builds the RunPod client, names the
+        cook, registers the path map and checks for money and orphan pods.
+        No pod is created here -- that is onSetupCook's job."""
         import hou
 
         # Before ANYTHING else, including _reset_cook_state: the module-scope
@@ -2891,11 +2909,20 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
                        len(orphans), names))
 
     def onSetupCook(self):
-        """[virtual] Called after onStartCook.
-
-        Brings up the sync pod, ships PDG's job scripts to the farm, starts the
-        MQ there and creates the initial GPU pods.
+        """[virtual] Called after onStartCook -- see _onSetupCookInner. Same
+        reason as onStartCook's own wrapper (Ruling R71): a Submit As Job
+        host pod has no other way to show what this raised.
         """
+        try:
+            return self._onSetupCookInner()
+        except Exception as e:
+            self._log("onSetupCook raised {}: {}\n{}".format(
+                type(e).__name__, e, traceback.format_exc()))
+            raise
+
+    def _onSetupCookInner(self):
+        """Brings up the sync pod, ships PDG's job scripts to the farm,
+        starts the MQ there and creates the initial GPU pods."""
         # First, before a single machine is rented: is the code in this
         # process the code on disk? The guard at module scope answered that
         # when the SCENE was loaded, which is not the same question -- the
