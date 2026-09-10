@@ -269,6 +269,7 @@ preset = node.evalParm(\"rpfarm_preset\")
 job_dir = hou.getenv(\"JOB\") or hou.expandString(\"$HIP\")
 project = node.evalParm(\"rpfarm_project\") or os.path.basename(os.path.normpath(job_dir))
 package_gb = node.evalParm(\"rpfarm_packagegb\")
+grouping = node.evalParm(\"rpfarm_grouping\") or \"packages\"
 
 cfg = rpcfg.load()
 user = cfg.user
@@ -346,7 +347,11 @@ if mode == \"deps\":
         # a NodeError is the only way to stop it that PDG reports plainly.
         raise hou.NodeError(str(e))
 
-items = rppkg.build_upload_items(mode, job_dir, user, project, custom, refs, package_gb)
+package_gb = node.evalParm(\"rpfarm_packagegb\")
+grouping = node.evalParm(\"rpfarm_grouping\") or \"packages\"
+items = rppkg.build_upload_items(mode, job_dir, user, project, custom, refs, package_gb, grouping=grouping)
+_say(\"Upload plan: {} file(s), {} item(s), {} GB limit per package ({})\".format(
+    sum(len(it[\"files\"]) for it in items), len(items), package_gb, grouping))
 
 if mode == \"deps\":
     # runpodfarm_scheduler's _loadPathMap merges this in -- see
@@ -436,12 +441,20 @@ def _set_out_of_process(wi, item_json_path):
 
 pkg_items = []
 for it in items:
-    name = \"upload_{:03d}\".format(it[\"index\"])
+    name = \"upload_{:03d}_of_{:03d}\".format(it[\"index\"] + 1, len(items))
     wi = item_holder.addWorkItem(name=name, inProcess=in_process)
     wi.setStringAttrib(\"rpfarm_item\", json.dumps(it))
     wi.setStringAttrib(\"rpfarm_role\", \"package\")
     wi.setIntAttrib(\"bytes\", it[\"bytes\"])
     wi.setIntAttrib(\"files\", len(it[\"files\"]))
+    wi.setIntAttrib(\"package_index\", it[\"index\"] + 1)
+    wi.setIntAttrib(\"package_count\", len(items))
+    wi.setStringAttrib(\"package_files\", \"\\n\".join(f[0] for f in it[\"files\"]))
+    wi.setStringAttrib(\"phase\", \"Waiting\")
+    wi.setFloatAttrib(\"percent\", 0.0)
+    wi.setCookPercent(0.0)
+    wi.setIntAttrib(\"bytes_done\", 0)
+    wi.setIntAttrib(\"bytes_total\", it[\"bytes\"])
     wi.setIntAttrib(\"compress\", 1 if compress else 0)
     if not in_process:
         _set_out_of_process(wi, _write_item_payload(name, it, compress))

@@ -107,7 +107,9 @@ def test_main_reports_success_and_attributes(tmp_path, monkeypatch):
     assert reported["files"] == 1
     assert reported["seconds"] == pytest.approx(0, abs=5)
     assert "mbps" in reported
-    assert reported["progress"] == "0/0 MB"
+    assert reported["progress"] == "Complete"
+    assert reported["phase"] == "Complete"
+    assert reported["percent"] == 100
 
 
 def test_main_without_pdg_scriptdir_still_succeeds(tmp_path, monkeypatch):
@@ -253,7 +255,7 @@ def test_main_download_reports_pdgcmd_attributes(tmp_path, monkeypatch):
     assert reported["bytes"] == 10
     assert reported["files"] == 1
     assert "mbps" in reported
-    assert reported["progress"] == "0/0 MB"
+    assert reported["progress"] == "Complete"
 
 
 def test_main_download_returns_nonzero_on_failure(tmp_path, monkeypatch):

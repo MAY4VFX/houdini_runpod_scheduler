@@ -44,11 +44,23 @@
         help    "Project folder on the network volume: /workspace/projects/<user>/<project>. Shows the name of the $JOB directory until you type your own."
     }
     parm {
+        name    "rpfarm_grouping"
+        label   "Work Items"
+        type    string
+        default { "packages" }
+        help    "Packages reduce process and connection overhead. One per file shows each file as a PDG item. Review Files shows the exact plan before upload."
+        menu {
+            "packages"  "Packages by size"
+            "files"     "One per file"
+        }
+    }
+    parm {
         name    "rpfarm_packagegb"
         label   "Package Size (GB)"
         type    float
         default { "1.5" }
         help    "Files are grouped into work items no larger than this (a single bigger file still gets its own item)."
+        disablewhen "{ rpfarm_grouping == files }"
         range   { 0.1 16 }
     }
     parm {
@@ -97,7 +109,7 @@
     }
     parm {
         name    "rpfarm_preview"
-        label   "Preview Upload..."
+        label   "Review Local / Farm Files..."
         type    button
         default { "0" }
         help    "Open that window now, without cooking. This is how you set the selection for a batch cook that will never open it."
@@ -109,6 +121,7 @@
         name    "rpfarm_clearexclude"
         label   "Re-check Everything"
         type    button
+        invisible
         default { "0" }
         help    "Forget every reference unchecked in the window."
         hidewhen "{ rpfarm_mode != deps }"

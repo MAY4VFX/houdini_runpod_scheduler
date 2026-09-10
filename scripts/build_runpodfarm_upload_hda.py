@@ -252,17 +252,19 @@ _ASSET_FINGERPRINT = {
     'config.py': (19880, '2fc22cfe0a7466eb'),
     'deps.py': (38558, '2daae12f5770289a'),
     'dispatch.py': (22191, '1121a6505c88adb3'),
+    'file_review.py': (16105, '52a8154037e39bcd'),
     'gpus.py': (8311, '7a28d5c2692b776e'),
     'houdini_local.py': (47763, '95636adab2dc7a22'),
     'ledger.py': (17327, '70425e75fb216f01'),
-    'package_runner.py': (8752, '96770e3879a6cb65'),
-    'packages.py': (61657, '030b2d03028b9c47'),
+    'package_runner.py': (8713, 'e5ef122028fea58b'),
+    'packages.py': (62850, '7452abd0ea71205b'),
     'pods.py': (33700, '0bc5854d8230e568'),
-    'preflight.py': (43096, '2c918d033e5ef268'),
+    'preflight.py': (45206, 'bea8fc057bc7e32a'),
+    'progress.py': (3439, 'c364a012f5cd92e6'),
     'runpod_api.py': (14539, 'b90960f9860c97fb'),
     'scene_setup.py': (18467, '8838d55cbb131f99'),
     'smoke.py': (42548, 'ce0c8d36fe763314'),
-    'sync.py': (20016, '96b1ccb1a9c2846e'),
+    'sync.py': (20186, 'fb1064832a115d00'),
     'tls.py': (3642, 'f3e50ea6ebd0308f'),
     'tools.py': (4290, 'c5d3b026f125578f'),
     'usddeps.py': (9631, '3c7192d3bd94d07f'),
@@ -383,11 +385,16 @@ def previewUpload(kwargs):
     except Exception:
         cfg = api = None
     remote_project = "/workspace/projects/{}/{}".format(cfg.user, project) if cfg else None
+    env_refs, env_problems = rpdeps.environment_refs(
+        getenv=lambda name: hou.getenv(name) or os.environ.get(name), log=_say)
+    env_refs = rpdeps.remove_pattern(env_refs, exclude_pattern)
+    for problem in env_problems:
+        _warn(problem)
 
     try:
-        paths = rppf.choose_uploads(node, scan, usd, ask=True, log=_say,
+        paths = rppf.choose_uploads(node, scan, usd, env_refs, ask=True, log=_say,
                                     job_dir=job_dir, remote_project=remote_project,
-                                    cfg=cfg, api=api)
+                                    cfg=cfg, api=api, intent="preview")
     except rppf.UploadCancelled:
         _say("preview closed with Cancel -- nothing changed")
         return
@@ -465,6 +472,7 @@ preset = node.evalParm("rpfarm_preset")
 job_dir = hou.getenv("JOB") or hou.expandString("$HIP")
 project = node.evalParm("rpfarm_project") or os.path.basename(os.path.normpath(job_dir))
 package_gb = node.evalParm("rpfarm_packagegb")
+grouping = node.evalParm("rpfarm_grouping") or "packages"
 
 cfg = rpcfg.load()
 user = cfg.user
@@ -542,7 +550,11 @@ if mode == "deps":
         # a NodeError is the only way to stop it that PDG reports plainly.
         raise hou.NodeError(str(e))
 
-items = rppkg.build_upload_items(mode, job_dir, user, project, custom, refs, package_gb)
+package_gb = node.evalParm("rpfarm_packagegb")
+grouping = node.evalParm("rpfarm_grouping") or "packages"
+items = rppkg.build_upload_items(mode, job_dir, user, project, custom, refs, package_gb, grouping=grouping)
+_say("Upload plan: {} file(s), {} item(s), {} GB limit per package ({})".format(
+    sum(len(it["files"]) for it in items), len(items), package_gb, grouping))
 
 if mode == "deps":
     # runpodfarm_scheduler's _loadPathMap merges this in -- see
@@ -632,12 +644,20 @@ def _set_out_of_process(wi, item_json_path):
 
 pkg_items = []
 for it in items:
-    name = "upload_{:03d}".format(it["index"])
+    name = "upload_{:03d}_of_{:03d}".format(it["index"] + 1, len(items))
     wi = item_holder.addWorkItem(name=name, inProcess=in_process)
     wi.setStringAttrib("rpfarm_item", json.dumps(it))
     wi.setStringAttrib("rpfarm_role", "package")
     wi.setIntAttrib("bytes", it["bytes"])
     wi.setIntAttrib("files", len(it["files"]))
+    wi.setIntAttrib("package_index", it["index"] + 1)
+    wi.setIntAttrib("package_count", len(items))
+    wi.setStringAttrib("package_files", "\\n".join(f[0] for f in it["files"]))
+    wi.setStringAttrib("phase", "Waiting")
+    wi.setFloatAttrib("percent", 0.0)
+    wi.setCookPercent(0.0)
+    wi.setIntAttrib("bytes_done", 0)
+    wi.setIntAttrib("bytes_total", it["bytes"])
     wi.setIntAttrib("compress", 1 if compress else 0)
     if not in_process:
         _set_out_of_process(wi, _write_item_payload(name, it, compress))
@@ -1122,7 +1142,7 @@ def main():
     )
     confirm_pt.setConditional(hou.parmCondType.HideWhen, "{ rpfarm_mode != deps }")
 
-    preview_pt = hou.ButtonParmTemplate("rpfarm_preview", "Preview Upload...")
+    preview_pt = hou.ButtonParmTemplate("rpfarm_preview", "Review Local / Farm Files...")
     preview_pt.setHelp(
         "Open that window now, without cooking. This is how you set the "
         "selection for a batch cook that will never open it."
@@ -1136,6 +1156,7 @@ def main():
     clearexclude_pt.setScriptCallback("hou.phm().clearExclusions(kwargs)")
     clearexclude_pt.setScriptCallbackLanguage(hou.scriptLanguage.Python)
     clearexclude_pt.setConditional(hou.parmCondType.HideWhen, "{ rpfarm_mode != deps }")
+    clearexclude_pt.hide(True)  # Reset is part of File Review; keep saved-scene compatibility.
 
     # Kept in sync with rpfarm.deps.ASSET_REGEX by
     # tests/test_hda_assets.py -- the builder cannot import rpfarm (it runs
@@ -1210,6 +1231,11 @@ def main():
         "rpfarm_packagegb", "Package Size (GB)", 1, default_value=(1.5,), min=0.1, max=16, max_is_strict=False
     )
     packagegb_pt.setHelp("Files are grouped into work items no larger than this (a single bigger file still gets its own item).")
+    grouping_pt = hou.StringParmTemplate(
+        "rpfarm_grouping", "Work Items", 1, default_value=("packages",),
+        menu_items=("packages", "files"), menu_labels=("Packages by size", "One per file"))
+    grouping_pt.setHelp("Packages reduce process and connection overhead. One per file shows each file as a PDG item. Review Files shows the exact plan before upload.")
+    packagegb_pt.setConditional(hou.parmCondType.DisableWhen, "{ rpfarm_grouping == files }")
     compress_pt = hou.StringParmTemplate(
         "rpfarm_compress", "Compression", 1, default_value=("auto",),
         menu_items=("auto", "on", "off"), menu_labels=("Auto", "On", "Off"),
@@ -1270,7 +1296,7 @@ def main():
     )
 
     for pt in (
-        mode_pt, scope_pt, project_pt, packagegb_pt, compress_pt,
+        mode_pt, scope_pt, project_pt, grouping_pt, packagegb_pt, compress_pt,
         confirm_pt, usddeep_pt, assetregex_pt, excludepattern_pt,
         preview_pt, clearexclude_pt, exclude_pt,
         custom_pt, postcmd_pt, preset_pt, houtar_pt, houver_pt, inprocess_pt,

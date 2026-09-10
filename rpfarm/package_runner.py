@@ -135,14 +135,9 @@ def main(argv):
     try:
         item = payload["item"]
 
-        def progress_cb(done, total, speed):
-            msg = "{:.0f}/{:.0f} MB".format(done / 2**20, total / 2**20)
-            print("[{}] progress {}".format(tag, msg), flush=True)
-            if pdgcmd is not None:
-                try:
-                    pdgcmd.setStringAttrib("progress", msg, 0)
-                except Exception:
-                    pass
+        from .progress import TransferProgress
+        progress_cb = TransferProgress(pdgcmd)
+        progress_cb.phase('Preparing')
 
         cfg = rpcfg.load()
         api = RunPodAPI(cfg.api_key)
@@ -150,6 +145,7 @@ def main(argv):
         with open(cfg.ssh_key_path + ".pub") as f:
             pubkey = f.read()
 
+        progress_cb.phase('Waiting for sync pod')
         pod = rppods.ensure_sync_pod(api, cfg, token, pubkey)
         ip, port = rprunpod.pod_public_endpoint(pod, 22)
         sftp = rpsync.SftpTarget(host=ip, port=port, key_path=cfg.ssh_key_path)
@@ -176,6 +172,7 @@ def main(argv):
             compress = bool(payload.get("compress"))
             stats = rppkg.run_upload_item(item, cfg, sftp, sync_client, compress, progress_cb)
         elapsed = time.time() - t0
+        progress_cb.finish()
         mbps = stats["bytes"] / 2**20 / max(1e-3, elapsed)
 
         print(
@@ -196,6 +193,8 @@ def main(argv):
 
         return 0
     except Exception:
+        if 'progress_cb' in locals() and hasattr(progress_cb, 'phase'):
+            progress_cb.phase('Failed')
         import traceback
 
         traceback.print_exc()

@@ -381,6 +381,8 @@ def _run_rclone(rclone_bin, args, progress_cb=None):
     Returns ``(last_stats_dict, elapsed_seconds)``. Raises SyncError if the
     process exits non-zero.
     """
+    from .progress import notify
+    notify(progress_cb, 'begin_transfer')
     t0 = time.time()
     proc = subprocess.Popen([rclone_bin, *args], stderr=subprocess.PIPE, text=True)
     last = {"bytes": 0, "transfers": 0}
@@ -396,10 +398,12 @@ def _run_rclone(rclone_bin, args, progress_cb=None):
         last["bytes"] = st.get("bytes", last["bytes"])
         last["transfers"] = st.get("transfers", last["transfers"])
         if progress_cb:
+            notify(progress_cb, 'details', st)
             progress_cb(st.get("bytes", 0), st.get("totalBytes", 0), st.get("speed", 0))
     returncode = proc.wait()
     if returncode != 0:
         raise SyncError(f"rclone exit {returncode}")
+    notify(progress_cb, 'end_transfer', last['bytes'])
     return last, time.time() - t0
 
 
@@ -408,8 +412,8 @@ def rclone_copy(package, target, direction, rclone_bin, local_root, remote_root,
     with tempfile.TemporaryDirectory() as tmp:
         args, _ = build_rclone_args(package, target, direction, local_root, remote_root, tmp)
         args = list(args) + list(extra_args)
-        _, seconds = _run_rclone(rclone_bin, args, progress_cb)
-        return SyncStats(files=len(package), bytes=sum(e.size for e in package), seconds=seconds)
+        last, seconds = _run_rclone(rclone_bin, args, progress_cb)
+        return SyncStats(files=last['transfers'], bytes=last['bytes'], seconds=seconds)
 
 
 def rclone_copy_dir(local_dir, target, direction, rclone_bin, remote_root, progress_cb=None):
