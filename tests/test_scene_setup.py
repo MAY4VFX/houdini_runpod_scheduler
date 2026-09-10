@@ -135,7 +135,7 @@ def test_a_fresh_network_gets_the_whole_graph_wired():
     net = FakeNetwork()
     result = ss.build(net, project="airship", frames=48, rop_candidates=["/out/karma1"])
 
-    assert roles(result.created) == {"scheduler", "upload", "gate", "render"}
+    assert roles(result.created) == {"scheduler", "upload", "gate", "render", "download"}
     assert not result.reused
 
     by_type = {n.type().name(): n for n in net.children()}
@@ -145,7 +145,8 @@ def test_a_fresh_network_gets_the_whole_graph_wired():
     assert fetch.inputs()[0] is gate
     # Only the bottom node carries the display flag: cooking anything else,
     # or cooking twice, pays for a second GPU pod.
-    assert fetch.display is True
+    assert by_type[ss.DOWNLOAD_TYPE].display is True
+    assert by_type[ss.DOWNLOAD_TYPE].inputs()[0] is fetch
     assert net.laid_out is True
 
 
@@ -189,13 +190,13 @@ def test_a_scheduler_path_pointing_at_nothing_is_repaired():
     assert result.scheduler_assigned is True
 
 
-def test_no_download_node_is_created():
+def test_download_is_the_explicit_delivery_stage():
     """The scheduler downloads outputs during the cook; a second node in
     Upstream Outputs mode walks the same files again. Why is documented in
     the README and this module -- not repeated to the artist at runtime."""
     net = FakeNetwork()
     ss.build(net)
-    assert ss.DOWNLOAD_TYPE not in {n.type().name() for n in net.children()}
+    assert ss.DOWNLOAD_TYPE in {n.type().name() for n in net.children()}
 
 
 def test_the_scene_is_what_configures_the_nodes():
@@ -238,7 +239,7 @@ def test_a_second_run_adopts_instead_of_duplicating():
 
     assert len(net.children()) == before
     assert not again.created
-    assert roles(again.reused) == {"scheduler", "upload", "gate", "render"}
+    assert roles(again.reused) == {"scheduler", "upload", "gate", "render", "download"}
     assert any("already set up" in line for line in ss.report(again))
 
 

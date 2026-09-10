@@ -108,7 +108,10 @@ print("\n=== the tabs ===")
 folders = [pt.label() for pt in s.parmTemplateGroup().entries() if pt.type() == hou.parmTemplateType.Folder]
 print("  tabs:", folders)
 check("tab order", folders,
-      ["Cook", "Farm", "Status", "Volume", "Paths", "Advanced", "Submit As Job", "Message Queue", "RPC Server"])
+      ["Cook", "Farm", "Status", "Volume", "Paths", "Advanced", "Run Job", "Background Cook", "Message Queue", "RPC Server"])
+legacy_background = next(pt for pt in s.parmTemplateGroup().entries() if pt.label() == 'Background Cook')
+check('legacy background tab remains hidden',
+      'rpfarm_verbose >= 0' in legacy_background.tabConditionals().get(hou.parmCondType.HideWhen, ''), True)
 for parm_name in ("rpfarm_pretaskcmd", "rpfarm_posttaskcmd", "rpfarm_envmulti", "rpfarm_envunset",
                   "rpfarm_houdinimaxthreads", "rpfarm_remoteworkingdir", "rpfarm_verbose",
                   "rpfarm_minpods", "rpfarm_maxcost", "rpfarm_downloadoutputs", "pdg_workingdir",

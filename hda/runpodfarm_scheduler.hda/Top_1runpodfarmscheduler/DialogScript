@@ -53,7 +53,7 @@
         }
         parm {
             name    "rpfarm_maxcost"
-            label   "Budget ($ per cook)"
+            label   "GPU Budget (USD per cook)"
             type    float
             default { "5.0" }
             range   { 0 500 }
@@ -67,10 +67,10 @@
         }
         parm {
             name    "rpfarm_downloadoutputs"
-            label   "Download Outputs"
+            label   "Legacy Auto Download"
             type    toggle
-            default { "1" }
-            help    "Pull each work item's output files back from the volume as soon as it finishes, to the paths the ROP was aimed at."
+            default { "0" }
+            help    "Compatibility for graphs without a Download TOP. New graphs use the visible Download stage. Both paths share delivery tracking."
         }
     }
 
@@ -192,17 +192,44 @@
         label   "Status"
 
         parm {
+            name "rpfarm_job"
+            label "Selected Job"
+            type string
+            default { "" }
+            menu {
+                [ "hou.phm().jobMenu(kwargs)" ]
+                language python
+            }
+        }
+        parm {
+            name "rpfarm_canceljob"
+            label "Cancel Selected Job"
+            type button
+            parmtag { "script_callback" "hou.phm().onCancelJob(kwargs)" }
+            parmtag { "script_callback_language" "python" }
+            disablewhen "{ rpfarm_job == '' }"
+        }
+        parm {
+            name "rpfarm_openjoblog"
+            label "Show Job Log File"
+            type button
+            parmtag { "script_callback" "hou.phm().onOpenJobLog(kwargs)" }
+            parmtag { "script_callback_language" "python" }
+            disablewhen "{ rpfarm_job == '' }"
+        }
+
+        parm {
             name    "rpfarm_modehelp"
             label   "Как это работает"
             type    string
-            default { "РЕЖИМ 1 — обычный кук (кнопка Cook на нижней ноде графа).\n    Houdini дирижирует: раздаёт задачи, забирает кадры, гасит машины.\n    HOUDINI ЗАКРЫВАТЬ НЕЛЬЗЯ. Закроете — задачи на машинах доработают,\n    но кадры никто не заберёт, а машины останутся включёнными и будут\n    тикать деньги, пока вы не откроете Houdini снова или не нажмёте\n    Stop Everything.\n\nРЕЖИМ 2 — отправить целиком (вкладка Submit As Job, кнопка Submit).\n    ПОКА НЕ ПРОВЕРЕН, НЕ ПОЛАГАЙТЕСЬ НА НЕГО. Замысел: сцена уезжает\n    на ферму и кукается там, без вашего Houdini. Сквозного прогона не\n    было, и по коду видно, что машину, на которой идёт сам кук, гасить\n    некому — ключа RunPod на ферме нет. То есть закрыв Houdini в этом\n    режиме, вы рискуете так же, как в первом. Пользуйтесь режимом 1,\n    пока здесь не появится другая надпись.\n\nКОГДА МАШИНЫ ГАСНУТ (только пока Houdini открыт):\n    рендер-машины — сразу после кука;\n    вспомогательная (sync) — через Sync Idle (Min) простоя, потом\n    удаляется через Sync Delete (Min). При закрытом Houdini не гаснет\n    никто: сторож живёт внутри Houdini." }
+            default { "Cook: this Houdini controls the graph. Background: Houdini may close; keep this computer on. Farm: upload finishes here, then the job runs independently. Retrieve its results with Download." }
             disablewhen "{ rpfarm_verbose >= 0 }"
             parmtag { "editor" "1" }
-            parmtag { "editorlines" "18-22" }
+            parmtag { "editorlines" "3-4" }
         }
         parm {
             name    "rpfarm_killsync"
-            label   "Stop Everything, Sync Pod Too"
+            label   "Stop My Farm..."
             type    button
             default { "0" }
             parmtag { "script_callback" "hou.phm().onKillAllIncludingSync(kwargs)" }
@@ -211,6 +238,7 @@
         }
         parm {
             name    "rpfarm_killall"
+            hidewhen "{ rpfarm_verbose >= 0 }"
             label   "Kill All Pods"
             type    button
             default { "0" }
@@ -220,11 +248,11 @@
         }
         parm {
             name    "rpfarm_syncledger"
-            label   "Sync Ledger"
+            label   "Refresh Farm / Ledger"
             type    button
             default { "0" }
             joinnext
-            parmtag { "script_callback" "hou.phm().onSyncLedger(kwargs)" }
+            parmtag { "script_callback" "hou.phm().onRefreshFarm(kwargs)" }
             parmtag { "script_callback_language" "python" }
             help    "Copy /workspace/ledger from the volume into ~/.rpfarm/ledger."
         }
@@ -277,6 +305,7 @@
         }
         parm {
             name    "rpfarm_volume_target"
+            hidewhen "{ rpfarm_verbose >= 0 }"
             label   "Target"
             type    string
             default { "" }
@@ -284,6 +313,7 @@
         }
         parm {
             name    "rpfarm_volume_delete"
+            hidewhen "{ rpfarm_verbose >= 0 }"
             label   "Delete Target"
             type    button
             default { "0" }
@@ -554,40 +584,51 @@
 
     group {
         name    "folder4"
-        label   "Submit As Job"
+        label   "Run Job"
+
+        parm {
+            name "rpfarm_launchmode"
+            label "Controller"
+            type string
+            default { "farm" }
+            menu { "farm" "On Farm" "background" "On This Computer (Background)" }
+        }
 
         parm {
             name    "rpfarm_submithelp"
             label   "Что делает Submit"
             type    string
-            default { "Сцена целиком уезжает на ферму и кукается там. Ваш Houdini после нажатия ни за что не отвечает — можно закрывать сразу, машины погасит сама ферма.\n\nКадры остаются НА ФЕРМЕ: заберите их потом кнопкой Manage Volume или нодой RunPodFarm Download.\n\nОбычная кнопка Cook работает наоборот: дирижирует ваш Houdini, и закрывать его до конца кука нельзя." }
+            default { "Farm runs the selected target after local upload; Download stays here for later retrieval. Background runs through its Download stage on this computer." }
             disablewhen "{ rpfarm_verbose >= 0 }"
             parmtag { "editor" "1" }
-            parmtag { "editorlines" "7-9" }
+            parmtag { "editorlines" "2-3" }
         }
         parm {
             name    "submitjob"
-            label   "Submit"
+            label   "Run Job"
             type    button
             default { "0" }
-            parmtag { "script_callback" "hou.pwd().hm().submitGraphAsJob(kwargs, hou.pwd())" }
+            parmtag { "script_callback" "hou.phm().onLaunchJob(kwargs)" }
             parmtag { "script_callback_language" "python" }
         }
         parm {
             name    "usesubmitjobnode"
+            hidewhen "{ rpfarm_verbose >= 0 }"
             label   "Use Output Node"
             type    toggle
             nolabel
             joinnext
-            default { "0" }
+            default { "1" }
+            disablewhen "{ rpfarm_verbose >= 0 }"
+            help    "Ruling R71: always on. Whatever node had the display flag is what Submit As Job sent -- and that is the entire cause of the design bug that cost six live rentals to fully diagnose. The target below is never inferred silently."
             parmtag { "script_callback_language" "python" }
         }
         parm {
             name    "submitjobnode"
-            label   "Output Node"
+            label   "Farm Target"
             type    oppath
             default { "" }
-            disablewhen "{ usesubmitjobnode == 0 }"
+            help    "The exact node Submit As Job sends to the farm -- shown here so you can check it before anything is rented. Point it at the render node, never at the network or at RunPodFarm Download: Submit As Job cooks this node and everything upstream of it, never anything downstream."
             parmtag { "opfilter" "!!TOP!!" }
             parmtag { "oprelative" "." }
             parmtag { "script_callback_language" "python" }
@@ -603,16 +644,17 @@
 
     group {
         name    "folder_bgcook"
+        hidewhentab "{ rpfarm_verbose >= 0 }"
         label   "Background Cook"
 
         parm {
             name    "rpfarm_bgcookhelp"
             label   "Что делает Background Cook"
             type    string
-            default { "Кук идёт как обычно (ваш компьютер, ваш ключ RunPod, ваши деньги) -- но отдельным процессом hython, который переживёт закрытие Houdini. Сцена сохраняется автоматически перед запуском.\n\nСледить не в Houdini: путь к файлу лога печатается сразу после нажатия и в диалоге, который появится один раз.\n\nЭто НЕ Submit As Job -- тот уезжает на ферму и не может сам погасить поды без ключа RunPod там." }
+            default { "Local background controller. The computer must stay on. Use Job status and Cancel Selected Job to manage it." }
             disablewhen "{ rpfarm_verbose >= 0 }"
             parmtag { "editor" "1" }
-            parmtag { "editorlines" "6-8" }
+            parmtag { "editorlines" "2-3" }
         }
         parm {
             name    "rpfarm_bgcookenable"

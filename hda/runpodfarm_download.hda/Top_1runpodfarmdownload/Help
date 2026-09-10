@@ -1,95 +1,23 @@
-= RunPodFarm Download =
-
 #type: node
 #context: top
 #internal: runpodfarmdownload
-#icon: TOP/pythonprocessor
-
-"""Download files from the RunPodFarm volume to local disk, as a normal TOP
-work item generator -- progress is visible per package as it cooks."""
-
-Work item = one package of files. Each package cooks on PDG's *local*
-scheduler (this node overrides `Scheduler` to its own internal
-`localscheduler`, never `runpodfarm_scheduler` -- same reasoning as the
-upload node: this download has to run on the machine that owns the local
-disk it's downloading to, not dispatch onto the farm itself). The override
-is a Python expression on the internal Python Processor's `Scheduler` parm
-re-resolving the sibling `localscheduler` node's absolute path at cook
-time -- see [Node:top/runpodfarm_upload]'s Help for why a bare relative
-name doesn't work here. This node's `OnCreated` event re-asserts the same
-expression once more when a new instance is made.
-
-Packages cook *out of process* by default (Ruling R22), through the same
-`rpfarm.package_runner` module the upload node uses (`rpfarm/package_runner.py`)
--- each work item's command is `python3 -m rpfarm.package_runner <item.json>`,
-whose payload's `"kind": "download"` selects `rpfarm.packages.run_download_item`
-over the upload path. See [Node:top/runpodfarm_upload]'s Help for why PDG's
-Python Processor requires a shell `.command` for genuine out-of-process
-dispatch, and why a plain `python3` (not `hython`) runs it. The Cook In
-Process toggle below switches back to the old callback-only path (this
-node's `cooktask`) for debugging.
-
-Cooking this node when it has an upstream input (`Upstream outputs` mode):
-cook THIS node -- the downstream-most node in the graph -- in one single
-`cookWorkItems()` call. Do not cook the upstream farm-scheduler generator
-node separately first and then cook this one: each top-level
-`cookWorkItems()` call starts its own independent PDG cook, so a second
-call does not treat the first call's already-`CookedSuccess` items as up
-to date -- it recooks the upstream node from scratch too, on
-`runpodfarm_scheduler`, which means a SECOND real (and separately billed)
-GPU pod for work that already ran once. One cook of this node is also the
-intended pattern: it lets `gen`'s item cook on the farm and this node's own
-download item cook locally, in one graph cook, one GPU pod total (live-
-verified; see the Task 10 report, `.superpowers/sdd/2026-09-02-rpfarm-v2/
-task-10-report.md`).
+#icon: opdef:/Top/runpodfarmdownload?IconSVG
+= RunPodFarm Download =
+Deliver farm outputs to their original local paths. Cook this node normally.
 
 @parameters
-
+Results From:
+    #id: rpfarm_job
+    Current Graph cooks the connected input. A selected submitted job restores its checkpoint and result manifest inside this cook. The upstream upload/render branch is excluded, so retrieving a job never submits it again.
 Mode:
     #id: rpfarm_mode
-    `Upstream outputs` reads each upstream work item's `resultData` (farm
-    paths reported while it ran) and localizes them via the `rpfarm_pathmap`
-    attribute the scheduler stamps onto every item it schedules -- no
-    upstream input means nothing to download (a warning, not an error).
-    `Custom paths` downloads exactly the remote -> local directory pairs
-    below; the files under each remote directory are listed on the sync pod
-    (`find <dir> -type f -printf '%s %p\n'`) at generate time, since they
-    only exist on the farm volume.
-
-Package Size (GB):
-    #id: rpfarm_packagegb
-
-    Files are grouped into work items no larger than this (a single file
-    bigger than the limit still gets its own item). Packages never span two
-    (local dir, farm dir) pairs -- see `rpfarm.packages.group_download_pairs`.
-
+    Upstream Outputs uses the original render file paths and mapping. Custom Paths retrieves the specified directories without cooking the connected render branch.
 Overwrite:
     #id: rpfarm_overwrite
+    Newer preserves a newer local file. Always uses ordinary size/time comparison. Never preserves every existing local file. A preserved file that differs from the farm is not counted as verified delivery for automatic cleanup.
 
-    `newer` (default) skips a local file that is not older than its remote
-    counterpart (`rclone --update`). `always` adds no extra flag, which is
-    rclone's own default comparison: it still skips a file whose size AND
-    modification time already match the remote exactly, and re-transfers
-    anything else -- "always" here means "no `--update`/`--ignore-existing`
-    override", not "every file every time". `never` skips anything that
-    already exists locally, regardless of mtime (`rclone --ignore-existing`).
-
-Custom Paths:
-    #id: rpfarm_custom
-
-    Multiparm of remote -> local directory pairs, used in Custom mode.
-
-Cook In Process (debug):
-    #id: rpfarm_inprocess
-
-    Off (default): packages download out of process, in parallel, without
-    blocking Houdini (Ruling R22; see above). On: cook in this Houdini
-    session instead -- blocks the UI, one package at a time, useful for
-    stepping through `run_download_item()` directly while debugging.
+Downloaded files appear as native PDG Output Files. Existing validated delivery receipts skip repeated transfers. Cancelled or failed transfers leave farm results available for another cook.
 
 @related
-
-- [Node:top/runpodfarm_upload]
-- [Node:top/runpodfarm_scheduler]
-- [Node:top/pythonprocessor]
-- [Node:top/localscheduler]
+- [Node:top/runpodfarmupload]
+- [Node:top/switch]

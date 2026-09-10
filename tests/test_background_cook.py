@@ -14,6 +14,56 @@ import pytest
 from rpfarm import background_cook as rpbg
 
 
+def test_tracked_launch_uses_explicit_target_and_persists_identity(tmp_path, monkeypatch):
+    import json
+    import sys
+    import types
+    from pathlib import Path
+    from rpfarm import config, context, jobs, houdini_local
+    values = {'submitjobnode': '../render', 'rpfarm_job': '', 'rpfarm_downloadoutputs': 1}
+    class Parm:
+        def __init__(self, key): self.key = key
+        def eval(self): return values[self.key]
+        def set(self, value): values[self.key] = value
+    download = types.SimpleNamespace(type=lambda: types.SimpleNamespace(name=lambda: 'runpodfarmdownload'),
+        parm=lambda _: types.SimpleNamespace(set=lambda value: None), path=lambda: '/obj/topnet/download')
+    target = types.SimpleNamespace(type=lambda: types.SimpleNamespace(name=lambda: 'ropfetch'),
+        getPDGGraphContext=lambda: types.SimpleNamespace(cooking=False), outputs=lambda: [download])
+    node = types.SimpleNamespace(parm=lambda name: Parm(name) if name in values else None,
+                                 node=lambda _: target)
+    saved = []
+    hou = types.SimpleNamespace(hipFile=types.SimpleNamespace(save=lambda: saved.append(True),
+        path=lambda: str(tmp_path / 'scene.hip')), expandString=lambda _: '/opt/hfs')
+    monkeypatch.setitem(sys.modules, 'hou', hou)
+    cfg = config.Config(api_key='private-test-key', user='artist', volume_id='v', template_id='t')
+    monkeypatch.setattr(context, 'resolve', lambda _: context.FarmContext(cfg, 'shot', str(tmp_path)))
+    monkeypatch.setattr(context, 'snapshot', lambda _: str(tmp_path / 'private-context.toml'))
+    monkeypatch.setattr(jobs, 'directory', lambda: tmp_path)
+    monkeypatch.setattr(houdini_local, 'HoudiniInstall', lambda _: types.SimpleNamespace(hython=Path('/fake/hython')))
+    calls = []
+    def launch(command, log_file, **kwargs):
+        calls.append((command, kwargs['env']['RPFARM_CONTEXT_PATH']))
+        return 4242
+    monkeypatch.setattr(rpbg, 'launch', launch)
+    job = rpbg.launch_tracked(node)
+    assert saved and calls
+    assert calls[0][0][calls[0][0].index('--toppath') + 1] == '/obj/topnet/download'
+    assert 'private-test-key' not in str(calls)
+    assert job['pid'] == 4242 and jobs.load(job['id'])['target'] == '/obj/topnet/download'
+    assert 'private-test-key' not in json.dumps(jobs.load(job['id']))
+    assert values['rpfarm_job'] == job['id']
+    assert values['rpfarm_downloadoutputs'] == 0
+
+
+def test_tracked_launch_rejects_a_missing_explicit_target(monkeypatch):
+    import sys
+    import types
+    monkeypatch.setitem(sys.modules, 'hou', types.SimpleNamespace())
+    node = types.SimpleNamespace(parm=lambda _: None)
+    with pytest.raises(rpbg.BackgroundCookError, match='Farm Target'):
+        rpbg.launch_tracked(node)
+
+
 def test_find_topcook_returns_the_path_when_it_exists(tmp_path):
     hhp = tmp_path / "houdini" / "python3.13libs"
     (hhp / "pdgjob").mkdir(parents=True)

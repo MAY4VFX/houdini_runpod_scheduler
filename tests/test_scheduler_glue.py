@@ -840,11 +840,11 @@ def test_the_demo_scene_never_enables_both_download_paths():
                / "scripts" / "build_demo_scene.py").read_text(encoding="utf-8")
 
     # greedy download stays on -- frames appear while the farm still renders
-    assert 'sched.parm("rpfarm_downloadoutputs").set(1)' in builder
+    assert 'sched.parm("rpfarm_downloadoutputs").set(0)' in builder
     # ...so no download node may be created in the chain
-    assert 'createNode("runpodfarmdownload"' not in builder
+    assert 'createNode("runpodfarmdownload"' in builder
     # and _verify refuses a scene where one came back
-    assert 'hou.node("/obj/topnet1/download") is None' in builder
+    assert 'hou.node("/obj/topnet1/download") is not None' in builder
 
 
 # ---------------------------------------------------------------------------
@@ -1609,6 +1609,16 @@ def test_prepare_task_env_calls_the_base_classs_batch_rpc_setup():
     assert task_env["PDG_RESULT_CLIENT_ID"] == "cid"
 
 
+def test_render_task_environment_excludes_controller_credentials():
+    sched = _TaskEnvScheduler()
+    secrets = {'RUNPOD_API_KEY': 'private', 'RPFARM_SESSION_TOKEN': 'private',
+               'RPFARM_HOST_SSH_KEY': 'private', 'RPFARM_CONTEXT_PATH': '/private/context'}
+    wi = types.SimpleNamespace(environment=dict(secrets, USER_OPTION='keep'))
+    result = _task_env_ns()['_prepareTaskEnv'](sched, None, wi)
+    assert not set(secrets) & set(result)
+    assert result['USER_OPTION'] == 'keep'
+
+
 def test_prepare_task_env_calls_addcommonjobenvvars_even_with_no_work_item():
     """Called with work_item=None too (onStopCook's own pretask env) --
     addCommonJobEnvVars must still run so PDG_RESULT_SERVER etc. are set
@@ -1736,7 +1746,8 @@ def test_submit_as_job_uses_a_throwaway_key_never_the_artists_own():
 
     # The private half shipped to the pod is the GENERATED key, not
     # self._cfg.ssh_key_path (the artist's own, real, persistent key).
-    assert "self._cfg.ssh_key_path" not in inner
+    assert '"RPFARM_HOST_SSH_KEY": ssh_key_pem' in inner
+    assert 'open(self._cfg.ssh_key_path' not in inner
     assert '"RPFARM_HOST_SSH_KEY": ssh_key_pem' in inner
     # The public half ships too (Ruling R71 fix, 2026-09-10 live finding):
     # the scheduler's own _read_pubkey unconditionally reads
@@ -1792,6 +1803,33 @@ def test_submit_as_job_ships_the_shared_session_token_via_process_env():
     # Not the per-cook GPU token -- that one is scoped to GPU pods only
     # (Ruling R70) and is not what authorizes talking to the sync pod.
     assert '"RPFARM_HOST_SESSION_TOKEN": self._cook_token' not in inner
+
+
+def test_submit_as_job_confirms_the_target_node_before_renting_anything():
+    """Decision 2 (Ruling R71, review finding, 2026-09-10): the owner's
+    exact complaint was "whatever node has the display flag" -- inferred
+    silently, never shown, and it moved. The confirmation must name
+    node_name and happen before onStartCook (before the cook lock, before
+    anything is created or rented), and Cancel must return without ever
+    reaching onStartCook."""
+    src = MODULE.read_text()
+    outer = src[src.index("def submitAsJob(self, graph_file, node_name):"):]
+    outer = outer[:outer.index("\n    def ", 1)]
+
+    assert "hou.ui.displayMessage(" in outer
+    assert "node_name" in outer
+    confirm = outer.index("hou.ui.displayMessage(")
+    start_cook = outer.index("return self._submitAsJobInner(node_name)")
+    assert confirm < start_cook, "confirm before onStartCook, not after"
+
+    # Cancel is the returned-early path: displayMessage's return value
+    # (truthy for the second/closed button, matching every other confirm
+    # dialog already in this file -- e.g. the volume-delete confirm) must
+    # gate a return that never reaches onStartCook.
+    assert 'buttons=("Отправить", "Отмена")' in outer
+    assert "default_choice=1, close_choice=1" in outer
+    cancel_block = outer[confirm:start_cook]
+    assert 'return "", ""' in cancel_block
 
 
 def test_onsetupcook_checks_divergence_before_uploading_pdg_temp():
@@ -1864,7 +1902,8 @@ def _sync_step(now, stamp="0"):
             "time": types.SimpleNamespace(time=lambda: now),
             "rppods": rpdispatch and __import__("rpfarm.pods", fromlist=["pods"]),
             "WorkerClient": lambda pid, tok: types.SimpleNamespace(
-                read_file=lambda path: stamp),
+                read_file=lambda path: stamp,
+                health=lambda: {'busy': 0, 'transfers': 0, 'ssh_sessions': 0, 'idle_s': 99999}),
             "_SYNC_LAST_USED": "/workspace/.rpfarm/sync_last_used",
         },
     )
@@ -2023,7 +2062,8 @@ def test_the_watch_runs_between_cooks_not_only_at_cook_start():
 
     assert "def startSyncPodWatch" in src
     assert "_SYNC_WATCH_INTERVAL_S" in src
-    assert "hou.ui.addEventLoopCallback" in src
+    assert "monitoring.start()" in src
+    assert "hou.ui.addEventLoopCallback" in (MODULE.parents[3] / "rpfarm" / "monitoring.py").read_text()
     # ...and the same policy function decides in both places
     assert src.count("rppods.sync_pod_action") >= 1
     assert "self._manageSyncPod()" in src
@@ -2948,7 +2988,7 @@ def _clean_env(exec_result=None, calls=None):
 @pytest.mark.parametrize("kwargs,because", [
     ({"mode": "off"}, None),
     ({"failed": 2}, "2 item(s) failed"),
-    ({"download_outputs": 0}, "Download Outputs is off"),
+    ({"download_outputs": 0, "downloads": 0}, "Download Outputs is off"),
     ({"queued": 1}, "1 download(s) never finished"),
     ({"downloads": 0}, "no outputs were downloaded"),
 ])
@@ -2972,16 +3012,22 @@ def test_auto_clean_deletes_nothing_when_the_cook_was_cancelled():
     assert any("cancelled" in line for line in sched.logs)
 
 
-def test_outputs_mode_removes_only_the_output_folders():
-    """The inputs stay, so the next cook uploads nothing -- which is the
-    whole reason this is the recommended mode."""
+def test_outputs_mode_removes_only_verified_files_from_this_cook(monkeypatch):
+    from rpfarm import delivery
+    monkeypatch.setattr(delivery, 'valid', lambda *args: True)
     clean, calls = _clean_env()
     sched = _CleanScheduler(mode="outputs")
+    pair = ('/workspace/projects/may/airship/render/frame.exr', '/local/frame.exr')
+    sched._work_items = {1: types.SimpleNamespace(
+        stringAttribValue=lambda name: 'cook/item', resultData=[pair[0]])}
+    sched._pathmap = {}
+    clean.__globals__['rppkg'] = types.SimpleNamespace(
+        result_data_path=lambda rd: rd, map_output_pair=lambda *args: pair)
     clean(sched, cancel=False)
     assert len(calls) == 1
-    assert "/workspace/projects/may/airship/render" in calls[0]
-    assert "/workspace/projects/may/airship/geo" in calls[0]
-    # Never the project itself.
+    assert pair[0] in calls[0]
+    assert "/workspace/projects/may/airship/geo" not in calls[0]
+    assert ' /workspace/projects/may/airship/render ' not in ' ' + calls[0] + ' '
     assert " /workspace/projects/may/airship " not in " {} ".format(calls[0])
     assert "--force" in calls[0]
 
@@ -3000,7 +3046,7 @@ def test_a_refusal_from_the_pod_is_reported_not_swallowed():
         "ok": False, "deleted": [], "bytes_freed": 0,
         "refused": [{"path": "/workspace/projects/may/airship/render",
                      "error": "outputs pending, not downloaded"}]})
-    sched = _CleanScheduler()
+    sched = _CleanScheduler(mode='project')
     clean(sched, cancel=False)
     assert any("outputs pending" in line for line in sched.logs), sched.logs
     assert any("nothing to delete" in line for line in sched.logs), sched.logs
@@ -3106,177 +3152,31 @@ class _FakeHouUi:
         self.messages.append((text, severity, title))
 
 
-def _bgcook_ns(topnet, save_error=None, find_topcook_error=None,
-              launch_error=None, ui_available=True):
-    """A fake ``hou`` module and a fake ``rpbgcook`` collaborator, wired for
-    one scenario each. Records what would have run without ever touching a
-    real filesystem/process -- see test_background_cook.py for that half.
-    """
-    hip_state = {"path": "/tmp/some_project/scene_v001.hip", "saved": False}
-
-    def _save():
-        if save_error:
-            raise save_error
-        hip_state["saved"] = True
-
-    hou_stub = types.SimpleNamespace(
-        expandString=lambda s: {"$HFS": "/opt/houdini", "$HHP": "/opt/houdini/houdini/python3.13libs"}.get(s, s),
-        hipFile=types.SimpleNamespace(save=_save, path=lambda: hip_state["path"]),
-        OperationFailed=RuntimeError,
-        isUIAvailable=lambda: ui_available,
-        ui=_FakeHouUi(),
-        severityType=types.SimpleNamespace(Error="Error", Message="Message"),
-    )
-
-    launch_calls = []
-
-    def _find_topcook(hhp):
-        if find_topcook_error:
-            raise find_topcook_error
-        return "/opt/houdini/houdini/python3.13libs/pdgjob/topcook.py"
-
-    def _launch(command, log_file, **kw):
-        if launch_error:
-            raise launch_error
-        launch_calls.append((command, log_file))
-        return 4242
-
-    rpbgcook_fake = types.SimpleNamespace(
-        find_topcook=_find_topcook,
-        build_command=lambda hython, topcook, hip, top, verbosity=2: [
-            str(hython), "--pdg", str(topcook), "--report", "none",
-            "--hip", hip, "--verbosity", str(verbosity), "--logs", "--toppath", top],
-        default_log_path=lambda ledger_dir, top, clock=None: pathlib.Path(
-            str(ledger_dir), "bgcook", "run.log"),
-        launch=_launch,
-        BackgroundCookError=RuntimeError,
-    )
-
-    class _Install:
-        def __init__(self, hfs):
-            self.hfs = hfs
-            self.hython = "/opt/houdini/bin/hython"
-
-    rphl_fake = types.SimpleNamespace(HoudiniInstall=_Install)
-    rpcfg_fake = types.SimpleNamespace(home=lambda: pathlib.Path("/home/.rpfarm"))
-
-    ns = load_methods(
-        ["onBackgroundCook", "_parentTopNet"],
-        {"rpbgcook": rpbgcook_fake, "rphl": rphl_fake, "rpcfg": rpcfg_fake,
-         "pathlib": pathlib, "hou": hou_stub},
-    )
-    return ns, hou_stub, launch_calls, hip_state
+def test_background_launch_keeps_a_job_on_the_scheduler():
+    values = []
+    node = types.SimpleNamespace(path=lambda: '/obj/topnet/farm',
+        parm=lambda name: types.SimpleNamespace(set=values.append))
+    record = {'id': 'abcdef12', 'mode': 'background', 'state': 'submitted',
+              'target': '/obj/topnet/download', 'log_path': '/tmp/job.log'}
+    ns = load_methods(['onBackgroundCook'], {
+        'rpbgcook': types.SimpleNamespace(launch_tracked=lambda node: record),
+        'startSyncPodWatch': lambda: None,
+        '_report': lambda *a: pytest.fail('unexpected launch error'),
+    })
+    ns['onBackgroundCook']({}, node)
+    assert values and 'abcdef12' in values[0] and '/tmp/job.log' in values[0]
 
 
-def test_background_cook_refuses_when_there_is_no_topnet_to_cook():
-    node = types.SimpleNamespace(
-        type=lambda: types.SimpleNamespace(name=lambda: "runpodfarmscheduler"),
-        parent=lambda: types.SimpleNamespace(
-            type=lambda: types.SimpleNamespace(name=lambda: "subnet"),
-            parent=lambda: None))
-    ns, hou_stub, launch_calls, hip_state = _bgcook_ns(topnet=None)
-
-    ns["onBackgroundCook"]({}, node)
-
-    assert launch_calls == []
-    assert hip_state["saved"] is False
-    assert any("не нашёл" in m[0].lower() for m in hou_stub.ui.messages)
-
-
-def _node_with_topnet(display_node=object()):
-    topnet = types.SimpleNamespace(
-        type=lambda: types.SimpleNamespace(name=lambda: "topnet"),
-        parent=lambda: None,
-        displayNode=lambda: display_node,
-        path=lambda: "/obj/topnet1")
-    node = types.SimpleNamespace(
-        type=lambda: types.SimpleNamespace(name=lambda: "runpodfarmscheduler"),
-        parent=lambda: topnet)
-    return node, topnet
-
-
-def test_background_cook_refuses_when_the_topnet_has_no_output_node():
-    node, topnet = _node_with_topnet(display_node=None)
-    ns, hou_stub, launch_calls, hip_state = _bgcook_ns(topnet=topnet)
-
-    ns["onBackgroundCook"]({}, node)
-
-    assert launch_calls == []
-    assert any("не нашёл" in m[0].lower() for m in hou_stub.ui.messages)
-
-
-def test_background_cook_saves_and_launches_the_detached_process():
-    node, topnet = _node_with_topnet()
-    ns, hou_stub, launch_calls, hip_state = _bgcook_ns(topnet=topnet)
-
-    ns["onBackgroundCook"]({}, node)
-
-    assert hip_state["saved"] is True
-    assert len(launch_calls) == 1
-    command, log_file = launch_calls[0]
-    assert command[0] == "/opt/houdini/bin/hython"
-    assert "--pdg" in command
-    assert command[command.index("--hip") + 1] == hip_state["path"]
-    assert command[command.index("--toppath") + 1] == "/obj/topnet1"
-    # The artist was told where to watch -- there is no other UI.
-    assert any(str(log_file) in m[0] for m in hou_stub.ui.messages)
-    assert any("4242" in m[0] for m in hou_stub.ui.messages)
-
-
-def test_background_cook_prints_instead_of_a_dialog_when_there_is_no_ui():
-    """Belt and braces: if this were ever triggered headlessly, it must not
-    try to pop a dialog hython has no window system for."""
-    node, topnet = _node_with_topnet()
-    ns, hou_stub, launch_calls, hip_state = _bgcook_ns(topnet=topnet, ui_available=False)
-
-    ns["onBackgroundCook"]({}, node)  # must not raise
-
-    assert len(launch_calls) == 1
-    assert hou_stub.ui.messages == []  # nothing shown -- printed instead
-
-
-def test_background_cook_reports_a_save_failure_without_launching():
-    node, topnet = _node_with_topnet()
-    ns, hou_stub, launch_calls, hip_state = _bgcook_ns(
-        topnet=topnet, save_error=RuntimeError("disk full"))
-
-    ns["onBackgroundCook"]({}, node)
-
-    assert launch_calls == []
-    assert any("сохран" in m[0].lower() for m in hou_stub.ui.messages)
-
-
-def test_background_cook_reports_a_missing_topcook_without_launching():
-    node, topnet = _node_with_topnet()
-    ns, hou_stub, launch_calls, hip_state = _bgcook_ns(
-        topnet=topnet, find_topcook_error=RuntimeError("topcook.py not found"))
-
-    ns["onBackgroundCook"]({}, node)
-
-    assert launch_calls == []
-    assert hip_state["saved"] is True  # saved before the topcook lookup
-    assert any("topcook.py not found" in m[0] for m in hou_stub.ui.messages)
-
-
-def test_background_cook_reports_a_launch_failure_without_raising():
-    node, topnet = _node_with_topnet()
-    ns, hou_stub, launch_calls, hip_state = _bgcook_ns(
-        topnet=topnet, launch_error=OSError("no such file: hython"))
-
-    ns["onBackgroundCook"]({}, node)  # must not raise
-
-    assert any("не смог запустить" in m[0].lower() for m in hou_stub.ui.messages)
-
-
-def test_background_cook_never_raises_into_the_button_callback():
-    """Whatever goes wrong, a button callback must not throw an unhandled
-    exception into Houdini's UI -- caught, reported, done."""
-    node = types.SimpleNamespace(parent=lambda: (_ for _ in ()).throw(RuntimeError("boom")))
-    ns, hou_stub, launch_calls, hip_state = _bgcook_ns(topnet=None)
-
-    ns["onBackgroundCook"]({}, node)  # must not raise
-
-    assert any("boom" in m[0] for m in hou_stub.ui.messages)
+def test_background_launch_error_is_visible_without_a_modal_dialog():
+    errors = []
+    def fail(node):
+        raise RuntimeError('Could not save the scene')
+    ns = load_methods(['onBackgroundCook'], {
+        'rpbgcook': types.SimpleNamespace(launch_tracked=fail),
+        '_report': lambda node, parm, message: errors.append(message),
+    })
+    ns['onBackgroundCook']({}, object())
+    assert errors and 'Could not save the scene' in errors[0]
 
 
 def test_disablewhen_gates_the_background_cook_button_on_its_own_toggle():

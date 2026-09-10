@@ -21,7 +21,7 @@ guard decides on.
 import hashlib
 import os
 
-VERSION = "2.3.0"
+VERSION = "2.4.0"
 
 
 def fingerprint(package_dir=None):

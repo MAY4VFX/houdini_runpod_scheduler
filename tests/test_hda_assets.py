@@ -413,24 +413,15 @@ def test_prefirstcreate_says_one_line_not_a_paragraph():
         assert len(message) <= 200, message
 
 
-def test_download_node_warns_when_the_scheduler_already_downloads_outputs():
-    """Both mechanisms on fetches every output twice.
-
-    The scheduler's "Download Outputs" pulls each item's outputs the moment it
-    succeeds; this node in Outputs mode pulls the same files again at the end
-    of the cook. The demo scene shipped with both on and an artist noticed the
-    files arriving twice -- the second pass re-transferred every frame and
-    re-acquired the sync pod to size them. Silence is the bug; the node has to
-    say it.
-    """
+def test_download_asset_contains_the_shared_delivery_fast_path():
+    """The built HDA must include the same receipt path exercised by delivery
+    tests and the three-process job round trip, instead of asking the artist
+    to manually disable one of two independent transfer mechanisms."""
     generate = _download_generate_source()
-
-    assert "_scheduler_downloads_outputs" in generate
-    assert "rpfarm_downloadoutputs" in generate
-    assert "a second time" in generate
-    # and it is checked in the outputs branch, before anything is planned
-    assert generate.index("_scheduler_downloads_outputs()") < generate.index(
-        "Outputs mode with no upstream input")
+    assert 'delivery.valid' in generate
+    assert 'already_delivered' in generate
+    assert 'Already delivered' in generate
+    assert 'addOutputFile' in generate
 
 
 def test_the_gpu_set_is_a_menu_not_a_string_to_type_from_memory():

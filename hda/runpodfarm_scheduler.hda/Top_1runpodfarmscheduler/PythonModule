@@ -193,46 +193,62 @@ def _stale_module_message(minimum, loaded, on_disk, root, changed=(), baked=True
         )
     shown = ", ".join(changed[:4])
     more = " и ещё {}".format(len(changed) - 4) if len(changed) > 4 else ""
+    package = __import__('sys').modules.get('rpfarm')
+    loaded_fingerprint = getattr(package, 'FINGERPRINT', None)
+    disk_fingerprint = _ondisk_fingerprint(pathlib.Path(root) / 'rpfarm')
+    if loaded_fingerprint and disk_fingerprint and loaded_fingerprint == disk_fingerprint:
+        action = 'Установите согласованную сборку Python и HDA. Перезапуск этой свежей сессии не исправит несовместимую сборку.'
+    else:
+        action = 'ПЕРЕЗАПУСТИТЕ HOUDINI, чтобы загрузить установленный пакет заново.'
     return (
         "Нода собрана против другого кода фермы, чем сейчас в памяти Houdini.\n"
         "\n"
-        "ПЕРЕЗАПУСТИТЕ HOUDINI. Больше ничего делать не нужно.\n"
+        "{action}\n"
         "\n"
         "Разошлись: {shown}{more}.\n"
         "В памяти rpfarm {seen}, нода собрана против {disk}.".format(
-            shown=shown, more=more, seen=loaded or "неизвестной версии",
+            action=action, shown=shown, more=more, seen=loaded or "неизвестной версии",
             disk=on_disk or "неизвестной версии")
     )
 
 # BEGIN baked by scripts/bake_asset_fingerprint.py -- do not edit
-_ASSET_BUILT_AGAINST_VERSION = '2.3.0'
+_ASSET_BUILT_AGAINST_VERSION = '2.4.0'
 _ASSET_FINGERPRINT = {
-    '__init__.py': (2490, 'c1250306daf5961f'),
+    '__init__.py': (2490, '84b00617a24de235'),
     '__main__.py': (52, '13a1a5b340cdcfc1'),
-    'background_cook.py': (5780, 'e3b1839f4958d88a'),
-    'cli.py': (71248, '1b7ef63474487e6d'),
+    'background_cook.py': (8292, '0e7f039578c949dd'),
+    'cli.py': (72171, '9a2152a00e573a1c'),
     'compression.py': (23234, 'bef2f19daebbc929'),
-    'config.py': (19880, '2fc22cfe0a7466eb'),
+    'config.py': (20080, '1dfcc2a15551dbe2'),
+    'context.py': (4466, '2fa09a0d45931725'),
+    'delivery.py': (3964, '63bb04491f97a3f3'),
     'deps.py': (38558, '2daae12f5770289a'),
     'dispatch.py': (22191, '1121a6505c88adb3'),
-    'file_review.py': (16105, '52a8154037e39bcd'),
+    'file_review.py': (16246, 'd81726007b4ba4dd'),
     'gpus.py': (8311, '7a28d5c2692b776e'),
-    'houdini_local.py': (47763, '95636adab2dc7a22'),
+    'host_render.py': (10983, 'a0139507d9f7fe7f'),
+    'houdini_local.py': (48596, '7902f068c70d702b'),
+    'jobs.py': (8732, '88bd5f01eed7897c'),
     'ledger.py': (17327, '70425e75fb216f01'),
-    'package_runner.py': (8713, 'e5ef122028fea58b'),
-    'packages.py': (62850, '7452abd0ea71205b'),
-    'pods.py': (33700, '0bc5854d8230e568'),
+    'monitoring.py': (6320, '941db2f923c756ae'),
+    'mq.py': (2124, '174afbd9f49ad86f'),
+    'package_runner.py': (9652, '939de3e067b005db'),
+    'packages.py': (63842, '42a0a9d34bdf67a8'),
+    'pods.py': (35551, '3b64efff30fb33d7'),
     'preflight.py': (45206, 'bea8fc057bc7e32a'),
     'progress.py': (3439, 'c364a012f5cd92e6'),
+    'releases.py': (4735, 'c6b364ccfb3534b3'),
     'runpod_api.py': (14539, 'b90960f9860c97fb'),
-    'scene_setup.py': (18467, '8838d55cbb131f99'),
+    'scene_setup.py': (18803, 'c8031966f92b71f3'),
     'smoke.py': (42548, 'ce0c8d36fe763314'),
-    'sync.py': (20186, 'fb1064832a115d00'),
+    'status.py': (458, '2205873427086b87'),
+    'submission.py': (1621, '6b428346b41fab92'),
+    'sync.py': (20962, '6ae2a7b7e1e25f58'),
     'tls.py': (3642, 'f3e50ea6ebd0308f'),
     'tools.py': (4290, 'c5d3b026f125578f'),
     'usddeps.py': (9631, '3c7192d3bd94d07f'),
     'volume.py': (10038, 'dc11b185a58c9262'),
-    'worker_client.py': (9791, 'cf6b40b1e879c658'),
+    'worker_client.py': (10012, '407feb11016dd01c'),
 }
 # END baked
 
@@ -413,11 +429,19 @@ def _sync_pod_step(api, cfg, token, stop_after_s, delete_after_s, log):
     the pod is off, so there is nothing of ours to ask.
     """
     name = rppods.sync_pod_name(cfg.user)
-    pods_seen = [p for p in api.list_pods(name) if p.get("name") == name]
+    all_pods = api.list_pods('')
+    pods_seen = [p for p in all_pods if p.get("name") == name]
+    if any(p.get('desiredStatus') == 'RUNNING' and p.get('name') != name
+           and rppods.pod_owner(p) == cfg.user for p in all_pods):
+        return pods_seen
     for pod in pods_seen:
         idle_s = stopped_s = None
         if pod.get("desiredStatus") == "RUNNING":
-            stamp = WorkerClient(pod["id"], token).read_file(_SYNC_LAST_USED)
+            client = WorkerClient(pod['id'], token)
+            health = client.health() if hasattr(client, 'health') else None
+            if rppods.classify_for_kill(pod, cfg.user, health)[0] != 'safe':
+                continue
+            stamp = client.read_file(_SYNC_LAST_USED)
             try:
                 idle_s = time.time() - float((stamp or "").strip())
             except (TypeError, ValueError):
@@ -459,53 +483,18 @@ def _seconds_since(stamp):
 
 
 def startSyncPodWatch(kwargs=None):
-    """Re-check the sync pod every minute for as long as Houdini is open.
-
-    The check used to run only in onSetupCook, which is precisely why a pod
-    once sat for hours: finish a cook, close nothing, start no new cook, and
-    nothing ever looked again. A session timer closes that gap for the case
-    the owner actually hits.
-
-    It does NOT close the real hole, and the parameter help says so: Houdini
-    is the only executor, so a closed or crashed Houdini retires nothing. An
-    atexit hook is registered too, but as a courtesy rather than a guarantee --
-    it does not run on a crash, a SIGKILL, or a power cut.
-    """
+    """Start one non-blocking farm/job watcher for this Houdini session."""
     global _sync_watch_started
     if _sync_watch_started:
         return
-    try:
-        import hou
-
-        if not hou.isUIAvailable():
-            return  # hython has no event loop to hang a timer on
-    except Exception:
+    import hou
+    if not hou.isUIAvailable():
         return
+    from rpfarm import monitoring
+    monitoring.start()
+    _sync_watch_started = True
 
-    def _tick():
-        try:
-            cfg = rpcfg.load()
-            stop_after = max(0, int(getattr(cfg, "sync_idle_min", 0) or 0)) * 60
-            delete_after = max(0, int(getattr(cfg, "sync_delete_min", 0) or 0)) * 60
-            if not stop_after and not delete_after:
-                return
-            seen = _sync_pod_step(RunPodAPI(cfg.api_key), cfg, rpcfg.session_token(),
-                                   stop_after, delete_after,
-                                   lambda m: print("[rpfarm] " + m, flush=True))
-            _showSyncPodBetweenCooks(seen)
-        except Exception:
-            # A housekeeping timer must never surface in the UI; the next tick
-            # tries again and Farm Status still shows what is out there.
-            pass
 
-    try:
-        hou.ui.addEventLoopCallback(_throttle(_tick, _SYNC_WATCH_INTERVAL_S))
-        import atexit
-
-        atexit.register(_tick)
-        _sync_watch_started = True
-    except Exception:
-        pass
 
 
 def _showSyncPodBetweenCooks(pods_seen):
@@ -536,10 +525,8 @@ def _showSyncPodBetweenCooks(pods_seen):
             parm = node.parm("rpfarm_status_text")
             if parm is None:
                 continue
-            current = parm.evalAsString()
-            if current.startswith("cook "):
-                continue  # a live cook owns this field
-            parm.set(text)
+            from rpfarm import status
+            parm.set(status.update(node.path(), farm=text))
     except Exception:
         pass
 
@@ -695,6 +682,9 @@ def _set_text(node, parm_name, text):
 
 
 def _report(node, parm_name, text):
+    if parm_name == 'rpfarm_status_text':
+        from rpfarm import status
+        text = status.update(node.path(), farm=text)
     _set_text(node, parm_name, text)
     print("[rpfarm] " + text, flush=True)
 
@@ -731,9 +721,7 @@ def onKillAllIncludingSync(kwargs):
     node = kwargs["node"]
     try:
         cfg, api = _node_config(node)
-        victims = list(rppods.find_orphans(api, cfg.user))
-        sync_name = rppods.sync_pod_name(cfg.user)
-        victims += [p for p in api.list_pods(sync_name) if p.get("name") == sync_name]
+        victims = [p for p in api.list_pods() if rppods.pod_owner(p) == cfg.user]
         if not victims:
             _report(node, "rpfarm_status_text", "Nothing of yours is running.")
             return
@@ -1163,6 +1151,7 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
     #: guard is safe by construction rather than by ordering -- and a future
     #: edit that moves the call cannot break it again.
     _active_cook_key = ""
+    _delivery_queue = None
 
     """PDG scheduler backed by RunPod pods.
 
@@ -1184,6 +1173,9 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         self._reset_cook_state()
 
     def _reset_cook_state(self):
+        if self._delivery_queue is not None:
+            self._delivery_queue.cancel()
+        self._delivery_queue = None
         # Never reads _cfg/_project: see _active_cook_key above for why this
         # method must work on an object that has no attributes yet.
         if self._active_cook_key:
@@ -1518,6 +1510,11 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
                 del task_env[k]
         task_env.update(add_env)
 
+        # A host controller can inherit account credentials; render tasks must not.
+        for name in list(task_env):
+            if name in ('RUNPOD_API_KEY', 'RPFARM_SESSION_TOKEN', 'RPFARM_CONTEXT_PATH') or name.startswith('RPFARM_HOST_'):
+                task_env.pop(name, None)
+
         return task_env
 
     def _ensureHoudiniPathmapEnv(self, task_env):
@@ -1672,6 +1669,7 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
             return
         try:
             work_item.setStringAttrib("rpfarm_pathmap", json.dumps(self._pathmap))
+            work_item.setStringAttrib('rpfarm_delivery_key', '{}/{}'.format(self._cook_id, work_item.id))
         except Exception as e:
             self._verboseLog("could not tag item {} with the path map: {}".format(
                 work_item.id, e))
@@ -1699,6 +1697,17 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
                     "path map: {} extra entries from {}".format(len(extra), ext))
         except (OSError, ValueError):
             pass
+        package_dir = os.environ.get('RPFARM_HOST_PKGDIR')
+        if package_dir:
+            try:
+                with open(os.path.join(package_dir, 'pathmap.json')) as f:
+                    for local, remote in json.load(f).items():
+                        pmap.setdefault(local, remote)
+            except (OSError, ValueError):
+                pass
+        if os.environ.get('RPFARM_COOK'):
+            pmap[self.tempDir(True)] = self.tempDir(False)
+            pmap[self.scriptDir(True)] = self.scriptDir(False)
         return pmap
 
     # -------------------------------------------------------------------------
@@ -1720,6 +1729,8 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
             remote_working_dir = self["rpfarm_remoteworkingdir"].evaluateString()
         else:
             remote_working_dir = self._remote_project
+            if os.environ.get('RPFARM_COOK'):
+                remote_working_dir += '/.jobs/' + self._cook_id
 
         working_dir = os.path.normpath(working_dir).replace("\\", "/")
         remote_working_dir = posixpath.normpath(remote_working_dir)
@@ -2203,7 +2214,8 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
 
         groups = rppkg.group_download_pairs(pairs)
         for local_root, remote_root, entries in groups:
-            self._sync_queue.append((local_root, remote_root, entries))
+            self._sync_queue.append((local_root, remote_root, entries,
+                                     work_item.stringAttribValue('rpfarm_delivery_key')))
         if groups:
             self._verboseLog("queued {} output(s) of item {} for download".format(
                 sum(len(entries) for _, _, entries in groups), work_item.id))
@@ -2336,44 +2348,58 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
                     "item {} finished with {} of {} expected output file(s) after "
                     "waiting for MQ; reporting it anyway".format(
                         entry["id"], have, entry["expected"]))
+            if item is not None and not have:
+                fallback = self._ropOutputPair(item)
+                if fallback:
+                    item.addOutputFile(fallback[0], 'file')
             self.workItemSucceeded(entry["id"], -1, entry["duration"])
             if item is not None:
                 self._download_outputs(item)
         self._settling = still
 
     def _drain_sync_queue(self, block=False, deadline=None):
-        """Run queued downloads. Failures go back on the queue and are retried
-        on a later tick; when blocking, until the deadline passes.
+        """Poll delivery futures without blocking pod/budget/status polling."""
+        from rpfarm.delivery import Queue
+        if self._delivery_queue is None:
+            if not self._sync_queue:
+                return
+            self._delivery_queue = Queue()
+        queue = self._delivery_queue
+        while True:
+            pending, self._sync_queue = self._sync_queue, []
+            for entry in pending:
+                if isinstance(entry, dict):
+                    item = entry
+                else:
+                    local, remote, files = entry[:3]
+                    item = {'local_root': local, 'remote_root': remote,
+                            'files': [[f.local, f.remote, f.size] for f in files],
+                            'delivery_key': entry[3] if len(entry) > 3 else '',
+                            'bytes': sum(f.size for f in files)}
+                queue.submit(item, self._cfg, self._sftp, self._sync_client)
+            for item, result, error in queue.poll():
+                if error:
+                    self._note('Download incomplete: {}. Results remain on the farm.'.format(error))
+                    self._sync_queue.append(item)
+                else:
+                    self._downloads_done += 1
+            if not block or (not queue.futures and not self._sync_queue):
+                return
+            if deadline is not None and time.time() >= deadline:
+                self._sync_queue.extend(item for item, _future in queue.futures)
+                queue.cancel()
+                return
+            time.sleep(.1)
 
-        Non-blocking, this moves **one** package per call: rclone runs
-        synchronously with no timeout, so draining the whole queue inside a
-        tick lets one heavy sequence stall pod polling and dispatch behind it.
-        onStopCook passes block=True and drains the lot under its deadline.
-        """
-        while self._sync_queue:
-            local_root, remote_root, entries = self._sync_queue.pop(0)
-            try:
-                os.makedirs(local_root, exist_ok=True)
-                rpsync.rclone_copy(
-                    entries, self._sftp, "down", self._cfg.rclone_path,
-                    local_root=local_root, remote_root=remote_root,
-                )
-                self._downloads_done += 1
-                self._verboseLog("downloaded {} file(s) to {}".format(
-                    len(entries), local_root))
-                if not block:
-                    return
-            except (rpsync.SyncError, OSError) as e:
-                self._verboseLog("download failed ({}), will retry: {}".format(
-                    remote_root, e))
-                self._sync_queue.append((local_root, remote_root, entries))
-                if not block:
-                    return
-                if deadline is not None and time.time() > deadline:
-                    self._log("giving up on {} queued download(s)".format(
-                        len(self._sync_queue)))
-                    return
-                time.sleep(2)
+    def _countGraphDeliveries(self):
+        try:
+            for node in self.context.graph.nodes():
+                for item in node.workItems:
+                    key = item.stringAttribValue('rpfarm_delivery_key') or ''
+                    if key.startswith(self._cook_id + '/') and item.intAttribValue('rpfarm_delivered') > 0:
+                        self._downloads_done += 1
+        except Exception as exc:
+            self._verboseLog('Could not inspect Download results: {}'.format(exc))
 
     # -------------------------------------------------------------------------
     # Cost
@@ -2558,8 +2584,10 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         lines.append("tasks: {} pending, {} running, {} failed".format(
             len(self._dispatcher.pending), len(self._dispatcher.running_tasks()),
             len(self._dispatcher.failed)))
-        if self._sync_queue:
-            lines.append("downloads queued: {}".format(len(self._sync_queue)))
+        delivery_queue = getattr(self, '_delivery_queue', None)
+        download_count = len(self._sync_queue) + (len(delivery_queue.futures) if delivery_queue else 0)
+        if download_count:
+            lines.append("downloads queued: {}".format(download_count))
         if self._last_pod_error:
             lines.append("last pod create error: {}".format(self._last_pod_error))
         max_cost = self._cost_tracker.get("max_cost", 0.0)
@@ -2592,7 +2620,8 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         if node is None:
             return
         try:
-            node.parm("rpfarm_status_text").set(text)
+            from rpfarm import status
+            node.parm("rpfarm_status_text").set(status.update(node.path(), cook=text))
         except Exception as e:
             self._verboseLog("status text update failed: {}".format(e))
 
@@ -2727,7 +2756,7 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
             or os.path.basename(self._job_dir)
             or "default"
         )
-        self._cook_id = uuid.uuid4().hex[:8]
+        self._cook_id = os.environ.get('RPFARM_COOK') or uuid.uuid4().hex[:8]
         self._active_cook_key = "{}/{}".format(self._cfg.user, self._project)
         _ACTIVE_COOKS.add(self._active_cook_key)
         self._remote_project = "/workspace/projects/{}/{}".format(
@@ -2783,6 +2812,10 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         # The working dir has to be set before the path map, which uses it.
         self._initWorkingDir()
         self._pathmap = self._loadPathMap()
+        logical_hip = os.environ.get('RPFARM_HOST_LOGICAL_HIP')
+        snapshot_hip = os.environ.get('RPFARM_HOST_HIP')
+        if logical_hip and snapshot_hip:
+            self._pathmap[logical_hip] = snapshot_hip
         self._registerPathMap()
 
         self._checkBalance()
@@ -3764,11 +3797,14 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
                 "Kill them with `rpfarm farm kill --all` or the Kill All Pods "
                 "button.".format(", ".join(self._terminate_retries.pending())))
 
-        if not cancel and self._sync_queue:
+        if cancel and self._delivery_queue is not None:
+            self._delivery_queue.cancel()
+        if not cancel and (self._sync_queue or self._delivery_queue is not None):
             self._log("finishing {} queued download(s)...".format(len(self._sync_queue)))
             self._drain_sync_queue(
                 block=True, deadline=time.time() + _STOP_DRAIN_MAX_SECONDS)
 
+        self._countGraphDeliveries()
         self._autoCleanAfterCook(cancel)
 
         # The sync pod stays up for the next cook; stamp it so a later cook can
@@ -3842,15 +3878,35 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
             why = "the cook was cancelled"
         elif self._dispatcher.failed:
             why = "{} item(s) failed".format(len(self._dispatcher.failed))
-        elif not self["rpfarm_downloadoutputs"].evaluateInt():
+        elif not self["rpfarm_downloadoutputs"].evaluateInt() and not self._downloads_done:
             why = "Download Outputs is off, so nothing was delivered"
-        elif self._sync_queue:
+        elif self._sync_queue or (getattr(self, '_delivery_queue', None) and self._delivery_queue.futures):
             why = "{} download(s) never finished".format(len(self._sync_queue))
         elif not self._downloads_done:
             why = "no outputs were downloaded this cook"
         if why:
             self._log("auto-clean skipped: {}. Nothing deleted.".format(why))
             return
+
+        if getattr(self, '_graph_failures', None):
+            self._log('auto-clean skipped: the graph has failed items')
+            return
+        verified_outputs = set()
+        if getattr(self, '_work_items', None):
+            from rpfarm import delivery
+            for wi in self._work_items.values():
+                key = wi.stringAttribValue('rpfarm_delivery_key') or ''
+                pairs = [rppkg.map_output_pair(rppkg.result_data_path(rd), self._pathmap)
+                         for rd in wi.resultData]
+                pairs = [p for p in pairs if p]
+                if not pairs:
+                    fallback = self._ropOutputPair(wi)
+                    pairs = [fallback] if fallback else []
+                if not pairs or any(not delivery.valid({'delivery_key': key}, self._cfg,
+                                                       [local, remote, 0]) for remote, local in pairs):
+                    self._log('auto-clean skipped: this cook has outputs without verified local delivery')
+                    return
+                verified_outputs.update(remote for remote, _local in pairs)
 
         user = self._cfg.user if self._cfg else ""
         project = self._project or ""
@@ -3862,7 +3918,12 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         if mode == "project":
             targets = [base]
         else:
-            targets = ["{}/{}".format(base, name) for name in _OUTPUT_DIR_NAMES]
+            # Output folders can contain results from other cooks. Their
+            # delivery was not proved above, so remove only this cook's files.
+            targets = sorted(p for p in verified_outputs if p.startswith(base + '/'))
+            if not targets or len(targets) != len(verified_outputs):
+                self._log('auto-clean skipped: no verified output files inside this project')
+                return
 
         node = self._houNode()
         if node is None:
@@ -3899,15 +3960,35 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
     # -------------------------------------------------------------------------
 
     def submitAsJob(self, graph_file, node_name):
-        """Cook the whole TOP graph on one dedicated CPU pod that drives
-        its own cook and shuts itself down when done -- Submit As Job,
-        mode 3 of three cook modes (Ruling R71). Unlike mode 1 (this
-        Houdini stays open and drives the cook) and mode 2 (a detached
-        local hython drives it, Ruling R68), THIS pod is its own
-        scheduler for its own nested cook: Houdini can close the moment
+        """Finish a partially-cooked graph on the farm -- Submit As Job,
+        mode 3 of three cook modes (Ruling R71, second cut). Unlike mode 1
+        (this Houdini stays open and drives the whole cook) and mode 2 (a
+        detached local hython drives it, Ruling R68), the boundary here is
+        the graph itself: upload cooks HERE, on this machine, with this
+        machine's files, before anything is rented (``_submitAsJobInner``);
+        only ``node_name`` and its upstream (never upload, never
+        downstream of it -- PDG structurally cannot cook downstream of a
+        cook target) ship to a dedicated pod that drives its own nested
+        cook and shuts itself down (and its render pods) when done.
+        Houdini can close, and the machine can be switched off, the moment
         this method returns.
 
-        Never functional before this: the original body called
+        First cut of this method cooked the WHOLE graph on the pod --
+        upload included, with no access to this machine's files, and
+        download included, landing frames on a pod that deletes itself
+        seconds later. The owner caught it, not this project: *"я отправил
+        на ферму задачу, закрыл Houdini, выключил компьютер ... и затем
+        через какое-то время включил компьютер и выкачал оттуда файлы
+        уже со своего компьютера"* -- submit-and-walk-away, not
+        whole-graph-relocation. Six live rentals were spent finding real
+        bugs in that first shape before the shape itself turned out to be
+        wrong; none of that work was wasted -- the throwaway keypair, the
+        instrumentation, and six-for-six self-termination on failure all
+        carry over unchanged. See Ruling R71 in the design doc for the
+        full account, including why ``pdgjob/topcook.py --taskgraphin`` is
+        a documented no-op in this Houdini build and cannot be used.
+
+        Before this method existed at all: the original body called
         ``self.transferFile(...)``, a method that does not exist on
         ``PyScheduler`` or anywhere in this class -- confirmed live, it
         raises ``AttributeError`` on the very first real line. It also
@@ -3949,10 +4030,28 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         sharing this cook id, which would include the host pod just
         created and still supposed to be running.
         """
-        self.onStartCook(False, None)
-        self._submit_as_job = True
+        # Decision 2 (Ruling R71, review finding): the target is whatever
+        # rpfarm_submittarget names -- usesubmitjobnode is permanently on
+        # (DialogScript) so pdg.scheduler.submitGraphAsJob never falls back
+        # to "whichever node has the display flag", the exact inference
+        # that cost six live rentals to fully diagnose. Confirmed with the
+        # artist by name, before ANYTHING is created or rented -- not
+        # after, the way the existing unsaved-changes dialog in
+        # submitGraphAsJob already does for a different question.
+        if hou.isUIAvailable():
+            if hou.ui.displayMessage(
+                "Отправить на ферму узел:\n\n{}\n\nПосле подтверждения "
+                "сцена уедет на отдельный под, который сам рендерит и сам "
+                "себя гасит вместе со своими подами. Неверный узел здесь "
+                "означает, что уедет не та часть графа.".format(node_name),
+                buttons=("Отправить", "Отмена"), default_choice=1, close_choice=1,
+                severity=hou.severityType.ImportantMessage, title="Submit As Job",
+            ):
+                return "", ""
+
+        if self._active_cook_key:
+            raise CookError('Finish or cancel the current cook before submitting another job.')
         try:
-            self.onSetupCook()
             return self._submitAsJobInner(node_name)
         except Exception as e:
             # Whatever failed, this session's OWN bookkeeping for the
@@ -3971,11 +4070,75 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
                     hou.ui.displayMessage(msg, severity=hou.severityType.Error)
             except Exception:
                 pass
+            self._releaseCookLock()
             self._reset_cook_state()
             raise
 
     def _submitAsJobInner(self, node_name):
+        import pdg
+        from rpfarm import jobs, submission
+
+        render_node = hou.node(node_name)
+        if render_node is None:
+            raise CookError("Submit As Job target node {} does not exist.".format(node_name))
+        if render_node.type().name() in ('runpodfarmdownload', 'topnet', 'topnetmgr'):
+            raise CookError('Select the render/compute target; Download remains on this machine.')
+        download = jobs.download_node(render_node)
+        hou.hipFile.save()
+
+        # Upload cooks HERE, now, with this machine's files -- exactly as
+        # it does today (Ruling R71, second cut). Walking inputAncestors()
+        # rather than requiring the artist to name the upload node
+        # separately: whatever runpodfarmupload node(s) feed the submitted
+        # node are the ones this job needs uploaded, no matter how deep or
+        # how many. A graph with none (render reads only farm-resident
+        # data already) is not an error -- nothing to do here.
+        upload_nodes = sorted(
+            (n for n in render_node.inputAncestors()
+             if n.type().name() == "runpodfarmupload"),
+            key=lambda n: n.path())
+        for n in upload_nodes:
+            n.dirtyAllWorkItems(False)
+            n.cookWorkItems(block=True)
+            nodes = [n] + list(n.allSubChildren())
+            failed = [wi.name for top in nodes if top.getPDGNode()
+                      for wi in top.getPDGNode().workItems if wi.state == pdg.workItemState.CookedFail]
+            errors = [error for top in nodes for error in top.errors()]
+            if failed or errors:
+                raise CookError(
+                    "Upload node {} had {} failed work item(s) ({}) -- "
+                    "nothing was submitted to the farm.".format(
+                        n.path(), len(failed), ", ".join((failed + errors)[:5])))
+
+        # Upload owns its ordinary local cook. Start submission bookkeeping
+        # only AFTER it finishes, so cook locks and MQ controllers do not nest.
+        self.onStartCook(False, None)
+        self._submit_as_job = True
+        self._sync_pod = rppods.ensure_sync_pod(self._api, self._cfg, self._token, self._pubkey)
+        self._sync_client = WorkerClient(self._sync_pod['id'], self._token)
+        ip, port = pod_public_endpoint(self._sync_pod, 22)
+        self._sftp = rpsync.SftpTarget(ip, port, self._cfg.ssh_key_path)
+
+        # tops_only=True never cooks anything (Ruling R71: PDG cannot cook
+        # downstream of the target node, and this does not even cook the
+        # target itself) -- it only instantiates PDG nodes for node_name
+        # and its upstream, which is what makes getPDGGraphContext() below
+        # reliable even when upload_nodes is empty. Verified live, locally,
+        # at zero cost before this was written: cooking a downstream node
+        # with tops_only=True, then serializing straight after an upstream
+        # node's own real cook, round-trips correctly across two entirely
+        # separate hython processes (see Ruling R71 in the design doc).
+        render_node.cookWorkItems(block=True, tops_only=True)
+        ctx = render_node.getPDGGraphContext()
+
         hip_local = hou.hipFile.path()
+        logical_hip = rppkg.delocalize_via_pathmap(hip_local, self._pathmap) or hip_local
+        remote_pkg_dir = self._remote_project + '/.jobs/' + self._cook_id + '/host_pkg'
+        job = {'id': self._cook_id, 'mode': 'farm', 'state': 'submitted',
+               'user': self._cfg.user, 'project': self._project, 'volume_id': self._cfg.volume_id,
+               'hip': hip_local, 'logical_hip': logical_hip, 'local_root': self._job_dir,
+               'target': node_name, 'package_dir': remote_pkg_dir, 'submitted_at': time.time(),
+               'max_minutes': _SUBMIT_AS_JOB_MAX_MINUTES, 'log_path': remote_pkg_dir + '/host.log'}
         node_types = ("runpodfarmscheduler", "runpodfarmupload",
                      "runpodfarmdownload", "runpodfarmstats")
         staging = tempfile.mkdtemp(prefix="rpfarm-hostpkg-")
@@ -3991,7 +4154,31 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
                 shutil.copy(nt.definition().libraryFilePath(),
                            os.path.join(hda_dir, type_name + ".hda"))
             shutil.copytree(str(_RPFARM_ROOT / "rpfarm"), os.path.join(staging, "rpfarm"))
-            shutil.copy(hip_local, os.path.join(staging, os.path.basename(hip_local)))
+            snapshot_path = os.path.join(staging, os.path.basename(hip_local))
+            snapshot_env = dict(os.environ)
+            snapshot_env['RPFARM_ROOT'] = str(_RPFARM_ROOT)
+            snapshot_env['HOUDINI_USER_PREF_DIR'] = os.path.join(staging, 'prefs', '__HVER__')
+            snapshot_env['HOUDINI_OTLSCAN_PATH'] = hda_dir + os.pathsep + '&'
+            subprocess.run([str(rphl.HoudiniInstall(pathlib.Path(hou.expandString('$HFS'))).hython),
+                            str(_RPFARM_ROOT / 'rpfarm' / 'submission.py'),
+                            '--source', hip_local, '--output', snapshot_path, '--logical', logical_hip],
+                           env=snapshot_env, check=True, capture_output=True, text=True)
+            jobs.write(os.path.join(staging, 'job.json'), job)
+            with open(os.path.join(staging, 'pathmap.json'), 'w') as f:
+                json.dump(self._pathmap, f)
+
+            # The upload state cooked above -- PDG's own native mechanism
+            # for continuing a partly-cooked graph elsewhere (Ruling R71,
+            # second cut). The host pod deserializes this BEFORE its own
+            # real cook of node_name, so upload's already-cooked items are
+            # never re-run on the farm (see pod/host_render.py).
+            try:
+                ctx.serializeWorkItems(
+                    os.path.join(staging, rppods.TASKGRAPH_IN_FILENAME), "")
+                submission.redact_checkpoint(os.path.join(staging, rppods.TASKGRAPH_IN_FILENAME),
+                    [self._cfg.api_key, self._token, self._cook_token, self._cfg.sesinetd_url])
+            except Exception as e:
+                raise CookError("Could not serialize the task graph state: {}".format(e)) from e
 
             # rpcfg.load() raises ConfigError -- and onStartCook turns that
             # into CookError -- if $RPFARM_HOME/config.toml does not exist
@@ -4005,10 +4192,9 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
             # instead, set by host_cook.py from what actually exists on
             # THAT machine (Ruling R71's _LOAD_OVERRIDE_ENV).
             shipped_cfg = dataclasses.replace(
-                self._cfg, api_key="", ssh_key_path="", rclone_path="")
+                self._cfg, api_key="", ssh_key_path="", rclone_path="", sesinetd_url="")
             rpcfg.save_to(shipped_cfg, os.path.join(staging, "config.toml"))
 
-            remote_pkg_dir = self.workingDir(False) + "/host_pkg"
             try:
                 rpsync.rclone_copy_dir(
                     staging, self._sftp, "up", self._cfg.rclone_path,
@@ -4102,6 +4288,7 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
                     # volume (rpfarm.config._SESSION_TOKEN_OVERRIDE_ENV).
                     "RPFARM_HOST_SESSION_TOKEN": self._token,
                     "RPFARM_HOST_HIP": hip_remote,
+                    "RPFARM_HOST_LOGICAL_HIP": logical_hip,
                     "RPFARM_HOST_TOPPATH": node_name,
                     "RPFARM_HOST_PKGDIR": remote_pkg_dir,
                     "RPFARM_HOST_MAX_MINUTES": str(_SUBMIT_AS_JOB_MAX_MINUTES),
@@ -4133,6 +4320,12 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
                           "a failed submit: {}".format(cleanup_error))
             raise
         pod_id = pod["id"]
+        jobs.save(dict(job, host_pod=pod_id))
+        download.parm('rpfarm_job').set(self._cook_id)
+        owner_node = self._houNode()
+        if owner_node and owner_node.parm('rpfarm_job'):
+            owner_node.parm('rpfarm_job').set(self._cook_id)
+        hou.hipFile.save()
         self._log("host pod created {} {} -- Houdini can close now, it will "
                   "shut itself down (and its own render pods) when the "
                   "cook ends".format(name, pod_id))
@@ -4158,7 +4351,6 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
             submitted_as_job=True,
         )
         self._mirror_ledger_to_volume()
-        self.stopPollingClient()
         self._clearPathMap()
         self._update_status_text(force=True)
         self._releaseCookLock()
@@ -4203,81 +4395,63 @@ def _parentTopNet(node):
 
 
 def onBackgroundCook(kwargs, node):
-    """[button, Background Cook tab] Mode 2 of three cook modes (Ruling
-    R68): cook this topnet in a DETACHED background hython on the
-    artist's own machine, so closing Houdini does not stop the cook.
-
-    Gated by the ``rpfarm_bgcookenable`` toggle (disablewhen on this
-    button) -- the artist's own words: "если человеку надо автономно,
-    чтобы этот процесс шел, то он галку поставил". Off by default;
-    turning it back off returns to today's behaviour exactly, nothing
-    here runs unless both the toggle is checked AND this button pressed.
-
-    Not Submit As Job (mode 3, ``submitjob`` above): that transfers the
-    whole job to a rented pod and needs the RunPod key up there to ever
-    shut itself down, which the owner refuses. This runs the SAME cook
-    the artist would get from pressing Cook, just driven by
-    ``$HHP/pdgjob/topcook.py`` -- Houdini's own mechanism, the exact
-    script ``submitAsJob`` above already ships to a pod, run locally
-    instead -- so the RunPod key never leaves this machine and the pods
-    still get shut down normally when the cook ends.
-    """
+    """Launch and retain the selected job; errors stay on the scheduler."""
     try:
-        topnet = _parentTopNet(node.parent())
-        if not topnet or not topnet.displayNode():
-            hou.ui.displayMessage(
-                "Не нашёл topnet с выходной нодой над этим шедулером -- "
-                "фоновый кук запускать нечего.", severity=hou.severityType.Error)
-            return
+        from rpfarm import jobs, status
+        job = rpbgcook.launch_tracked(node)
+        node.parm('rpfarm_status_text').set(status.update(node.path(), job=jobs.describe(job)))
+        startSyncPodWatch()
+    except Exception as exc:
+        _report(node, 'rpfarm_status_text', 'Background launch failed: ' + str(exc))
 
-        try:
-            hou.hipFile.save()
-        except hou.OperationFailed as e:
-            hou.ui.displayMessage(
-                "Не смог сохранить сцену перед запуском ({}) -- фоновый "
-                "кук грузит .hip с диска, несохранённое он не увидит. "
-                "Сохраните сцену вручную и попробуйте снова.".format(e),
-                severity=hou.severityType.Error)
-            return
-        hip_path = hou.hipFile.path()
 
-        install = rphl.HoudiniInstall(pathlib.Path(hou.expandString("$HFS")))
-        if install.hython is None:
-            hou.ui.displayMessage(
-                "Не нашёл hython рядом с этим Houdini ({}) -- фоновый кук "
-                "запустить нечем.".format(install.hfs),
-                severity=hou.severityType.Error)
-            return
-        try:
-            topcook = rpbgcook.find_topcook(hou.expandString("$HHP"))
-        except rpbgcook.BackgroundCookError as e:
-            hou.ui.displayMessage(str(e), severity=hou.severityType.Error)
-            return
+def onLaunchJob(kwargs):
+    node = kwargs['node']
+    if node.evalParm('rpfarm_launchmode') == 'background':
+        return onBackgroundCook(kwargs, node)
+    return submitGraphAsJob(kwargs, node)
 
-        top_path = topnet.path()
-        command = rpbgcook.build_command(install.hython, topcook, hip_path, top_path)
-        log_file = rpbgcook.default_log_path(rpcfg.home(), top_path)
-        try:
-            pid = rpbgcook.launch(command, log_file)
-        except OSError as e:
-            hou.ui.displayMessage(
-                "Не смог запустить фоновый процесс: {}".format(e),
-                severity=hou.severityType.Error)
-            return
 
-        message = (
-            "Фоновый кук запущен (PID {}). Houdini можно закрывать -- "
-            "поды фермы погасит сам процесс, как обычно.\n\n"
-            "Смотреть прогресс: {}".format(pid, log_file))
-        if hou.isUIAvailable():
-            hou.ui.displayMessage(message, severity=hou.severityType.Message,
-                                  title="Background Cook")
-        else:
-            print(message)
-    except Exception as e:  # noqa: BLE001 - a button callback must not raise into Houdini's UI
-        try:
-            hou.ui.displayMessage(
-                "Фоновый кук не запустился: {}".format(e),
-                severity=hou.severityType.Error)
-        except Exception:
-            print("background cook failed to start: {}".format(e))
+def jobMenu(kwargs=None):
+    from rpfarm import jobs
+    return jobs.menu()
+
+
+def onRefreshFarm(kwargs):
+    from rpfarm import monitoring
+    try:
+        monitoring.request(kwargs['node'], include_ledger=True)
+    except Exception as exc:
+        _report(kwargs['node'], 'rpfarm_status_text', 'Refresh failed: ' + str(exc))
+
+
+def onCancelJob(kwargs):
+    from rpfarm import jobs, status
+    node = kwargs['node']
+    try:
+        job = jobs.load(node.evalParm('rpfarm_job'))
+        cfg, api = _node_config(node)
+        updated = jobs.cancel(job, cfg, api)
+        node.parm('rpfarm_status_text').set(status.update(node.path(), job=jobs.describe(updated)))
+    except Exception as exc:
+        _report(node, 'rpfarm_status_text', 'Could not cancel selected job: ' + str(exc))
+
+
+def onOpenJobLog(kwargs):
+    from rpfarm import jobs
+    node = kwargs['node']
+    try:
+        job = jobs.load(node.evalParm('rpfarm_job'))
+        path = job['log_path']
+        if job['mode'] == 'farm':
+            cfg, api = _node_config(node)
+            _pod, client = jobs._client(job, cfg, api, create=True)
+            text = client.read_file(path)
+            if text is None:
+                raise RuntimeError('Remote log is not available')
+            local = jobs.directory() / (job['id'] + '.log')
+            local.write_text(text)
+            path = str(local)
+        hou.ui.showInFileBrowser(path)
+    except Exception as exc:
+        _report(node, 'rpfarm_status_text', 'Could not open job log: ' + str(exc))

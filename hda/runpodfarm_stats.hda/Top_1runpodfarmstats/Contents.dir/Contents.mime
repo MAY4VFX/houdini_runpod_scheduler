@@ -50,7 +50,7 @@ stat
   author may@maymac01-2.local
   access 0777
 }
-color UT_Color RGB 0.8 0.8 0.8 
+color UT_Color RGB 0.8 0.8 0.8
 delscript ""
 exprlanguage hscript
 end
@@ -103,7 +103,7 @@ stat
   author may@maymac01-2.local
   access 0777
 }
-color UT_Color RGB 0.8 0.8 0.8 
+color UT_Color RGB 0.8 0.8 0.8
 delscript ""
 exprlanguage hscript
 end
@@ -162,7 +162,7 @@ stat
   author may@maymac01-2.local
   access 0777
 }
-color UT_Color RGB 0.8 0.8 0.8 
+color UT_Color RGB 0.8 0.8 0.8
 delscript ""
 exprlanguage hscript
 end
@@ -341,7 +341,7 @@ stat
   author may@maymac01-2.local
   access 0777
 }
-color UT_Color RGB 0.478 0.478 0.478 
+color UT_Color RGB 0.478 0.478 0.478
 delscript ""
 exprlanguage hscript
 end

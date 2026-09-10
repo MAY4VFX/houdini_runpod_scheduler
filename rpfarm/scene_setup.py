@@ -235,6 +235,10 @@ def build(parent, project="", frames=1, rop_candidates=(), max_pods=DEFAULT_MAX_
     upload, upload_is_new = adopt_or_create(UPLOAD_TYPE, UPLOAD_NAME, "upload")
     gate, gate_is_new = adopt_or_create(GATE_TYPE, GATE_NAME, "gate")
     fetch, fetch_is_new = adopt_or_create(FETCH_TYPE, FETCH_NAME, "render")
+    download, download_is_new = adopt_or_create(DOWNLOAD_TYPE, 'download', 'download')
+    _set(scheduler, 'rpfarm_downloadoutputs', 0)
+    if not _eval_string(scheduler.parm('submitjobnode')):
+        _set(scheduler, 'submitjobnode', fetch.path())
 
     # -- preconfigure from the scene, and only where the scene has an answer.
     #    A parm left alone keeps the asset's own default expression, which
@@ -268,6 +272,7 @@ def build(parent, project="", frames=1, rop_candidates=(), max_pods=DEFAULT_MAX_
     #    artist has since rearranged does not rewire it behind their back.
     _wire(gate, 0, upload, result)
     _wire(fetch, 0, gate, result)
+    _wire(download, 0, fetch, result)
 
     topscheduler = parent.parm("topscheduler")
     if topscheduler is not None:
@@ -301,7 +306,7 @@ def build(parent, project="", frames=1, rop_candidates=(), max_pods=DEFAULT_MAX_
 
     if fetch_is_new or upload_is_new or gate_is_new:
         _call(parent, "layoutChildren")
-    _call(fetch, "setDisplayFlag", True)
+    _call(download, "setDisplayFlag", True)
     return result
 
 

@@ -231,46 +231,62 @@ def _stale_module_message(minimum, loaded, on_disk, root, changed=(), baked=True
         )
     shown = ", ".join(changed[:4])
     more = " и ещё {}".format(len(changed) - 4) if len(changed) > 4 else ""
+    package = __import__('sys').modules.get('rpfarm')
+    loaded_fingerprint = getattr(package, 'FINGERPRINT', None)
+    disk_fingerprint = _ondisk_fingerprint(pathlib.Path(root) / 'rpfarm')
+    if loaded_fingerprint and disk_fingerprint and loaded_fingerprint == disk_fingerprint:
+        action = 'Установите согласованную сборку Python и HDA. Перезапуск этой свежей сессии не исправит несовместимую сборку.'
+    else:
+        action = 'ПЕРЕЗАПУСТИТЕ HOUDINI, чтобы загрузить установленный пакет заново.'
     return (
         "Нода собрана против другого кода фермы, чем сейчас в памяти Houdini.\\n"
         "\\n"
-        "ПЕРЕЗАПУСТИТЕ HOUDINI. Больше ничего делать не нужно.\\n"
+        "{action}\\n"
         "\\n"
         "Разошлись: {shown}{more}.\\n"
         "В памяти rpfarm {seen}, нода собрана против {disk}.".format(
-            shown=shown, more=more, seen=loaded or "неизвестной версии",
+            action=action, shown=shown, more=more, seen=loaded or "неизвестной версии",
             disk=on_disk or "неизвестной версии")
     )
 
 # BEGIN baked by scripts/bake_asset_fingerprint.py -- do not edit
-_ASSET_BUILT_AGAINST_VERSION = '2.3.0'
+_ASSET_BUILT_AGAINST_VERSION = '2.4.0'
 _ASSET_FINGERPRINT = {
-    '__init__.py': (2490, 'c1250306daf5961f'),
+    '__init__.py': (2490, '84b00617a24de235'),
     '__main__.py': (52, '13a1a5b340cdcfc1'),
-    'background_cook.py': (5780, 'e3b1839f4958d88a'),
-    'cli.py': (71248, '1b7ef63474487e6d'),
+    'background_cook.py': (8292, '0e7f039578c949dd'),
+    'cli.py': (72171, '9a2152a00e573a1c'),
     'compression.py': (23234, 'bef2f19daebbc929'),
-    'config.py': (19880, '2fc22cfe0a7466eb'),
+    'config.py': (20080, '1dfcc2a15551dbe2'),
+    'context.py': (4466, '2fa09a0d45931725'),
+    'delivery.py': (3964, '63bb04491f97a3f3'),
     'deps.py': (38558, '2daae12f5770289a'),
     'dispatch.py': (22191, '1121a6505c88adb3'),
-    'file_review.py': (16105, '52a8154037e39bcd'),
+    'file_review.py': (16246, 'd81726007b4ba4dd'),
     'gpus.py': (8311, '7a28d5c2692b776e'),
-    'houdini_local.py': (47763, '95636adab2dc7a22'),
+    'host_render.py': (10983, 'a0139507d9f7fe7f'),
+    'houdini_local.py': (48596, '7902f068c70d702b'),
+    'jobs.py': (8732, '88bd5f01eed7897c'),
     'ledger.py': (17327, '70425e75fb216f01'),
-    'package_runner.py': (8713, 'e5ef122028fea58b'),
-    'packages.py': (62850, '7452abd0ea71205b'),
-    'pods.py': (33700, '0bc5854d8230e568'),
+    'monitoring.py': (6320, '941db2f923c756ae'),
+    'mq.py': (2124, '174afbd9f49ad86f'),
+    'package_runner.py': (9652, '939de3e067b005db'),
+    'packages.py': (63842, '42a0a9d34bdf67a8'),
+    'pods.py': (35551, '3b64efff30fb33d7'),
     'preflight.py': (45206, 'bea8fc057bc7e32a'),
     'progress.py': (3439, 'c364a012f5cd92e6'),
+    'releases.py': (4735, 'c6b364ccfb3534b3'),
     'runpod_api.py': (14539, 'b90960f9860c97fb'),
-    'scene_setup.py': (18467, '8838d55cbb131f99'),
+    'scene_setup.py': (18803, 'c8031966f92b71f3'),
     'smoke.py': (42548, 'ce0c8d36fe763314'),
-    'sync.py': (20186, 'fb1064832a115d00'),
+    'status.py': (458, '2205873427086b87'),
+    'submission.py': (1621, '6b428346b41fab92'),
+    'sync.py': (20962, '6ae2a7b7e1e25f58'),
     'tls.py': (3642, 'f3e50ea6ebd0308f'),
     'tools.py': (4290, 'c5d3b026f125578f'),
     'usddeps.py': (9631, '3c7192d3bd94d07f'),
     'volume.py': (10038, 'dc11b185a58c9262'),
-    'worker_client.py': (9791, 'cf6b40b1e879c658'),
+    'worker_client.py': (10012, '407feb11016dd01c'),
 }
 # END baked
 
@@ -684,99 +700,25 @@ pass
 '''
 
 HELP_TEXT = '''\
-= RunPodFarm Stats =
-
 #type: node
 #context: top
 #internal: runpodfarmstats
-#icon: TOP/pythonprocessor
-
-"""Journal and cost analytics for RunPodFarm: turns the local ~/.rpfarm/ledger
-into work items (one per task/idle/unattributed record) plus a summary of
-totals by project and by user."""
-
-Work item = one ledger record (a task, a pod's synthetic idle remainder, or
-a billed pod with no matching local record -- see
-[Node:python/rpfarm.ledger.merge_billing]) after the Project/User/Since/
-Until filters. Every item cooks *in process* -- unlike
-[Node:top/runpodfarm_upload] and [Node:top/runpodfarm_download], this node
-never dispatches through `rpfarm.package_runner`: the data volume here is
-small (the local journal, plus one `GET /billing/pods` call), so there is
-nothing worth parallelizing out of process (Task 11 addendum). This node
-still overrides `Scheduler` to its own internal `localscheduler` (same
-absolute-path Python expression trick as the other two nodes, reasserted in
-`OnCreated`) purely so cooking it never accidentally dispatches onto
-`runpodfarm_scheduler` and spins up a real GPU pod for what is a read-only
-report.
-
-All the real logic (loading the ledger, filtering, merging billing,
-building the summary text) lives in this asset's own `PythonModule` --
-shared between the `generate` callback and the `Refresh`/`Export CSV`
-buttons, the same pattern [Node:top/runpodfarm_scheduler] uses for its own
-buttons.
+#icon: opdef:/Top/runpodfarmstats?IconSVG
+= RunPodFarm Stats =
+Inspect task history and costs as work-item attributes, filter by project/user/date, and export CSV.
 
 @parameters
-
-Since / Until:
-    #id: rpfarm_since
-
-    `YYYY-MM-DD`, either empty. Filters ledger records by their `started`
-    timestamp. Billing calls (when Use Billing is on) default to 90 days
-    back when Since is empty -- RunPod's billing endpoints need a bounded
-    range, unlike the ledger filter itself.
-
-Project / User:
-    #id: rpfarm_project
-
-    Exact-match filters on the ledger record's own `project`/`user`
-    fields. Empty means no filter.
-
 Use Billing:
     #id: rpfarm_usebilling
-
-    Off: costs come from the scheduler's own live `cost_est` (no network
-    call). On: `generate` calls `GET /billing/pods` and
-    `GET /billing/networkvolumes` and merges RunPod's actual charge in via
-    `rpfarm.ledger.merge_billing`, prorated per pod by task duration, with
-    the remainder folded into a synthetic idle record.
-
+    Merge actual RunPod billing with the local task ledger. When unavailable, the node marks estimates explicitly.
 Refresh:
     #id: rpfarm_refresh
-
-    Pulls any ledger files off the volume this session doesn't have locally
-    yet (`rpfarm.ledger.sync_from_volume`, via the sync pod's worker HTTP
-    API -- not rclone/sftp, there is nothing to gain from a second
-    transport just to fetch a handful of small text files), then re-cooks
-    this node so `generate` picks up the new data (and re-pulls billing, if
-    Use Billing is on).
-
+    Synchronize history, then recompute the report. Operational job/pod status is available on the scheduler's Status tab.
 Export CSV:
     #id: rpfarm_export_csv
+    Write the current filtered report to a local CSV file.
 
-    Writes the current filtered+merged record set to
-    `~/.rpfarm/exports/rpfarm_stats_<timestamp>.csv`
-    (`rpfarm.ledger.to_csv`) and prepends the path to the summary text.
-
-Summary:
-    #id: rpfarm_summary
-
-    Read-only: totals by project and by user ($ / GPU-hours / tasks / $ per
-    task), volume storage cost for the period (Use Billing only), and
-    cleanup candidates -- projects with no cook in over 30 days. With Use
-    Billing on, each candidate also gets its real on-disk size (Task 12's
-    housekeeping `ls`, via the sync pod) and an estimated $/month: that
-    project's byte share of the period's actual
-    `GET /billing/networkvolumes` charge, prorated to 30 days -- never a
-    guessed $/GB rate. With Use Billing off, size/$/month show as "n/a"
-    and nothing touches the sync pod or the network at all.
-
-@related
-
-- [Node:top/runpodfarm_scheduler]
-- [Node:top/runpodfarm_upload]
-- [Node:top/runpodfarm_download]
-- [Node:top/pythonprocessor]
-- [Node:top/localscheduler]
+Live scheduler budgets cover GPU compute. Sync, host controllers and storage are shown separately or in actual account billing.
 '''
 
 

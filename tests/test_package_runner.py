@@ -7,6 +7,25 @@ import pytest
 from rpfarm import package_runner
 
 
+def test_download_registers_actual_local_pdg_outputs(tmp_path, monkeypatch):
+    output = tmp_path / 'image.exr'
+    output.write_bytes(b'img')
+    item = {'index': 0, 'local_root': str(tmp_path), 'remote_root': '/remote',
+            'files': [[str(output), '/remote/image.exr', 3]], 'bytes': 3}
+    _patch_download_pipeline(monkeypatch, {'files': 1, 'bytes': 3, 'seconds': 1}, [])
+    outputs = []
+    pdg = types.SimpleNamespace(addOutputFile=outputs.extend,
+        setIntAttrib=lambda *a: None, setStringAttrib=lambda *a: None,
+        setFloatAttrib=lambda *a: None)
+    monkeypatch.setattr(package_runner, '_pdgcmd', lambda: pdg)
+    assert package_runner.main([_write_download_payload(tmp_path, item)]) == 0
+    assert outputs == [str(output)]
+    output.unlink()
+    outputs.clear()
+    assert package_runner.main([_write_download_payload(tmp_path, item)]) == 1
+    assert outputs == []
+
+
 class FakeCfg:
     rclone_path = "/bin/true"
     api_key = "k"

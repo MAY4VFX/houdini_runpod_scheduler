@@ -117,3 +117,55 @@ def launch(command: list[str], log_file: Path, cwd: str | None = None,
         proc = popen(command, stdout=f, stderr=subprocess.STDOUT,
                     stdin=subprocess.DEVNULL, cwd=cwd, env=env, **kwargs)
     return proc.pid
+
+
+def launch_tracked(node):
+    """Launch the explicit target and its local delivery stage as one durable job."""
+    import os
+    import time
+    import uuid
+    import hou
+    from . import context, jobs
+    from .houdini_local import HoudiniInstall
+
+    reference = context.value(node, 'submitjobnode', '')
+    target = node.node(reference) if reference else None
+    if target is None or target.type().name() in ('topnet', 'topnetmgr', 'runpodfarmdownload'):
+        raise BackgroundCookError('Set Farm Target to the render/compute node first.')
+    graph = target.getPDGGraphContext()
+    if graph and graph.cooking:
+        raise BackgroundCookError('Finish or cancel the current cook first.')
+    download = jobs.download_node(target)
+    if node.parm('rpfarm_downloadoutputs'):
+        node.parm('rpfarm_downloadoutputs').set(0)
+    download.parm('rpfarm_job').set('')
+    hou.hipFile.save()
+    farm = context.resolve(node)
+    job_id = uuid.uuid4().hex[:8]
+    artifact_dir = jobs.directory() / 'artifacts' / job_id
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    log_file = artifact_dir / 'background.log'
+    record = jobs.save({'id': job_id, 'mode': 'background', 'state': 'submitted',
+        'user': farm.cfg.user, 'project': farm.project, 'volume_id': farm.cfg.volume_id,
+        'hip': hou.hipFile.path(), 'logical_hip': hou.hipFile.path(),
+        'local_root': farm.local_root, 'target': download.path(),
+        'log_path': str(log_file), 'submitted_at': time.time(), 'max_minutes': 240})
+    package_root = Path(__file__).resolve().parent.parent
+    install = HoudiniInstall(Path(hou.expandString('$HFS')))
+    env = dict(os.environ)
+    env.update(RPFARM_ROOT=str(package_root), RPFARM_COOK=job_id,
+               RPFARM_CONTEXT_PATH=context.snapshot(farm.cfg))
+    env['PYTHONPATH'] = str(package_root) + os.pathsep + env.get('PYTHONPATH', '')
+    command = [str(install.hython), str(package_root / 'rpfarm' / 'host_render.py'),
+               '--hip', record['hip'], '--toppath', record['target'],
+               '--taskgraphout', str(artifact_dir / 'taskgraph_out.bin'),
+               '--jobfile', str(jobs.directory() / (job_id + '.json'))]
+    try:
+        pid = launch(command, log_file, env=env)
+    except Exception:
+        jobs.save(dict(record, state='failed', error='Could not start local controller'))
+        raise
+    record = jobs.save(dict(jobs.load(job_id), pid=pid))
+    if node.parm('rpfarm_job'):
+        node.parm('rpfarm_job').set(job_id)
+    return record

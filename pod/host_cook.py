@@ -176,6 +176,27 @@ def build_topcook_command(hython, topcook, hip_path, top_path, verbosity=2):
     ]
 
 
+def build_host_command(hython, hip_path, top_path, pkg_dir):
+    return [hython, os.path.join(os.path.dirname(__file__), 'host_render.py'),
+            '--hip', hip_path, '--toppath', top_path,
+            '--taskgraphin', os.path.join(pkg_dir, 'taskgraph_in.bin'),
+            '--taskgraphout', os.path.join(pkg_dir, 'taskgraph_out.bin')]
+
+
+def _failed_job(pkg_dir, reason):
+    try:
+        path = os.path.join(pkg_dir, 'job.json')
+        with open(path) as f:
+            job = json.load(f)
+        if job.get('state') not in ('complete', 'failed', 'canceled'):
+            job.update(state='failed', error=reason, updated_at=time.time())
+            with open(path + '.tmp', 'w') as f:
+                json.dump(job, f)
+            os.replace(path + '.tmp', path)
+    except (OSError, ValueError):
+        pass
+
+
 def main():
     api_key = os.environ.get("RUNPOD_API_KEY", "")
     pod_id = os.environ.get("RUNPOD_POD_ID", "")
@@ -286,18 +307,18 @@ def main():
         terminate_pod(pod_id, api_key)
         return 1
 
-    command = build_topcook_command(hython, topcook, hip_path, top_path)
+    command = build_host_command(hython, hip_path, top_path, pkg_dir)
     try:
         log("cook starting: {} --toppath {}".format(os.path.basename(hip_path), top_path))
         t0 = time.monotonic()
-        proc = subprocess.run(
-            command, env=env, timeout=max_minutes * 60 - 30,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-        )
+        os.makedirs(pkg_dir, exist_ok=True)
+        with open(os.path.join(pkg_dir, 'host.log'), 'a') as output:
+            proc = subprocess.run(
+                command, env=env, timeout=max_minutes * 60 - 30,
+                stdout=output, stderr=subprocess.STDOUT, text=True,
+            )
         rc = proc.returncode
         log("cook finished in {:.0f}s, exit {}".format(time.monotonic() - t0, rc))
-        sys.stdout.write(proc.stdout[-20000:])
-        sys.stdout.flush()
     except subprocess.TimeoutExpired as e:
         log("cook did not finish within {} minutes -- killed".format(max_minutes))
         if e.stdout:
@@ -306,6 +327,8 @@ def main():
         log("cook raised an unexpected error ({}) -- terminating anyway".format(type(e).__name__))
     finally:
         watchdog.cancel()
+        if rc != 0:
+            _failed_job(pkg_dir, 'Host cook failed or exceeded its runtime limit. See host.log.')
         sweep_render_pods(pod_id, user, cook_id, api_key)
         terminate_pod(pod_id, api_key)
     return rc

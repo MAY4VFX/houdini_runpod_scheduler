@@ -14,6 +14,26 @@
     inputlabel	4	"Input 4"
 
     parm {
+        name    "rpfarm_job"
+        label   "Results From"
+        type    string
+        default { "" }
+        help    "Current graph cooks the connected input. A submitted job restores its results inside this cook without rerunning Upload or Render."
+        hidewhen "{ rpfarm_mode == custom }"
+        menu {
+            [ "return hou.phm().jobMenu()" ]
+            language python
+        }
+    }
+    parm {
+        name    "rpfarm_jobstatus"
+        label   "Job Status"
+        type    string
+        default { [ "hou.phm().jobStatus()" python ] }
+        disablewhen "{ rpfarm_inprocess >= 0 }"
+        hidewhen "{ rpfarm_mode == custom }"
+    }
+    parm {
         name    "rpfarm_mode"
         label   "Mode"
         type    string

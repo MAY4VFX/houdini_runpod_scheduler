@@ -156,6 +156,20 @@ def main(argv):
         if kind == "download":
             overwrite = payload.get("overwrite", "newer")
             stats = rppkg.run_download_item(item, cfg, sftp, sync_client, overwrite, progress_cb)
+            report = getattr(pdgcmd, 'addOutputFile', None)
+            if report is not None:
+                outputs = [f[0] for f in item['files']]
+                missing = [p for p in outputs if not os.path.isfile(p)]
+                if missing:
+                    raise rpsync.SyncError('Local outputs missing after download: ' + ', '.join(missing[:5]))
+                if outputs:
+                    report(outputs)
+                pdgcmd.setIntAttrib('rpfarm_delivered', stats.get('delivered', len(outputs)), 0)
+                pdgcmd.setStringAttrib('rpfarm_delivery_key', item.get('delivery_key', ''), 0)
+                if item.get('job_id'):
+                    from .jobs import downloaded
+                    from .delivery import valid
+                    downloaded(item['job_id'], [entry[0] for entry in item['files'] if valid(item, cfg, entry)])
         else:
             autogrow_note = rppkg.maybe_grow_volume(
                 api, cfg, sync_client, item.get("bytes") or 0,

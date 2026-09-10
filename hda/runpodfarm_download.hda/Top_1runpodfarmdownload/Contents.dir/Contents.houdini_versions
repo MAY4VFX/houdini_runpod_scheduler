@@ -3,6 +3,7 @@
 	],
 	"indexes":{
 		"hdaroot/output0.userdata":0,
+		"hdaroot/source.userdata":0,
 		"hdaroot/localscheduler.userdata":1
 	}
 }

@@ -1,0 +1,203 @@
+import ast
+import hashlib
+import os
+import pathlib
+import sys
+root = pathlib.Path(os.environ.get('RPFARM_ROOT', pathlib.Path.home() / '.rpfarm' / 'pkg'))
+if str(root) not in sys.path:
+    sys.path.insert(0, str(root))
+# -- stale-module guard ------------------------------------------------------
+#
+# The asset and the package ship together and are updated together, but Python
+# caches modules in sys.modules for the life of the process. A Houdini that was
+# already open when the checkout updated runs the NEW asset against the OLD
+# package, and the artist sees either an ImportError naming a symbol they have
+# never heard of, or -- worse, and this is what happened on 2026-09-05 -- a
+# cook whose work items simply fail.
+#
+# THE CHECK IS A FACT, NOT A NUMBER. It compares the package's own
+# FINGERPRINT (size + content digest of every module file, taken when this
+# process imported it) against those files as they are now. If anything
+# differs, the code in memory is not the code on disk, and no version needs
+# to have been bumped for us to know it.
+#
+# That matters because the version check that used to be the whole guard
+# failed exactly where it was needed: rpfarm.VERSION sat at 2.2.0 through
+# seven commits that changed deps.py, preflight.py and usddeps.py, so
+# "loaded >= minimum" was true while the loaded code was a week behind. A
+# guard that depends on someone remembering to bump a number is a guard that
+# is off whenever they forget. The version is still read -- but only to make
+# the message concrete.
+_MIN_RPFARM_VERSION = "2.3.0"
+
+
+def _version_tuple(text):
+    """("2.1.0") -> (2, 1, 0). Unparseable parts sort as 0, never raises."""
+    parts = []
+    for chunk in str(text or "").split("."):
+        digits = "".join(c for c in chunk if c.isdigit())
+        parts.append(int(digits) if digits else 0)
+    return tuple(parts) or (0,)
+
+
+def _ondisk_rpfarm_version(root):
+    """rpfarm's VERSION as it is ON DISK, read without importing it.
+
+    Importing is precisely what cannot answer this question: the import is
+    what hands back the cached module. Parsed with ast, so a half-written or
+    unexpected __init__ cannot execute anything or raise here.
+    """
+    try:
+        source = (pathlib.Path(root) / "rpfarm" / "__init__.py").read_text(encoding="utf-8")
+        for node in ast.parse(source).body:
+            if isinstance(node, ast.Assign) and any(
+                    isinstance(t, ast.Name) and t.id == "VERSION" for t in node.targets):
+                return ast.literal_eval(node.value)
+    except Exception:  # noqa: BLE001 - a diagnostic must not become the failure
+        return None
+    return None
+
+
+def _ondisk_fingerprint(package_dir):
+    """The same measurement rpfarm takes of itself, computed here.
+
+    Only used by the bake script and the tests -- the runtime check never
+    looks at the disk (see _asset_mismatch for why).
+    """
+    out = {}
+    try:
+        names = sorted(os.listdir(package_dir))
+    except Exception:
+        return out
+    for name in names:
+        if not name.endswith(".py"):
+            continue
+        try:
+            with open(os.path.join(package_dir, name), "rb") as handle:
+                data = handle.read()
+        except Exception:
+            continue
+        out[name] = (len(data), hashlib.sha256(data).hexdigest()[:16])
+    return out
+
+
+def _asset_mismatch(package, baked):
+    """Modules whose loaded content is not what this asset was built against.
+
+    Both sides live INSIDE this Houdini: ``package.FINGERPRINT`` is what the
+    modules were when this process imported them, ``baked`` is what they were
+    when this asset was built. The disk is deliberately not consulted.
+
+    That is the whole correction. Comparing against the disk answered the
+    wrong question -- "has anyone touched the checkout?" -- so every push
+    while an artist had Houdini open blocked their next cook, while a
+    session that was genuinely broken (an asset reinstalled under a running
+    Houdini, which reloads definitions without reopening the scene) could
+    still look fine. Comparing the asset with the package it was built
+    against answers the only question that matters to the artist: is my tool
+    consistent with itself?
+
+    An asset with no baked fingerprint predates this and gets a warning, not
+    a stop -- it may well be fine, and refusing to cook on "I cannot tell"
+    is how a guard gets switched off.
+    """
+    loaded = getattr(package, "FINGERPRINT", None)
+    if not isinstance(loaded, dict):
+        return ["<no fingerprint: this rpfarm predates the check>"]
+    if not baked:
+        return []
+    return sorted(name for name in baked if loaded.get(name) != baked[name])
+
+
+def _stale_module_message(minimum, loaded, on_disk, root, changed=(), baked=True):
+    """The sentence to show the artist, or None when nothing is wrong.
+
+    ``changed`` is the answer from :func:`_asset_mismatch`; the version
+    arguments only make the message concrete. An asset that carries no baked
+    fingerprint at all cannot be judged, so it says so quietly instead of
+    refusing to work.
+    """
+    changed = list(changed)
+    if not changed:
+        return None
+    if not baked or any(name.startswith("<") for name in changed):
+        return (
+            "ВНИМАНИЕ: не могу проверить, сходится ли нода с кодом фермы.\n"
+            "\n"
+            "Это старая нода или старый пакет rpfarm. Кук пойдёт, но если он\n"
+            "упадёт странно — перезапустите Houdini, а потом обновите ноды:\n"
+            "    python3 -m rpfarm setup"
+        )
+    shown = ", ".join(changed[:4])
+    more = " и ещё {}".format(len(changed) - 4) if len(changed) > 4 else ""
+    package = __import__('sys').modules.get('rpfarm')
+    loaded_fingerprint = getattr(package, 'FINGERPRINT', None)
+    disk_fingerprint = _ondisk_fingerprint(pathlib.Path(root) / 'rpfarm')
+    if loaded_fingerprint and disk_fingerprint and loaded_fingerprint == disk_fingerprint:
+        action = 'Установите согласованную сборку Python и HDA. Перезапуск этой свежей сессии не исправит несовместимую сборку.'
+    else:
+        action = 'ПЕРЕЗАПУСТИТЕ HOUDINI, чтобы загрузить установленный пакет заново.'
+    return (
+        "Нода собрана против другого кода фермы, чем сейчас в памяти Houdini.\n"
+        "\n"
+        "{action}\n"
+        "\n"
+        "Разошлись: {shown}{more}.\n"
+        "В памяти rpfarm {seen}, нода собрана против {disk}.".format(
+            action=action, shown=shown, more=more, seen=loaded or "неизвестной версии",
+            disk=on_disk or "неизвестной версии")
+    )
+
+# BEGIN baked by scripts/bake_asset_fingerprint.py -- do not edit
+_ASSET_BUILT_AGAINST_VERSION = '2.4.0'
+_ASSET_FINGERPRINT = {
+    '__init__.py': (2490, '84b00617a24de235'),
+    '__main__.py': (52, '13a1a5b340cdcfc1'),
+    'background_cook.py': (8292, '0e7f039578c949dd'),
+    'cli.py': (72171, '9a2152a00e573a1c'),
+    'compression.py': (23234, 'bef2f19daebbc929'),
+    'config.py': (20080, '1dfcc2a15551dbe2'),
+    'context.py': (4466, '2fa09a0d45931725'),
+    'delivery.py': (3964, '63bb04491f97a3f3'),
+    'deps.py': (38558, '2daae12f5770289a'),
+    'dispatch.py': (22191, '1121a6505c88adb3'),
+    'file_review.py': (16246, 'd81726007b4ba4dd'),
+    'gpus.py': (8311, '7a28d5c2692b776e'),
+    'host_render.py': (10983, 'a0139507d9f7fe7f'),
+    'houdini_local.py': (48596, '7902f068c70d702b'),
+    'jobs.py': (8732, '88bd5f01eed7897c'),
+    'ledger.py': (17327, '70425e75fb216f01'),
+    'monitoring.py': (6320, '941db2f923c756ae'),
+    'mq.py': (2124, '174afbd9f49ad86f'),
+    'package_runner.py': (9652, '939de3e067b005db'),
+    'packages.py': (63842, '42a0a9d34bdf67a8'),
+    'pods.py': (35551, '3b64efff30fb33d7'),
+    'preflight.py': (45206, 'bea8fc057bc7e32a'),
+    'progress.py': (3439, 'c364a012f5cd92e6'),
+    'releases.py': (4735, 'c6b364ccfb3534b3'),
+    'runpod_api.py': (14539, 'b90960f9860c97fb'),
+    'scene_setup.py': (18803, 'c8031966f92b71f3'),
+    'smoke.py': (42548, 'ce0c8d36fe763314'),
+    'status.py': (458, '2205873427086b87'),
+    'submission.py': (1621, '6b428346b41fab92'),
+    'sync.py': (20962, '6ae2a7b7e1e25f58'),
+    'tls.py': (3642, 'f3e50ea6ebd0308f'),
+    'tools.py': (4290, 'c5d3b026f125578f'),
+    'usddeps.py': (9631, '3c7192d3bd94d07f'),
+    'volume.py': (10038, 'dc11b185a58c9262'),
+    'worker_client.py': (10012, '407feb11016dd01c'),
+}
+# END baked
+
+def farmCodeMessage():
+    import rpfarm
+    return _stale_module_message(_MIN_RPFARM_VERSION, rpfarm.VERSION,
+        _ASSET_BUILT_AGAINST_VERSION, root, _asset_mismatch(rpfarm, _ASSET_FINGERPRINT))
+
+def jobMenu():
+    from rpfarm import jobs
+    return jobs.menu(farm_only=True)
+def jobStatus():
+    import hou
+    from rpfarm import jobs
+    return jobs.selected_description(hou.pwd().evalParm('rpfarm_job'))

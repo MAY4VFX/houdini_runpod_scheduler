@@ -203,11 +203,16 @@ _LOAD_OVERRIDE_ENV = {
     "api_key": "RUNPOD_API_KEY",
     "ssh_key_path": "RPFARM_SSH_KEY_PATH",
     "rclone_path": "RPFARM_RCLONE_PATH",
+    "sesinetd_url": "SESINETD_URL",
 }
 
 
 def load() -> Config:
     """Read ``$RPFARM_HOME/config.toml``. Raises ConfigError if missing."""
+    context_path = os.environ.get('RPFARM_CONTEXT_PATH')
+    if context_path:
+        from .context import load_snapshot
+        return load_snapshot(context_path)
     path = home() / CONFIG_FILENAME
     if not path.exists():
         raise ConfigError(f"no config at {path}; run `rpfarm setup` first")
