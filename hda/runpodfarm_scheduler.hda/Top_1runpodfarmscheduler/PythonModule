@@ -4062,7 +4062,7 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         # accepted on its own, no process required; removing the line is
         # then tidiness, not the security boundary. Same bound the
         # watchdog uses, so the key cannot outlive the pod it was made for.
-        expiry = (datetime.datetime.utcnow()
+        expiry = (datetime.datetime.now(datetime.timezone.utc)
                  + datetime.timedelta(minutes=_SUBMIT_AS_JOB_MAX_MINUTES)
                  ).strftime("%Y%m%d%H%M")
         authorized_line = 'expiry-time="{}" {}'.format(expiry, host_pubkey)
@@ -4084,6 +4084,7 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
                 extra={
                     "RUNPOD_API_KEY": self._cfg.api_key,
                     "RPFARM_HOST_SSH_KEY": ssh_key_pem,
+                    "RPFARM_HOST_SSH_PUBKEY": host_pubkey,
                     "RPFARM_HOST_HIP": hip_remote,
                     "RPFARM_HOST_TOPPATH": node_name,
                     "RPFARM_HOST_PKGDIR": remote_pkg_dir,

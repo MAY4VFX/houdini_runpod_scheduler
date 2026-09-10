@@ -1738,6 +1738,10 @@ def test_submit_as_job_uses_a_throwaway_key_never_the_artists_own():
     # self._cfg.ssh_key_path (the artist's own, real, persistent key).
     assert "self._cfg.ssh_key_path" not in inner
     assert '"RPFARM_HOST_SSH_KEY": ssh_key_pem' in inner
+    # The public half ships too (Ruling R71 fix, 2026-09-10 live finding):
+    # the scheduler's own _read_pubkey unconditionally reads
+    # <ssh_key_path>.pub, and only the private half used to be shipped.
+    assert '"RPFARM_HOST_SSH_PUBKEY": host_pubkey' in inner
 
     # A failed pod-create de-authorizes the same key it just authorized --
     # never left trusted with nothing that will ever use it.
@@ -1760,7 +1764,7 @@ def test_submit_as_job_key_is_time_bounded_even_if_nothing_ever_removes_it():
 
     assert "_SUBMIT_AS_JOB_MAX_MINUTES" in inner
     assert 'expiry-time="{}"' in inner
-    expiry_computed = inner.index("datetime.datetime.utcnow()")
+    expiry_computed = inner.index("datetime.datetime.now(datetime.timezone.utc)")
     authorize = inner.index("self._sync_client.exec(")
     assert expiry_computed < authorize
 

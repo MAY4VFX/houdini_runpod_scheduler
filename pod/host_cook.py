@@ -185,13 +185,15 @@ def main():
     top_path = os.environ.get("RPFARM_HOST_TOPPATH", "")
     pkg_dir = os.environ.get("RPFARM_HOST_PKGDIR", "")
     ssh_key_pem = os.environ.get("RPFARM_HOST_SSH_KEY", "")
+    ssh_pubkey = os.environ.get("RPFARM_HOST_SSH_PUBKEY", "")
     hfs = os.environ.get("HFS", "")
     max_minutes = int(os.environ.get("RPFARM_HOST_MAX_MINUTES") or DEFAULT_MAX_MINUTES)
 
-    if not (api_key and pod_id and hip_path and top_path and pkg_dir and ssh_key_pem):
+    if not (api_key and pod_id and hip_path and top_path and pkg_dir
+           and ssh_key_pem and ssh_pubkey):
         log("missing required env (RUNPOD_API_KEY/RUNPOD_POD_ID/RPFARM_HOST_HIP/"
-            "RPFARM_HOST_TOPPATH/RPFARM_HOST_PKGDIR/RPFARM_HOST_SSH_KEY) -- "
-            "cannot run, terminating self")
+            "RPFARM_HOST_TOPPATH/RPFARM_HOST_PKGDIR/RPFARM_HOST_SSH_KEY/"
+            "RPFARM_HOST_SSH_PUBKEY) -- cannot run, terminating self")
         if pod_id and api_key:
             terminate_pod(pod_id, api_key)
         return 1
@@ -238,6 +240,17 @@ def main():
     fd = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as f:
         f.write(ssh_key_pem if ssh_key_pem.endswith("\n") else ssh_key_pem + "\n")
+    # _read_pubkey (the scheduler's own, used by EVERY cook to build the
+    # PUBLIC_KEY every pod's authorized_keys gets) reads <ssh_key_path>.pub
+    # unconditionally -- confirmed live (2026-09-10): the nested scheduler
+    # raised CookError("Cannot read the SSH public key at
+    # /tmp/.rpfarm_host_key.pub") one rental after the RPFARM_HOME fix,
+    # because only the private half was ever written here. The public
+    # half travels alongside the private one, same env-shipping pattern.
+    pub_path = key_path + ".pub"
+    with open(pub_path, "w") as f:
+        f.write(ssh_pubkey if ssh_pubkey.endswith("\n") else ssh_pubkey + "\n")
+    os.chmod(pub_path, 0o644)
     env["RPFARM_SSH_KEY_PATH"] = key_path
     env["RPFARM_RCLONE_PATH"] = shutil.which("rclone") or "/usr/bin/rclone"
 

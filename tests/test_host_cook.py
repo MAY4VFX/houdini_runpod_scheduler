@@ -183,6 +183,25 @@ def test_main_terminates_self_when_required_env_is_missing(monkeypatch):
     assert terminated == ["pod1"]
 
 
+def test_main_terminates_self_when_only_the_pubkey_is_missing(monkeypatch, tmp_path):
+    """The private key alone is not enough -- _read_pubkey (the
+    scheduler's own) needs <ssh_key_path>.pub too."""
+    monkeypatch.setenv("RUNPOD_API_KEY", "key")
+    monkeypatch.setenv("RUNPOD_POD_ID", "pod1")
+    monkeypatch.setenv("RPFARM_HOST_HIP", str(tmp_path / "scene.hip"))
+    monkeypatch.setenv("RPFARM_HOST_TOPPATH", "/obj/topnet1")
+    monkeypatch.setenv("RPFARM_HOST_PKGDIR", str(tmp_path / "host_pkg"))
+    monkeypatch.setenv("RPFARM_HOST_SSH_KEY", "-----BEGIN OPENSSH PRIVATE KEY-----\nx\n-----END OPENSSH PRIVATE KEY-----\n")
+    monkeypatch.delenv("RPFARM_HOST_SSH_PUBKEY", raising=False)
+    terminated = []
+    monkeypatch.setattr(host_cook, "terminate_pod", lambda pod_id, key: terminated.append(pod_id))
+
+    rc = host_cook.main()
+
+    assert rc == 1
+    assert terminated == ["pod1"]
+
+
 def test_main_terminates_self_and_sweeps_when_topcook_is_not_found(monkeypatch, tmp_path):
     monkeypatch.setenv("RUNPOD_API_KEY", "key")
     monkeypatch.setenv("RUNPOD_POD_ID", "pod1")
@@ -192,6 +211,7 @@ def test_main_terminates_self_and_sweeps_when_topcook_is_not_found(monkeypatch, 
     monkeypatch.setenv("RPFARM_HOST_TOPPATH", "/obj/topnet1")
     monkeypatch.setenv("RPFARM_HOST_PKGDIR", str(tmp_path / "host_pkg"))
     monkeypatch.setenv("RPFARM_HOST_SSH_KEY", "-----BEGIN OPENSSH PRIVATE KEY-----\nfakekeydata\n-----END OPENSSH PRIVATE KEY-----\n")
+    monkeypatch.setenv("RPFARM_HOST_SSH_PUBKEY", "ssh-ed25519 AAAAfakepubkeydata rpfarm-host-test")
     monkeypatch.setenv("HFS", str(tmp_path / "nohfs"))  # no topcook.py under here
     terminated = []
     monkeypatch.setattr(host_cook, "terminate_pod", lambda pod_id, key: terminated.append(pod_id))
@@ -211,6 +231,7 @@ def test_main_runs_topcook_and_terminates_self_on_success(monkeypatch, tmp_path)
     monkeypatch.setenv("RPFARM_HOST_TOPPATH", "/obj/topnet1")
     monkeypatch.setenv("RPFARM_HOST_PKGDIR", str(tmp_path / "host_pkg"))
     monkeypatch.setenv("RPFARM_HOST_SSH_KEY", "-----BEGIN OPENSSH PRIVATE KEY-----\nfakekeydata\n-----END OPENSSH PRIVATE KEY-----\n")
+    monkeypatch.setenv("RPFARM_HOST_SSH_PUBKEY", "ssh-ed25519 AAAAfakepubkeydata rpfarm-host-test")
     monkeypatch.setenv("HFS", str(tmp_path / "hfs"))
     libs = tmp_path / "hfs" / "houdini" / "python3.13libs" / "pdgjob"
     libs.mkdir(parents=True)
@@ -255,7 +276,15 @@ def test_main_runs_topcook_and_terminates_self_on_success(monkeypatch, tmp_path)
     assert os.path.exists(key_path)
     assert stat.S_IMODE(os.stat(key_path).st_mode) == 0o600
     assert open(key_path).read().startswith("-----BEGIN OPENSSH PRIVATE KEY-----")
+    # The public half too (Ruling R71 fix): the scheduler's own
+    # _read_pubkey unconditionally reads <ssh_key_path>.pub -- confirmed
+    # live (2026-09-10) this was the SECOND real failure, one rental
+    # after RPFARM_HOME, because only the private half was ever written.
+    pub_path = key_path + ".pub"
+    assert os.path.exists(pub_path)
+    assert open(pub_path).read().strip() == "ssh-ed25519 AAAAfakepubkeydata rpfarm-host-test"
     os.remove(key_path)
+    os.remove(pub_path)
 
 
 def test_main_terminates_self_even_when_the_cook_times_out(monkeypatch, tmp_path):
@@ -267,6 +296,7 @@ def test_main_terminates_self_even_when_the_cook_times_out(monkeypatch, tmp_path
     monkeypatch.setenv("RPFARM_HOST_TOPPATH", "/obj/topnet1")
     monkeypatch.setenv("RPFARM_HOST_PKGDIR", str(tmp_path / "host_pkg"))
     monkeypatch.setenv("RPFARM_HOST_SSH_KEY", "-----BEGIN OPENSSH PRIVATE KEY-----\nfakekeydata\n-----END OPENSSH PRIVATE KEY-----\n")
+    monkeypatch.setenv("RPFARM_HOST_SSH_PUBKEY", "ssh-ed25519 AAAAfakepubkeydata rpfarm-host-test")
     monkeypatch.setenv("RPFARM_HOST_MAX_MINUTES", "1")
     monkeypatch.setenv("HFS", str(tmp_path / "hfs"))
     libs = tmp_path / "hfs" / "houdini" / "python3.13libs" / "pdgjob"
@@ -296,6 +326,7 @@ def test_main_terminates_self_even_on_an_unexpected_exception(monkeypatch, tmp_p
     monkeypatch.setenv("RPFARM_HOST_TOPPATH", "/obj/topnet1")
     monkeypatch.setenv("RPFARM_HOST_PKGDIR", str(tmp_path / "host_pkg"))
     monkeypatch.setenv("RPFARM_HOST_SSH_KEY", "-----BEGIN OPENSSH PRIVATE KEY-----\nfakekeydata\n-----END OPENSSH PRIVATE KEY-----\n")
+    monkeypatch.setenv("RPFARM_HOST_SSH_PUBKEY", "ssh-ed25519 AAAAfakepubkeydata rpfarm-host-test")
     monkeypatch.setenv("HFS", str(tmp_path / "hfs"))
     libs = tmp_path / "hfs" / "houdini" / "python3.13libs" / "pdgjob"
     libs.mkdir(parents=True)
