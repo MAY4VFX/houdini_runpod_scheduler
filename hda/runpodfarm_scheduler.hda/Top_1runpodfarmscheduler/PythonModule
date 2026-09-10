@@ -48,6 +48,7 @@ import pathlib
 import posixpath
 import shlex
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -4007,34 +4008,89 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         finally:
             shutil.rmtree(staging, ignore_errors=True)
 
+        # A THROWAWAY keypair, not the artist's own (review finding,
+        # 2026-09-10): PUBLIC_KEY -- the artist's real one -- is already
+        # trusted by every pod's authorized_keys (sync AND render), so
+        # shipping its PRIVATE half to a host pod would mean a compromised
+        # host pod can root-shell into anything on the account, not just
+        # read/write the volume over SFTP the way this key can. Generated
+        # here and authorized on the sync pod ONLY -- scope is bounded
+        # even before time is: a leak of it reaches the sync pod, never
+        # anything else. If pod creation fails below, it is de-authorized
+        # immediately (nothing will ever use it). If the pod IS created,
+        # this key stays authorized for as long as the entry sits in
+        # authorized_keys -- the host pod has no ssh CLIENT to remove its
+        # own line (openssh-server only, no openssh-client in the image),
+        # so this is NOT yet time-bounded on the success path. Known,
+        # deferred: a pruning pass in a normal cook's own onSetupCook,
+        # by the rpfarm-host-<cook_id> comment this key is tagged with,
+        # is the planned follow-up -- said plainly rather than claimed.
+        host_keys_dir = tempfile.mkdtemp(prefix="rpfarm-hostkey-")
         try:
-            with open(self._cfg.ssh_key_path) as f:
+            priv_path = os.path.join(host_keys_dir, "id_ed25519")
+            try:
+                subprocess.run(
+                    ["ssh-keygen", "-t", "ed25519", "-N", "", "-f", priv_path,
+                     "-C", "rpfarm-host-{}".format(self._cook_id)],
+                    check=True, capture_output=True, text=True)
+            except (subprocess.CalledProcessError, OSError) as e:
+                raise CookError("Could not generate a throwaway SSH key for the "
+                                "host pod: {}".format(e)) from e
+            with open(priv_path) as f:
                 ssh_key_pem = f.read()
-        except OSError as e:
-            raise CookError("Could not read the SSH private key at {}: {}".format(
-                self._cfg.ssh_key_path, e)) from e
+            with open(priv_path + ".pub") as f:
+                host_pubkey = f.read().strip()
+        finally:
+            shutil.rmtree(host_keys_dir, ignore_errors=True)
 
-        host_token = secrets.token_hex(16)
-        hip_remote = remote_pkg_dir + "/" + os.path.basename(hip_local)
-        env = rppods.pod_env(
-            self._cfg, "host", host_token, 1, self._pubkey,
-            cook=self._cook_id, project=self._project,
-            extra={
-                "RUNPOD_API_KEY": self._cfg.api_key,
-                "RPFARM_HOST_SSH_KEY": ssh_key_pem,
-                "RPFARM_HOST_HIP": hip_remote,
-                "RPFARM_HOST_TOPPATH": node_name,
-                "RPFARM_HOST_PKGDIR": remote_pkg_dir,
-            },
-        )
-        name = "rpfarm-{}-{}-{}-host".format(self._cfg.user, self._project, self._cook_id)
         try:
-            pod = self._api.create_cpu_pod(
-                name, self._templateId(), self._volumeId(), env, rppods.PORTS,
-                datacenter=self._datacenterId(), cloud_type=self._cloudType(),
+            self._sync_client.exec(
+                "mkdir -p ~/.ssh && echo {} >> ~/.ssh/authorized_keys".format(
+                    shlex.quote(host_pubkey)),
+                timeout_s=30)
+        except Exception as e:
+            raise CookError("Could not authorize the host pod's throwaway key "
+                            "on the sync pod: {}".format(e)) from e
+
+        try:
+            host_token = secrets.token_hex(16)
+            hip_remote = remote_pkg_dir + "/" + os.path.basename(hip_local)
+            env = rppods.pod_env(
+                self._cfg, "host", host_token, 1, self._pubkey,
+                cook=self._cook_id, project=self._project,
+                extra={
+                    "RUNPOD_API_KEY": self._cfg.api_key,
+                    "RPFARM_HOST_SSH_KEY": ssh_key_pem,
+                    "RPFARM_HOST_HIP": hip_remote,
+                    "RPFARM_HOST_TOPPATH": node_name,
+                    "RPFARM_HOST_PKGDIR": remote_pkg_dir,
+                },
             )
-        except RunPodError as e:
-            raise CookError("Could not create the Submit As Job host pod: {}".format(e)) from e
+            name = "rpfarm-{}-{}-{}-host".format(self._cfg.user, self._project, self._cook_id)
+            try:
+                pod = self._api.create_cpu_pod(
+                    name, self._templateId(), self._volumeId(), env, rppods.PORTS,
+                    datacenter=self._datacenterId(), cloud_type=self._cloudType(),
+                )
+            except RunPodError as e:
+                raise CookError("Could not create the Submit As Job host pod: {}".format(e)) from e
+        except Exception:
+            # The pod that would have USED this key was never created (or
+            # its own env never reached it) -- de-authorize now rather
+            # than leaving a throwaway key trusted on the sync pod with
+            # nothing left holding its private half responsibly. Best
+            # effort: an unreachable sync pod here means the entry is
+            # already unreachable too, not a bigger problem than that.
+            try:
+                self._sync_client.exec(
+                    "grep -vF {} ~/.ssh/authorized_keys > ~/.ssh/authorized_keys.tmp "
+                    "&& mv ~/.ssh/authorized_keys.tmp ~/.ssh/authorized_keys".format(
+                        shlex.quote(host_pubkey)),
+                    timeout_s=30)
+            except Exception as cleanup_error:
+                self._log("could not de-authorize the throwaway host key after "
+                          "a failed submit: {}".format(cleanup_error))
+            raise
         pod_id = pod["id"]
         self._log("host pod created {} {} -- Houdini can close now, it will "
                   "shut itself down (and its own render pods) when the "

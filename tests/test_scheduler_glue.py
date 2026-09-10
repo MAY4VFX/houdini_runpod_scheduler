@@ -1715,6 +1715,37 @@ def test_submit_as_job_ships_a_redacted_config_toml_into_the_staging_dir():
     assert config_write < upload_call
 
 
+def test_submit_as_job_uses_a_throwaway_key_never_the_artists_own():
+    """Review finding, 2026-09-10: PUBLIC_KEY (the artist's real key) is
+    already trusted by every pod's authorized_keys, so shipping its
+    private half to a host pod would let a compromised host pod
+    root-shell into anything on the account. A fresh ssh-keygen'd pair,
+    authorized on the sync pod only, bounds a leak to the sync pod
+    instead. Checked at the source level (too hou-heavy to fully
+    execute)."""
+    src = MODULE.read_text()
+    inner = src[src.index("def _submitAsJobInner(self, node_name):"):]
+    inner = inner[:inner.index("\n    def ", 1)]
+
+    assert '"ssh-keygen"' in inner
+    keygen = inner.index('"ssh-keygen"')
+    authorize = inner.index("self._sync_client.exec(")
+    pod_create = inner.index("self._api.create_cpu_pod(")
+    assert keygen < authorize < pod_create, \
+        "generate, then authorize on the sync pod, before the pod that needs it exists"
+
+    # The private half shipped to the pod is the GENERATED key, not
+    # self._cfg.ssh_key_path (the artist's own, real, persistent key).
+    assert "self._cfg.ssh_key_path" not in inner
+    assert '"RPFARM_HOST_SSH_KEY": ssh_key_pem' in inner
+
+    # A failed pod-create de-authorizes the same key it just authorized --
+    # never left trusted with nothing that will ever use it.
+    assert "grep -vF" in inner
+    deauthorize = inner.index("grep -vF")
+    assert authorize < pod_create < deauthorize
+
+
 def test_onsetupcook_checks_divergence_before_uploading_pdg_temp():
     """onSetupCook itself never rents a GPU pod (that is onTick's job, once
     PDG actually has work -- see its own comment on _raised_for_work); the
