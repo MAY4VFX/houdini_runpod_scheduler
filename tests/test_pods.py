@@ -334,6 +334,28 @@ def test_find_orphans_filters_to_running_only():
     assert {p["id"] for p in orphans} == {"gpu1"}
 
 
+def test_find_orphans_excludes_a_running_submit_as_job_host_pod():
+    # Ruling R71, review finding: a running host pod is not a GPU orphan --
+    # it is the thing still driving its own cook, and it already manages
+    # its own lifecycle (self-termination + its own watchdog). Before this,
+    # a live host pod warned about itself as "1 GPU pod still running".
+    api = FakeAPI()
+    api.pods["gpu1"] = {"id": "gpu1", "name": "rpfarm-may-shot010-abcd1234-1", "desiredStatus": "RUNNING"}
+    api.pods["host1"] = {"id": "host1", "name": "rpfarm-may-shot010-abcd1234-host", "desiredStatus": "RUNNING"}
+    orphans = pods.find_orphans(api, "may")
+    assert {p["id"] for p in orphans} == {"gpu1"}
+
+
+def test_host_pod_name_matches_is_host_pod_name():
+    name = pods.host_pod_name("may", "shot010", "abcd1234")
+    assert name == "rpfarm-may-shot010-abcd1234-host"
+    assert pods.is_host_pod_name(name)
+
+
+def test_is_host_pod_name_rejects_a_gpu_slot_name():
+    assert not pods.is_host_pod_name("rpfarm-may-shot010-abcd1234-1")
+
+
 def test_terminate_all_calls_terminate_pod_for_each():
     api = FakeAPI()
     api.pods["a"] = {"id": "a", "name": "rpfarm-may-x-1"}

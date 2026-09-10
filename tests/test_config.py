@@ -199,6 +199,28 @@ def test_session_token_roundtrip_and_permissions(tmp_path, monkeypatch):
     assert tok1 == tok2  # created once, then reused
 
 
+def test_session_token_env_override_skips_the_file_entirely(tmp_path, monkeypatch):
+    # Ruling R71, root cause of the first live Submit As Job failure: the
+    # host pod's $RPFARM_HOME has no token file (it is the shipped,
+    # volume-resident package dir), so without this override
+    # session_token() silently minted a random token instead of the one
+    # already authorizing the running sync pod -- read as "pod not ready"
+    # for the full 300s timeout, not as an auth mismatch.
+    monkeypatch.setenv("RPFARM_HOME", str(tmp_path))
+    monkeypatch.setenv("RPFARM_SESSION_TOKEN", "shared-token-from-the-artists-own-machine")
+    assert config.session_token() == "shared-token-from-the-artists-own-machine"
+    # And it never touched the file -- the whole point is this stays out
+    # of $RPFARM_HOME, which on the host pod is the shared volume.
+    assert not (tmp_path / "token").exists()
+
+
+def test_session_token_ignores_override_when_unset(tmp_path, monkeypatch):
+    monkeypatch.setenv("RPFARM_HOME", str(tmp_path))
+    monkeypatch.delenv("RPFARM_SESSION_TOKEN", raising=False)
+    tok = config.session_token()
+    assert (tmp_path / "token").read_text().strip() == tok
+
+
 # -- rclone_bin: platform -> asset mapping (no network) -----------------------
 
 

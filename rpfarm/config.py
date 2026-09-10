@@ -384,10 +384,37 @@ def api_key_status(config_key: str | None, node_key: str = "") -> str:
 
 # -- session token ----------------------------------------------------------
 
+#: Same shape as ``_LOAD_OVERRIDE_ENV`` above, for the same one caller: the
+#: Submit As Job host pod has no ``$RPFARM_HOME/token`` of its own -- its
+#: ``$RPFARM_HOME`` is the shipped, volume-resident package directory
+#: (Ruling R71), and the token must never be written there (every log file
+#: on the volume is readable by anyone who reaches it -- the same reasoning
+#: that put the SSH key on a throwaway keypair instead). Left unset,
+#: :func:`session_token` behaves exactly as it always has: read-or-create
+#: the file at ``$RPFARM_HOME/token``.
+#:
+#: Root cause (Ruling R71, live-confirmed 2026-09-10): without this
+#: override, the host pod called ``session_token()`` with no file present,
+#: silently minted a brand-new random token, and used THAT to talk to the
+#: sync pod the artist's own machine had already created and authorized
+#: with its OWN token. ``ensure_sync_pod`` correctly found and reused the
+#: running pod -- the "not ready in 300s" was ``/health`` 401ing on every
+#: single poll for the full timeout, not a reuse-vs-create bug. Reproduced
+#: directly against the live pod with a deliberately wrong token before
+#: writing this fix.
+_SESSION_TOKEN_OVERRIDE_ENV = "RPFARM_SESSION_TOKEN"
+
 
 def session_token() -> str:
     """Read (or create) the shared per-user worker token at
-    ``$RPFARM_HOME/token``: 32 hex chars, chmod 600."""
+    ``$RPFARM_HOME/token``: 32 hex chars, chmod 600.
+
+    ``RPFARM_SESSION_TOKEN`` in the environment overrides this outright and
+    skips the file entirely -- see :data:`_SESSION_TOKEN_OVERRIDE_ENV`.
+    """
+    override = os.environ.get(_SESSION_TOKEN_OVERRIDE_ENV)
+    if override:
+        return override
     h = home()
     h.mkdir(parents=True, exist_ok=True)
     path = h / TOKEN_FILENAME

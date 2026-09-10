@@ -186,14 +186,16 @@ def main():
     pkg_dir = os.environ.get("RPFARM_HOST_PKGDIR", "")
     ssh_key_pem = os.environ.get("RPFARM_HOST_SSH_KEY", "")
     ssh_pubkey = os.environ.get("RPFARM_HOST_SSH_PUBKEY", "")
+    session_token = os.environ.get("RPFARM_HOST_SESSION_TOKEN", "")
     hfs = os.environ.get("HFS", "")
     max_minutes = int(os.environ.get("RPFARM_HOST_MAX_MINUTES") or DEFAULT_MAX_MINUTES)
 
     if not (api_key and pod_id and hip_path and top_path and pkg_dir
-           and ssh_key_pem and ssh_pubkey):
+           and ssh_key_pem and ssh_pubkey and session_token):
         log("missing required env (RUNPOD_API_KEY/RUNPOD_POD_ID/RPFARM_HOST_HIP/"
             "RPFARM_HOST_TOPPATH/RPFARM_HOST_PKGDIR/RPFARM_HOST_SSH_KEY/"
-            "RPFARM_HOST_SSH_PUBKEY) -- cannot run, terminating self")
+            "RPFARM_HOST_SSH_PUBKEY/RPFARM_HOST_SESSION_TOKEN) -- cannot run, "
+            "terminating self")
         if pod_id and api_key:
             terminate_pod(pod_id, api_key)
         return 1
@@ -253,6 +255,22 @@ def main():
     os.chmod(pub_path, 0o644)
     env["RPFARM_SSH_KEY_PATH"] = key_path
     env["RPFARM_RCLONE_PATH"] = shutil.which("rclone") or "/usr/bin/rclone"
+
+    # The shared sync-pod session token (rpfarm.config.session_token()).
+    # Root cause of the first live failure (2026-09-10, confirmed by
+    # reproducing the same 401 directly against the live pod): with
+    # nothing here, the nested scheduler's own session_token() call finds
+    # no $RPFARM_HOME/token (RPFARM_HOME is <pkg_dir>, which has no token
+    # file -- shipping the real one there would put an account-wide,
+    # never-expiring credential on a volume every log file on it is
+    # already readable from) and mints a random one instead, which then
+    # /health-401s against the sync pod the artist's own machine already
+    # authorized with ITS token -- indistinguishable from "not ready" at
+    # the call site. Delivered through process env only, exactly like the
+    # SSH key and the RunPod key above, and read by
+    # rpfarm.config._SESSION_TOKEN_OVERRIDE_ENV -- never written to disk
+    # here, let alone anywhere under pkg_dir.
+    env["RPFARM_SESSION_TOKEN"] = session_token
 
     # "hython" bare, not an absolute path: entrypoint.sh already sourced
     # houdini_setup_bash before execing this process, so hython is on

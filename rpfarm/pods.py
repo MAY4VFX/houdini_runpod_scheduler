@@ -57,6 +57,25 @@ def sync_pod_name(user):
     return f"rpfarm-sync-{user}"
 
 
+def host_pod_name(user, project, cook8):
+    """Ruling R71's Submit As Job host pod -- same ``rpfarm-<user>-<project>-
+    <cook8>-`` shape as :func:`pod_name`'s GPU pods, but ``-host`` where a
+    GPU pod carries a numeric slot index, so the two are never ambiguous
+    (a slot index is a digit; a host pod is not)."""
+    return f"rpfarm-{user}-{project}-{cook8}-host"
+
+
+def is_host_pod_name(name):
+    """True for a name built by :func:`host_pod_name`. Used to tell a
+    Submit As Job host pod apart from an orphaned GPU pod (:func:`find_orphans`,
+    Ruling R71) -- a host pod is neither the sync pod nor something any
+    existing cleanup path is entitled to kill on the same terms as a GPU
+    pod: it is the thing driving its OWN cook, expected to run for as long
+    as that cook does, and it already terminates itself (normally or via
+    its own watchdog) without help from this account's other machinery."""
+    return name.endswith("-host")
+
+
 def pod_env(cfg, role, token, slots, pubkey, extra=None, cook="", project=""):
     """Environment a pod is created with.
 
@@ -733,13 +752,23 @@ def stop_mq(client: WorkerClient) -> None:
 
 def find_orphans(api, user):
     """GPU pods for ``user`` that are still running -- excludes the sync
-    pod, whose lifecycle is managed separately by :func:`ensure_sync_pod`."""
+    pod, whose lifecycle is managed separately by :func:`ensure_sync_pod`,
+    and a Submit As Job host pod (Ruling R71), which manages its own
+    lifecycle (self-termination, plus its own watchdog) and is not a GPU
+    pod at all. Without this second exclusion a running host pod showed up
+    as "1 GPU pod still running and still billing" in its own warning to
+    itself -- harmless as a log line today, but the exact predicate a
+    future auto-reap-at-cook-start or standalone watchdog (both still
+    unbuilt, both owner-deferred) would need to NOT terminate a cook that
+    is, correctly, still running."""
     prefix = f"rpfarm-{user}-"
     sync_name = sync_pod_name(user)
     return [
         p
         for p in api.list_pods(prefix)
-        if p.get("name") != sync_name and p.get("desiredStatus") == "RUNNING"
+        if p.get("name") != sync_name
+        and not is_host_pod_name(p.get("name") or "")
+        and p.get("desiredStatus") == "RUNNING"
     ]
 
 

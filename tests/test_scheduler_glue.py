@@ -1773,6 +1773,27 @@ def test_submit_as_job_key_is_time_bounded_even_if_nothing_ever_removes_it():
     assert '"RPFARM_HOST_MAX_MINUTES": str(_SUBMIT_AS_JOB_MAX_MINUTES)' in inner
 
 
+def test_submit_as_job_ships_the_shared_session_token_via_process_env():
+    """Root cause of the sixth live run's failure (Ruling R71, confirmed
+    2026-09-10 by reproducing the same 401 directly against the running
+    sync pod): ensure_sync_pod correctly found and reused the existing
+    RUNNING sync pod -- the failure was wait_ready's /health check 401ing
+    for the full 300s, because the host pod's own session_token() call
+    had no $RPFARM_HOME/token to read and minted a random one instead of
+    the token that pod's worker.py was actually started with. self._token
+    (Ruling R70's shared, sync-pod-only token) must travel to the host
+    pod through the SAME process-env-only channel as the RunPod key and
+    the throwaway SSH key -- never a second copy on the shared volume,
+    which config.toml already avoids for api_key/ssh_key_path/rclone_path."""
+    src = MODULE.read_text()
+    inner = src[src.index("def _submitAsJobInner(self, node_name):"):]
+    inner = inner[:inner.index("\n    def ", 1)]
+    assert '"RPFARM_HOST_SESSION_TOKEN": self._token' in inner
+    # Not the per-cook GPU token -- that one is scoped to GPU pods only
+    # (Ruling R70) and is not what authorizes talking to the sync pod.
+    assert '"RPFARM_HOST_SESSION_TOKEN": self._cook_token' not in inner
+
+
 def test_onsetupcook_checks_divergence_before_uploading_pdg_temp():
     """onSetupCook itself never rents a GPU pod (that is onTick's job, once
     PDG actually has work -- see its own comment on _raised_for_work); the

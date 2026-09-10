@@ -193,6 +193,30 @@ def test_main_terminates_self_when_only_the_pubkey_is_missing(monkeypatch, tmp_p
     monkeypatch.setenv("RPFARM_HOST_PKGDIR", str(tmp_path / "host_pkg"))
     monkeypatch.setenv("RPFARM_HOST_SSH_KEY", "-----BEGIN OPENSSH PRIVATE KEY-----\nx\n-----END OPENSSH PRIVATE KEY-----\n")
     monkeypatch.delenv("RPFARM_HOST_SSH_PUBKEY", raising=False)
+    monkeypatch.setenv("RPFARM_HOST_SESSION_TOKEN", "shared-session-token")
+    terminated = []
+    monkeypatch.setattr(host_cook, "terminate_pod", lambda pod_id, key: terminated.append(pod_id))
+
+    rc = host_cook.main()
+
+    assert rc == 1
+    assert terminated == ["pod1"]
+
+
+def test_main_terminates_self_when_only_the_session_token_is_missing(monkeypatch, tmp_path):
+    """Root cause of the first live failure (Ruling R71, confirmed
+    2026-09-10 by reproducing the same 401 directly against the running
+    sync pod): without this, session_token() mints a random token instead
+    of the one already authorizing the sync pod, and ensure_sync_pod's
+    wait_ready reads that as "pod not ready" for the full 300s timeout."""
+    monkeypatch.setenv("RUNPOD_API_KEY", "key")
+    monkeypatch.setenv("RUNPOD_POD_ID", "pod1")
+    monkeypatch.setenv("RPFARM_HOST_HIP", str(tmp_path / "scene.hip"))
+    monkeypatch.setenv("RPFARM_HOST_TOPPATH", "/obj/topnet1")
+    monkeypatch.setenv("RPFARM_HOST_PKGDIR", str(tmp_path / "host_pkg"))
+    monkeypatch.setenv("RPFARM_HOST_SSH_KEY", "-----BEGIN OPENSSH PRIVATE KEY-----\nx\n-----END OPENSSH PRIVATE KEY-----\n")
+    monkeypatch.setenv("RPFARM_HOST_SSH_PUBKEY", "ssh-ed25519 AAAAfakepubkeydata rpfarm-host-test")
+    monkeypatch.delenv("RPFARM_HOST_SESSION_TOKEN", raising=False)
     terminated = []
     monkeypatch.setattr(host_cook, "terminate_pod", lambda pod_id, key: terminated.append(pod_id))
 
@@ -212,6 +236,7 @@ def test_main_terminates_self_and_sweeps_when_topcook_is_not_found(monkeypatch, 
     monkeypatch.setenv("RPFARM_HOST_PKGDIR", str(tmp_path / "host_pkg"))
     monkeypatch.setenv("RPFARM_HOST_SSH_KEY", "-----BEGIN OPENSSH PRIVATE KEY-----\nfakekeydata\n-----END OPENSSH PRIVATE KEY-----\n")
     monkeypatch.setenv("RPFARM_HOST_SSH_PUBKEY", "ssh-ed25519 AAAAfakepubkeydata rpfarm-host-test")
+    monkeypatch.setenv("RPFARM_HOST_SESSION_TOKEN", "shared-session-token")
     monkeypatch.setenv("HFS", str(tmp_path / "nohfs"))  # no topcook.py under here
     terminated = []
     monkeypatch.setattr(host_cook, "terminate_pod", lambda pod_id, key: terminated.append(pod_id))
@@ -232,6 +257,7 @@ def test_main_runs_topcook_and_terminates_self_on_success(monkeypatch, tmp_path)
     monkeypatch.setenv("RPFARM_HOST_PKGDIR", str(tmp_path / "host_pkg"))
     monkeypatch.setenv("RPFARM_HOST_SSH_KEY", "-----BEGIN OPENSSH PRIVATE KEY-----\nfakekeydata\n-----END OPENSSH PRIVATE KEY-----\n")
     monkeypatch.setenv("RPFARM_HOST_SSH_PUBKEY", "ssh-ed25519 AAAAfakepubkeydata rpfarm-host-test")
+    monkeypatch.setenv("RPFARM_HOST_SESSION_TOKEN", "shared-session-token")
     monkeypatch.setenv("HFS", str(tmp_path / "hfs"))
     libs = tmp_path / "hfs" / "houdini" / "python3.13libs" / "pdgjob"
     libs.mkdir(parents=True)
@@ -269,6 +295,11 @@ def test_main_runs_topcook_and_terminates_self_on_success(monkeypatch, tmp_path)
     # failure ("Failed to start scheduler"), not the ssh key.
     assert env["RPFARM_HOME"] == str(tmp_path / "host_pkg")
     assert env["HOUDINI_OTLSCAN_PATH"].startswith(str(tmp_path / "host_pkg" / "hda"))
+    # The shared sync-pod session token (Ruling R71, root cause of the
+    # first live failure) -- delivered through process env only, read by
+    # rpfarm.config._SESSION_TOKEN_OVERRIDE_ENV, never written to a file
+    # under pkg_dir (the shared volume).
+    assert env["RPFARM_SESSION_TOKEN"] == "shared-session-token"
     # The key itself was written to a LOCAL container path, never under
     # /workspace (the shared volume) -- and readable only by this pod.
     import stat
@@ -297,6 +328,7 @@ def test_main_terminates_self_even_when_the_cook_times_out(monkeypatch, tmp_path
     monkeypatch.setenv("RPFARM_HOST_PKGDIR", str(tmp_path / "host_pkg"))
     monkeypatch.setenv("RPFARM_HOST_SSH_KEY", "-----BEGIN OPENSSH PRIVATE KEY-----\nfakekeydata\n-----END OPENSSH PRIVATE KEY-----\n")
     monkeypatch.setenv("RPFARM_HOST_SSH_PUBKEY", "ssh-ed25519 AAAAfakepubkeydata rpfarm-host-test")
+    monkeypatch.setenv("RPFARM_HOST_SESSION_TOKEN", "shared-session-token")
     monkeypatch.setenv("RPFARM_HOST_MAX_MINUTES", "1")
     monkeypatch.setenv("HFS", str(tmp_path / "hfs"))
     libs = tmp_path / "hfs" / "houdini" / "python3.13libs" / "pdgjob"
@@ -327,6 +359,7 @@ def test_main_terminates_self_even_on_an_unexpected_exception(monkeypatch, tmp_p
     monkeypatch.setenv("RPFARM_HOST_PKGDIR", str(tmp_path / "host_pkg"))
     monkeypatch.setenv("RPFARM_HOST_SSH_KEY", "-----BEGIN OPENSSH PRIVATE KEY-----\nfakekeydata\n-----END OPENSSH PRIVATE KEY-----\n")
     monkeypatch.setenv("RPFARM_HOST_SSH_PUBKEY", "ssh-ed25519 AAAAfakepubkeydata rpfarm-host-test")
+    monkeypatch.setenv("RPFARM_HOST_SESSION_TOKEN", "shared-session-token")
     monkeypatch.setenv("HFS", str(tmp_path / "hfs"))
     libs = tmp_path / "hfs" / "houdini" / "python3.13libs" / "pdgjob"
     libs.mkdir(parents=True)

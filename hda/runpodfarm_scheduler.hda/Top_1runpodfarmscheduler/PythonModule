@@ -212,7 +212,7 @@ _ASSET_FINGERPRINT = {
     'background_cook.py': (5780, 'e3b1839f4958d88a'),
     'cli.py': (71248, '1b7ef63474487e6d'),
     'compression.py': (23234, 'bef2f19daebbc929'),
-    'config.py': (18411, '13b98663b9fcf255'),
+    'config.py': (19880, '2fc22cfe0a7466eb'),
     'deps.py': (38558, '2daae12f5770289a'),
     'dispatch.py': (22191, '1121a6505c88adb3'),
     'gpus.py': (8311, '7a28d5c2692b776e'),
@@ -220,7 +220,7 @@ _ASSET_FINGERPRINT = {
     'ledger.py': (17327, '70425e75fb216f01'),
     'package_runner.py': (8752, '96770e3879a6cb65'),
     'packages.py': (61657, '030b2d03028b9c47'),
-    'pods.py': (32144, '6f2434aa6ba2a02f'),
+    'pods.py': (33700, '0bc5854d8230e568'),
     'preflight.py': (43096, '2c918d033e5ef268'),
     'runpod_api.py': (14539, 'b90960f9860c97fb'),
     'scene_setup.py': (18467, '8838d55cbb131f99'),
@@ -4085,13 +4085,27 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
                     "RUNPOD_API_KEY": self._cfg.api_key,
                     "RPFARM_HOST_SSH_KEY": ssh_key_pem,
                     "RPFARM_HOST_SSH_PUBKEY": host_pubkey,
+                    # The shared sync-pod session token (Ruling R70's
+                    # self._token, distinct from the per-cook GPU token).
+                    # Root cause of the first live failure: with nothing
+                    # here, the host pod's own session_token() call found
+                    # no $RPFARM_HOME/token (RPFARM_HOME is the shipped,
+                    # volume-resident package dir -- there is no file to
+                    # find) and silently minted a random one instead, which
+                    # /health then 401'd on every poll against the sync pod
+                    # the artist's own machine had already authorized with
+                    # ITS token -- read as "not ready", not as "wrong key".
+                    # Delivered via process env only, same as the RunPod
+                    # key and the SSH key -- never written to the shared
+                    # volume (rpfarm.config._SESSION_TOKEN_OVERRIDE_ENV).
+                    "RPFARM_HOST_SESSION_TOKEN": self._token,
                     "RPFARM_HOST_HIP": hip_remote,
                     "RPFARM_HOST_TOPPATH": node_name,
                     "RPFARM_HOST_PKGDIR": remote_pkg_dir,
                     "RPFARM_HOST_MAX_MINUTES": str(_SUBMIT_AS_JOB_MAX_MINUTES),
                 },
             )
-            name = "rpfarm-{}-{}-{}-host".format(self._cfg.user, self._project, self._cook_id)
+            name = rppods.host_pod_name(self._cfg.user, self._project, self._cook_id)
             try:
                 pod = self._api.create_cpu_pod(
                     name, self._templateId(), self._volumeId(), env, rppods.PORTS,
