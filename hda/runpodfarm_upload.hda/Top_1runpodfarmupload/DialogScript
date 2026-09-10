@@ -37,11 +37,36 @@
         }
     }
     parm {
+        name    "rpfarm_context"
+        label   "Farm Context"
+        type    string
+        default { [ "hou.phm().effectiveContext()" python ] }
+        disablewhen "{ rpfarm_inprocess >= 0 }"
+    }
+    parm {
+        name    "rpfarm_projectoverride"
+        label   "Override Project"
+        type    toggle
+        default { "0" }
+    }
+    parm {
         name    "rpfarm_project"
         label   "Project"
         type    string
         default { [ "hou.phm().project_default()" python ] }
         help    "Project folder on the network volume: /workspace/projects/<user>/<project>. Shows the name of the $JOB directory until you type your own."
+        hidewhen "{ rpfarm_projectoverride == 0 }"
+    }
+    parm {
+        name    "rpfarm_grouping"
+        label   "Work Items"
+        type    string
+        default { "packages" }
+        help    "Packages reduce process and connection overhead. One per file shows each file as a PDG item. Review Files shows the exact plan before upload."
+        menu {
+            "packages"  "Packages by size"
+            "files"     "One per file"
+        }
     }
     parm {
         name    "rpfarm_packagegb"
@@ -49,6 +74,7 @@
         type    float
         default { "1.5" }
         help    "Files are grouped into work items no larger than this (a single bigger file still gets its own item)."
+        disablewhen "{ rpfarm_grouping == files }"
         range   { 0.1 16 }
     }
     parm {
@@ -56,7 +82,7 @@
         label   "Compression"
         type    string
         default { "auto" }
-        help    "auto compresses by default (Ruling R23: no live uplink measurement exists yet -- `rpfarm doctor` will supply one in Task 13, at which point auto starts actually comparing it against 200 Mbps instead of always compressing)."
+        help    "Auto uses the measured uplink when available. Identical farm files are skipped before compression."
         menu {
             "auto"  "Auto"
             "on"    "On"
@@ -97,7 +123,7 @@
     }
     parm {
         name    "rpfarm_preview"
-        label   "Preview Upload..."
+        label   "Review Local / Farm Files..."
         type    button
         default { "0" }
         help    "Open that window now, without cooking. This is how you set the selection for a batch cook that will never open it."
@@ -109,6 +135,7 @@
         name    "rpfarm_clearexclude"
         label   "Re-check Everything"
         type    button
+        invisible
         default { "0" }
         help    "Forget every reference unchecked in the window."
         hidewhen "{ rpfarm_mode != deps }"

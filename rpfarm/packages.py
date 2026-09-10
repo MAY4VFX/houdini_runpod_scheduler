@@ -171,7 +171,7 @@ def _group_by_pathmap(entries, path_map):
     return [(local, path_map[local], es) for local, es in buckets.items() if es]
 
 
-def build_upload_items(mode, job_dir, user, project, custom, refs, package_gb):
+def build_upload_items(mode, job_dir, user, project, custom, refs, package_gb, grouping='packages'):
     """Plan the work items for one ``runpodfarm_upload`` cook.
 
     ``mode`` is ``"deps"`` (uses ``refs`` via
@@ -183,7 +183,17 @@ def build_upload_items(mode, job_dir, user, project, custom, refs, package_gb):
     ``onGenerate``) decides which item(s), if any, carry a post-command per
     Ruling R3 (run once, after all packages).
     """
+    if grouping not in ('packages', 'files'):
+        raise ValueError('unknown upload grouping: {}'.format(grouping))
     max_bytes = max(1, int(package_gb * 2**30))
+
+    def finish(groups):
+        items = _items_from_groups(groups, max_bytes)
+        if grouping == 'files':
+            items = [dict(item, files=[file], bytes=file[2]) for item in items for file in item['files']]
+        for i, item in enumerate(items):
+            item['index'] = i
+        return items
 
     if mode == "custom":
         groups = []
@@ -197,13 +207,13 @@ def build_upload_items(mode, job_dir, user, project, custom, refs, package_gb):
             # directory pair, local IS already the walk root, so it stays.
             local_root = os.path.dirname(local) if os.path.isfile(local) else local
             groups.append((local_root, remote_dir, entries))
-        return _items_from_groups(groups, max_bytes)
+        return finish(groups)
 
     if mode == "deps":
         remote_project = f"/workspace/projects/{user}/{project}"
         entries, path_map = resolve_entries(refs, job_dir, remote_project)
         groups = _group_by_pathmap(entries, path_map)
-        return _items_from_groups(groups, max_bytes)
+        return finish(groups)
 
     raise ValueError(f"unknown upload mode: {mode!r}")
 
@@ -256,7 +266,7 @@ def group_download_pairs(pairs, sizes=None):
     """
     sizes = sizes or {}
     groups = {}
-    for remote, local in pairs:
+    for remote, local in dict.fromkeys(pairs):
         key = (os.path.dirname(local), posixpath.dirname(remote))
         groups.setdefault(key, []).append(FileEntry(local=local, remote=remote, size=sizes.get(remote, 0)))
     return [(local_root, remote_root, entries) for (local_root, remote_root), entries in groups.items()]
@@ -691,6 +701,9 @@ class _SyncTouchHeartbeat:
             touch_sync_pod(self._sync_client, log=self._warn_once)
         except Exception as e:  # noqa: BLE001 - see the class docstring
             self._warn_once("sync pod idle-stamp heartbeat failed: {}".format(e))
+
+    def __getattr__(self, name):
+        return getattr(self._progress_cb, name)
 
 
 # Spec 4.1: "Ресайз вверх автоматический: при заполнении > 85% перед
@@ -1196,6 +1209,8 @@ def run_upload_item(item, cfg, sftp, sync_client, compress, progress_cb=None):
     Returns ``{"files", "bytes", "seconds"}`` summed across every transfer
     this call made.
     """
+    from .progress import notify
+    notify(progress_cb, 'phase', 'Comparing with farm')
     entries = [FileEntry(local=local, remote=remote, size=size) for local, remote, size in item["files"]]
     local_root = item["local_root"]
     remote_root = item["remote_root"]
@@ -1238,12 +1253,16 @@ def run_upload_item(item, cfg, sftp, sync_client, compress, progress_cb=None):
             _stderr_log("{} of {} file(s) already on the farm and unchanged -- "
                         "not sent".format(skipped, before))
     if not entries and not (item.get("post_command") or ""):
+        notify(progress_cb, 'plan', 0, 0, skipped=before)
         touch_sync_pod(sync_client)
         return {"files": 0, "bytes": 0, "seconds": 0.0}
 
     if compress:
+        notify(progress_cb, 'phase', 'Compressing')
         with tempfile.TemporaryDirectory() as staging_dir:
             raw_package, staged_package, decompress_command = compress_stage(entries, staging_dir, remote_root)
+            notify(progress_cb, 'plan', sum(e.size for e in raw_package + staged_package),
+                   len(entries), skipped=before - len(entries))
             if raw_package:
                 _accumulate(
                     rclone_copy(raw_package, sftp, "up", cfg.rclone_path, local_root, remote_root, progress_cb=progress_cb)
@@ -1255,16 +1274,20 @@ def run_upload_item(item, cfg, sftp, sync_client, compress, progress_cb=None):
                     )
                 )
     else:
+        notify(progress_cb, 'plan', sum(e.size for e in entries), len(entries),
+               skipped=before - len(entries))
         if entries:
             _accumulate(rclone_copy(entries, sftp, "up", cfg.rclone_path, local_root, remote_root, progress_cb=progress_cb))
 
     timeout_s = _scaled_timeout(item.get("bytes"))
 
     if decompress_command:
+        notify(progress_cb, 'phase', 'Unpacking on farm')
         _exec_checked(sync_client, decompress_command, timeout_s)
 
     post_command = item.get("post_command") or ""
     if post_command:
+        notify(progress_cb, 'phase', 'Running post-command')
         _exec_checked(sync_client, post_command, timeout_s)
 
     touch_sync_pod(sync_client)
@@ -1285,7 +1308,16 @@ _OVERWRITE_EXTRA_ARGS = {
 }
 
 
-def run_download_item(item, cfg, sftp, sync_client, overwrite, progress_cb=None):
+def run_download_item(item, cfg, sftp, sync_client, overwrite, progress_cb=None, cancel=None):
+    from . import delivery
+    def perform(pending):
+        return _transfer_download_item(pending, cfg, sftp, sync_client, overwrite, progress_cb, cancel)
+    if not item.get('delivery_key'):
+        return perform(item)  # compatibility with work items generated by old HDAs
+    return delivery.transfer(item, cfg, perform, cancel=cancel or (lambda: False))
+
+
+def _transfer_download_item(item, cfg, sftp, sync_client, overwrite, progress_cb=None, cancel=None):
     """Transfer one work item's package down from the farm.
 
     Mirrors :func:`run_upload_item` for ``direction="down"``, with two
@@ -1304,9 +1336,12 @@ def run_download_item(item, cfg, sftp, sync_client, overwrite, progress_cb=None)
     if overwrite not in _OVERWRITE_EXTRA_ARGS:
         raise ValueError(f"unknown overwrite mode: {overwrite!r}")
 
+    from .progress import notify
     entries = [FileEntry(local=local, remote=remote, size=size) for local, remote, size in item["files"]]
+    notify(progress_cb, 'plan', sum(e.size for e in entries), len(entries))
     local_root = item["local_root"]
     remote_root = item["remote_root"]
+    comparison = remote_index(sftp, cfg.rclone_path, remote_root) if item.get('delivery_key') else None
 
     touch_sync_pod(sync_client)
     progress_cb = _SyncTouchHeartbeat(sync_client, progress_cb)
@@ -1322,6 +1357,7 @@ def run_download_item(item, cfg, sftp, sync_client, overwrite, progress_cb=None)
             remote_root,
             progress_cb=progress_cb,
             extra_args=_OVERWRITE_EXTRA_ARGS[overwrite],
+            **({'cancel': cancel} if cancel is not None else {}),
         )
     else:
         stats = SyncStats(files=0, bytes=0, seconds=0.0)
@@ -1329,4 +1365,11 @@ def run_download_item(item, cfg, sftp, sync_client, overwrite, progress_cb=None)
     touch_sync_pod(sync_client)
     _touch_project_index(sync_client, remote_root, "download")
 
-    return {"files": stats.files, "bytes": stats.bytes, "seconds": stats.seconds}
+    result = {"files": stats.files, "bytes": stats.bytes, "seconds": stats.seconds}
+    if comparison is not None:
+        result['verified'] = {}
+        for entry in entries:
+            if already_on_farm(entry, comparison, local_root, remote_root):
+                st = os.stat(entry.local)
+                result['verified'][entry.local] = {'size': st.st_size, 'mtime_ns': st.st_mtime_ns}
+    return result

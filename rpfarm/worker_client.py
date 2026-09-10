@@ -94,7 +94,14 @@ class WorkerClient:
     # -- calls -------------------------------------------------------------
 
     def health(self) -> dict | None:
-        return self._json("GET", "/health")
+        status, raw = self._call('GET', '/health')
+        self.last_health_status = status
+        if status != 200 or not raw:
+            return None
+        try:
+            return json.loads(raw)
+        except (ValueError, TypeError):
+            return None
 
     def submit(self, task_id, command, env, cwd=None, log_path=None) -> str:
         """Submit a task. Returns ``"accepted"``, ``"busy"``, or

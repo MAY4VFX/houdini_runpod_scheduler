@@ -132,7 +132,7 @@ PICTURE = "$HIP/{}/rpfarm_demo.$F4.exr".format(RENDER_SUBDIR)
 
 TOPNET = "/obj/topnet1"
 # The downstream-most node of the chain, and so the one Submit cooks.
-COOK_TARGET = TOPNET + "/render"
+COOK_TARGET = TOPNET + "/download"
 SCHEDULER = TOPNET + "/rpfarm"
 
 # Filled into the cost sticky note; kept here so one edit updates the scene.
@@ -355,7 +355,7 @@ def build_topnet(karma):
     sched.parm("rpfarm_slots").set(TASKS_PER_POD)
     sched.parm("rpfarm_idletimeout").set(120)
     sched.parm("rpfarm_maxcost").set(BUDGET)
-    sched.parm("rpfarm_downloadoutputs").set(1)
+    sched.parm("rpfarm_downloadoutputs").set(0)
     sched.parm("rpfarm_verbose").set(1)
     topnet.parm("topscheduler").set(sched.path())
 
@@ -391,7 +391,9 @@ def build_topnet(karma):
     # eight more download items re-transfer them at the end. That node is for
     # pulling folders nothing reported as an output; duplicating the scheduler
     # is not its job. The node itself now warns when both are on.
-    render.setDisplayFlag(True)
+    download = topnet.createNode("runpodfarmdownload", "download")
+    download.setInput(0, render)
+    download.setDisplayFlag(True)
 
     stats = topnet.createNode("runpodfarmstats", "stats")
     stats.parm("rpfarm_project").set(PROJECT)
@@ -402,7 +404,7 @@ def build_topnet(karma):
 
     upload.matchCurrentDefinition()
 
-    topnet.layoutChildren([upload, gate, render])
+    topnet.layoutChildren([upload, gate, render, download])
     _place_side_nodes(topnet, submit, stats)
     _add_sticky_notes(topnet, submit, stats)
     return topnet
@@ -856,7 +858,7 @@ def _verify(dest, dest_dir):
     sched = hou.node(SCHEDULER)
     for name, want in (("rpfarm_minpods", MIN_PODS), ("rpfarm_maxpods", MAX_PODS),
                        ("rpfarm_slots", TASKS_PER_POD),
-                       ("rpfarm_maxcost", BUDGET), ("rpfarm_downloadoutputs", 1)):
+                       ("rpfarm_maxcost", BUDGET), ("rpfarm_downloadoutputs", 0)):
         check(abs(float(sched.parm(name).eval()) - want) < 1e-6,
               "rpfarm/{} = {!r}, expected {!r}".format(name, sched.parm(name).eval(), want))
     check(hou.node(TOPNET).parm("topscheduler").eval() == SCHEDULER,
@@ -864,11 +866,11 @@ def _verify(dest, dest_dir):
 
     target = hou.node(COOK_TARGET)
     check(target.isDisplayFlagSet(), "the cooked node does not carry the display flag")
-    check(target.inputs() and target.inputs()[0].name() == "gate",
-          "render is not wired to the waitforall gate")
+    check(target.inputs() and target.inputs()[0].name() == "render",
+          "download is not wired to render")
     # Both download paths on at once fetches every frame twice -- the artist
     # saw it happen. The scheduler's greedy download is the one kept.
-    check(hou.node("/obj/topnet1/download") is None,
+    check(hou.node("/obj/topnet1/download") is not None,
           "a runpodfarm_download node is back in the chain while the scheduler "
           "is also downloading outputs: every frame would be fetched twice")
 

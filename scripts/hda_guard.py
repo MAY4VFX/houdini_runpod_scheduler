@@ -149,14 +149,21 @@ def _stale_module_message(minimum, loaded, on_disk, root, changed=(), baked=True
         )
     shown = ", ".join(changed[:4])
     more = " и ещё {}".format(len(changed) - 4) if len(changed) > 4 else ""
+    package = __import__('sys').modules.get('rpfarm')
+    loaded_fingerprint = getattr(package, 'FINGERPRINT', None)
+    disk_fingerprint = _ondisk_fingerprint(pathlib.Path(root) / 'rpfarm')
+    if loaded_fingerprint and disk_fingerprint and loaded_fingerprint == disk_fingerprint:
+        action = 'Установите согласованную сборку Python и HDA. Перезапуск этой свежей сессии не исправит несовместимую сборку.'
+    else:
+        action = 'ПЕРЕЗАПУСТИТЕ HOUDINI, чтобы загрузить установленный пакет заново.'
     return (
         "Нода собрана против другого кода фермы, чем сейчас в памяти Houdini.\\n"
         "\\n"
-        "ПЕРЕЗАПУСТИТЕ HOUDINI. Больше ничего делать не нужно.\\n"
+        "{action}\\n"
         "\\n"
         "Разошлись: {shown}{more}.\\n"
         "В памяти rpfarm {seen}, нода собрана против {disk}.".format(
-            shown=shown, more=more, seen=loaded or "неизвестной версии",
+            action=action, shown=shown, more=more, seen=loaded or "неизвестной версии",
             disk=on_disk or "неизвестной версии")
     )
 """

@@ -230,44 +230,62 @@ def _stale_module_message(minimum, loaded, on_disk, root, changed=(), baked=True
         )
     shown = ", ".join(changed[:4])
     more = " и ещё {}".format(len(changed) - 4) if len(changed) > 4 else ""
+    package = __import__('sys').modules.get('rpfarm')
+    loaded_fingerprint = getattr(package, 'FINGERPRINT', None)
+    disk_fingerprint = _ondisk_fingerprint(pathlib.Path(root) / 'rpfarm')
+    if loaded_fingerprint and disk_fingerprint and loaded_fingerprint == disk_fingerprint:
+        action = 'Установите согласованную сборку Python и HDA. Перезапуск этой свежей сессии не исправит несовместимую сборку.'
+    else:
+        action = 'ПЕРЕЗАПУСТИТЕ HOUDINI, чтобы загрузить установленный пакет заново.'
     return (
         "Нода собрана против другого кода фермы, чем сейчас в памяти Houdini.\\n"
         "\\n"
-        "ПЕРЕЗАПУСТИТЕ HOUDINI. Больше ничего делать не нужно.\\n"
+        "{action}\\n"
         "\\n"
         "Разошлись: {shown}{more}.\\n"
         "В памяти rpfarm {seen}, нода собрана против {disk}.".format(
-            shown=shown, more=more, seen=loaded or "неизвестной версии",
+            action=action, shown=shown, more=more, seen=loaded or "неизвестной версии",
             disk=on_disk or "неизвестной версии")
     )
 
 # BEGIN baked by scripts/bake_asset_fingerprint.py -- do not edit
-_ASSET_BUILT_AGAINST_VERSION = '2.3.0'
+_ASSET_BUILT_AGAINST_VERSION = '2.4.0'
 _ASSET_FINGERPRINT = {
-    '__init__.py': (2490, 'c1250306daf5961f'),
+    '__init__.py': (2490, '84b00617a24de235'),
     '__main__.py': (52, '13a1a5b340cdcfc1'),
-    'background_cook.py': (5780, 'e3b1839f4958d88a'),
-    'cli.py': (71248, '1b7ef63474487e6d'),
+    'background_cook.py': (8292, '0e7f039578c949dd'),
+    'cli.py': (72171, '9a2152a00e573a1c'),
     'compression.py': (23234, 'bef2f19daebbc929'),
-    'config.py': (19880, '2fc22cfe0a7466eb'),
+    'config.py': (20080, '1dfcc2a15551dbe2'),
+    'context.py': (4466, '2fa09a0d45931725'),
+    'delivery.py': (3964, '63bb04491f97a3f3'),
     'deps.py': (38558, '2daae12f5770289a'),
     'dispatch.py': (22191, '1121a6505c88adb3'),
+    'file_review.py': (16246, 'd81726007b4ba4dd'),
     'gpus.py': (8311, '7a28d5c2692b776e'),
-    'houdini_local.py': (47763, '95636adab2dc7a22'),
+    'host_render.py': (10983, 'a0139507d9f7fe7f'),
+    'houdini_local.py': (48596, '7902f068c70d702b'),
+    'jobs.py': (8732, '88bd5f01eed7897c'),
     'ledger.py': (17327, '70425e75fb216f01'),
-    'package_runner.py': (8752, '96770e3879a6cb65'),
-    'packages.py': (61657, '030b2d03028b9c47'),
-    'pods.py': (33700, '0bc5854d8230e568'),
-    'preflight.py': (43096, '2c918d033e5ef268'),
+    'monitoring.py': (6320, '941db2f923c756ae'),
+    'mq.py': (2124, '174afbd9f49ad86f'),
+    'package_runner.py': (9652, '939de3e067b005db'),
+    'packages.py': (63842, '42a0a9d34bdf67a8'),
+    'pods.py': (35551, '3b64efff30fb33d7'),
+    'preflight.py': (45206, 'bea8fc057bc7e32a'),
+    'progress.py': (3439, 'c364a012f5cd92e6'),
+    'releases.py': (4735, 'c6b364ccfb3534b3'),
     'runpod_api.py': (14539, 'b90960f9860c97fb'),
-    'scene_setup.py': (18467, '8838d55cbb131f99'),
+    'scene_setup.py': (18803, 'c8031966f92b71f3'),
     'smoke.py': (42548, 'ce0c8d36fe763314'),
-    'sync.py': (20016, '96b1ccb1a9c2846e'),
+    'status.py': (458, '2205873427086b87'),
+    'submission.py': (1621, '6b428346b41fab92'),
+    'sync.py': (20962, '6ae2a7b7e1e25f58'),
     'tls.py': (3642, 'f3e50ea6ebd0308f'),
     'tools.py': (4290, 'c5d3b026f125578f'),
     'usddeps.py': (9631, '3c7192d3bd94d07f'),
     'volume.py': (10038, 'dc11b185a58c9262'),
-    'worker_client.py': (9791, 'cf6b40b1e879c658'),
+    'worker_client.py': (10012, '407feb11016dd01c'),
 }
 # END baked
 
@@ -344,6 +362,15 @@ def _warn(message):
         pass
 
 
+def effectiveContext():
+    try:
+        import hou
+        from rpfarm import context
+        return context.resolve(hou.pwd()).description()
+    except Exception as exc:
+        return str(exc)
+
+
 def previewUpload(kwargs):
     """Show the upload plan without cooking anything.
 
@@ -378,16 +405,23 @@ def previewUpload(kwargs):
     job_dir = hou.getenv("JOB") or hou.expandString("$HIP")
     project = node.evalParm("rpfarm_project") or os.path.basename(os.path.normpath(job_dir))
     try:
-        cfg = rpcfg.load()
+        from rpfarm import context as rpcontext
+        farm_context = rpcontext.resolve(node, job_dir)
+        cfg, project = farm_context.cfg, farm_context.project
         api = RunPodAPI(cfg.api_key)
     except Exception:
         cfg = api = None
     remote_project = "/workspace/projects/{}/{}".format(cfg.user, project) if cfg else None
+    env_refs, env_problems = rpdeps.environment_refs(
+        getenv=lambda name: hou.getenv(name) or os.environ.get(name), log=_say)
+    env_refs = rpdeps.remove_pattern(env_refs, exclude_pattern)
+    for problem in env_problems:
+        _warn(problem)
 
     try:
-        paths = rppf.choose_uploads(node, scan, usd, ask=True, log=_say,
+        paths = rppf.choose_uploads(node, scan, usd, env_refs, ask=True, log=_say,
                                     job_dir=job_dir, remote_project=remote_project,
-                                    cfg=cfg, api=api)
+                                    cfg=cfg, api=api, intent="preview")
     except rppf.UploadCancelled:
         _say("preview closed with Cancel -- nothing changed")
         return
@@ -465,8 +499,12 @@ preset = node.evalParm("rpfarm_preset")
 job_dir = hou.getenv("JOB") or hou.expandString("$HIP")
 project = node.evalParm("rpfarm_project") or os.path.basename(os.path.normpath(job_dir))
 package_gb = node.evalParm("rpfarm_packagegb")
+grouping = node.evalParm("rpfarm_grouping") or "packages"
 
-cfg = rpcfg.load()
+from rpfarm import context as rpcontext
+farm_context = rpcontext.resolve(node, job_dir)
+cfg, project = farm_context.cfg, farm_context.project
+context_path = rpcontext.snapshot(cfg)
 user = cfg.user
 # Same formula build_upload_items itself uses (rpfarm/packages.py) -- kept
 # in sync by a test, not by hoping nobody edits one without the other.
@@ -542,7 +580,11 @@ if mode == "deps":
         # a NodeError is the only way to stop it that PDG reports plainly.
         raise hou.NodeError(str(e))
 
-items = rppkg.build_upload_items(mode, job_dir, user, project, custom, refs, package_gb)
+package_gb = node.evalParm("rpfarm_packagegb")
+grouping = node.evalParm("rpfarm_grouping") or "packages"
+items = rppkg.build_upload_items(mode, job_dir, user, project, custom, refs, package_gb, grouping=grouping)
+_say("Upload plan: {} file(s), {} item(s), {} GB limit per package ({})".format(
+    sum(len(it["files"]) for it in items), len(items), package_gb, grouping))
 
 if mode == "deps":
     # runpodfarm_scheduler's _loadPathMap merges this in -- see
@@ -621,7 +663,7 @@ def _make_command(item_json_path):
 def _write_item_payload(name, it, compress_flag):
     path = os.path.join(items_dir, "{}.json".format(name))
     with open(path, "w") as f:
-        json.dump({"item": it, "compress": compress_flag}, f)
+        json.dump({"item": it, "compress": compress_flag, "context_path": context_path}, f)
     return path
 
 
@@ -632,12 +674,20 @@ def _set_out_of_process(wi, item_json_path):
 
 pkg_items = []
 for it in items:
-    name = "upload_{:03d}".format(it["index"])
+    name = "upload_{:03d}_of_{:03d}".format(it["index"] + 1, len(items))
     wi = item_holder.addWorkItem(name=name, inProcess=in_process)
     wi.setStringAttrib("rpfarm_item", json.dumps(it))
     wi.setStringAttrib("rpfarm_role", "package")
     wi.setIntAttrib("bytes", it["bytes"])
     wi.setIntAttrib("files", len(it["files"]))
+    wi.setIntAttrib("package_index", it["index"] + 1)
+    wi.setIntAttrib("package_count", len(items))
+    wi.setStringAttrib("package_files", "\\n".join(f[0] for f in it["files"]))
+    wi.setStringAttrib("phase", "Waiting")
+    wi.setFloatAttrib("percent", 0.0)
+    wi.setCookPercent(0.0)
+    wi.setIntAttrib("bytes_done", 0)
+    wi.setIntAttrib("bytes_total", it["bytes"])
     wi.setIntAttrib("compress", 1 if compress else 0)
     if not in_process:
         _set_out_of_process(wi, _write_item_payload(name, it, compress))
@@ -718,7 +768,8 @@ from rpfarm import sync as rpsync
 from rpfarm.runpod_api import RunPodAPI, pod_public_endpoint
 from rpfarm.worker_client import WorkerClient
 
-cfg = rpcfg.load()
+from rpfarm import context as rpcontext
+cfg = rpcontext.resolve(self.topNode().parent()).cfg
 api = RunPodAPI(cfg.api_key)
 token = rpcfg.session_token()
 with open(cfg.ssh_key_path + ".pub") as f:
@@ -755,301 +806,39 @@ work_item.setIntAttrib("files", stats["files"])
 '''
 
 HELP_TEXT = '''\
-= RunPodFarm Upload =
-
 #type: node
 #context: top
 #internal: runpodfarmupload
-#icon: TOP/pythonprocessor
+#icon: opdef:/Top/runpodfarmupload?IconSVG
+= RunPodFarm Upload =
+Upload scene dependencies or explicit files to the selected farm context.
 
-"""Package and upload files to the RunPodFarm sync pod, as a normal TOP
-work item generator -- progress is visible per package as it cooks."""
-
-Work item = one package of files. Each package cooks on PDG's *local*
-scheduler (this node overrides `Scheduler` to its own internal
-`localscheduler`, never `runpodfarm_scheduler` -- pointing it at that
-scheduler would recurse: the upload has to finish before the farm cook
-that needs its files can even start). The override is a Python expression
-on the internal Python Processor's `Scheduler` parm re-resolving the
-sibling `localscheduler` node's absolute path at cook time -- a bare
-relative name silently falls back to "network default" instead (verified
-empirically; see the Task 9 report if this ever needs re-deriving). This
-node's `OnCreated` event re-asserts the same expression once more when a
-new instance is made, belt-and-suspenders: a silently wrong scheduler here
-means real recursion in production, not a cosmetic bug.
-
-Packages cook *out of process* by default (Ruling R22 -- must not block
-Houdini's UI, and progress must be visible per package): each work item's
-command is `python3 -m rpfarm.package_runner <item.json>`
-(`rpfarm/package_runner.py`), which PDG's local scheduler runs as a
-genuine separate process, in parallel across its slots. PDG's Python
-Processor only dispatches a work item out of process when it carries a
-shell `.command` this way -- a callback-only item with neither `inProcess`
-nor a command silently no-ops (PDG marks it succeeded in ~0s without ever
-running the callback; this was live-verified, not theoretical, which is
-why this node doesn't use the simpler callback-only path). `package_runner`
-reports `bytes`/`files`/`seconds`/`mbps`/`progress` back onto the live
-work item via `pdgcmd` (the standard mechanism for any out-of-process PDG
-command item), and runs under a plain `python3` -- every `rpfarm` module
-it touches is stdlib-only, so there's no reason to pay `hython`'s startup
-cost per package, and the generating process's own `sys.executable` would
-be wrong here anyway (that process is `hython`). The Cook In Process
-toggle below switches back to the old callback-only path (this node's
-`cooktask`) for debugging -- blocking, one item at a time, but easier to
-step through directly in Houdini's own process.
-
-If this node's optional input is wired to an already-cooked farm item
-(e.g. uploading something a `runpodfarm_scheduler` cook produced), cook
-THIS node in one `cookWorkItems()` call rather than cooking the upstream
-node separately first: a second, separate top-level cook does not treat
-the first call's already-succeeded items as up to date and recooks them
-too -- a second, separately billed GPU pod for work that already ran once
-(live-verified on `runpodfarm_download`; see [Node:top/runpodfarm_download]'s
-Help and `.superpowers/sdd/2026-09-02-rpfarm-v2/task-10-report.md` for the
-full explanation).
-
-The dependency set has two halves and they are found in two different
-ways. Parameter references come from `hou.fileReferences()` -- resolved
-BOTH by evaluating the parameter and by expanding the string, keeping
-whichever exists (an FBX parameter evaluates to
-`airship_v06.fbx#Airship_bindings,convertoff`, an address into the file
-that is not a path on disk; 38 of that scene's references resolve only
-through the string, so following SideFX's "evaluate the parameter" advice
-alone would drop all 38). A `<UDIM>` template is globbed into
-its real tiles rather than reduced to its folder (that reduction is why
-one material's six tiles used to drag all 72 files of `tex_mip` along).
-USD references come from the stage the ROP renders, plus
-`UsdUtils.ComputeAllDependencies` on each layer file.
-
-`hou.fileReferences()` is not blind to USD: what a layer's textures are
-duplicated onto -- `mtlximage` parameters, say -- it reports like any
-other file reference. What it cannot report is what lives only inside a
-layer, and what sits on a parameter SideFX never tagged as a file
-reference: `filepath1` on a `reference::2.0` LOP is
-`stringParmType.Regular`, so the `.usdc` the whole render is built from
-does not appear at all. Measured on `airship_v013.hip`: 78 files / 1.2 GB
-from parameters, 155 files / 2.8 GB with the USD half -- and without that
-half both `.usdc` layers stay on the artist's machine.
+Connect Upload through a Wait for All gate before the compute nodes. One upload item represents a package, or one file when that grouping is selected.
 
 @parameters
-
 Mode:
     #id: rpfarm_mode
-    `Project dependencies` walks `hou.fileReferences()` (via
-    `rpfarm.deps.collect_refs`/`resolve_entries`) -- the hip file itself
-    plus everything it references, expanded and de-duplicated. `Custom
-    paths` uploads exactly the local -> remote pairs below.
-
-Dependencies:
-    #id: rpfarm_scope
-
-    Which references count. `This cook's branch` starts at every ROP Fetch
-    in this TOP network, resolves each `roppath`, and walks upstream from
-    there -- input ancestors, node-reference parameters (a LOP reaching a
-    SOP through `soppath`), and the contents of every node it reaches.
-    `Whole scene` is every file reference in the hip file, which is what
-    this node did unconditionally before 2026-09-05.
-
-    Why branch is the default: on a real scene the difference was 794 files
-    / 9.97 GB against 113 files / 1.32 GB, and everything extra is uplink
-    time paid before a rented GPU starts rendering. When the branch cannot
-    be resolved (nothing in the network fetches a ROP), `collect_refs`
-    falls back to the whole scene and says so in the log -- narrowing never
-    silently ships less than it can prove.
-
-    What NEITHER scope can see: assets a USD layer references from inside
-    itself. Those are resolved by USD at render time and never appear in
-    `hou.fileReferences()`, so they are missing from `Whole scene` too --
-    narrowing does not lose them, it was never able to find them. Add them
-    by hand in `Custom paths` (or upload the folder they live in once).
-
-    Output parameters are dropped in BOTH scopes: `pdg_workingdir`,
-    `outputimage`, `savetodirectory_directory`, cryptomatte side-cars and
-    the rest of `rpfarm.deps._NON_DEPENDENCY_PARMS`. A scheduler's working
-    directory is not a dependency of anything, and it is what turned one
-    parameter into 11.54 GB (ten .hip versions, 467 finished EXRs and a
-    1.47 GB export zip) the day this was found.
-
-Confirm Before Upload:
-    #id: rpfarm_confirm
-
-    Shows what will move, before it moves: ONE window, a TREE of everything
-    that could upload, with a size, a checkbox and a `Found by` column
-    saying why the row is there.
-
-    Folders open all the way down to the individual file; only the top
-    level is open to begin with, so 500 rendered frames are one collapsed
-    row rather than 500. A checkbox on any level: unchecking a folder
-    unchecks everything under it, and a folder holding a mix shows the
-    partially-checked box -- otherwise a collapsed row would hide the fact
-    that something inside was dropped. Weight and file count on a folder
-    are the totals of what is under it, so the line says what saying no to
-    it is worth.
-
-    * `scene` -- a Houdini parameter holds the path.
-    * `USD` -- a stage reads it and no parameter names it.
-    * `output (not a dependency)` -- a parameter holds it, but it says
-      where results GO (`pdg_workingdir`, `outputimage`, ...). Unchecked to
-      start with, shown with its real weight, and yours to overrule: on the
-      field scene that is how one parameter's 11.54 GB became visible
-      instead of invisible.
-
-    Heaviest first within every level -- the row worth arguing with is the
-    first one you see. A file that is not on disk is never a row: it goes
-    to the `Not on disk, skipped` line at the bottom, because an empty row
-    with a dash for a size reads as a bug.
-
-    Why not Houdini's own `File > Pre-Flight Scene` window
-    (`hou.ui.displayFileDependencyDialog`): it is fed entirely by
-    `hou.fileReferences()` and its rows ARE `(hou.Parm, pattern)` pairs.
-    A file a USD layer names from inside itself has no parameter, so it
-    cannot become a row, and none of the call's five arguments adds one.
-    `hou.fileReferences()` is not blind to USD -- it finds exactly what is
-    duplicated onto a parameter Houdini tagged as a file reference (the
-    `mtlximage` textures on the field scene) -- but it misses both what
-    lives only inside a layer AND what sits on an untagged parameter
-    (`filepath1` on a `reference::2.0` LOP is `stringParmType.Regular`, so
-    the .usdc the whole render is built from is simply absent). One window
-    that shows everything beats two that each show half.
-
-    Your answer is remembered on the node (`rpfarm_exclude`, hidden) at the
-    level you gave it: unchecking a folder of 500 frames stores that one
-    folder, not 500 paths. A nearer answer wins, so a single file re-checked
-    inside an unchecked folder stays checked. Cancel stops the cook -- it
-    does not fall through to uploading what was there before.
-
-    Turn it off for batch/headless work. A cook without a UI never shows a
-    window anyway (`hou.isUIAvailable()`); the log then says so. PDG
-    generation does not run on Houdini's main thread, and Qt from another
-    thread is not a raised exception, it is a lost session -- so the window
-    is actually built there instead (`confirm_on_main_thread`, via
-    `hou.ui.postEventCallback`), and this thread waits for it. With no UI
-    at all, the remembered answer is used and every directory that will
-    upload is logged with its full weight. If the window FAILS to open, or
-    the main thread never gets to it, the upload proceeds with that same
-    remembered answer and the reason is logged: a confirmation window must
-    never be the reason a farm submission dies.
-
-Scan USD Layer Files Too:
-    #id: rpfarm_usddeep
-
-    On (default): each USD layer on disk also goes through
-    `UsdUtils.ComputeAllDependencies`, which reads the layer FILE rather
-    than the composed stage -- so it finds what this session never composed
-    (an unloaded payload, an unselected variant, a purpose the viewport
-    filtered out) and expands `<UDIM>` into real files itself.
-
-    Off: only what the live stage reads. Cheaper, and enough when every
-    layer is fully composed here.
-
-    The measured trade: on the field scene the layer scan cost 0.02s and
-    added 71 source textures / 1.6 GB that the render did not read (the
-    materials point at mipped EXRs instead). It is on by default because
-    the opposite mistake -- a texture missing on the farm -- costs a
-    rendered-nothing GPU hour, and because those 71 files are one click
-    away in the USD window. The community reports this call can be slow on
-    very large scenes, so the cook logs how long it took.
-
-Preview Upload...:
+    Project Dependencies collects this branch's scene, USD and environment references. Custom Paths uses the explicit local → remote pairs.
+Farm Context:
+    #id: rpfarm_context
+    Effective user, project, datacenter and volume from the selected scheduler. Override Project is an explicit exception.
+Review Local / Farm Files:
     #id: rpfarm_preview
-
-    Open that window now, without cooking -- and the way to set the
-    selection for a batch cook that will never open it.
-
-Re-check Everything:
-    #id: rpfarm_clearexclude
-
-    Forget every answer given in the window, at every level: everything
-    checked again except output references, which go back to unchecked.
-
-Project:
-    #id: rpfarm_project
-
-    Remote project folder: `/workspace/projects/<user>/<project>`. The field
-    shows the name of the `$JOB` directory -- what this upload will really
-    use -- as a default expression (`hou.phm().project_default()`); type
-    your own and the literal replaces it and wins.
-
-Package Size (GB):
-    #id: rpfarm_packagegb
-
-    Files are grouped into work items no larger than this (a single file
-    bigger than the limit still gets its own item).
-
+    Review both trees and the package plan. Green means identical size and modification time; amber means different; unknown is not absence. Checkboxes select uploads. Highlighted rows select files for confirmed deletion. Local files go to Trash. Confirmed deletions are immediate.
+    Save Selection in a manually opened review does not upload. Continue Upload in the pre-cook window continues that cook.
+Work Items:
+    #id: rpfarm_grouping
+    Packages by size reduces process overhead. One per file exposes each file as a work item. Hover the package list in File Review to inspect its contents.
 Compression:
     #id: rpfarm_compress
-
-    `auto` is meant to compress when a measured uplink is below 200 Mbps
-    and skip it above that -- but no node or CLI measures uplink yet
-    (Ruling R23), so today `auto` unconditionally compresses, the safe
-    choice for an unknown connection. `rpfarm doctor` (Task 13) is where
-    that measurement will come from; once it exists, `auto` starts
-    comparing against it with no change needed here. `on`/`off` force it
-    either way. Compressible files are staged to a temp dir with zstd and
-    decompressed on the sync pod after upload -- see
-    `rpfarm.sync.compress_stage`.
-
-Custom Paths:
-    #id: rpfarm_custom
-
-    Multiparm of local -> remote pairs, used in Custom mode (and filled in
-    automatically by the Install Houdini preset). `local` may be a file or
-    a directory (walked recursively, subdirectories preserved under
-    `remote`).
-
+    Auto uses the measured uplink when available. Files already identical on the farm are skipped before compression.
 Post-command:
     #id: rpfarm_postcmd
-
-    Shell command run on the sync pod once, after every package in this
-    cook has uploaded -- not once per package. Implemented as one extra
-    "upload_post" work item that PDG's `onAddInternalDependencies` callback
-    makes depend on every package item (the first working option that
-    doesn't need a second scheduler pass: package items are added first in
-    `onGenerate`, then the post item's dependency on all of them is wired
-    once every item exists). Ignored when empty. A non-zero exit fails the
-    work item (`rpfarm.packages.run_upload_item` checks this command's
-    exit code, same as the decompress step -- neither is allowed to fail
-    silently), with a timeout scaled from the item's own byte size (a
-    600s floor, since this item never carries files of its own).
-
-Preset:
-    #id: rpfarm_preset
-
-    `Install Houdini from tarball` computes Custom Paths and Post-command
-    from the two fields below via `rpfarm.packages.houdini_install_preset`
-    at generate time (the visible Custom Paths / Post-command parms are
-    left alone, not overwritten, in case a mistaken preset pick needs to
-    be undone without losing hand-entered values).
-
-Houdini Tarball:
-    #id: rpfarm_houtar
-
-    Local path to `houdini-<version>-linux_x86_64_gcc14.2.tar.gz`. Uploads
-    to `/workspace/apps/dist/`; the post-command extracts it and runs the
-    silent Linux installer into `/workspace/houdini/<version>`.
-
-Houdini Version:
-    #id: rpfarm_houver
-
-    Shows `houdini_version` from `~/.rpfarm/config.toml` -- the version the
-    farm pods run -- as a default expression (`hou.phm().cfg_default`), so
-    the field says what will be installed instead of sitting empty. Type
-    your own to install a different one. Empty means there is no config
-    yet: run `rpfarm setup`.
-
-Cook In Process (debug):
-    #id: rpfarm_inprocess
-
-    Off (default): packages upload out of process, in parallel, without
-    blocking Houdini (Ruling R22; see above). On: cook in this Houdini
-    session instead -- blocks the UI, one package at a time, useful for
-    stepping through `run_upload_item()` directly while debugging.
+    Runs on the sync pod once, after all packages finish.
 
 @related
-
-- [Node:top/runpodfarm_scheduler]
-- [Node:top/pythonprocessor]
-- [Node:top/localscheduler]
+- [Node:top/ropfetch]
+- [Node:top/runpodfarmdownload]
 '''
 
 
@@ -1122,7 +911,7 @@ def main():
     )
     confirm_pt.setConditional(hou.parmCondType.HideWhen, "{ rpfarm_mode != deps }")
 
-    preview_pt = hou.ButtonParmTemplate("rpfarm_preview", "Preview Upload...")
+    preview_pt = hou.ButtonParmTemplate("rpfarm_preview", "Review Local / Farm Files...")
     preview_pt.setHelp(
         "Open that window now, without cooking. This is how you set the "
         "selection for a batch cook that will never open it."
@@ -1136,6 +925,7 @@ def main():
     clearexclude_pt.setScriptCallback("hou.phm().clearExclusions(kwargs)")
     clearexclude_pt.setScriptCallbackLanguage(hou.scriptLanguage.Python)
     clearexclude_pt.setConditional(hou.parmCondType.HideWhen, "{ rpfarm_mode != deps }")
+    clearexclude_pt.hide(True)  # Reset is part of File Review; keep saved-scene compatibility.
 
     # Kept in sync with rpfarm.deps.ASSET_REGEX by
     # tests/test_hda_assets.py -- the builder cannot import rpfarm (it runs
@@ -1206,18 +996,27 @@ def main():
         "Project folder on the network volume: /workspace/projects/<user>/<project>. "
         "Shows the name of the $JOB directory until you type your own."
     )
+    project_override_pt = hou.ToggleParmTemplate('rpfarm_projectoverride', 'Override Project', default_value=False)
+    project_pt.setConditional(hou.parmCondType.HideWhen, '{ rpfarm_projectoverride == 0 }')
+    context_pt = hou.StringParmTemplate('rpfarm_context', 'Farm Context', 1,
+        default_expression=('hou.phm().effectiveContext()',),
+        default_expression_language=(hou.scriptLanguage.Python,))
+    context_pt.setConditional(hou.parmCondType.DisableWhen, '{ rpfarm_inprocess >= 0 }')
     packagegb_pt = hou.FloatParmTemplate(
         "rpfarm_packagegb", "Package Size (GB)", 1, default_value=(1.5,), min=0.1, max=16, max_is_strict=False
     )
     packagegb_pt.setHelp("Files are grouped into work items no larger than this (a single bigger file still gets its own item).")
+    grouping_pt = hou.StringParmTemplate(
+        "rpfarm_grouping", "Work Items", 1, default_value=("packages",),
+        menu_items=("packages", "files"), menu_labels=("Packages by size", "One per file"))
+    grouping_pt.setHelp("Packages reduce process and connection overhead. One per file shows each file as a PDG item. Review Files shows the exact plan before upload.")
+    packagegb_pt.setConditional(hou.parmCondType.DisableWhen, "{ rpfarm_grouping == files }")
     compress_pt = hou.StringParmTemplate(
         "rpfarm_compress", "Compression", 1, default_value=("auto",),
         menu_items=("auto", "on", "off"), menu_labels=("Auto", "On", "Off"),
     )
     compress_pt.setHelp(
-        "auto compresses by default (Ruling R23: no live uplink measurement exists yet -- "
-        "`rpfarm doctor` will supply one in Task 13, at which point auto starts actually "
-        "comparing it against 200 Mbps instead of always compressing)."
+        "Auto uses the measured uplink when available. Identical farm files are skipped before compression."
     )
 
     local_pt = hou.StringParmTemplate(
@@ -1270,7 +1069,7 @@ def main():
     )
 
     for pt in (
-        mode_pt, scope_pt, project_pt, packagegb_pt, compress_pt,
+        mode_pt, scope_pt, context_pt, project_override_pt, project_pt, grouping_pt, packagegb_pt, compress_pt,
         confirm_pt, usddeep_pt, assetregex_pt, excludepattern_pt,
         preview_pt, clearexclude_pt, exclude_pt,
         custom_pt, postcmd_pt, preset_pt, houtar_pt, houver_pt, inprocess_pt,

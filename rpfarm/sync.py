@@ -375,17 +375,44 @@ def build_rclone_dir_args(local_dir, target, direction, remote_root):
 # -- subprocess runner ---------------------------------------------------------
 
 
-def _run_rclone(rclone_bin, args, progress_cb=None):
+def _cancelable_lines(proc, cancel):
+    import queue
+    import threading
+    chunks = queue.Queue()
+    def read():
+        try:
+            for line in proc.stderr:
+                chunks.put(line)
+        finally:
+            chunks.put(None)
+    threading.Thread(target=read, daemon=True).start()
+    while True:
+        if cancel():
+            proc.kill()
+            proc.wait()
+            raise InterruptedError('Download cancelled')
+        try:
+            line = chunks.get(timeout=.2)
+        except queue.Empty:
+            continue
+        if line is None:
+            return
+        yield line
+
+
+def _run_rclone(rclone_bin, args, progress_cb=None, cancel=None):
     """Run rclone, parse its ``--use-json-log`` stderr for progress.
 
     Returns ``(last_stats_dict, elapsed_seconds)``. Raises SyncError if the
     process exits non-zero.
     """
+    from .progress import notify
+    notify(progress_cb, 'begin_transfer')
     t0 = time.time()
     proc = subprocess.Popen([rclone_bin, *args], stderr=subprocess.PIPE, text=True)
     last = {"bytes": 0, "transfers": 0}
     assert proc.stderr is not None
-    for line in proc.stderr:
+    for line in (_cancelable_lines(proc, cancel) if cancel is not None else proc.stderr):
         try:
             msg = json.loads(line)
         except ValueError:
@@ -396,20 +423,23 @@ def _run_rclone(rclone_bin, args, progress_cb=None):
         last["bytes"] = st.get("bytes", last["bytes"])
         last["transfers"] = st.get("transfers", last["transfers"])
         if progress_cb:
+            notify(progress_cb, 'details', st)
             progress_cb(st.get("bytes", 0), st.get("totalBytes", 0), st.get("speed", 0))
     returncode = proc.wait()
     if returncode != 0:
         raise SyncError(f"rclone exit {returncode}")
+    notify(progress_cb, 'end_transfer', last['bytes'])
     return last, time.time() - t0
 
 
-def rclone_copy(package, target, direction, rclone_bin, local_root, remote_root, progress_cb=None, extra_args=()):
+def rclone_copy(package, target, direction, rclone_bin, local_root, remote_root, progress_cb=None, extra_args=(), cancel=None):
     """Transfer one package (list of FileEntry) via ``rclone copy --files-from``."""
     with tempfile.TemporaryDirectory() as tmp:
         args, _ = build_rclone_args(package, target, direction, local_root, remote_root, tmp)
         args = list(args) + list(extra_args)
-        _, seconds = _run_rclone(rclone_bin, args, progress_cb)
-        return SyncStats(files=len(package), bytes=sum(e.size for e in package), seconds=seconds)
+        kwargs = {'cancel': cancel} if cancel is not None else {}
+        last, seconds = _run_rclone(rclone_bin, args, progress_cb, **kwargs)
+        return SyncStats(files=last['transfers'], bytes=last['bytes'], seconds=seconds)
 
 
 def rclone_copy_dir(local_dir, target, direction, rclone_bin, remote_root, progress_cb=None):

@@ -157,44 +157,62 @@ def _stale_module_message(minimum, loaded, on_disk, root, changed=(), baked=True
         )
     shown = ", ".join(changed[:4])
     more = " и ещё {}".format(len(changed) - 4) if len(changed) > 4 else ""
+    package = __import__('sys').modules.get('rpfarm')
+    loaded_fingerprint = getattr(package, 'FINGERPRINT', None)
+    disk_fingerprint = _ondisk_fingerprint(pathlib.Path(root) / 'rpfarm')
+    if loaded_fingerprint and disk_fingerprint and loaded_fingerprint == disk_fingerprint:
+        action = 'Установите согласованную сборку Python и HDA. Перезапуск этой свежей сессии не исправит несовместимую сборку.'
+    else:
+        action = 'ПЕРЕЗАПУСТИТЕ HOUDINI, чтобы загрузить установленный пакет заново.'
     return (
         "Нода собрана против другого кода фермы, чем сейчас в памяти Houdini.\n"
         "\n"
-        "ПЕРЕЗАПУСТИТЕ HOUDINI. Больше ничего делать не нужно.\n"
+        "{action}\n"
         "\n"
         "Разошлись: {shown}{more}.\n"
         "В памяти rpfarm {seen}, нода собрана против {disk}.".format(
-            shown=shown, more=more, seen=loaded or "неизвестной версии",
+            action=action, shown=shown, more=more, seen=loaded or "неизвестной версии",
             disk=on_disk or "неизвестной версии")
     )
 
 # BEGIN baked by scripts/bake_asset_fingerprint.py -- do not edit
-_ASSET_BUILT_AGAINST_VERSION = '2.3.0'
+_ASSET_BUILT_AGAINST_VERSION = '2.4.0'
 _ASSET_FINGERPRINT = {
-    '__init__.py': (2490, 'c1250306daf5961f'),
+    '__init__.py': (2490, '84b00617a24de235'),
     '__main__.py': (52, '13a1a5b340cdcfc1'),
-    'background_cook.py': (5780, 'e3b1839f4958d88a'),
-    'cli.py': (71248, '1b7ef63474487e6d'),
+    'background_cook.py': (8292, '0e7f039578c949dd'),
+    'cli.py': (72171, '9a2152a00e573a1c'),
     'compression.py': (23234, 'bef2f19daebbc929'),
-    'config.py': (19880, '2fc22cfe0a7466eb'),
+    'config.py': (20080, '1dfcc2a15551dbe2'),
+    'context.py': (4466, '2fa09a0d45931725'),
+    'delivery.py': (3964, '63bb04491f97a3f3'),
     'deps.py': (38558, '2daae12f5770289a'),
     'dispatch.py': (22191, '1121a6505c88adb3'),
+    'file_review.py': (16246, 'd81726007b4ba4dd'),
     'gpus.py': (8311, '7a28d5c2692b776e'),
-    'houdini_local.py': (47763, '95636adab2dc7a22'),
+    'host_render.py': (10983, 'a0139507d9f7fe7f'),
+    'houdini_local.py': (48596, '7902f068c70d702b'),
+    'jobs.py': (8732, '88bd5f01eed7897c'),
     'ledger.py': (17327, '70425e75fb216f01'),
-    'package_runner.py': (8752, '96770e3879a6cb65'),
-    'packages.py': (61657, '030b2d03028b9c47'),
-    'pods.py': (33700, '0bc5854d8230e568'),
-    'preflight.py': (43096, '2c918d033e5ef268'),
+    'monitoring.py': (6320, '941db2f923c756ae'),
+    'mq.py': (2124, '174afbd9f49ad86f'),
+    'package_runner.py': (9652, '939de3e067b005db'),
+    'packages.py': (63842, '42a0a9d34bdf67a8'),
+    'pods.py': (35551, '3b64efff30fb33d7'),
+    'preflight.py': (45206, 'bea8fc057bc7e32a'),
+    'progress.py': (3439, 'c364a012f5cd92e6'),
+    'releases.py': (4735, 'c6b364ccfb3534b3'),
     'runpod_api.py': (14539, 'b90960f9860c97fb'),
-    'scene_setup.py': (18467, '8838d55cbb131f99'),
+    'scene_setup.py': (18803, 'c8031966f92b71f3'),
     'smoke.py': (42548, 'ce0c8d36fe763314'),
-    'sync.py': (20016, '96b1ccb1a9c2846e'),
+    'status.py': (458, '2205873427086b87'),
+    'submission.py': (1621, '6b428346b41fab92'),
+    'sync.py': (20962, '6ae2a7b7e1e25f58'),
     'tls.py': (3642, 'f3e50ea6ebd0308f'),
     'tools.py': (4290, 'c5d3b026f125578f'),
     'usddeps.py': (9631, '3c7192d3bd94d07f'),
     'volume.py': (10038, 'dc11b185a58c9262'),
-    'worker_client.py': (9791, 'cf6b40b1e879c658'),
+    'worker_client.py': (10012, '407feb11016dd01c'),
 }
 # END baked
 
@@ -271,6 +289,15 @@ def _warn(message):
         pass
 
 
+def effectiveContext():
+    try:
+        import hou
+        from rpfarm import context
+        return context.resolve(hou.pwd()).description()
+    except Exception as exc:
+        return str(exc)
+
+
 def previewUpload(kwargs):
     """Show the upload plan without cooking anything.
 
@@ -305,16 +332,23 @@ def previewUpload(kwargs):
     job_dir = hou.getenv("JOB") or hou.expandString("$HIP")
     project = node.evalParm("rpfarm_project") or os.path.basename(os.path.normpath(job_dir))
     try:
-        cfg = rpcfg.load()
+        from rpfarm import context as rpcontext
+        farm_context = rpcontext.resolve(node, job_dir)
+        cfg, project = farm_context.cfg, farm_context.project
         api = RunPodAPI(cfg.api_key)
     except Exception:
         cfg = api = None
     remote_project = "/workspace/projects/{}/{}".format(cfg.user, project) if cfg else None
+    env_refs, env_problems = rpdeps.environment_refs(
+        getenv=lambda name: hou.getenv(name) or os.environ.get(name), log=_say)
+    env_refs = rpdeps.remove_pattern(env_refs, exclude_pattern)
+    for problem in env_problems:
+        _warn(problem)
 
     try:
-        paths = rppf.choose_uploads(node, scan, usd, ask=True, log=_say,
+        paths = rppf.choose_uploads(node, scan, usd, env_refs, ask=True, log=_say,
                                     job_dir=job_dir, remote_project=remote_project,
-                                    cfg=cfg, api=api)
+                                    cfg=cfg, api=api, intent="preview")
     except rppf.UploadCancelled:
         _say("preview closed with Cancel -- nothing changed")
         return

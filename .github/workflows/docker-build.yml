@@ -9,6 +9,11 @@ on:
       - 'pod/**'
       - '.github/workflows/docker-build.yml'
   workflow_dispatch:
+    inputs:
+      update_template:
+        description: Update the shared RunPod template after building
+        type: boolean
+        default: true
 
 env:
   REGISTRY: ghcr.io
@@ -38,7 +43,13 @@ jobs:
 
       - name: Extract short SHA
         id: meta
-        run: echo "short_sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+        run: |
+          image_tags="$REGISTRY/$IMAGE_NAME:${GITHUB_SHA::7}"
+          if [ "$GITHUB_REF" = "refs/heads/main" ]; then
+            image_tags="$image_tags,$REGISTRY/$IMAGE_NAME:latest"
+          fi
+          echo "short_sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          echo "image_tags=$image_tags" >> "$GITHUB_OUTPUT"
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v6
@@ -47,13 +58,12 @@ jobs:
           file: pod/Dockerfile
           platforms: linux/amd64
           push: true
-          tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.short_sha }}
+          tags: ${{ steps.meta.outputs.image_tags }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
       - name: Update RunPod template
+        if: github.event_name != 'workflow_dispatch' || inputs.update_template
         env:
           RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
           TEMPLATE_ID: ${{ vars.RPFARM_TEMPLATE_ID }}

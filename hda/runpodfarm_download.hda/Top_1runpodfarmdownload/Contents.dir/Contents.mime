@@ -50,7 +50,7 @@ stat
   author may@maymac01-2.local
   access 0777
 }
-color UT_Color RGB 0.8 0.8 0.8 
+color UT_Color RGB 0.8 0.8 0.8
 delscript ""
 exprlanguage hscript
 end
@@ -89,7 +89,7 @@ Content-Disposition: attachment; filename="hdaroot/output0.def"
 Content-Type: text/plain
 
 comment ""
-position -1.8592 6.8942
+position -1.6944 0.8942
 connectornextid 1
 flags =  lock off model off template off footprint off xray off bypass off display on render on highlight off unload off savedata off compress off colordefault on exposed on
 outputsNamed3
@@ -110,7 +110,7 @@ stat
   author may@maymac01-2.local
   access 0777
 }
-color UT_Color RGB 0.8 0.8 0.8 
+color UT_Color RGB 0.8 0.8 0.8
 delscript ""
 exprlanguage hscript
 end
@@ -149,7 +149,7 @@ Content-Disposition: attachment; filename="hdaroot/pythonprocessor1.def"
 Content-Type: text/plain
 
 comment ""
-position -1.8592 7.7884
+position -1.6944 1.7884
 connectornextid 2
 flags =  lock off model off template off footprint off xray off bypass off display off render off highlight off unload off savedata off compress off colordefault on exposed on
 outputsNamed3
@@ -158,11 +158,11 @@ outputsNamed3
 }
 inputsNamed3
 {
-0 	(0) "" 1 "input1"
+0 	source 3 1 "input1"
 }
 inputs
 {
-0 	(0) 0 1
+0 	source 0 1
 }
 stat
 {
@@ -171,7 +171,7 @@ stat
   author may@maymac01-2.local
   access 0777
 }
-color UT_Color RGB 0.8 0.8 0.8 
+color UT_Color RGB 0.8 0.8 0.8
 delscript ""
 exprlanguage hscript
 end
@@ -263,10 +263,15 @@ def _warn(message):
     print(\"[rpfarm-download] WARNING: {}\".format(message), flush=True)
 
 mode = node.evalParm(\"rpfarm_mode\")
+stale = node.hdaModule().farmCodeMessage()
+if stale:
+    raise RuntimeError(stale)
 package_gb = node.evalParm(\"rpfarm_packagegb\")
 overwrite = node.evalParm(\"rpfarm_overwrite\")
 
-cfg = rpcfg.load()
+from rpfarm import context as rpcontext
+cfg = rpcontext.resolve(node).cfg
+context_path = rpcontext.snapshot(cfg)
 api = RunPodAPI(cfg.api_key)
 token = rpcfg.session_token()
 with open(cfg.ssh_key_path + \".pub\") as f:
@@ -276,31 +281,13 @@ with open(cfg.ssh_key_path + \".pub\") as f:
 # packaging, \"custom\" to list each remote directory's files in the first
 # place (there is no local filesystem to walk -- the files only exist on
 # the farm volume).
-pod = rppods.ensure_sync_pod(api, cfg, token, pubkey)
-sync_client = WorkerClient(pod[\"id\"], token)
+client_holder = []
+def _get_sync_client(_cfg=cfg, _api=api, _token=token, _pubkey=pubkey, _holder=client_holder):
+    if not _holder:
+        pod = rppods.ensure_sync_pod(_api, _cfg, _token, _pubkey)
+        _holder.append(WorkerClient(pod['id'], _token))
+    return _holder[0]
 
-def _scheduler_downloads_outputs():
-    \"\"\"Is the farm scheduler already pulling every item's outputs itself?
-
-    \"Download Outputs\" on the scheduler fetches each work item's outputs the
-    moment it succeeds -- frames appear while the farm is still rendering.
-    This node in \"outputs\" mode then fetches the same files again at the end
-    of the cook. Both were on in the demo scene and nobody noticed until an
-    artist asked why the files arrived twice; the second pass re-transferred
-    every frame and re-acquired the sync pod to stat them.
-
-    Never raises: failing to answer this must not fail a generate.
-    \"\"\"
-    try:
-        topnet = node.parent()
-        parm = topnet.parm(\"topscheduler\") if topnet is not None else None
-        sched = hou.node(parm.eval()) if parm and parm.eval() else None
-        if sched is None or \"runpodfarmscheduler\" not in sched.type().name():
-            return False
-        flag = sched.parm(\"rpfarm_downloadoutputs\")
-        return bool(flag and flag.eval())
-    except Exception:
-        return False
 
 
 def _stat_sizes(remotes):
@@ -315,7 +302,7 @@ def _stat_sizes(remotes):
     if not remotes:
         return {}
     cmd = \"stat -c '%s %n' \" + \" \".join(shlex.quote(r) for r in remotes)
-    result = sync_client.exec(cmd, timeout_s=rppkg._scaled_timeout(0))
+    result = _get_sync_client().exec(cmd, timeout_s=rppkg._scaled_timeout(0))
     sizes, missing = rppkg.parse_stat_sizes(result.get(\"stdout\"), remotes)
     if missing:
         shown = \", \".join(missing[:5]) + (\" ...\" if len(missing) > 5 else \"\")
@@ -387,21 +374,18 @@ if mode == \"outputs\":
                     \"back to a local path (rpfarm_pathmap has {} entry(ies))\".format(
                         up.name, len(result_data), len(path_map)))
             continue
-        sizes = _stat_sizes(sorted({r for r, _l in item_pairs}))
+        from rpfarm import delivery
+        delivery_key = up.stringAttribValue('rpfarm_delivery_key') or ''
+        already_delivered = bool(delivery_key) and all(
+            delivery.valid({'delivery_key': delivery_key}, cfg, [local, remote, 0])
+            for remote, local in item_pairs)
+        sizes = ({remote: os.path.getsize(local) for remote, local in item_pairs}
+                 if already_delivered else _stat_sizes(sorted({r for r, _l in item_pairs})))
         for it in rppkg.build_download_items(mode, item_pairs, package_gb, sizes):
+            it['delivery_key'] = delivery_key
+            it['already_delivered'] = already_delivered
+            it['job_id'] = node.evalParm('rpfarm_job') if node.parm('rpfarm_job') else ''
             planned.append((it, up))
-
-    if _scheduler_downloads_outputs():
-        _warn(
-            \"The scheduler's \\\"Download Outputs\\\" is ON, so every item's outputs \"
-            \"are already fetched the moment it succeeds -- while the farm is \"
-            \"still rendering. This node in Outputs mode will fetch the same \"
-            \"files a second time at the end of the cook, re-transferring them \"
-            \"and re-acquiring the sync pod to size them. Pick one: turn off \"
-            \"Download Outputs on the scheduler to have this node do it at the \"
-            \"end, or drop this node from the chain to keep the files arriving \"
-            \"as they are made. Outputs mode is for pulling files nothing \"
-            \"reported as an output; duplicating the scheduler is not its job.\")
 
     if not upstream_items:
         _warn(\"Outputs mode with no upstream input: nothing to download\")
@@ -415,7 +399,7 @@ elif mode == \"custom\":
         if not remote_dir or not local_dir:
             continue
         find_cmd = \"find {} -type f -printf '%s %p\\\\n'\".format(shlex.quote(remote_dir))
-        result = sync_client.exec(find_cmd, timeout_s=rppkg._scaled_timeout(0))
+        result = _get_sync_client().exec(find_cmd, timeout_s=rppkg._scaled_timeout(0))
         if result.get(\"exit_code\") != 0:
             _warn(
                 \"listing remote dir {} failed: {}\".format(remote_dir, (result.get(\"stderr\") or \"\").strip())
@@ -438,7 +422,7 @@ elif mode == \"custom\":
             pairs.append((remote_path, local_path))
             sizes[remote_path] = size
     for it in rppkg.build_download_items(mode, pairs, package_gb, sizes):
-        planned.append((it, None))
+        planned.append((it, upstream_items[0] if upstream_items else None))
 else:
     raise hou.NodeError(\"unknown rpfarm_mode: {}\".format(mode))
 
@@ -481,7 +465,8 @@ def _make_command(item_json_path):
 def _write_item_payload(name, it):
     path = os.path.join(items_dir, \"{}.json\".format(name))
     with open(path, \"w\") as f:
-        json.dump({\"kind\": \"download\", \"item\": it, \"overwrite\": overwrite}, f)
+        json.dump({\"kind\": \"download\", \"item\": it, \"overwrite\": overwrite,
+                   \"context_path\": context_path}, f)
     return path
 
 
@@ -501,7 +486,7 @@ for it, parent in planned:
     # build_download_items() call total, so its own it[\"index\"] is already
     # globally unique on its own.
     name = \"download_{}_{:03d}\".format(parent.name, it[\"index\"]) if parent is not None else \"download_{:03d}\".format(it[\"index\"])
-    kwargs = {\"name\": name, \"inProcess\": in_process}
+    kwargs = {\"name\": name, \"inProcess\": in_process and not it.get('already_delivered')}
     if parent is not None:
         kwargs[\"parent\"] = parent
     wi = item_holder.addWorkItem(**kwargs)
@@ -509,6 +494,13 @@ for it, parent in planned:
     wi.setStringAttrib(\"overwrite\", overwrite)
     wi.setIntAttrib(\"bytes\", it[\"bytes\"])
     wi.setIntAttrib(\"files\", len(it[\"files\"]))
+    wi.setStringAttrib('rpfarm_delivery_key', it.get('delivery_key', ''))
+    if it.get('already_delivered'):
+        for local, _remote, _size in it['files']:
+            wi.addOutputFile(local, 'file')
+        wi.setIntAttrib('rpfarm_delivered', len(it['files']))
+        wi.setStringAttrib('phase', 'Already delivered')
+        continue
     if not in_process:
         wi.setCommand(_make_command(_write_item_payload(name, it)))
         wi.addEnvironmentVar(\"PYTHONPATH\", rpfarm_pkg_root)
@@ -562,7 +554,8 @@ from rpfarm import sync as rpsync
 from rpfarm.runpod_api import RunPodAPI, pod_public_endpoint
 from rpfarm.worker_client import WorkerClient
 
-cfg = rpcfg.load()
+from rpfarm import context as rpcontext
+cfg = rpcontext.resolve(self.topNode().parent()).cfg
 api = RunPodAPI(cfg.api_key)
 token = rpcfg.session_token()
 with open(cfg.ssh_key_path + \".pub\") as f:
@@ -583,6 +576,12 @@ def progress_cb(done, total, speed):
 
 t0 = time.time()
 stats = rppkg.run_download_item(item, cfg, sftp, sync_client, overwrite, progress_cb)
+for local, _remote, _size in item['files']:
+    if not os.path.isfile(local):
+        raise RuntimeError('Local output missing after download: ' + local)
+    work_item.addOutputFile(local, 'file')
+work_item.setIntAttrib('rpfarm_delivered', stats.get('delivered', len(item['files'])))
+work_item.setStringAttrib('rpfarm_delivery_key', item.get('delivery_key', ''))
 elapsed = time.time() - t0
 
 work_item.setFloatAttrib(\"seconds\", elapsed)
@@ -650,7 +649,7 @@ Content-Disposition: attachment; filename="hdaroot/localscheduler.def"
 Content-Type: text/plain
 
 comment ""
-position -1.11759e-08 5.6987
+position 0 0.8942
 connectornextid 0
 flags =  lock off model off template off footprint off xray off bypass off display off render off highlight off unload off savedata off compress off colordefault on exposed on
 outputsNamed3
@@ -669,7 +668,7 @@ stat
   author may@maymac01-2.local
   access 0777
 }
-color UT_Color RGB 0.478 0.478 0.478 
+color UT_Color RGB 0.478 0.478 0.478
 delscript ""
 exprlanguage hscript
 end
@@ -765,13 +764,370 @@ Content-Type: text/plain
 }
 
 --HOUDINIMIMEBOUNDARY0xD3ADD339-0x00000F49-0x56B122C9-0x00000001HOUDINIMIMEBOUNDARY
+Content-Disposition: attachment; filename="hdaroot/submitted_results.init"
+Content-Type: text/plain
+
+type = pythonprocessor
+matchesdef = 0
+
+--HOUDINIMIMEBOUNDARY0xD3ADD339-0x00000F49-0x56B122C9-0x00000001HOUDINIMIMEBOUNDARY
+Content-Disposition: attachment; filename="hdaroot/submitted_results.def"
+Content-Type: text/plain
+
+comment ""
+position -1.6944 2.6826
+connectornextid 1
+flags =  lock off model off template off footprint off xray off bypass off display off render off highlight off unload off savedata off compress off colordefault on exposed on
+outputsNamed3
+{
+0 "output1"
+}
+inputsNamed3
+{
+}
+inputs
+{
+}
+stat
+{
+  create -1
+  modify -1
+  author may@maymac01-2.local
+  access 0777
+}
+color UT_Color RGB 0.8 0.8 0.8
+delscript ""
+exprlanguage hscript
+end
+
+--HOUDINIMIMEBOUNDARY0xD3ADD339-0x00000F49-0x56B122C9-0x00000001HOUDINIMIMEBOUNDARY
+Content-Disposition: attachment; filename="hdaroot/submitted_results.parm"
+Content-Type: text/plain
+
+{
+version 0.8
+savenodescript	[ 0	locks=0 ]	(	0	)
+savenodehda	[ 0	locks=0 ]	(	0	)
+sepparm2	[ 0	locks=0 ]	(	)
+processor	[ 0	locks=0 ]	(	0	0	0	)
+pdg_workitemgeneration	[ 0	locks=0 ]	(	"2"	)
+pdg_command	[ 0	locks=0 ]	(	""	)
+sepparm	[ 0	locks=0 ]	(	)
+callbacks	[ 0	locks=0 ]	(	0	0	0	0	0	)
+generate	[ 0	locks=0 ]	(	"stale = self.topNode().parent().hdaModule().farmCodeMessage()
+if stale:
+    raise RuntimeError(stale)
+import os, pathlib, sys
+root = pathlib.Path(os.environ.get('RPFARM_ROOT', pathlib.Path.home() / '.rpfarm' / 'pkg'))
+if str(root) not in sys.path:
+    sys.path.insert(0, str(root))
+import json
+from rpfarm import context as rpcontext, jobs
+from rpfarm.runpod_api import RunPodAPI
+node = self.topNode().parent()
+job_id = node.evalParm('rpfarm_job')
+if not job_id:
+    raise RuntimeError('No submitted job selected')
+cfg = rpcontext.resolve(node).cfg
+job, state_path, manifest = jobs.fetch_results(
+    job_id, cfg, RunPodAPI(cfg.api_key), cancel=lambda: self.context.canceling,
+    log=lambda text: self.addWarning(text))
+self.context.deserializeWorkItems(state_path)
+if manifest.get('target') != job.get('target'):
+    raise RuntimeError('The result manifest names a different target')
+if job.get('state') != 'complete':
+    self.addWarning('Job {}: {}. Collecting available outputs.'.format(job_id, job.get('state')))
+for record in manifest.get('items', []):
+    imported = item_holder.addWorkItem(name='result_' + str(record['id']))
+    imported.setStringAttrib('rpfarm_pathmap', record['pathmap'])
+    imported.setStringAttrib('rpfarm_delivery_key', record['delivery_key'])
+    for path, tag in record['outputs']:
+        imported.addOutputFile(path, tag or 'file')
+"	)
+useregeneratestatic	[ 0	locks=0 ]	(	"off"	)
+regeneratestatic	[ 0	locks=0 ]	(	"# Called when this node may need to regenerate existing work items
+#
+# self           -   A reference to the current pdg.Node instance
+# item_holder    -   A pdg.WorkItemHolder for constructing and adding new work items
+# existing_items -   The existing work items in the node
+# upstream_items -   The list of work items in the node above, or empty list
+# generation_type -   The type of generation, e.g. pdg.generationType.Static, Dynamic, or Regenerate"	)
+addinternaldependencies	[ 0	locks=0 ]	(	"# Called when the node has generated work items so that dependencies can
+# be added between work items in this node.
+#
+# self              -   A reference to the current pdg.Node instance
+# dependency_holder -   A pdg.WorkItemHolder for adding pairs of items that should have a dependency
+# internal_items    -   The list of items, either all static items or a group of dynamic items
+# is_static         -   Boolean indicating if the items list contains static items
+"	)
+cooktask	[ 0	locks=0 ]	(	"# Called when an in process work item needs to cook. In process work items
+# are created by passing the `inProcess=True` flag when constructing the item in
+# the `Generate` callback
+#
+# self              -   A reference to the current pdg.Node instance
+# work_item         -   The work item being cooked by this callback"	)
+servicename	[ 0	locks=0 ]	(	""	)
+sepparm3	[ 0	locks=0 ]	(	)
+alwaysregenerate	[ 0	locks=0 ]	(	"off"	)
+dirtyonregenerate	[ 0	locks=0 ]	(	"off"	)
+dirtyonincomplete	[ 0	locks=0 ]	(	"off"	)
+sepparm4	[ 0	locks=0 ]	(	)
+requiresgeneratedinputs	[ 0	locks=0 ]	(	"off"	)
+requirescookedinputs	[ 0	locks=0 ]	(	"off"	)
+requiresscenefile	[ 0	locks=0 ]	(	"off"	)
+requiresinputdata	[ 0	locks=0 ]	(	"off"	)
+sepparm6	[ 0	locks=0 ]	(	)
+usesdynamicbatching	[ 0	locks=0 ]	(	"off"	)
+sepparm7	[ 0	locks=0 ]	(	)
+usestatefilter	[ 0	locks=0 ]	(	"off"	)
+statefilter	[ 0	locks=0 ]	(	"0"	)
+clearfailures	[ 0	locks=0 ]	(	"off"	)
+pdgnodedeps	[ 0	locks=0 ]	(	1	)
+topscheduler	[ 0	locks=0 ]	(	""	)
+addjobparms	[ 0	locks=0 ]	(	0	)
+pdg_useschedulewhen	[ 0	locks=0 ]	(	"off"	)
+pdg_schedulewhen	[ 0	locks=0 ]	(	1	)
+sepparm5	[ 0	locks=0 ]	(	)
+pdg_workitemlabel	[ 0	locks=0 ]	(	"0"	)
+pdg_workitemlabelexpr	[ 0	locks=0 ]	(	""	)
+pdg_workitempriority	[ 0	locks=0 ]	(	"0"	)
+pdg_workitempriorityexpr	[ 0	locks=0 ]	(	0	)
+pdgnodedep1	[ 0	locks=0 ]	(	""	)
+}
+
+--HOUDINIMIMEBOUNDARY0xD3ADD339-0x00000F49-0x56B122C9-0x00000001HOUDINIMIMEBOUNDARY
+Content-Disposition: attachment; filename="hdaroot/submitted_results.userdata"
+Content-Type: text/plain
+
+{
+	"___Version___":{
+		"type":"string",
+		"value":""
+	},
+	"___toolcount___":{
+		"type":"string",
+		"value":"1"
+	},
+	"___toolid___":{
+		"type":"string",
+		"value":"object_cop2plane"
+	}
+}
+
+--HOUDINIMIMEBOUNDARY0xD3ADD339-0x00000F49-0x56B122C9-0x00000001HOUDINIMIMEBOUNDARY
+Content-Disposition: attachment; filename="hdaroot/custom_paths.init"
+Content-Type: text/plain
+
+type = pythonprocessor
+matchesdef = 0
+
+--HOUDINIMIMEBOUNDARY0xD3ADD339-0x00000F49-0x56B122C9-0x00000001HOUDINIMIMEBOUNDARY
+Content-Disposition: attachment; filename="hdaroot/custom_paths.def"
+Content-Type: text/plain
+
+comment ""
+position -1.6944 2.6826
+connectornextid 1
+flags =  lock off model off template off footprint off xray off bypass off display off render off highlight off unload off savedata off compress off colordefault on exposed on
+outputsNamed3
+{
+0 "output1"
+}
+inputsNamed3
+{
+}
+inputs
+{
+}
+stat
+{
+  create -1
+  modify -1
+  author may@maymac01-2.local
+  access 0777
+}
+color UT_Color RGB 0.8 0.8 0.8
+delscript ""
+exprlanguage hscript
+end
+
+--HOUDINIMIMEBOUNDARY0xD3ADD339-0x00000F49-0x56B122C9-0x00000001HOUDINIMIMEBOUNDARY
+Content-Disposition: attachment; filename="hdaroot/custom_paths.parm"
+Content-Type: text/plain
+
+{
+version 0.8
+savenodescript	[ 0	locks=0 ]	(	0	)
+savenodehda	[ 0	locks=0 ]	(	0	)
+sepparm2	[ 0	locks=0 ]	(	)
+processor	[ 0	locks=0 ]	(	0	0	0	)
+pdg_workitemgeneration	[ 0	locks=0 ]	(	"2"	)
+pdg_command	[ 0	locks=0 ]	(	""	)
+sepparm	[ 0	locks=0 ]	(	)
+callbacks	[ 0	locks=0 ]	(	0	0	0	0	0	)
+generate	[ 0	locks=0 ]	(	item_holder.addWorkItem()	)
+useregeneratestatic	[ 0	locks=0 ]	(	"off"	)
+regeneratestatic	[ 0	locks=0 ]	(	"# Called when this node may need to regenerate existing work items
+#
+# self           -   A reference to the current pdg.Node instance
+# item_holder    -   A pdg.WorkItemHolder for constructing and adding new work items
+# existing_items -   The existing work items in the node
+# upstream_items -   The list of work items in the node above, or empty list
+# generation_type -   The type of generation, e.g. pdg.generationType.Static, Dynamic, or Regenerate"	)
+addinternaldependencies	[ 0	locks=0 ]	(	"# Called when the node has generated work items so that dependencies can
+# be added between work items in this node.
+#
+# self              -   A reference to the current pdg.Node instance
+# dependency_holder -   A pdg.WorkItemHolder for adding pairs of items that should have a dependency
+# internal_items    -   The list of items, either all static items or a group of dynamic items
+# is_static         -   Boolean indicating if the items list contains static items
+"	)
+cooktask	[ 0	locks=0 ]	(	"# Called when an in process work item needs to cook. In process work items
+# are created by passing the `inProcess=True` flag when constructing the item in
+# the `Generate` callback
+#
+# self              -   A reference to the current pdg.Node instance
+# work_item         -   The work item being cooked by this callback"	)
+servicename	[ 0	locks=0 ]	(	""	)
+sepparm3	[ 0	locks=0 ]	(	)
+alwaysregenerate	[ 0	locks=0 ]	(	"off"	)
+dirtyonregenerate	[ 0	locks=0 ]	(	"off"	)
+dirtyonincomplete	[ 0	locks=0 ]	(	"off"	)
+sepparm4	[ 0	locks=0 ]	(	)
+requiresgeneratedinputs	[ 0	locks=0 ]	(	"off"	)
+requirescookedinputs	[ 0	locks=0 ]	(	"off"	)
+requiresscenefile	[ 0	locks=0 ]	(	"off"	)
+requiresinputdata	[ 0	locks=0 ]	(	"off"	)
+sepparm6	[ 0	locks=0 ]	(	)
+usesdynamicbatching	[ 0	locks=0 ]	(	"off"	)
+sepparm7	[ 0	locks=0 ]	(	)
+usestatefilter	[ 0	locks=0 ]	(	"off"	)
+statefilter	[ 0	locks=0 ]	(	"0"	)
+clearfailures	[ 0	locks=0 ]	(	"off"	)
+pdgnodedeps	[ 0	locks=0 ]	(	1	)
+topscheduler	[ 0	locks=0 ]	(	""	)
+addjobparms	[ 0	locks=0 ]	(	0	)
+pdg_useschedulewhen	[ 0	locks=0 ]	(	"off"	)
+pdg_schedulewhen	[ 0	locks=0 ]	(	1	)
+sepparm5	[ 0	locks=0 ]	(	)
+pdg_workitemlabel	[ 0	locks=0 ]	(	"0"	)
+pdg_workitemlabelexpr	[ 0	locks=0 ]	(	""	)
+pdg_workitempriority	[ 0	locks=0 ]	(	"0"	)
+pdg_workitempriorityexpr	[ 0	locks=0 ]	(	0	)
+pdgnodedep1	[ 0	locks=0 ]	(	""	)
+}
+
+--HOUDINIMIMEBOUNDARY0xD3ADD339-0x00000F49-0x56B122C9-0x00000001HOUDINIMIMEBOUNDARY
+Content-Disposition: attachment; filename="hdaroot/custom_paths.userdata"
+Content-Type: text/plain
+
+{
+	"___Version___":{
+		"type":"string",
+		"value":""
+	},
+	"___toolcount___":{
+		"type":"string",
+		"value":"1"
+	},
+	"___toolid___":{
+		"type":"string",
+		"value":"object_cop2plane"
+	}
+}
+
+--HOUDINIMIMEBOUNDARY0xD3ADD339-0x00000F49-0x56B122C9-0x00000001HOUDINIMIMEBOUNDARY
+Content-Disposition: attachment; filename="hdaroot/source.init"
+Content-Type: text/plain
+
+type = switch
+matchesdef = 1
+
+--HOUDINIMIMEBOUNDARY0xD3ADD339-0x00000F49-0x56B122C9-0x00000001HOUDINIMIMEBOUNDARY
+Content-Disposition: attachment; filename="hdaroot/source.def"
+Content-Type: text/plain
+
+comment ""
+position -1.6944 2.6826
+connectornextid 4
+flags =  lock off model off template off footprint off xray off bypass off display off render off highlight off unload off savedata off compress off colordefault on exposed on
+outputsNamed3
+{
+3 "output1"
+}
+inputsNamed3
+{
+0 	(0) "" 1 "input1"
+1 	submitted_results 0 1 "input2"
+2 	custom_paths 0 1 "input3"
+}
+inputs
+{
+0 	(0) 0 1
+1 	submitted_results 0 1
+2 	custom_paths 0 1
+}
+stat
+{
+  create -1
+  modify -1
+  author may@maymac01-2.local
+  access 0777
+}
+color UT_Color RGB 0.8 1 0.7
+delscript ""
+exprlanguage hscript
+end
+
+--HOUDINIMIMEBOUNDARY0xD3ADD339-0x00000F49-0x56B122C9-0x00000001HOUDINIMIMEBOUNDARY
+Content-Disposition: attachment; filename="hdaroot/source.chn"
+Content-Type: text/plain
+
+{
+    channel input {
+      lefttype = extend
+      righttype = extend
+      flags = 0
+      segment { options = {	 untie  iv ov is os ia oa }
+
+	 length = 0 expr = "2 if hou.pwd().parent().evalParm('rpfarm_mode') == 'custom' else (1 if hou.pwd().parent().evalParm('rpfarm_job') else 0)" language = python }
+    }
+  }
+
+--HOUDINIMIMEBOUNDARY0xD3ADD339-0x00000F49-0x56B122C9-0x00000001HOUDINIMIMEBOUNDARY
+Content-Disposition: attachment; filename="hdaroot/source.parm"
+Content-Type: text/plain
+
+{
+version 0.8
+input	[ 0	locks=0 ]	(	[ input	0 ] 	)
+invalidindex	[ 0	locks=0 ]	(	"1"	)
+invalidate	[ 0	locks=0 ]	(	"off"	)
+keepfailed	[ 0	locks=0 ]	(	"off"	)
+}
+
+--HOUDINIMIMEBOUNDARY0xD3ADD339-0x00000F49-0x56B122C9-0x00000001HOUDINIMIMEBOUNDARY
+Content-Disposition: attachment; filename="hdaroot/source.userdata"
+Content-Type: text/plain
+
+{
+	"___Version___":{
+		"type":"string",
+		"value":"___EXTERNAL___"
+	}
+}
+
+--HOUDINIMIMEBOUNDARY0xD3ADD339-0x00000F49-0x56B122C9-0x00000001HOUDINIMIMEBOUNDARY
 Content-Disposition: attachment; filename="hdaroot.order"
 Content-Type: text/plain
 
-3
+6
 output0
 pythonprocessor1
 localscheduler
+submitted_results
+custom_paths
+source
 
 --HOUDINIMIMEBOUNDARY0xD3ADD339-0x00000F49-0x56B122C9-0x00000001HOUDINIMIMEBOUNDARY
 Content-Disposition: attachment; filename="hdaroot.net"

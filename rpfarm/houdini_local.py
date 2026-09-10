@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import ast
 import glob
+import json
 import os
 import platform
 import re
@@ -420,6 +421,10 @@ def build_and_install_hdas(install: HoudiniInstall, otls_cache_dir: Path, root: 
             continue
         collapsed = otls_cache_dir / f"{name}.hda"
         stale = asset_state(source, package_fingerprint)["stale"]
+        if stale:
+            results.append({'name': name, 'ok': False, 'installed_to': None, 'stale': True,
+                            'error': 'HDA and Python differ; rebuild the bundle before installing.'})
+            continue
         try:
             collapse_hda(install.hotl, source, collapsed, runner=runner)
             target = install_hda_file(install, collapsed, name)
@@ -526,6 +531,17 @@ def asset_state(path: Path, package_fingerprint) -> dict:
 def installed_asset_states(install: HoudiniInstall, package_fingerprint) -> dict:
     """:func:`asset_state` for every HDA as it is INSTALLED for this artist."""
     otls = install.user_pref_dir / "otls"
+    managed = install.user_pref_dir / 'packages' / 'runpodfarm-release.json'
+    if managed.is_file():
+        try:
+            settings = json.loads(managed.read_text())
+            root = next(Path(entry['RPFARM_ROOT']) for entry in settings.get('env', []) if 'RPFARM_ROOT' in entry)
+            if (root / 'houdini' / 'otls').is_dir():
+                import rpfarm
+                otls = root / 'houdini' / 'otls'
+                package_fingerprint = rpfarm.fingerprint(str(root / 'rpfarm'))
+        except (OSError, ValueError, KeyError, StopIteration, TypeError):
+            pass
     return {name: asset_state(otls / f"{name}.hda", package_fingerprint)
             for name in HDA_NAMES}
 

@@ -135,21 +135,18 @@ def main(argv):
     try:
         item = payload["item"]
 
-        def progress_cb(done, total, speed):
-            msg = "{:.0f}/{:.0f} MB".format(done / 2**20, total / 2**20)
-            print("[{}] progress {}".format(tag, msg), flush=True)
-            if pdgcmd is not None:
-                try:
-                    pdgcmd.setStringAttrib("progress", msg, 0)
-                except Exception:
-                    pass
+        from .progress import TransferProgress
+        progress_cb = TransferProgress(pdgcmd)
+        progress_cb.phase('Preparing')
 
-        cfg = rpcfg.load()
+        from .context import load_snapshot
+        cfg = load_snapshot(payload.get('context_path'))
         api = RunPodAPI(cfg.api_key)
         token = rpcfg.session_token()
         with open(cfg.ssh_key_path + ".pub") as f:
             pubkey = f.read()
 
+        progress_cb.phase('Waiting for sync pod')
         pod = rppods.ensure_sync_pod(api, cfg, token, pubkey)
         ip, port = rprunpod.pod_public_endpoint(pod, 22)
         sftp = rpsync.SftpTarget(host=ip, port=port, key_path=cfg.ssh_key_path)
@@ -159,6 +156,20 @@ def main(argv):
         if kind == "download":
             overwrite = payload.get("overwrite", "newer")
             stats = rppkg.run_download_item(item, cfg, sftp, sync_client, overwrite, progress_cb)
+            report = getattr(pdgcmd, 'addOutputFile', None)
+            if report is not None:
+                outputs = [f[0] for f in item['files']]
+                missing = [p for p in outputs if not os.path.isfile(p)]
+                if missing:
+                    raise rpsync.SyncError('Local outputs missing after download: ' + ', '.join(missing[:5]))
+                if outputs:
+                    report(outputs)
+                pdgcmd.setIntAttrib('rpfarm_delivered', stats.get('delivered', len(outputs)), 0)
+                pdgcmd.setStringAttrib('rpfarm_delivery_key', item.get('delivery_key', ''), 0)
+                if item.get('job_id'):
+                    from .jobs import downloaded
+                    from .delivery import valid
+                    downloaded(item['job_id'], [entry[0] for entry in item['files'] if valid(item, cfg, entry)])
         else:
             autogrow_note = rppkg.maybe_grow_volume(
                 api, cfg, sync_client, item.get("bytes") or 0,
@@ -176,6 +187,7 @@ def main(argv):
             compress = bool(payload.get("compress"))
             stats = rppkg.run_upload_item(item, cfg, sftp, sync_client, compress, progress_cb)
         elapsed = time.time() - t0
+        progress_cb.finish()
         mbps = stats["bytes"] / 2**20 / max(1e-3, elapsed)
 
         print(
@@ -196,6 +208,8 @@ def main(argv):
 
         return 0
     except Exception:
+        if 'progress_cb' in locals() and hasattr(progress_cb, 'phase'):
+            progress_cb.phase('Failed')
         import traceback
 
         traceback.print_exc()

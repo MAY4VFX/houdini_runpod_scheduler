@@ -73,6 +73,244 @@ FAMILY_ONCREATED = (
     'node.setUserData("nodeshape", "rpfarm")\n'
 )
 
+PYTHON_MODULE = '''\
+import ast
+import hashlib
+import os
+import pathlib
+import sys
+root = pathlib.Path(os.environ.get('RPFARM_ROOT', pathlib.Path.home() / '.rpfarm' / 'pkg'))
+if str(root) not in sys.path:
+    sys.path.insert(0, str(root))
+# -- stale-module guard ------------------------------------------------------
+#
+# The asset and the package ship together and are updated together, but Python
+# caches modules in sys.modules for the life of the process. A Houdini that was
+# already open when the checkout updated runs the NEW asset against the OLD
+# package, and the artist sees either an ImportError naming a symbol they have
+# never heard of, or -- worse, and this is what happened on 2026-09-05 -- a
+# cook whose work items simply fail.
+#
+# THE CHECK IS A FACT, NOT A NUMBER. It compares the package's own
+# FINGERPRINT (size + content digest of every module file, taken when this
+# process imported it) against those files as they are now. If anything
+# differs, the code in memory is not the code on disk, and no version needs
+# to have been bumped for us to know it.
+#
+# That matters because the version check that used to be the whole guard
+# failed exactly where it was needed: rpfarm.VERSION sat at 2.2.0 through
+# seven commits that changed deps.py, preflight.py and usddeps.py, so
+# "loaded >= minimum" was true while the loaded code was a week behind. A
+# guard that depends on someone remembering to bump a number is a guard that
+# is off whenever they forget. The version is still read -- but only to make
+# the message concrete.
+_MIN_RPFARM_VERSION = "2.3.0"
+
+
+def _version_tuple(text):
+    """("2.1.0") -> (2, 1, 0). Unparseable parts sort as 0, never raises."""
+    parts = []
+    for chunk in str(text or "").split("."):
+        digits = "".join(c for c in chunk if c.isdigit())
+        parts.append(int(digits) if digits else 0)
+    return tuple(parts) or (0,)
+
+
+def _ondisk_rpfarm_version(root):
+    """rpfarm's VERSION as it is ON DISK, read without importing it.
+
+    Importing is precisely what cannot answer this question: the import is
+    what hands back the cached module. Parsed with ast, so a half-written or
+    unexpected __init__ cannot execute anything or raise here.
+    """
+    try:
+        source = (pathlib.Path(root) / "rpfarm" / "__init__.py").read_text(encoding="utf-8")
+        for node in ast.parse(source).body:
+            if isinstance(node, ast.Assign) and any(
+                    isinstance(t, ast.Name) and t.id == "VERSION" for t in node.targets):
+                return ast.literal_eval(node.value)
+    except Exception:  # noqa: BLE001 - a diagnostic must not become the failure
+        return None
+    return None
+
+
+def _ondisk_fingerprint(package_dir):
+    """The same measurement rpfarm takes of itself, computed here.
+
+    Only used by the bake script and the tests -- the runtime check never
+    looks at the disk (see _asset_mismatch for why).
+    """
+    out = {}
+    try:
+        names = sorted(os.listdir(package_dir))
+    except Exception:
+        return out
+    for name in names:
+        if not name.endswith(".py"):
+            continue
+        try:
+            with open(os.path.join(package_dir, name), "rb") as handle:
+                data = handle.read()
+        except Exception:
+            continue
+        out[name] = (len(data), hashlib.sha256(data).hexdigest()[:16])
+    return out
+
+
+def _asset_mismatch(package, baked):
+    """Modules whose loaded content is not what this asset was built against.
+
+    Both sides live INSIDE this Houdini: ``package.FINGERPRINT`` is what the
+    modules were when this process imported them, ``baked`` is what they were
+    when this asset was built. The disk is deliberately not consulted.
+
+    That is the whole correction. Comparing against the disk answered the
+    wrong question -- "has anyone touched the checkout?" -- so every push
+    while an artist had Houdini open blocked their next cook, while a
+    session that was genuinely broken (an asset reinstalled under a running
+    Houdini, which reloads definitions without reopening the scene) could
+    still look fine. Comparing the asset with the package it was built
+    against answers the only question that matters to the artist: is my tool
+    consistent with itself?
+
+    An asset with no baked fingerprint predates this and gets a warning, not
+    a stop -- it may well be fine, and refusing to cook on "I cannot tell"
+    is how a guard gets switched off.
+    """
+    loaded = getattr(package, "FINGERPRINT", None)
+    if not isinstance(loaded, dict):
+        return ["<no fingerprint: this rpfarm predates the check>"]
+    if not baked:
+        return []
+    return sorted(name for name in baked if loaded.get(name) != baked[name])
+
+
+def _stale_module_message(minimum, loaded, on_disk, root, changed=(), baked=True):
+    """The sentence to show the artist, or None when nothing is wrong.
+
+    ``changed`` is the answer from :func:`_asset_mismatch`; the version
+    arguments only make the message concrete. An asset that carries no baked
+    fingerprint at all cannot be judged, so it says so quietly instead of
+    refusing to work.
+    """
+    changed = list(changed)
+    if not changed:
+        return None
+    if not baked or any(name.startswith("<") for name in changed):
+        return (
+            "ВНИМАНИЕ: не могу проверить, сходится ли нода с кодом фермы.\\n"
+            "\\n"
+            "Это старая нода или старый пакет rpfarm. Кук пойдёт, но если он\\n"
+            "упадёт странно — перезапустите Houdini, а потом обновите ноды:\\n"
+            "    python3 -m rpfarm setup"
+        )
+    shown = ", ".join(changed[:4])
+    more = " и ещё {}".format(len(changed) - 4) if len(changed) > 4 else ""
+    package = __import__('sys').modules.get('rpfarm')
+    loaded_fingerprint = getattr(package, 'FINGERPRINT', None)
+    disk_fingerprint = _ondisk_fingerprint(pathlib.Path(root) / 'rpfarm')
+    if loaded_fingerprint and disk_fingerprint and loaded_fingerprint == disk_fingerprint:
+        action = 'Установите согласованную сборку Python и HDA. Перезапуск этой свежей сессии не исправит несовместимую сборку.'
+    else:
+        action = 'ПЕРЕЗАПУСТИТЕ HOUDINI, чтобы загрузить установленный пакет заново.'
+    return (
+        "Нода собрана против другого кода фермы, чем сейчас в памяти Houdini.\\n"
+        "\\n"
+        "{action}\\n"
+        "\\n"
+        "Разошлись: {shown}{more}.\\n"
+        "В памяти rpfarm {seen}, нода собрана против {disk}.".format(
+            action=action, shown=shown, more=more, seen=loaded or "неизвестной версии",
+            disk=on_disk or "неизвестной версии")
+    )
+
+# BEGIN baked by scripts/bake_asset_fingerprint.py -- do not edit
+_ASSET_BUILT_AGAINST_VERSION = '2.4.0'
+_ASSET_FINGERPRINT = {
+    '__init__.py': (2490, '84b00617a24de235'),
+    '__main__.py': (52, '13a1a5b340cdcfc1'),
+    'background_cook.py': (8292, '0e7f039578c949dd'),
+    'cli.py': (72171, '9a2152a00e573a1c'),
+    'compression.py': (23234, 'bef2f19daebbc929'),
+    'config.py': (20080, '1dfcc2a15551dbe2'),
+    'context.py': (4466, '2fa09a0d45931725'),
+    'delivery.py': (3964, '63bb04491f97a3f3'),
+    'deps.py': (38558, '2daae12f5770289a'),
+    'dispatch.py': (22191, '1121a6505c88adb3'),
+    'file_review.py': (16246, 'd81726007b4ba4dd'),
+    'gpus.py': (8311, '7a28d5c2692b776e'),
+    'host_render.py': (10983, 'a0139507d9f7fe7f'),
+    'houdini_local.py': (48596, '7902f068c70d702b'),
+    'jobs.py': (8732, '88bd5f01eed7897c'),
+    'ledger.py': (17327, '70425e75fb216f01'),
+    'monitoring.py': (6320, '941db2f923c756ae'),
+    'mq.py': (2124, '174afbd9f49ad86f'),
+    'package_runner.py': (9652, '939de3e067b005db'),
+    'packages.py': (63842, '42a0a9d34bdf67a8'),
+    'pods.py': (35551, '3b64efff30fb33d7'),
+    'preflight.py': (45206, 'bea8fc057bc7e32a'),
+    'progress.py': (3439, 'c364a012f5cd92e6'),
+    'releases.py': (4735, 'c6b364ccfb3534b3'),
+    'runpod_api.py': (14539, 'b90960f9860c97fb'),
+    'scene_setup.py': (18803, 'c8031966f92b71f3'),
+    'smoke.py': (42548, 'ce0c8d36fe763314'),
+    'status.py': (458, '2205873427086b87'),
+    'submission.py': (1621, '6b428346b41fab92'),
+    'sync.py': (20962, '6ae2a7b7e1e25f58'),
+    'tls.py': (3642, 'f3e50ea6ebd0308f'),
+    'tools.py': (4290, 'c5d3b026f125578f'),
+    'usddeps.py': (9631, '3c7192d3bd94d07f'),
+    'volume.py': (10038, 'dc11b185a58c9262'),
+    'worker_client.py': (10012, '407feb11016dd01c'),
+}
+# END baked
+
+def farmCodeMessage():
+    import rpfarm
+    return _stale_module_message(_MIN_RPFARM_VERSION, rpfarm.VERSION,
+        _ASSET_BUILT_AGAINST_VERSION, root, _asset_mismatch(rpfarm, _ASSET_FINGERPRINT))
+
+def jobMenu():
+    from rpfarm import jobs
+    return jobs.menu(farm_only=True)
+def jobStatus():
+    import hou
+    from rpfarm import jobs
+    return jobs.selected_description(hou.pwd().evalParm('rpfarm_job'))
+'''
+
+RESUME_CODE = '''\
+stale = self.topNode().parent().hdaModule().farmCodeMessage()
+if stale:
+    raise RuntimeError(stale)
+import os, pathlib, sys
+root = pathlib.Path(os.environ.get('RPFARM_ROOT', pathlib.Path.home() / '.rpfarm' / 'pkg'))
+if str(root) not in sys.path:
+    sys.path.insert(0, str(root))
+import json
+from rpfarm import context as rpcontext, jobs
+from rpfarm.runpod_api import RunPodAPI
+node = self.topNode().parent()
+job_id = node.evalParm('rpfarm_job')
+if not job_id:
+    raise RuntimeError('No submitted job selected')
+cfg = rpcontext.resolve(node).cfg
+job, state_path, manifest = jobs.fetch_results(
+    job_id, cfg, RunPodAPI(cfg.api_key), cancel=lambda: self.context.canceling,
+    log=lambda text: self.addWarning(text))
+self.context.deserializeWorkItems(state_path)
+if manifest.get('target') != job.get('target'):
+    raise RuntimeError('The result manifest names a different target')
+if job.get('state') != 'complete':
+    self.addWarning('Job {}: {}. Collecting available outputs.'.format(job_id, job.get('state')))
+for record in manifest.get('items', []):
+    imported = item_holder.addWorkItem(name='result_' + str(record['id']))
+    imported.setStringAttrib('rpfarm_pathmap', record['pathmap'])
+    imported.setStringAttrib('rpfarm_delivery_key', record['delivery_key'])
+    for path, tag in record['outputs']:
+        imported.addOutputFile(path, tag or 'file')
+'''
+
 GENERATE_CODE = '''\
 # Called when this node should generate new work items from upstream items.
 #
@@ -131,10 +369,15 @@ def _warn(message):
     print("[rpfarm-download] WARNING: {}".format(message), flush=True)
 
 mode = node.evalParm("rpfarm_mode")
+stale = node.hdaModule().farmCodeMessage()
+if stale:
+    raise RuntimeError(stale)
 package_gb = node.evalParm("rpfarm_packagegb")
 overwrite = node.evalParm("rpfarm_overwrite")
 
-cfg = rpcfg.load()
+from rpfarm import context as rpcontext
+cfg = rpcontext.resolve(node).cfg
+context_path = rpcontext.snapshot(cfg)
 api = RunPodAPI(cfg.api_key)
 token = rpcfg.session_token()
 with open(cfg.ssh_key_path + ".pub") as f:
@@ -144,31 +387,13 @@ with open(cfg.ssh_key_path + ".pub") as f:
 # packaging, "custom" to list each remote directory's files in the first
 # place (there is no local filesystem to walk -- the files only exist on
 # the farm volume).
-pod = rppods.ensure_sync_pod(api, cfg, token, pubkey)
-sync_client = WorkerClient(pod["id"], token)
+client_holder = []
+def _get_sync_client(_cfg=cfg, _api=api, _token=token, _pubkey=pubkey, _holder=client_holder):
+    if not _holder:
+        pod = rppods.ensure_sync_pod(_api, _cfg, _token, _pubkey)
+        _holder.append(WorkerClient(pod['id'], _token))
+    return _holder[0]
 
-def _scheduler_downloads_outputs():
-    """Is the farm scheduler already pulling every item's outputs itself?
-
-    "Download Outputs" on the scheduler fetches each work item's outputs the
-    moment it succeeds -- frames appear while the farm is still rendering.
-    This node in "outputs" mode then fetches the same files again at the end
-    of the cook. Both were on in the demo scene and nobody noticed until an
-    artist asked why the files arrived twice; the second pass re-transferred
-    every frame and re-acquired the sync pod to stat them.
-
-    Never raises: failing to answer this must not fail a generate.
-    """
-    try:
-        topnet = node.parent()
-        parm = topnet.parm("topscheduler") if topnet is not None else None
-        sched = hou.node(parm.eval()) if parm and parm.eval() else None
-        if sched is None or "runpodfarmscheduler" not in sched.type().name():
-            return False
-        flag = sched.parm("rpfarm_downloadoutputs")
-        return bool(flag and flag.eval())
-    except Exception:
-        return False
 
 
 def _stat_sizes(remotes):
@@ -183,7 +408,7 @@ def _stat_sizes(remotes):
     if not remotes:
         return {}
     cmd = "stat -c '%s %n' " + " ".join(shlex.quote(r) for r in remotes)
-    result = sync_client.exec(cmd, timeout_s=rppkg._scaled_timeout(0))
+    result = _get_sync_client().exec(cmd, timeout_s=rppkg._scaled_timeout(0))
     sizes, missing = rppkg.parse_stat_sizes(result.get("stdout"), remotes)
     if missing:
         shown = ", ".join(missing[:5]) + (" ..." if len(missing) > 5 else "")
@@ -255,21 +480,18 @@ if mode == "outputs":
                     "back to a local path (rpfarm_pathmap has {} entry(ies))".format(
                         up.name, len(result_data), len(path_map)))
             continue
-        sizes = _stat_sizes(sorted({r for r, _l in item_pairs}))
+        from rpfarm import delivery
+        delivery_key = up.stringAttribValue('rpfarm_delivery_key') or ''
+        already_delivered = bool(delivery_key) and all(
+            delivery.valid({'delivery_key': delivery_key}, cfg, [local, remote, 0])
+            for remote, local in item_pairs)
+        sizes = ({remote: os.path.getsize(local) for remote, local in item_pairs}
+                 if already_delivered else _stat_sizes(sorted({r for r, _l in item_pairs})))
         for it in rppkg.build_download_items(mode, item_pairs, package_gb, sizes):
+            it['delivery_key'] = delivery_key
+            it['already_delivered'] = already_delivered
+            it['job_id'] = node.evalParm('rpfarm_job') if node.parm('rpfarm_job') else ''
             planned.append((it, up))
-
-    if _scheduler_downloads_outputs():
-        _warn(
-            "The scheduler's \\"Download Outputs\\" is ON, so every item's outputs "
-            "are already fetched the moment it succeeds -- while the farm is "
-            "still rendering. This node in Outputs mode will fetch the same "
-            "files a second time at the end of the cook, re-transferring them "
-            "and re-acquiring the sync pod to size them. Pick one: turn off "
-            "Download Outputs on the scheduler to have this node do it at the "
-            "end, or drop this node from the chain to keep the files arriving "
-            "as they are made. Outputs mode is for pulling files nothing "
-            "reported as an output; duplicating the scheduler is not its job.")
 
     if not upstream_items:
         _warn("Outputs mode with no upstream input: nothing to download")
@@ -283,7 +505,7 @@ elif mode == "custom":
         if not remote_dir or not local_dir:
             continue
         find_cmd = "find {} -type f -printf '%s %p\\\\n'".format(shlex.quote(remote_dir))
-        result = sync_client.exec(find_cmd, timeout_s=rppkg._scaled_timeout(0))
+        result = _get_sync_client().exec(find_cmd, timeout_s=rppkg._scaled_timeout(0))
         if result.get("exit_code") != 0:
             _warn(
                 "listing remote dir {} failed: {}".format(remote_dir, (result.get("stderr") or "").strip())
@@ -306,7 +528,7 @@ elif mode == "custom":
             pairs.append((remote_path, local_path))
             sizes[remote_path] = size
     for it in rppkg.build_download_items(mode, pairs, package_gb, sizes):
-        planned.append((it, None))
+        planned.append((it, upstream_items[0] if upstream_items else None))
 else:
     raise hou.NodeError("unknown rpfarm_mode: {}".format(mode))
 
@@ -349,7 +571,8 @@ def _make_command(item_json_path):
 def _write_item_payload(name, it):
     path = os.path.join(items_dir, "{}.json".format(name))
     with open(path, "w") as f:
-        json.dump({"kind": "download", "item": it, "overwrite": overwrite}, f)
+        json.dump({"kind": "download", "item": it, "overwrite": overwrite,
+                   "context_path": context_path}, f)
     return path
 
 
@@ -369,7 +592,7 @@ for it, parent in planned:
     # build_download_items() call total, so its own it["index"] is already
     # globally unique on its own.
     name = "download_{}_{:03d}".format(parent.name, it["index"]) if parent is not None else "download_{:03d}".format(it["index"])
-    kwargs = {"name": name, "inProcess": in_process}
+    kwargs = {"name": name, "inProcess": in_process and not it.get('already_delivered')}
     if parent is not None:
         kwargs["parent"] = parent
     wi = item_holder.addWorkItem(**kwargs)
@@ -377,6 +600,13 @@ for it, parent in planned:
     wi.setStringAttrib("overwrite", overwrite)
     wi.setIntAttrib("bytes", it["bytes"])
     wi.setIntAttrib("files", len(it["files"]))
+    wi.setStringAttrib('rpfarm_delivery_key', it.get('delivery_key', ''))
+    if it.get('already_delivered'):
+        for local, _remote, _size in it['files']:
+            wi.addOutputFile(local, 'file')
+        wi.setIntAttrib('rpfarm_delivered', len(it['files']))
+        wi.setStringAttrib('phase', 'Already delivered')
+        continue
     if not in_process:
         wi.setCommand(_make_command(_write_item_payload(name, it)))
         wi.addEnvironmentVar("PYTHONPATH", rpfarm_pkg_root)
@@ -416,7 +646,8 @@ from rpfarm import sync as rpsync
 from rpfarm.runpod_api import RunPodAPI, pod_public_endpoint
 from rpfarm.worker_client import WorkerClient
 
-cfg = rpcfg.load()
+from rpfarm import context as rpcontext
+cfg = rpcontext.resolve(self.topNode().parent()).cfg
 api = RunPodAPI(cfg.api_key)
 token = rpcfg.session_token()
 with open(cfg.ssh_key_path + ".pub") as f:
@@ -437,6 +668,12 @@ def progress_cb(done, total, speed):
 
 t0 = time.time()
 stats = rppkg.run_download_item(item, cfg, sftp, sync_client, overwrite, progress_cb)
+for local, _remote, _size in item['files']:
+    if not os.path.isfile(local):
+        raise RuntimeError('Local output missing after download: ' + local)
+    work_item.addOutputFile(local, 'file')
+work_item.setIntAttrib('rpfarm_delivered', stats.get('delivered', len(item['files'])))
+work_item.setStringAttrib('rpfarm_delivery_key', item.get('delivery_key', ''))
 elapsed = time.time() - t0
 
 work_item.setFloatAttrib("seconds", elapsed)
@@ -446,101 +683,29 @@ work_item.setIntAttrib("files", stats["files"])
 '''
 
 HELP_TEXT = '''\
-= RunPodFarm Download =
-
 #type: node
 #context: top
 #internal: runpodfarmdownload
-#icon: TOP/pythonprocessor
-
-"""Download files from the RunPodFarm volume to local disk, as a normal TOP
-work item generator -- progress is visible per package as it cooks."""
-
-Work item = one package of files. Each package cooks on PDG's *local*
-scheduler (this node overrides `Scheduler` to its own internal
-`localscheduler`, never `runpodfarm_scheduler` -- same reasoning as the
-upload node: this download has to run on the machine that owns the local
-disk it's downloading to, not dispatch onto the farm itself). The override
-is a Python expression on the internal Python Processor's `Scheduler` parm
-re-resolving the sibling `localscheduler` node's absolute path at cook
-time -- see [Node:top/runpodfarm_upload]'s Help for why a bare relative
-name doesn't work here. This node's `OnCreated` event re-asserts the same
-expression once more when a new instance is made.
-
-Packages cook *out of process* by default (Ruling R22), through the same
-`rpfarm.package_runner` module the upload node uses (`rpfarm/package_runner.py`)
--- each work item's command is `python3 -m rpfarm.package_runner <item.json>`,
-whose payload's `"kind": "download"` selects `rpfarm.packages.run_download_item`
-over the upload path. See [Node:top/runpodfarm_upload]'s Help for why PDG's
-Python Processor requires a shell `.command` for genuine out-of-process
-dispatch, and why a plain `python3` (not `hython`) runs it. The Cook In
-Process toggle below switches back to the old callback-only path (this
-node's `cooktask`) for debugging.
-
-Cooking this node when it has an upstream input (`Upstream outputs` mode):
-cook THIS node -- the downstream-most node in the graph -- in one single
-`cookWorkItems()` call. Do not cook the upstream farm-scheduler generator
-node separately first and then cook this one: each top-level
-`cookWorkItems()` call starts its own independent PDG cook, so a second
-call does not treat the first call's already-`CookedSuccess` items as up
-to date -- it recooks the upstream node from scratch too, on
-`runpodfarm_scheduler`, which means a SECOND real (and separately billed)
-GPU pod for work that already ran once. One cook of this node is also the
-intended pattern: it lets `gen`'s item cook on the farm and this node's own
-download item cook locally, in one graph cook, one GPU pod total (live-
-verified; see the Task 10 report, `.superpowers/sdd/2026-09-02-rpfarm-v2/
-task-10-report.md`).
+#icon: opdef:/Top/runpodfarmdownload?IconSVG
+= RunPodFarm Download =
+Deliver farm outputs to their original local paths. Cook this node normally.
 
 @parameters
-
+Results From:
+    #id: rpfarm_job
+    Current Graph cooks the connected input. A selected submitted job restores its checkpoint and result manifest inside this cook. The upstream upload/render branch is excluded, so retrieving a job never submits it again.
 Mode:
     #id: rpfarm_mode
-    `Upstream outputs` reads each upstream work item's `resultData` (farm
-    paths reported while it ran) and localizes them via the `rpfarm_pathmap`
-    attribute the scheduler stamps onto every item it schedules -- no
-    upstream input means nothing to download (a warning, not an error).
-    `Custom paths` downloads exactly the remote -> local directory pairs
-    below; the files under each remote directory are listed on the sync pod
-    (`find <dir> -type f -printf '%s %p\\n'`) at generate time, since they
-    only exist on the farm volume.
-
-Package Size (GB):
-    #id: rpfarm_packagegb
-
-    Files are grouped into work items no larger than this (a single file
-    bigger than the limit still gets its own item). Packages never span two
-    (local dir, farm dir) pairs -- see `rpfarm.packages.group_download_pairs`.
-
+    Upstream Outputs uses the original render file paths and mapping. Custom Paths retrieves the specified directories without cooking the connected render branch.
 Overwrite:
     #id: rpfarm_overwrite
+    Newer preserves a newer local file. Always uses ordinary size/time comparison. Never preserves every existing local file. A preserved file that differs from the farm is not counted as verified delivery for automatic cleanup.
 
-    `newer` (default) skips a local file that is not older than its remote
-    counterpart (`rclone --update`). `always` adds no extra flag, which is
-    rclone's own default comparison: it still skips a file whose size AND
-    modification time already match the remote exactly, and re-transfers
-    anything else -- "always" here means "no `--update`/`--ignore-existing`
-    override", not "every file every time". `never` skips anything that
-    already exists locally, regardless of mtime (`rclone --ignore-existing`).
-
-Custom Paths:
-    #id: rpfarm_custom
-
-    Multiparm of remote -> local directory pairs, used in Custom mode.
-
-Cook In Process (debug):
-    #id: rpfarm_inprocess
-
-    Off (default): packages download out of process, in parallel, without
-    blocking Houdini (Ruling R22; see above). On: cook in this Houdini
-    session instead -- blocks the UI, one package at a time, useful for
-    stepping through `run_download_item()` directly while debugging.
+Downloaded files appear as native PDG Output Files. Existing validated delivery receipts skip repeated transfers. Cancelled or failed transfers leave farm results available for another cook.
 
 @related
-
-- [Node:top/runpodfarm_upload]
-- [Node:top/runpodfarm_scheduler]
-- [Node:top/pythonprocessor]
-- [Node:top/localscheduler]
+- [Node:top/runpodfarmupload]
+- [Node:top/switch]
 '''
 
 
@@ -552,7 +717,18 @@ def main():
     pp = sn.createNode("pythonprocessor", "pythonprocessor1")
     localsched = sn.createNode("localscheduler", "localscheduler")
 
-    pp.setInput(0, sn.indirectInputs()[0])
+    resume = sn.createNode('pythonprocessor', 'submitted_results')
+    resume.parm('generate').set(RESUME_CODE)
+    custom_source = sn.createNode('pythonprocessor', 'custom_paths')
+    custom_source.parm('generate').set('item_holder.addWorkItem()')
+    source = sn.createNode('switch', 'source')
+    source.setInput(0, sn.indirectInputs()[0])
+    source.setInput(1, resume)
+    source.setInput(2, custom_source)
+    source.parm('input').setExpression(
+        "2 if hou.pwd().parent().evalParm('rpfarm_mode') == 'custom' else (1 if hou.pwd().parent().evalParm('rpfarm_job') else 0)", language=hou.exprLanguage.Python)
+    source.parm('invalidate').set(0)
+    pp.setInput(0, source)
     out0 = sn.node("output0")
     out0.setInput(0, pp, 0)
 
@@ -580,6 +756,16 @@ def main():
     out0.moveToGoodPosition()
 
     ptg = hou.ParmTemplateGroup()
+    job_pt = hou.StringParmTemplate('rpfarm_job', 'Results From', 1, default_value=('',),
+        item_generator_script='return hou.phm().jobMenu()',
+        item_generator_script_language=hou.scriptLanguage.Python)
+    job_pt.setHelp('Current graph cooks the connected input. A submitted job restores its results inside this cook without rerunning Upload or Render.')
+    job_pt.setConditional(hou.parmCondType.HideWhen, '{ rpfarm_mode == custom }')
+    job_status_pt = hou.StringParmTemplate('rpfarm_jobstatus', 'Job Status', 1,
+        default_expression=("hou.phm().jobStatus()",),
+        default_expression_language=(hou.scriptLanguage.Python,))
+    job_status_pt.setConditional(hou.parmCondType.DisableWhen, '{ rpfarm_inprocess >= 0 }')
+    job_status_pt.setConditional(hou.parmCondType.HideWhen, '{ rpfarm_mode == custom }')
 
     mode_pt = hou.StringParmTemplate(
         "rpfarm_mode", "Mode", 1, default_value=("outputs",),
@@ -621,7 +807,7 @@ def main():
         "On: cook in this Houdini session instead -- blocks the UI, one package at a time, useful for debugging."
     )
 
-    for pt in (mode_pt, packagegb_pt, overwrite_pt, custom_pt, inprocess_pt):
+    for pt in (job_pt, job_status_pt, mode_pt, packagegb_pt, overwrite_pt, custom_pt, inprocess_pt):
         ptg.append(pt)
 
     sn.setParmTemplateGroup(ptg)
@@ -643,6 +829,7 @@ def main():
     )
 
     definition = new_type.type().definition()
+    definition.addSection('PythonModule', PYTHON_MODULE)
     definition.addSection("Help", HELP_TEXT)
     # The icon rides inside the asset rather than as a file on disk:
     # nothing to install, nothing to lose, and it follows the .hda

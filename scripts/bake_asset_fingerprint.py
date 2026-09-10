@@ -30,6 +30,7 @@ REPO = pathlib.Path(__file__).resolve().parent.parent
 TARGETS = (
     REPO / "scripts" / "build_runpodfarm_upload_hda.py",
     REPO / "scripts" / "build_runpodfarm_stats_hda.py",
+    REPO / "scripts" / "build_runpodfarm_download_hda.py",
     REPO / "hda" / "runpodfarm_scheduler.hda" / "Top_1runpodfarmscheduler" / "PythonModule",
 )
 
@@ -59,6 +60,15 @@ def rewrite(path, guard, block, check=False):
     text = path.read_text(encoding="utf-8")
     if guard.BAKE_BEGIN not in text:
         return False
+    guard_start = text.find('# -- stale-module guard ')
+    if guard_start >= 0:
+        guard_end = text.index(guard.BAKE_BEGIN, guard_start)
+        source = guard.GUARD_SOURCE.rstrip() + '\n\n'
+        if path.name.startswith('build_'):
+            source = source.replace('\\', '\\\\')
+        text_with_guard = text[:guard_start] + source + text[guard_end:]
+    else:
+        text_with_guard = text
     indent = _indent_of(text, guard.BAKE_BEGIN)
     body = "\n".join((indent + line if line else "") for line in block.splitlines())
     # A builder holds the block inside a non-raw '''...''' literal, where a
@@ -68,7 +78,7 @@ def rewrite(path, guard, block, check=False):
     pattern = re.compile(
         re.escape(indent + guard.BAKE_BEGIN) + r".*?" + re.escape(guard.BAKE_END),
         re.S)
-    new_text = pattern.sub(lambda _m: body.rstrip("\n"), text, count=1)
+    new_text = pattern.sub(lambda _m: body.rstrip("\n"), text_with_guard, count=1)
     if new_text == text:
         return False
     if not check:

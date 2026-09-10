@@ -210,7 +210,10 @@ def test_start_mq_rewrites_public_address():
     pod = FakeAPI().create_cpu_pod("rpfarm-sync-may", "t", "v", {}, [])
     line = pods.start_mq(c, pod, "c1", sleep=lambda s: None)
     assert line == "PDG_MQ 9.9.9.9 14440 14440 14442"
-    assert "mqserver -p 4440" in c.execs[0] and "-w 4442" in c.execs[0]
+    import shlex
+    command = shlex.split(c.execs[0])
+    assert command[:2] == ['python3', '-c']
+    compile(command[2], '<mq bootstrap>', 'exec')
 
 
 def test_names():
@@ -365,10 +368,10 @@ def test_terminate_all_calls_terminate_pod_for_each():
     assert api.pods == {}
 
 
-def test_stop_mq_kills_mqserver():
+def test_stopping_one_cook_does_not_kill_the_shared_mqserver():
     c = FakeClient()
     pods.stop_mq(c)
-    assert "pkill -f mqserver" in c.execs[0]
+    assert c.execs == []
 
 
 # ---------------------------------------------------------------------------

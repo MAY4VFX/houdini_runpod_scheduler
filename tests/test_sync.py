@@ -152,7 +152,8 @@ def test_rclone_copy_success_reports_stats_and_progress(tmp_path):
         progress_cb=lambda b, tb, sp: seen.append((b, tb, sp)),
     )
     assert isinstance(stats, SyncStats)
-    assert stats.files == 2 and stats.bytes == 10
+    # The fake rclone reports one actual transfer, despite two planned files.
+    assert stats.files == 1 and stats.bytes == 10
     assert seen == [(10, 10, 1.0)]
 
 

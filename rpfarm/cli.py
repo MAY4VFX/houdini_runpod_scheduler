@@ -515,6 +515,17 @@ def cmd_setup(args, prompt=input):
     rclone_path = rpcfg.rclone_bin()
     print(f"[OK] rclone ready ({rclone_path})")
 
+    if (home / 'release.json').exists():
+        from . import releases
+        try:
+            release = releases.install(houdini_local.repo_root(), home,
+                                       houdini_local.find_houdini_installations())
+        except Exception as exc:
+            print('[FAIL] release installation: {}'.format(exc), file=sys.stderr)
+            return 1
+        print('[OK] next Houdini session will use {}'.format(release))
+        return 0
+
     # Swapping the package an artist's Houdini reads while it is mid-cook is
     # exactly what cost 2026-09-08's rendered frame -- refuse rather than
     # pretend everything is fine. Best-effort (see cook_is_running's own
@@ -526,6 +537,14 @@ def cmd_setup(args, prompt=input):
               file=sys.stderr)
         return 1
 
+    import rpfarm
+    source_root = houdini_local.repo_root()
+    current_fp = rpfarm.fingerprint(str(source_root / 'rpfarm'))
+    stale_sources = [name for name in houdini_local.HDA_NAMES
+                     if houdini_local.asset_state(houdini_local.hda_source_dir(name, source_root), current_fp)['stale']]
+    if stale_sources:
+        print('[FAIL] rebuild Python/HDA bundle before installation: ' + ', '.join(stale_sources), file=sys.stderr)
+        return 1
     _ensure_package_symlink(home)
 
     installs = houdini_local.find_houdini_installations()
@@ -542,7 +561,7 @@ def cmd_setup(args, prompt=input):
         stale = [r["name"] for r in results if r.get("stale")]
         if stale:
             print(f"    [WARN] built against an older rpfarm: {', '.join(stale)}. "
-                  f"Installed anyway, but rebuild them with "
+                  f"Not installed; rebuild them with "
                   f"`hython scripts/rebuild_assets.py` so the asset and the "
                   f"package agree.")
         # The HDAs carry their own icons (an IconSVG section each), but a

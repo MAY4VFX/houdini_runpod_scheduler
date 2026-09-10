@@ -3,6 +3,7 @@ DialogScript	DialogScript
 CreateScript	CreateScript
 InternalFileOptions	InternalFileOptions
 Contents.gz	Contents.gz
+PythonModule	PythonModule
 Help	Help
 IconSVG	IconSVG
 OnCreated	OnCreated

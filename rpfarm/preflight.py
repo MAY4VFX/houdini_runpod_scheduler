@@ -538,7 +538,7 @@ def houdini_qt():
 
 def build_dialog(roots, missing, checked, title="RunPodFarm", parent=None, mbps=None,
                  header=None, accept_label="Upload", columns=None,
-                 protected=None, locked=None):
+                 protected=None, locked=None, allow_empty=False):
     """Construct (but do not run) the confirmation window.
 
     One window, two jobs (Ruling R55). The volume manager needs exactly this
@@ -612,6 +612,7 @@ def build_dialog(roots, missing, checked, title="RunPodFarm", parent=None, mbps=
         detail = "1 file" if node.files == 1 else "{} files".format(node.files)
         first = QtGui.QStandardItem(label)
         first.setData(node.path, QtCore.Qt.UserRole + 1)
+        first.setToolTip(node.path)
         first.setCheckable(True)
         first.setEditable(False)
         if not node.is_leaf:
@@ -718,7 +719,10 @@ def build_dialog(roots, missing, checked, title="RunPodFarm", parent=None, mbps=
     def _refresh(*_args):
         chosen = _checked()
         head.setText(header(roots, chosen))
-        upload.setEnabled(bool(chosen))
+        upload.setEnabled(bool(chosen) or allow_empty)
+        callback = getattr(dialog, 'rpfarm_selection_changed', None)
+        if callback:
+            callback(chosen)
 
     def _set_all(state):
         model.blockSignals(True)
@@ -784,12 +788,36 @@ def build_dialog(roots, missing, checked, title="RunPodFarm", parent=None, mbps=
     dialog.rpfarm_checked = _checked
     dialog.rpfarm_view = view
     dialog.rpfarm_model = model
+    def set_checked(paths):
+        wanted = {normalise(p) for p in paths}
+        model.blockSignals(True)
+        for item, node in leaf_items:
+            item.setCheckState(QtCore.Qt.Checked if normalise(node.path) in wanted
+                               else QtCore.Qt.Unchecked)
+        for item in root_items:
+            _refold(item)
+        model.blockSignals(False)
+        _refresh()
+
+    def rebuild_tree():
+        wanted = _checked()
+        model.blockSignals(True)
+        model.removeRows(0, model.rowCount())
+        leaf_items.clear()
+        locked_paths.clear()
+        root_items[:] = [add(root, model.invisibleRootItem()) for root in roots]
+        model.blockSignals(False)
+        set_checked(wanted)
+        view.expandToDepth(0)
+
+    dialog.rpfarm_set_checked = set_checked
+    dialog.rpfarm_rebuild_tree = rebuild_tree
     return dialog
 
 
 def confirm(roots, missing, checked, title="RunPodFarm", parent=None, mbps=None,
             header=None, accept_label="Upload", columns=None,
-            protected=None, locked=None):
+            protected=None, locked=None, review=None):
     """Show the plan. Returns the checked paths, or None if cancelled.
 
     None means the artist said no -- the caller must stop the cook, and must
@@ -805,9 +833,13 @@ def confirm(roots, missing, checked, title="RunPodFarm", parent=None, mbps=None,
             parent = None
     if QtWidgets.QApplication.instance() is None:  # pragma: no cover - Houdini always has one
         QtWidgets.QApplication([])
-    dialog = build_dialog(roots, missing, checked, title=title, parent=parent, mbps=mbps,
-                          header=header, accept_label=accept_label, columns=columns,
-                          protected=protected, locked=locked)
+    if review is not None:
+        from . import file_review
+        dialog = file_review.build_dialog(review, missing, checked, parent=parent, mbps=mbps)
+    else:
+        dialog = build_dialog(roots, missing, checked, title=title, parent=parent, mbps=mbps,
+                              header=header, accept_label=accept_label, columns=columns,
+                              protected=protected, locked=locked)
     if not dialog.exec():
         return None
     return dialog.rpfarm_checked()
@@ -957,7 +989,7 @@ def fetch_farm_index(cfg, api, remote_project, log=None):
 
 
 def choose_uploads(node, scan, usd_paths=(), env_paths=(), ask=False, log=None, window=None,
-                   job_dir=None, remote_project=None, cfg=None, api=None):
+                   job_dir=None, remote_project=None, cfg=None, api=None, intent="cook"):
     """The final list of local paths this cook uploads.
 
     One window, one tree, one stored answer. Every reference this cook could
@@ -1006,10 +1038,19 @@ def choose_uploads(node, scan, usd_paths=(), env_paths=(), ask=False, log=None, 
     # to look for an already-running sync pod). Never on its own account --
     # see fetch_farm_index's own docstring for why a listing is never
     # allowed to start a pod.
+    review = None
     if job_dir and remote_project:
         pairs = farm_pairs([leaf.path for leaf in leaves(roots)], job_dir, remote_project)
         index = fetch_farm_index(cfg, api, remote_project, log=say) if cfg and api else None
         annotate_farm_state(roots, pairs, index, remote_project)
+        if ask:
+            from .file_review import FileReview
+            review = FileReview(rows, roots, job_dir, remote_project, index, cfg, api, intent)
+            try:
+                review.package_gb = node.evalParm('rpfarm_packagegb')
+                review.grouping = node.evalParm('rpfarm_grouping') or 'packages'
+            except Exception:
+                pass  # Older scenes use the compatible package defaults.
 
     mbps = measured_uplink()
     off, on = load_choices(node.evalParm("rpfarm_exclude"))
@@ -1029,12 +1070,20 @@ def choose_uploads(node, scan, usd_paths=(), env_paths=(), ask=False, log=None, 
         asker = window or confirm_on_main_thread
         try:
             chosen = asker(roots, missing, checked, title="RunPodFarm -- what will upload",
-                           mbps=mbps)
+                           mbps=mbps, review=review,
+                           accept_label="Save Selection" if intent == "preview" else "Continue Upload")
         except Exception as exc:
             say("confirmation window unavailable ({}) -- using the remembered answer".format(exc))
             chosen = checked
         if chosen is None:
             raise UploadCancelled("upload cancelled in the confirmation window")
+        if review is not None:
+            for key, value in (('rpfarm_packagegb', review.package_gb),
+                               ('rpfarm_grouping', review.grouping)):
+                try:
+                    node.parm(key).set(value)
+                except Exception:
+                    pass
         chosen = {normalise(p) for p in chosen}
         if chosen != {normalise(p) for p in checked}:
             node.parm("rpfarm_exclude").set(

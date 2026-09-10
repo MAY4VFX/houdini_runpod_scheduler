@@ -36,6 +36,18 @@ from .worker_client import WorkerClient
 
 PORTS = ["22/tcp", "4440/tcp", "4442/tcp", "8000/http"]
 
+# Filenames inside the shipped Submit As Job host_pkg/ staging dir for
+# PDG's own serialize/deserializeWorkItems state (Ruling R71, second cut).
+# One shared source rather than a literal duplicated on both ends: the
+# scheduler's own _submitAsJobInner (hda/runpodfarm_scheduler.hda/...
+# /PythonModule) writes TASKGRAPH_IN before shipping the package; the
+# host pod's pod/host_render.py reads it and writes TASKGRAPH_OUT after
+# its own cook, back onto the SAME mounted volume path -- no upload/
+# download step of its own, since host_pkg/ already lives on the network
+# volume every pod mounts.
+TASKGRAPH_IN_FILENAME = "taskgraph_in.bin"
+TASKGRAPH_OUT_FILENAME = "taskgraph_out.bin"
+
 SYNC_SLOTS = 4
 
 # How long ensure_sync_pod waits to acquire the sync-pod lock before
@@ -338,8 +350,14 @@ def wait_ready(api, client, pod_id, timeout=300, cancel=lambda: False, sleep=tim
             has_ssh_port = True
         except RunPodError:
             has_ssh_port = False
-        if has_ssh_port and client.health():
-            return pod
+        if has_ssh_port:
+            if client.health():
+                return pod
+            if getattr(client, 'last_health_status', None) in (401, 403):
+                from .worker_client import WorkerError
+                raise WorkerError(client.last_health_status,
+                    'Sync/worker access denied: the pod uses a different session token. '
+                    'It is running, but this session is not authorized; waiting will not help.')
         sleep(3)
     raise TimeoutError(f"pod {pod_id} not ready in {timeout}s")
 
@@ -484,6 +502,11 @@ def _dedupe_running(api, running, log):
     return [keep]
 
 
+def _sync_volume_matches(pod, cfg):
+    volume = pod.get('networkVolumeId') or (pod.get('networkVolume') or {}).get('id')
+    return not volume or volume == cfg.volume_id
+
+
 def find_running_sync_pod(api, cfg, log=None):
     """This user's sync pod, if one is already RUNNING -- read-only.
 
@@ -501,7 +524,7 @@ def find_running_sync_pod(api, cfg, log=None):
     except RunPodError as e:
         say("could not check for a running sync pod: {}".format(e))
         return None
-    running = [p for p in existing if p.get("desiredStatus") == "RUNNING"]
+    running = [p for p in existing if p.get("desiredStatus") == "RUNNING" and _sync_volume_matches(p, cfg)]
     return running[0] if running else None
 
 
@@ -511,6 +534,11 @@ def _find_or_create_sync_pod(api, cfg, token, pubkey, log, cloud_type=None, woke
     # delimiter, so "rpfarm-sync-may" would also match another user's
     # "rpfarm-sync-mayakovsky" pod -- filter down to an exact name match.
     existing = [p for p in api.list_pods(name) if p.get("name") == name]
+    wrong = [p for p in existing if not _sync_volume_matches(p, cfg)]
+    if wrong:
+        raise rpcfg.ConfigError(
+            'Sync pod {} belongs to a different volume. Select that volume or finish '
+            'using that sync pod before switching volumes; nothing was changed.'.format(wrong[0]['id']))
     running = _dedupe_running(api, [p for p in existing if p.get("desiredStatus") == "RUNNING"], log)
     if running:
         return running[0]
@@ -722,13 +750,14 @@ def start_mq(client: WorkerClient, pod: dict, cook_id: str, sleep=time.sleep, ti
     source ...`` prefix.
     """
     conn_path = f"/workspace/.rpfarm/mq_{cook_id}.txt"
-    log_path = f"/workspace/ledger/logs/mq_{cook_id}.log"
-    command = (
-        f"rm -f {conn_path}; "
-        f"nohup mqserver -p 4440 -n 64 -l 1 -c {conn_path} -w 4442 16 /result "
-        f"> {log_path} 2>&1 & sleep 1"
-    )
-    client.exec(command, timeout_s=30)
+    import inspect
+    import shlex
+    from .mq import ensure_shared_mq
+    script = inspect.getsource(ensure_shared_mq) + '\nensure_shared_mq({!r})'.format(conn_path)
+    command = 'python3 -c ' + shlex.quote(script)
+    result = client.exec(command, timeout_s=30)
+    if result.get('exit_code'):
+        raise RuntimeError('Could not start/reuse the shared MQ server: ' + str(result.get('stderr', ''))[-500:])
 
     t0 = time.time()
     while time.time() - t0 < timeout:
@@ -744,7 +773,9 @@ def start_mq(client: WorkerClient, pod: dict, cook_id: str, sleep=time.sleep, ti
 
 
 def stop_mq(client: WorkerClient) -> None:
-    client.exec("pkill -f mqserver", timeout_s=10)
+    # Disconnecting this cook's polling client is sufficient. The daemon
+    # belongs to the sync pod and may still be serving another host cook.
+    return None
 
 
 # -- orphans --------------------------------------------------------------

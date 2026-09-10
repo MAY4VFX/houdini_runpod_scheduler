@@ -90,6 +90,12 @@ def rebuild_generated(hotl: Path, log=print):
             if target.exists():
                 shutil.rmtree(target)
             subprocess.run([str(hotl), "-t", str(target), str(out)], check=True)
+            # hotl emits trailing spaces on color records for new internal nodes.
+            for mime in target.rglob('Contents.mime'):
+                lines = mime.read_text().splitlines(keepends=True)
+                cleaned = ''.join(line.rstrip() + '\n' if line.startswith('color UT_Color ') else line
+                                  for line in lines)
+                mime.write_text(cleaned)
             log(f"rebuilt {target.relative_to(REPO)}")
             built.append(name)
     return built
