@@ -211,6 +211,17 @@ def main():
     # replaces the default path unless told to append to it.
     env["HOUDINI_OTLSCAN_PATH"] = hda_dir + (":" + existing_scan if existing_scan else ":&")
     env["RPFARM_ROOT"] = rpfarm_root
+    # rpcfg.load() (rpfarm/config.py) reads $RPFARM_HOME/config.toml --
+    # defaults to ~/.rpfarm, i.e. /root/.rpfarm on this pod, which does
+    # not exist. Confirmed live (2026-09-10): the nested scheduler's
+    # onStartCook raised ConfigError("no config at /root/.rpfarm/
+    # config.toml") and PDG showed only "Failed to start scheduler" --
+    # the instrumentation added for exactly this (Ruling R71) is what
+    # surfaced it in one rental instead of a fourth guess. The shipped
+    # config.toml lives at <pkg_dir>/config.toml (same place submitAsJob
+    # wrote it), so $RPFARM_HOME is that same directory -- not a second
+    # copy anywhere else, which would only be one more thing to drift.
+    env["RPFARM_HOME"] = pkg_dir
 
     # The nested scheduler (running inside topcook.py's own cook, same
     # rpfarm code every other cook uses) needs to reach the sync pod over

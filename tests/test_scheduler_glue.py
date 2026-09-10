@@ -1746,6 +1746,29 @@ def test_submit_as_job_uses_a_throwaway_key_never_the_artists_own():
     assert authorize < pod_create < deauthorize
 
 
+def test_submit_as_job_key_is_time_bounded_even_if_nothing_ever_removes_it():
+    """Review finding, 2026-09-10: cleanup that depends on the submitting
+    session or the host pod staying alive is not a real boundary -- the
+    artist closing Houdini and walking away is the whole point of this
+    mode. sshd's own expiry-time authorized_keys option must be present,
+    computed from the SAME bound the watchdog uses (one constant, not two
+    hardcoded 240s that could drift), and set before the key is
+    authorized on the sync pod."""
+    src = MODULE.read_text()
+    inner = src[src.index("def _submitAsJobInner(self, node_name):"):]
+    inner = inner[:inner.index("\n    def ", 1)]
+
+    assert "_SUBMIT_AS_JOB_MAX_MINUTES" in inner
+    assert 'expiry-time="{}"' in inner
+    expiry_computed = inner.index("datetime.datetime.utcnow()")
+    authorize = inner.index("self._sync_client.exec(")
+    assert expiry_computed < authorize
+
+    # The same constant, not a second independently-chosen number, is
+    # what the pod's own watchdog is told to use.
+    assert '"RPFARM_HOST_MAX_MINUTES": str(_SUBMIT_AS_JOB_MAX_MINUTES)' in inner
+
+
 def test_onsetupcook_checks_divergence_before_uploading_pdg_temp():
     """onSetupCook itself never rents a GPU pod (that is onTick's job, once
     PDG actually has work -- see its own comment on _raised_for_work); the

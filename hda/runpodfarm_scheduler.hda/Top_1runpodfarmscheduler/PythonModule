@@ -41,6 +41,7 @@ from __future__ import print_function
 
 import ast
 import dataclasses
+import datetime
 import json
 import os
 import hashlib
@@ -285,6 +286,14 @@ from pdg.utils.simple_mq import SimpleMQSchedulerMixin
 
 # Rolling window of work-item durations that feeds the autoscaler.
 _AUTOSCALE_HISTORY_SIZE = rpdispatch.AUTOSCALE_HISTORY_SIZE
+
+# Submit As Job (Ruling R71): the ceiling the host pod's own watchdog uses
+# to self-terminate a hung/crashed cook, and the SAME number the throwaway
+# ssh key's authorized_keys expiry-time is computed from -- one constant,
+# not two independently-hardcoded 240s that could silently drift apart.
+# Passed explicitly via RPFARM_HOST_MAX_MINUTES rather than trusted to
+# match host_cook.py's own default.
+_SUBMIT_AS_JOB_MAX_MINUTES = 240
 
 # Minimum gap between /health polls of the same pod. The pod proxy sits behind
 # Cloudflare and onTick fires roughly once a second; there is nothing to gain
@@ -4043,10 +4052,24 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         finally:
             shutil.rmtree(host_keys_dir, ignore_errors=True)
 
+        # Time-bounded even if nothing ever runs the removal below (Ruling
+        # R71, review finding): the artist closing Houdini and walking
+        # away is the entire point of this mode, so cleanup that depends
+        # on this session, or on the host pod, still being alive is not a
+        # real boundary -- the exact shape of the orphaned-pod bug, here
+        # leaving a live credential instead of a billing machine. sshd's
+        # own expiry-time authorized_keys option makes the key stop being
+        # accepted on its own, no process required; removing the line is
+        # then tidiness, not the security boundary. Same bound the
+        # watchdog uses, so the key cannot outlive the pod it was made for.
+        expiry = (datetime.datetime.utcnow()
+                 + datetime.timedelta(minutes=_SUBMIT_AS_JOB_MAX_MINUTES)
+                 ).strftime("%Y%m%d%H%M")
+        authorized_line = 'expiry-time="{}" {}'.format(expiry, host_pubkey)
         try:
             self._sync_client.exec(
                 "mkdir -p ~/.ssh && echo {} >> ~/.ssh/authorized_keys".format(
-                    shlex.quote(host_pubkey)),
+                    shlex.quote(authorized_line)),
                 timeout_s=30)
         except Exception as e:
             raise CookError("Could not authorize the host pod's throwaway key "
@@ -4064,6 +4087,7 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
                     "RPFARM_HOST_HIP": hip_remote,
                     "RPFARM_HOST_TOPPATH": node_name,
                     "RPFARM_HOST_PKGDIR": remote_pkg_dir,
+                    "RPFARM_HOST_MAX_MINUTES": str(_SUBMIT_AS_JOB_MAX_MINUTES),
                 },
             )
             name = "rpfarm-{}-{}-{}-host".format(self._cfg.user, self._project, self._cook_id)

@@ -243,6 +243,10 @@ def test_main_runs_topcook_and_terminates_self_on_success(monkeypatch, tmp_path)
     assert env["RPFARM_SSH_KEY_PATH"] == "/tmp/.rpfarm_host_key"
     assert env["RPFARM_RCLONE_PATH"]
     assert env["RPFARM_ROOT"] == str(tmp_path / "host_pkg")
+    # rpcfg.load() defaults to $RPFARM_HOME/config.toml, ~/.rpfarm
+    # otherwise -- confirmed live (2026-09-10) this was the actual first
+    # failure ("Failed to start scheduler"), not the ssh key.
+    assert env["RPFARM_HOME"] == str(tmp_path / "host_pkg")
     assert env["HOUDINI_OTLSCAN_PATH"].startswith(str(tmp_path / "host_pkg" / "hda"))
     # The key itself was written to a LOCAL container path, never under
     # /workspace (the shared volume) -- and readable only by this pod.
