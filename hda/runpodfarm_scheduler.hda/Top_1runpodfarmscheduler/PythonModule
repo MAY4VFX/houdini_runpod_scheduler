@@ -4038,6 +4038,47 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         # artist by name, before ANYTHING is created or rented -- not
         # after, the way the existing unsaved-changes dialog in
         # submitGraphAsJob already does for a different question.
+        # Ruling R72 (acceptance dry run, 2026-09-11): the target comes from
+        # OUR Farm Target parm, never from the node_name PDG hands us.
+        # pdg.scheduler.submitGraphAsJob reads `usesubmitjobnode` and, when
+        # it is off, silently passes whichever node has the display flag.
+        # The DialogScript defaults that toggle to on and hides it -- but a
+        # scheduler node created BEFORE that default existed keeps the old
+        # stored 0 forever (the owner's own airship scene: value 0, default
+        # 1, parm hidden and disabled, so the artist cannot even see or fix
+        # it). Six live rentals were spent on exactly this inference. So:
+        # empty Farm Target is refused outright, a stale toggle is repaired
+        # in place, and a node_name that disagrees with Farm Target is
+        # refused rather than trusted.
+        target = self["submitjobnode"].evaluateString().strip()
+        if not target:
+            raise CookError(
+                "Farm Target пуст. Укажите на вкладке Run Job ноду рендера, "
+                "которую отправляем на ферму (обычно ROP Fetch). Пустая цель "
+                "означала бы «что стоит под флагом отображения» -- ровно та "
+                "догадка, из-за которой режим не работал.")
+        try:
+            hnode = self._houNode()
+            use_parm = hnode.parm("usesubmitjobnode") if hnode is not None else None
+            if use_parm is not None and not use_parm.eval():
+                use_parm.set(1)
+                self._log("usesubmitjobnode was 0 on this node (stale value from "
+                          "before Ruling R71); set to 1 so PDG uses Farm Target")
+        except Exception as e:  # never let bookkeeping stop a submit
+            self._log("could not repair usesubmitjobnode: {}".format(e))
+        # Farm Target is `oprelative "."`: a path picked with the chooser is
+        # relative to THIS scheduler node ("../fetch"), so resolve from it.
+        hnode = self._houNode()
+        target_node = hnode.node(target) if hnode is not None else hou.node(target)
+        if target_node is None:
+            raise CookError("Farm Target указывает на несуществующую ноду: {}".format(target))
+        if node_name and hou.node(node_name) is not None and hou.node(node_name) != target_node:
+            raise CookError(
+                "PDG передал для отправки ноду {} (флаг отображения), а Farm Target "
+                "указывает на {}. Отправляю только то, что названо явно -- проверьте "
+                "Farm Target на вкладке Run Job.".format(node_name, target_node.path()))
+        node_name = target_node.path()
+
         if hou.isUIAvailable():
             if hou.ui.displayMessage(
                 "Отправить на ферму узел:\n\n{}\n\nПосле подтверждения "

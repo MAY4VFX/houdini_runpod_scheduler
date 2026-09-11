@@ -596,12 +596,11 @@
 
         parm {
             name    "rpfarm_submithelp"
-            label   "Что делает Submit"
-            type    string
-            default { "Farm runs the selected target after local upload; Download stays here for later retrieval. Background runs through its Download stage on this computer." }
-            disablewhen "{ rpfarm_verbose >= 0 }"
-            parmtag { "editor" "1" }
-            parmtag { "editorlines" "2-3" }
+            label   "rpfarm_submithelp"
+            type    label
+            nolabel
+            size    3
+            default { "Run Job: заливка идёт ЗДЕСЬ, с вашими файлами. Дождитесь её конца." "Потом на ферму уезжает только Farm Target и всё выше него; под сам рендерит и сам гасит себя и свои машины." "После этого Houdini можно закрыть и выключить компьютер. Кадры остаются на ферме -- заберёте нодой RunPodFarm Download." }
         }
         parm {
             name    "submitjob"
@@ -649,12 +648,11 @@
 
         parm {
             name    "rpfarm_bgcookhelp"
-            label   "Что делает Background Cook"
-            type    string
-            default { "Local background controller. The computer must stay on. Use Job status and Cancel Selected Job to manage it." }
-            disablewhen "{ rpfarm_verbose >= 0 }"
-            parmtag { "editor" "1" }
-            parmtag { "editorlines" "2-3" }
+            label   "rpfarm_bgcookhelp"
+            type    label
+            nolabel
+            size    3
+            default { "Background Cook: кук идёт как обычно, но отдельным процессом на ЭТОМ компьютере -- он переживёт закрытие Houdini." "Компьютер должен не уснуть. Путь к логу печатается один раз при запуске." "Это не Run Job: здесь ваш компьютер дирижирует до конца, включая скачивание." }
         }
         parm {
             name    "rpfarm_bgcookenable"

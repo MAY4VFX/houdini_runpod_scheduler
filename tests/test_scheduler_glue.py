@@ -3189,3 +3189,38 @@ def test_disablewhen_gates_the_background_cook_button_on_its_own_toggle():
     launch_parm = text[text.index('name    "rpfarm_bgcooklaunch"'):]
     launch_parm = launch_parm[:launch_parm.index("}\n    }")]
     assert 'disablewhen "{ rpfarm_bgcookenable == 0 }"' in launch_parm
+
+
+def test_submit_as_job_refuses_an_empty_farm_target_before_the_dialog():
+    """Ruling R72. PDG's own submitGraphAsJob falls back to the display-flag
+    node when `usesubmitjobnode` is off, and a scheduler node created before
+    that toggle defaulted to on keeps a stored 0 forever, hidden and disabled
+    (the owner's real scene). So the target is read from OUR Farm Target
+    parm, an empty one is refused before the confirm dialog, the stale
+    toggle is repaired in place, and a node_name that disagrees with Farm
+    Target is refused rather than trusted."""
+    src = MODULE.read_text()
+    outer = src[src.index("def submitAsJob(self, graph_file, node_name):"):]
+    outer = outer[:outer.index("\n    def ", 1)]
+    guard = outer.index('self["submitjobnode"].evaluateString()')
+    confirm = outer.index("hou.ui.displayMessage(")
+    assert guard < confirm, "Farm Target is checked before anything is shown or rented"
+    assert "Farm Target пуст" in outer
+    assert 'use_parm.set(1)' in outer
+    assert "hou.node(node_name) != target_node" in outer
+    assert "node_name = target_node.path()" in outer
+
+
+def test_help_texts_are_labels_not_stored_strings():
+    """Ruling R72. The two help texts on Run Job / Background Cook were
+    string parms with a default: a node created under an older definition
+    keeps the OLD sentence forever, and the owner's scene showed a Run Job
+    help that said the whole scene leaves and Houdini can be closed at
+    once -- which, after the redesign, would have lost his upload. A label
+    parm stores nothing, so it can never go stale."""
+    ds = DIALOG.read_text() if "DIALOG" in globals() else (MODULE.parent / "DialogScript").read_text()
+    for name in ("rpfarm_submithelp", "rpfarm_bgcookhelp"):
+        block_start = ds.index('name    "%s"' % name)
+        block = ds[block_start: ds.index("        }", block_start)]
+        assert "type    label" in block, name
+        assert "type    string" not in block, name
