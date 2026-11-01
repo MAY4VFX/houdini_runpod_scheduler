@@ -277,6 +277,18 @@ def jobStatus():
     import hou
     from rpfarm import jobs
     return jobs.selected_description(hou.pwd().evalParm('rpfarm_job'))
+def onJobChanged(kwargs):
+    """Results From changed: the work items already in this session belong
+    to the other source and would wait forever on a dependency that is gone
+    (live 2026-11-01: back from a job to the live graph, gate/cams/render sat
+    in Waiting after upload finished). Dirty the network so the next cook
+    generates from the source now selected."""
+    node = kwargs["node"]
+    net = node.parent()
+    try:
+        net.dirtyAllWorkItems(False)
+    except Exception:
+        node.dirtyAllWorkItems(False)
 '''
 
 RESUME_CODE = '''\
@@ -758,7 +770,9 @@ def main():
     ptg = hou.ParmTemplateGroup()
     job_pt = hou.StringParmTemplate('rpfarm_job', 'Results From', 1, default_value=('',),
         item_generator_script='return hou.phm().jobMenu()',
-        item_generator_script_language=hou.scriptLanguage.Python)
+        item_generator_script_language=hou.scriptLanguage.Python,
+        script_callback='hou.phm().onJobChanged(kwargs)',
+        script_callback_language=hou.scriptLanguage.Python)
     job_pt.setHelp('Current graph cooks the connected input. A submitted job restores its results inside this cook without rerunning Upload or Render.')
     job_pt.setConditional(hou.parmCondType.HideWhen, '{ rpfarm_mode == custom }')
     job_status_pt = hou.StringParmTemplate('rpfarm_jobstatus', 'Job Status', 1,

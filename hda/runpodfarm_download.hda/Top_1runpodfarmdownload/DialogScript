@@ -24,6 +24,8 @@
             [ "return hou.phm().jobMenu()" ]
             language python
         }
+        parmtag { "script_callback" "hou.phm().onJobChanged(kwargs)" }
+        parmtag { "script_callback_language" "python" }
     }
     parm {
         name    "rpfarm_jobstatus"

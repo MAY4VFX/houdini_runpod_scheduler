@@ -201,3 +201,15 @@ def jobStatus():
     import hou
     from rpfarm import jobs
     return jobs.selected_description(hou.pwd().evalParm('rpfarm_job'))
+def onJobChanged(kwargs):
+    """Results From changed: the work items already in this session belong
+    to the other source and would wait forever on a dependency that is gone
+    (live 2026-11-01: back from a job to the live graph, gate/cams/render sat
+    in Waiting after upload finished). Dirty the network so the next cook
+    generates from the source now selected."""
+    node = kwargs["node"]
+    net = node.parent()
+    try:
+        net.dirtyAllWorkItems(False)
+    except Exception:
+        node.dirtyAllWorkItems(False)

@@ -3309,3 +3309,13 @@ def test_orphan_sweep_never_terminates_the_host_pod_it_runs_on():
     from rpfarm import pods as rppods
     assert rppods.lifecycle_is_elsewhere({"name": "rpfarm-may-yoyo-50a7d711-host", "id": "x"})
     assert not rppods.lifecycle_is_elsewhere({"name": "rpfarm-may-yoyo-50a7d711-1", "id": "y"})
+
+
+def test_changing_results_from_dirties_the_network():
+    """Live 2026-11-01: switching Download's Results From from a job back to
+    the live graph left gate/cams/render Waiting forever on a dependency from
+    the other source."""
+    src = (MODULE.parent.parent.parent.parent / "scripts" / "build_runpodfarm_download_hda.py").read_text()
+    assert "script_callback='hou.phm().onJobChanged(kwargs)'" in src
+    assert "def onJobChanged(kwargs):" in src
+    assert "dirtyAllWorkItems(False)" in src[src.index("def onJobChanged(kwargs):"):]
