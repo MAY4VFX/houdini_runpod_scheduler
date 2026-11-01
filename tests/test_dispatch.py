@@ -606,3 +606,57 @@ def test_the_autoscaler_does_not_outnumber_the_work_either():
         pending=6, active_pods=1, max_pods=8,
         render_times=[2400.0], threshold_min=10.0)
     assert many > 1, "and real work still scales up"
+
+
+def test_scrub_local_pythonpath_drops_only_the_local_package_root():
+    env = {"PYTHONPATH": "/Users/artist/.rpfarm/pkg:/workspace/projects/artist/x/python"}
+    rpdispatch.scrub_local_pythonpath(env, ["/Users/artist/.rpfarm/pkg"])
+    assert env["PYTHONPATH"] == "/workspace/projects/artist/x/python"
+
+
+def test_scrub_local_pythonpath_removes_the_variable_when_nothing_is_left():
+    env = {"PYTHONPATH": "/Users/artist/.rpfarm/pkg/", "OTHER": "1"}
+    rpdispatch.scrub_local_pythonpath(env, ["/Users/artist/.rpfarm/pkg"])
+    assert env == {"OTHER": "1"}
+
+
+def test_scrub_local_pythonpath_leaves_an_unrelated_value_alone():
+    env = {"PYTHONPATH": "/opt/studio/python"}
+    rpdispatch.scrub_local_pythonpath(env, ["/Users/artist/.rpfarm/pkg"])
+    assert env == {"PYTHONPATH": "/opt/studio/python"}
+    rpdispatch.scrub_local_pythonpath({}, ["/x"])
+
+
+def test_a_task_queued_behind_a_busy_pod_never_runs_out_of_capacity_time():
+    """Live 2026-11-01: one pod rendering camera 2 of 3, camera 3 queued for
+    15 min was failed as "RunPod never had a machine"."""
+    d = Dispatcher(slots_per_pod=1)
+    d.add_pod("pod1")
+    first, second = _task("a", 1), _task("b", 2)
+    d.enqueue(first, now=1000.0)
+    d.enqueue(second, now=1000.0)
+    d.assign(first.task_id, "pod1")
+
+    assert d.capacity_expired(1000.0 + 3600, 900) == []
+
+
+def test_a_booting_pod_counts_as_capacity_too():
+    d = Dispatcher()
+    d.add_pod("pod1", status="CREATED", created_at=1000.0)
+    d.enqueue(_task(), now=1000.0)
+
+    assert d.capacity_expired(1000.0 + 3600, 900) == []
+
+
+def test_the_clock_starts_when_the_last_pod_goes_not_when_the_task_was_queued():
+    d = Dispatcher(slots_per_pod=1)
+    d.add_pod("pod1")
+    busy, waiting = _task("a", 1), _task("b", 2)
+    d.enqueue(busy, now=1000.0)
+    d.enqueue(waiting, now=1000.0)
+    d.assign(busy.task_id, "pod1")
+
+    d.pod_dead("pod1", now=5000.0)
+
+    assert d.capacity_expired(5000.0 + 899, 900) == []
+    assert {t.task_id for t in d.capacity_expired(5000.0 + 900, 900)} == {"a", "b"}

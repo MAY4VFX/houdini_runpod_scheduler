@@ -223,7 +223,7 @@ _ASSET_FINGERPRINT = {
     'context.py': (4466, '2fa09a0d45931725'),
     'delivery.py': (3964, '63bb04491f97a3f3'),
     'deps.py': (38558, '2daae12f5770289a'),
-    'dispatch.py': (22191, '1121a6505c88adb3'),
+    'dispatch.py': (24908, '2e9fa7ce1894bbf8'),
     'file_review.py': (16246, 'd81726007b4ba4dd'),
     'gpus.py': (8311, '7a28d5c2692b776e'),
     'host_render.py': (10983, 'a0139507d9f7fe7f'),
@@ -1514,6 +1514,10 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         for name in list(task_env):
             if name in ('RUNPOD_API_KEY', 'RPFARM_SESSION_TOKEN', 'RPFARM_CONTEXT_PATH') or name.startswith('RPFARM_HOST_'):
                 task_env.pop(name, None)
+        # The local upload/download TOPs put this machine's rpfarm package on
+        # PYTHONPATH and PDG hands it down to every render item; on the pod it
+        # names nothing and only produced misleading import tracebacks.
+        rpdispatch.scrub_local_pythonpath(task_env)
 
         return task_env
 
@@ -2396,7 +2400,11 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
             for node in self.context.graph.nodes():
                 for item in node.workItems:
                     key = item.stringAttribValue('rpfarm_delivery_key') or ''
-                    if key.startswith(self._cook_id + '/') and item.intAttribValue('rpfarm_delivered') > 0:
+                    # intAttribValue is None on every item that never carried
+                    # the attribute (the render items, the gate...) -- comparing
+                    # it to 0 raised and aborted the whole count (live
+                    # 2026-11-01, yoyo).
+                    if key.startswith(self._cook_id + '/') and (item.intAttribValue('rpfarm_delivered') or 0) > 0:
                         self._downloads_done += 1
         except Exception as exc:
             self._verboseLog('Could not inspect Download results: {}'.format(exc))

@@ -129,6 +129,10 @@ class Dispatcher:
         self._running: dict[str, TaskState] = {}
         self.failed: list[TaskState] = []
         self._failed_cursor = 0
+        # When the pool last went from "has a live pod" to "has none". The
+        # capacity clock of a queued task never starts before it: a task that
+        # waited behind a busy pod was waiting for its TURN, not for RunPod.
+        self._no_pod_since: float | None = None
 
     # -- pods ---------------------------------------------------------------
 
@@ -170,6 +174,8 @@ class Dispatcher:
             return []
         now = time.time() if now is None else now
         pod.status = "DEAD"
+        if not any(p.status in ("RUNNING", "CREATED") for p in self.pods.values()):
+            self._no_pod_since = now
 
         retry = []
         for task_id in sorted(pod.running):
@@ -303,8 +309,20 @@ class Dispatcher:
         """
         if wait_seconds <= 0:
             return []
+        # A live pod -- running, or created and still booting -- means the
+        # farm HAS capacity; a task in the queue is waiting for a slot on it,
+        # and how long that takes is the length of the renders ahead of it.
+        # Measured live 2026-11-01 on the owner's yoyo scene: one RTX 4090,
+        # three cameras of ~4-5 min each, Max Pods 2 but the autoscaler
+        # rightly kept one pod -- and the third camera was failed after 15 min
+        # "waiting for a free machine ... RunPod never had one" while the pod
+        # it was queued for was rendering the second.
+        if any(p.status in ("RUNNING", "CREATED") for p in self.pods.values()):
+            return []
+        floor = self._no_pod_since if self._no_pod_since is not None else float("-inf")
         return [t for t in self._pending
-                if t.queued_at is not None and (now - t.queued_at) >= wait_seconds]
+                if t.queued_at is not None
+                and (now - max(t.queued_at, floor)) >= wait_seconds]
 
     def running_tasks(self) -> list[TaskState]:
         return list(self._running.values())
@@ -572,3 +590,35 @@ def append_record(path, **record) -> None:
             f.write(json.dumps(record, default=str) + "\n")
     except OSError:
         pass
+
+
+# -- task environment --------------------------------------------------------
+
+
+def scrub_local_pythonpath(env: dict, local_roots=None) -> None:
+    """Drop this workstation's rpfarm package root from a pod task's PYTHONPATH.
+
+    The upload and download TOPs run locally and set ``PYTHONPATH`` to the
+    local rpfarm package (``~/.rpfarm/pkg``) on their work items. PDG copies a
+    parent item's environment to its children, so every render item below
+    them used to reach the pod carrying a macOS path. On the pod it names
+    nothing, and the only effect was a pair of ``No module named 'rpfarm'``
+    tracebacks at the top of every render log -- which read as a broken
+    farm. Other entries are kept: a studio may set PYTHONPATH on purpose.
+    Removes the variable outright when nothing is left. Mutates ``env``.
+    """
+    raw = env.get("PYTHONPATH")
+    if not raw:
+        return
+    if local_roots is None:
+        # The directory that holds this very package -- what the TOPs put there.
+        local_roots = [os.path.dirname(os.path.dirname(os.path.realpath(__file__)))]
+    drop = {os.path.normpath(r) for r in local_roots if r}
+    # Both separators: the value was built on the workstation (":" on macOS
+    # and Linux, ";" on Windows) and is read on Linux.
+    parts = [p for p in raw.replace(";", ":").split(":") if p]
+    kept = [p for p in parts if os.path.normpath(p) not in drop]
+    if kept:
+        env["PYTHONPATH"] = ":".join(kept)
+    else:
+        env.pop("PYTHONPATH", None)

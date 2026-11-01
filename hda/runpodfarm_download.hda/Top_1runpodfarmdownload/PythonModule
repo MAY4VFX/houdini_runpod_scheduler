@@ -160,7 +160,7 @@ _ASSET_FINGERPRINT = {
     'context.py': (4466, '2fa09a0d45931725'),
     'delivery.py': (3964, '63bb04491f97a3f3'),
     'deps.py': (38558, '2daae12f5770289a'),
-    'dispatch.py': (22191, '1121a6505c88adb3'),
+    'dispatch.py': (24908, '2e9fa7ce1894bbf8'),
     'file_review.py': (16246, 'd81726007b4ba4dd'),
     'gpus.py': (8311, '7a28d5c2692b776e'),
     'host_render.py': (10983, 'a0139507d9f7fe7f'),
