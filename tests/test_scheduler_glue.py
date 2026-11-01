@@ -3262,3 +3262,14 @@ def test_run_job_asks_file_review_before_the_blocking_upload_cook():
     upload = (MODULE.parent.parent.parent / "runpodfarm_upload.hda" / "Top_1runpodfarmupload"
               / "PythonModule").read_text()
     assert "def reviewBeforeSubmit(node):" in upload
+
+
+def test_run_job_upload_check_skips_children_without_work_items():
+    """Live 2026-11-01: the failed-item check walked the upload's children,
+    one of which is its own localscheduler, whose PDG object has no
+    workItems -- AttributeError killed every Run Job after its upload."""
+    src = MODULE.read_text()
+    inner = src[src.index("def _submitAsJobInner(self, node_name):"):]
+    inner = inner[:inner.index("\n    def ", 1)]
+    assert 'getattr(top.getPDGNode(), "workItems", None)' in inner
+    assert "top.getPDGNode().workItems" not in inner

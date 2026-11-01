@@ -4198,8 +4198,13 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
                 if asked_here:
                     confirm.set(1)
             nodes = [n] + list(n.allSubChildren())
+            # getattr: the upload's own localscheduler is one of its
+            # children, and a scheduler's PDG object has no workItems -- the
+            # bare attribute access killed every Run Job right after its
+            # upload finished (live 2026-11-01, yoyo).
             failed = [wi.name for top in nodes if top.getPDGNode()
-                      for wi in top.getPDGNode().workItems if wi.state == pdg.workItemState.CookedFail]
+                      for wi in (getattr(top.getPDGNode(), "workItems", None) or [])
+                      if wi.state == pdg.workItemState.CookedFail]
             errors = [error for top in nodes for error in top.errors()]
             if failed or errors:
                 raise CookError(
