@@ -1267,7 +1267,16 @@ def _probe_pod(cfg, pod):
     try:
         if _health_probe is not None:
             return _health_probe(pod), None
-        return WorkerClient(pod["id"], rpcfg.session_token()).health(), None
+        client = WorkerClient(pod["id"], rpcfg.session_token())
+        health = client.health()
+        if health is None and getattr(client, "last_health_status", None) == 401:
+            # GPU pods are created with their cook's own token, which only
+            # that Houdini session holds -- so this is "not ours to ask",
+            # not "unreachable". Said precisely: the old "no answer" sent
+            # people looking for a network problem (live 2026-11-01).
+            return None, ("it answers only its own cook's Houdini session; an "
+                          "abandoned GPU pod also terminates itself after 20 min idle")
+        return health, None
     except Exception as e:  # noqa: BLE001 - a probe failure is an answer, not a crash
         return None, str(e)
 
