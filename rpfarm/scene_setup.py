@@ -261,6 +261,7 @@ def build(parent, project="", frames=1, rop_candidates=(), max_pods=DEFAULT_MAX_
 
     if result.rop:
         _set(fetch, "roppath", result.rop)
+        point_fetch_at_image(fetch, _resolve(parent, result.rop))
     # "Frame Range", not "ROP Node Configuration": the latter hands the whole
     # range to the ROP as ONE work item that renders every frame in one
     # hython -- on one pod. One item per frame is what makes this a farm.
@@ -332,6 +333,41 @@ def _type_name(node):
         return node.type().name()
     except Exception:  # pragma: no cover - a node that cannot say is not ours
         return ""
+
+
+#: ROP types whose image is NOT the output a ROP Fetch reports by default.
+#: A ``usdrender_rop`` reports its ``lopoutput`` (``__render__.usd``, a
+#: scratch file that never exists on the workstation), so PDG's cache check
+#: never finds a finished frame and re-renders -- and re-bills -- every
+#: camera already on disk. Measured live 2026-11-01 on the yoyo scene.
+IMAGE_OUTPUT_PARM = {
+    "usdrender_rop": "outputimage",
+    "usdrender": "outputimage",
+}
+
+
+def point_fetch_at_image(fetch, rop):
+    """Make ``fetch`` (a ROP Fetch) report ``rop``'s image as its output.
+
+    Only acts where it is needed and safe: the ROP is a type listed in
+    :data:`IMAGE_OUTPUT_PARM`, the fetch has not been given a custom output
+    parm already (the artist's choice wins), and the image parm exists.
+    Returns the parm name it set, or "" when it left the fetch alone.
+    """
+    if fetch is None or rop is None:
+        return ""
+    image_parm = IMAGE_OUTPUT_PARM.get(_type_name(rop))
+    if not image_parm or rop.parm(image_parm) is None:
+        return ""
+    use = fetch.parm("usecustomoutput")
+    name = fetch.parm("customoutput")
+    if use is None or name is None:
+        return ""
+    if _eval_string(use) not in ("", "0") and _eval_string(name):
+        return ""
+    use.set(1)
+    name.set(image_parm)
+    return image_parm
 
 
 def _set(node, parm_name, value):

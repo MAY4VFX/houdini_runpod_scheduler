@@ -341,3 +341,36 @@ def test_the_tool_never_opens_a_dialog():
 
     source = inspect.getsource(ss)
     assert "displayMessage" not in source
+
+
+# -- ROP Fetch on a USD Render ROP reports the image (live 2026-11-01) -------
+
+
+def _fetch_and_rop(rop_type, use=0, custom=""):
+    fetch = FakeNode("ropfetch", "render", None, parms=("usecustomoutput", "customoutput"))
+    fetch.parms["usecustomoutput"].value = use
+    fetch.parms["customoutput"].value = custom
+    rop = FakeNode(rop_type, "render_cams", None, parms=("outputimage", "picture"))
+    return fetch, rop
+
+
+def test_fetch_on_usdrender_rop_reports_the_image():
+    fetch, rop = _fetch_and_rop("usdrender_rop")
+    assert ss.point_fetch_at_image(fetch, rop) == "outputimage"
+    assert fetch.parms["usecustomoutput"].value == 1
+    assert fetch.parms["customoutput"].value == "outputimage"
+
+
+def test_an_output_parm_the_artist_chose_is_left_alone():
+    fetch, rop = _fetch_and_rop("usdrender_rop", use=1, custom="lopoutput")
+    assert ss.point_fetch_at_image(fetch, rop) == ""
+    assert fetch.parms["customoutput"].value == "lopoutput"
+    assert fetch.parms["customoutput"].sets == 0
+
+
+def test_other_rop_types_are_not_touched():
+    fetch, rop = _fetch_and_rop("karma")
+    assert ss.point_fetch_at_image(fetch, rop) == ""
+    assert fetch.parms["usecustomoutput"].sets == 0
+    assert ss.point_fetch_at_image(None, rop) == ""
+    assert ss.point_fetch_at_image(fetch, None) == ""

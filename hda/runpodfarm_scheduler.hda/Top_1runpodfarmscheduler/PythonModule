@@ -239,7 +239,7 @@ _ASSET_FINGERPRINT = {
     'progress.py': (3439, 'c364a012f5cd92e6'),
     'releases.py': (4735, 'c6b364ccfb3534b3'),
     'runpod_api.py': (14539, 'b90960f9860c97fb'),
-    'scene_setup.py': (18803, 'c8031966f92b71f3'),
+    'scene_setup.py': (20203, 'b935ce9bb5a96bee'),
     'smoke.py': (42548, 'ce0c8d36fe763314'),
     'status.py': (458, '2205873427086b87'),
     'submission.py': (1621, '6b428346b41fab92'),
@@ -3046,6 +3046,7 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         self.startPollingClient()
 
         self._preflightXpu()
+        self._pointFetchesAtImages()
 
         # NO pods here. This used to be `_scale_up(max(1, minpods))` at cook
         # start, before PDG had decided whether any work item actually needs
@@ -3638,6 +3639,34 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         except Exception as e:
             # A courtesy summary must never break a cook.
             self._verboseLog("could not sweep the graph for failures: {}".format(e))
+
+    def _pointFetchesAtImages(self):
+        """Let PDG see finished frames of a USD Render ROP as finished.
+
+        A ROP Fetch on a usdrender_rop reports `__render__.usd` as its output,
+        a file that never exists on the workstation, so every re-cook
+        re-rendered -- and re-billed -- frames already on disk (live
+        2026-11-01, yoyo: two of three cameras rendered again). Repaired in
+        place, like the stale submit toggle (R72), and said out loud; an
+        output parm the artist set by hand is left alone.
+        """
+        try:
+            import hou
+            from rpfarm import scene_setup as rpscene
+
+            for node in self.topNode().parent().children():
+                roppath = node.parm("roppath")
+                if roppath is None:
+                    continue
+                rop = hou.node(roppath.eval() or "")
+                parm = rpscene.point_fetch_at_image(node, rop)
+                if parm:
+                    self._log("{} now reports {}'s {} as its output, so frames "
+                              "already on disk count as done instead of being "
+                              "rendered again (save the scene to keep it)".format(
+                                  node.path(), rop.path(), parm))
+        except Exception as e:  # noqa: BLE001 - a repair must not break the cook
+            self._verboseLog("could not check ROP Fetch outputs: {}".format(e))
 
     def _xpuRops(self):
         """ROPs this topnet is about to render that ask for Karma XPU.
