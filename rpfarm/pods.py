@@ -22,6 +22,7 @@ kept and the rest are terminated.
 from __future__ import annotations
 
 import contextlib
+import os
 import platform
 import time
 
@@ -869,3 +870,10 @@ def create_apart_from(api, create, sync_pod, log=print, retries=MAX_COLOCATION_R
         api.terminate_pod(pod["id"])
         pod = create()
     return pod
+
+
+def lifecycle_is_elsewhere(pod) -> bool:
+    """A pod a cook's orphan sweep must leave alone: a Submit As Job host
+    (host_cook.py ends it) or the pod this code itself runs on."""
+    name = (pod or {}).get("name") or ""
+    return is_host_pod_name(name) or (pod or {}).get("id") == os.environ.get("RUNPOD_POD_ID")

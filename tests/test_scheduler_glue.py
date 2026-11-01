@@ -3295,3 +3295,17 @@ def test_run_job_ships_the_artists_colour_config_to_the_host():
     ocio = src[src.index("def _ensureOcioEnv(self, task_env):"):]
     ocio = ocio[:ocio.index("\n    def ", 1)]
     assert ocio.index('os.environ.get("RPFARM_HOST_OCIO")') < ocio.index('os.environ.get("OCIO")')
+
+
+def test_orphan_sweep_never_terminates_the_host_pod_it_runs_on():
+    """Live 2026-11-01, yoyo Run Job: the host's scheduler swept the host pod
+    (it carries the cook id) as an orphan and killed it before the checkpoint,
+    manifest and final job state were written."""
+    src = MODULE.read_text()
+    sweep = src[src.index("def _sweepOrphanPods(self):"):]
+    sweep = sweep[:sweep.index("\n    def ", 1)]
+    guard = sweep.index("rppods.lifecycle_is_elsewhere(pod)")
+    assert guard < sweep.index("self._terminate_pod(pod_id)")
+    from rpfarm import pods as rppods
+    assert rppods.lifecycle_is_elsewhere({"name": "rpfarm-may-yoyo-50a7d711-host", "id": "x"})
+    assert not rppods.lifecycle_is_elsewhere({"name": "rpfarm-may-yoyo-50a7d711-1", "id": "y"})

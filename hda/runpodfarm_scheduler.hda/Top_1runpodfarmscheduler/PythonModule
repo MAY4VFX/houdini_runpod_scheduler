@@ -234,7 +234,7 @@ _ASSET_FINGERPRINT = {
     'mq.py': (2124, '174afbd9f49ad86f'),
     'package_runner.py': (9652, '939de3e067b005db'),
     'packages.py': (63842, '42a0a9d34bdf67a8'),
-    'pods.py': (38293, '62500e3e84938c56'),
+    'pods.py': (38622, 'dbd6022b12a910d1'),
     'preflight.py': (45206, 'bea8fc057bc7e32a'),
     'progress.py': (3439, 'c364a012f5cd92e6'),
     'releases.py': (4735, 'c6b364ccfb3534b3'),
@@ -2508,6 +2508,14 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
                 continue
             if pod_id in self._dispatcher.pods:
                 continue  # the loop right after this one already has it
+            if rppods.lifecycle_is_elsewhere(pod):
+                # The Submit As Job host carries this cook's id too, and its
+                # own lifecycle belongs to host_cook.py. Live 2026-11-01: the
+                # host's scheduler terminated the host itself here, before
+                # host_render wrote the checkpoint, the manifest and the job's
+                # final state -- the frames were on the farm and the job said
+                # "running" forever.
+                continue
             self._log("orphan pod {} ({}) from this cook was never "
                       "registered here -- terminating it".format(pod_id, name))
             self._terminate_pod(pod_id)
