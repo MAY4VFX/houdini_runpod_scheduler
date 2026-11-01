@@ -109,6 +109,10 @@ class Config:
     # not an eviction: waiting is the correct response, and 15 minutes is the
     # owner's default.
     capacity_wait_min: int = 15
+    #: Minutes an abandoned GPU pod (no controller, no task, CPU/GPU idle)
+    #: waits before terminating itself; 0 turns that off. See
+    #: pod/worker.py OrphanWatchdog.
+    gpu_orphan_min: int = 20
     # SECURE (vetted datacentres) or COMMUNITY (cheaper hosts, often has
     # machines when SECURE is empty). See rpfarm.runpod_api.CLOUD_TYPES.
     cloud_type: str = "SECURE"

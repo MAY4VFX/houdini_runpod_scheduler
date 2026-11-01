@@ -118,6 +118,8 @@ def pod_env(cfg, role, token, slots, pubkey, extra=None, cook="", project=""):
         "PUBLIC_KEY": pubkey,
         "HOUDINI_VERSION": cfg.houdini_version,
     }
+    if role == "gpu":
+        env["RPFARM_ORPHAN_MIN"] = str(getattr(cfg, "gpu_orphan_min", 20))
     # Raises rather than starting a pod with no license server configured
     # at all: such a pod boots, bills, and fails every task on a license
     # error. sesinetd_url (Ruling R69) wins when set -- entrypoint.sh reads

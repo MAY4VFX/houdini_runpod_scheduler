@@ -234,6 +234,7 @@ def test_pod_env_contents():
         "RPFARM_PROJECT": "",
         "PUBLIC_KEY": "ssh-ed25519 AAA",
         "HOUDINI_VERSION": c.houdini_version,
+        "RPFARM_ORPHAN_MIN": "20",
         "SESINETD_HOST": c.sesinetd_host,
         "SESINETD_PORT": str(c.sesinetd_port),
         "NODE_ID": "n1",
@@ -1033,3 +1034,10 @@ def test_replacement_gives_up_after_the_retry_limit_and_keeps_the_last():
     kept = pods.create_apart_from(api, api.create, {"publicIp": "9.9.9.9"}, retries=2,
                                   log=lambda *_: None, sleep=lambda _s: None)
     assert kept["id"] == "p3" and api.terminated == ["p1", "p2"]
+
+
+def test_gpu_pods_carry_the_orphan_threshold_and_sync_pods_do_not():
+    c = cfg()
+    c.gpu_orphan_min = 2
+    assert pods.pod_env(c, "gpu", "t", 1, "pk")["RPFARM_ORPHAN_MIN"] == "2"
+    assert "RPFARM_ORPHAN_MIN" not in pods.pod_env(c, "sync", "t", 1, "pk")
