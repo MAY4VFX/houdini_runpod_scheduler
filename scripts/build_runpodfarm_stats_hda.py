@@ -274,7 +274,7 @@ _ASSET_FINGERPRINT = {
     'packages.py': (63842, '42a0a9d34bdf67a8'),
     'pods.py': (38719, '63f9d25e63602de4'),
     'preflight.py': (45206, 'bea8fc057bc7e32a'),
-    'progress.py': (3439, 'c364a012f5cd92e6'),
+    'progress.py': (3696, '48f1d06649c5666b'),
     'releases.py': (4735, 'c6b364ccfb3534b3'),
     'runpod_api.py': (14539, 'b90960f9860c97fb'),
     'scene_setup.py': (21279, 'a49f1efe5f3e3e80'),

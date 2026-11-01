@@ -66,3 +66,34 @@ def test_network_progress_does_not_claim_job_complete_before_unpacking():
     assert pdg.values['phase'] == 'Unpacking on farm'
     assert pdg.values['progress'] == 'Unpacking on farm'
     assert pdg.values['native_percent'] < 100
+
+
+def test_attribute_types_never_change_between_updates():
+    """PDG refuses to change an attribute's type and the error is swallowed:
+    eta_seconds was created Int (-1) and then sent as Float, so it stayed -1
+    for a whole live transfer (2026-11-01)."""
+    from rpfarm.progress import TransferProgress
+
+    class Rec:
+        def __init__(self):
+            self.kinds = {}
+
+        def _rec(self, kind, name):
+            assert self.kinds.setdefault(name, kind) == kind, (name, self.kinds[name], kind)
+
+        def setIntAttrib(self, name, value, i):
+            self._rec("Int", name)
+
+        def setFloatAttrib(self, name, value, i):
+            self._rec("Float", name)
+
+        def setStringAttrib(self, name, value, i):
+            self._rec("String", name)
+
+    rec = Rec()
+    p = TransferProgress(rec)
+    p.plan(1000, 3)
+    p.begin_transfer()
+    p(100, 1000, 50.0)
+    p(500, 1000, 0.0)
+    p.finish()

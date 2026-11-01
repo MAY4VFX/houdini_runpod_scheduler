@@ -64,13 +64,16 @@ class TransferProgress:
         done = self.offset + done
         self.done = done
         remaining = max(0, total - done)
-        eta = remaining / speed if speed > 0 else -1
+        # Always an int: the attribute is created as one (-1 in phase()), and
+        # PDG silently refuses a float into an int attribute -- the ETA read
+        # -1 for a whole 1.2 GB transfer with the speed known (live 2026-11-01).
+        eta = int(round(remaining / speed)) if speed > 0 else -1
         percent = min(100.0, done * 100.0 / total) if total else 0.0
         self._native('workItemSetCustomState', 'Transferring')
         self._native('workItemSetCookPercent', min(99.0, percent))
         for name, value in (('bytes_done', int(done)), ('bytes_total', int(total)),
                             ('speed_mib_s', speed / 2**20), ('eta_seconds', eta),
-                            ('percent', percent)):
+                            ('percent', float(percent))):
             self._set(name, value)
         self._set('progress', '{} / {} · {:.0f}% · {:.1f} MiB/s · {}'.format(
             human_bytes(done), human_bytes(total), percent, speed / 2**20,
@@ -79,7 +82,7 @@ class TransferProgress:
     def finish(self):
         self.phase('Complete')
         self._native('workItemSetCookPercent', 100.0)
-        self._set('percent', 100)
+        self._set('percent', 100.0)
         self._set('eta_seconds', 0)
         self._set('current_files', '')
         self._set('bytes_done', int(max(self.done, self.offset)))
