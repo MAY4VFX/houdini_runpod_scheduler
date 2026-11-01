@@ -4555,7 +4555,11 @@ def submitGraphAsJob(kwargs, node):
     except Exception:
         pass  # PDG's own dialog remains the fallback
     try:
-        submitGraphAsJob(kwargs, node, 'RunPod Farm')
+        # quiet=True: PDG's helper shows its "Unsaved Changes" confirmation
+        # UNCONDITIONALLY (it never checks hasUnsavedChanges -- read in
+        # $HFS/houdini/python3.13libs/pdg/scheduler.py), and the scene was
+        # saved just above. Everything else is reported by submitAsJob itself.
+        submitGraphAsJob(kwargs, node, 'RunPod Farm', quiet=True)
     except Exception as exc:
         # A refusal raised from a button callback is shown nowhere by PDG --
         # the artist pressed Run Job and saw nothing. Say it.

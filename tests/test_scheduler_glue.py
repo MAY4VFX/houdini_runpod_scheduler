@@ -3237,7 +3237,7 @@ def test_run_job_repairs_the_stale_toggle_before_pdg_picks_the_node():
     wrapper = src[src.index("def submitGraphAsJob(kwargs, node):"):]
     wrapper = wrapper[:wrapper.index("\ndef ", 1)]
     repair = wrapper.index("use.set(1)")
-    pdg_call = wrapper.index("submitGraphAsJob(kwargs, node, 'RunPod Farm')")
+    pdg_call = wrapper.index("submitGraphAsJob(kwargs, node, 'RunPod Farm', quiet=True)")
     assert repair < pdg_call
     assert "except Exception as exc:" in wrapper[pdg_call:]
     assert "hou.ui.displayMessage(" in wrapper[pdg_call:]
@@ -3282,7 +3282,7 @@ def test_run_job_saves_before_pdg_asks_about_unsaved_changes():
     src = MODULE.read_text()
     wrapper = src[src.index("def submitGraphAsJob(kwargs, node):"):]
     wrapper = wrapper[:wrapper.index("\ndef ", 1)]
-    assert wrapper.index("hou.hipFile.save()") < wrapper.index("submitGraphAsJob(kwargs, node, 'RunPod Farm')")
+    assert wrapper.index("hou.hipFile.save()") < wrapper.index("submitGraphAsJob(kwargs, node, 'RunPod Farm', quiet=True)")
 
 
 def test_run_job_ships_the_artists_colour_config_to_the_host():
