@@ -988,3 +988,48 @@ def test_a_pod_we_created_still_gets_the_full_timeout(tmp_path, monkeypatch):
                            client_factory=lambda pid: FakeClient(),
                            sleep=lambda s: None, log=lambda m: None)
     assert seen["timeout"] == 300, "a created pod keeps the full patience"
+
+
+# -- never keep a pod on the sync pod's machine (live 2026-11-01) -------------
+
+
+class _PlacementAPI:
+    def __init__(self, ips):
+        self.ips = list(ips)
+        self.created = []
+        self.terminated = []
+
+    def create(self):
+        pid = "p{}".format(len(self.created) + 1)
+        self.created.append(pid)
+        return {"id": pid}
+
+    def get_pod(self, pid):
+        return {"id": pid, "publicIp": self.ips[self.created.index(pid)]}
+
+    def terminate_pod(self, pid):
+        self.terminated.append(pid)
+
+
+def test_shares_machine_compares_public_ips():
+    from rpfarm import pods
+    assert pods.shares_machine({"publicIp": "1.2.3.4"}, {"publicIp": "1.2.3.4"})
+    assert not pods.shares_machine({"publicIp": "1.2.3.4"}, {"publicIp": "5.6.7.8"})
+    assert not pods.shares_machine({"publicIp": ""}, {"publicIp": ""})
+    assert not pods.shares_machine(None, {"publicIp": "1.2.3.4"})
+
+
+def test_a_pod_on_the_sync_machine_is_replaced():
+    from rpfarm import pods
+    api = _PlacementAPI(["9.9.9.9", "1.1.1.1"])
+    kept = pods.create_apart_from(api, api.create, {"publicIp": "9.9.9.9"},
+                                  log=lambda *_: None, sleep=lambda _s: None)
+    assert kept["id"] == "p2" and api.terminated == ["p1"]
+
+
+def test_replacement_gives_up_after_the_retry_limit_and_keeps_the_last():
+    from rpfarm import pods
+    api = _PlacementAPI(["9.9.9.9"] * 5)
+    kept = pods.create_apart_from(api, api.create, {"publicIp": "9.9.9.9"}, retries=2,
+                                  log=lambda *_: None, sleep=lambda _s: None)
+    assert kept["id"] == "p3" and api.terminated == ["p1", "p2"]

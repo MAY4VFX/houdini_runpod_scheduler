@@ -234,7 +234,7 @@ _ASSET_FINGERPRINT = {
     'mq.py': (2124, '174afbd9f49ad86f'),
     'package_runner.py': (9652, '939de3e067b005db'),
     'packages.py': (63842, '42a0a9d34bdf67a8'),
-    'pods.py': (35551, '3b64efff30fb33d7'),
+    'pods.py': (38293, '62500e3e84938c56'),
     'preflight.py': (45206, 'bea8fc057bc7e32a'),
     'progress.py': (3439, 'c364a012f5cd92e6'),
     'releases.py': (4735, 'c6b364ccfb3534b3'),
@@ -1196,6 +1196,7 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         self._clients = {}
         self._work_items = {}
         self._sync_pod = None
+        self._colocation_replaced = 0
         self._sync_client = None
         self._sftp = None
         self._sync_queue = []
@@ -1941,6 +1942,18 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         except RunPodError as e:
             self._verboseLog("get_pod {} failed: {}".format(pod.pod_id, e))
             info = {}
+        if rppods.shares_machine(info, self._sync_pod) and \
+                self._colocation_replaced < rppods.MAX_COLOCATION_RETRIES:
+            # Same physical machine as the sync pod: this pod cannot reach the
+            # sync pod's public IP (hairpin NAT), so it could never talk to the
+            # MQ. Replace it before it takes a task (live 2026-11-01).
+            self._colocation_replaced += 1
+            self._log("pod {} landed on the sync pod's own machine ({}); pods there "
+                      "cannot reach each other -- replacing it".format(
+                          pod.pod_id, info.get("publicIp")))
+            self._terminate_pod(pod.pod_id)
+            self._dispatcher.pod_dead(pod.pod_id)
+            return
         pod.cost_per_hr = float(info.get("costPerHr") or 0.0)
         gpus = health.get("gpus") or []
         pod.gpu = gpus[0].get("name", "") if gpus else str(info.get("machineType") or "")
@@ -4398,10 +4411,19 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
             )
             name = rppods.host_pod_name(self._cfg.user, self._project, self._cook_id)
             try:
-                pod = self._api.create_cpu_pod(
-                    name, self._templateId(), self._volumeId(), env, rppods.PORTS,
-                    datacenter=self._datacenterId(), cloud_type=self._cloudType(),
-                )
+                # Kept only off the sync pod's machine: a host there can reach
+                # neither the volume over sftp nor the MQ (live 2026-11-01,
+                # yoyo -- hung forever on its first transfer). Houdini is
+                # still open here, so this wait is the artist's, not a
+                # silent one: the log says what is happening.
+                self._log("waiting for the host pod to be placed...")
+                pod = rppods.create_apart_from(
+                    self._api,
+                    lambda: self._api.create_cpu_pod(
+                        name, self._templateId(), self._volumeId(), env, rppods.PORTS,
+                        datacenter=self._datacenterId(), cloud_type=self._cloudType(),
+                    ),
+                    self._sync_pod, log=self._log)
             except RunPodError as e:
                 raise CookError("Could not create the Submit As Job host pod: {}".format(e)) from e
         except Exception:

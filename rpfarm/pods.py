@@ -806,3 +806,66 @@ def find_orphans(api, user):
 def terminate_all(api, pod_ids: list[str]):
     for pid in pod_ids:
         api.terminate_pod(pid)
+
+
+# -- placement: never on the sync pod's own machine --------------------------
+#
+# Live 2026-11-01: a Submit As Job host pod landed on the SAME physical
+# machine as the sync pod (both publicIp 213.173.105.103). A pod cannot reach
+# its own machine's public IP (hairpin NAT: TCP to 213.173.105.103:<port>
+# failed from the host while it succeeded from the workstation), nor the
+# neighbour container's private address -- so the host's sftp to the volume
+# and its MQ connection hung forever. RunPod's private networking exists
+# only for GPU pods, and the sync pod is CPU. The only reliable answer is to
+# not keep a pod that shares the sync pod's machine.
+
+#: How many times to replace a pod that landed on the sync pod's machine
+#: before keeping it anyway (with a warning) -- a datacenter with one free
+#: machine must not loop forever.
+MAX_COLOCATION_RETRIES = 3
+
+
+def shares_machine(pod, other) -> bool:
+    """True when both pods report the same public IP -- the same machine."""
+    a = (pod or {}).get("publicIp") or ""
+    b = (other or {}).get("publicIp") or ""
+    return bool(a) and a == b
+
+
+def wait_public_ip(api, pod_id, timeout=300, sleep=time.sleep, now=time.monotonic):
+    """The pod's record once it reports a publicIp, or None on timeout."""
+    deadline = now() + timeout
+    while now() < deadline:
+        try:
+            pod = api.get_pod(pod_id) or {}
+        except RunPodError:
+            pod = {}
+        if pod.get("publicIp"):
+            return pod
+        sleep(5)
+    return None
+
+
+def create_apart_from(api, create, sync_pod, log=print, retries=MAX_COLOCATION_RETRIES,
+                      timeout=300, sleep=time.sleep, now=time.monotonic):
+    """Create a pod with ``create()`` and keep it only off the sync pod's machine.
+
+    Returns the pod record kept. A pod whose IP never shows up within
+    ``timeout`` is kept as is -- this guards one specific failure, it must
+    not turn a slow boot into a failed submit.
+    """
+    pod = create()
+    for attempt in range(retries + 1):
+        placed = wait_public_ip(api, pod["id"], timeout=timeout, sleep=sleep, now=now)
+        if placed is None or not shares_machine(placed, sync_pod):
+            return placed or pod
+        if attempt == retries:
+            log("pod {} is on the sync pod's machine ({}) again after {} "
+                "replacement(s); keeping it -- it may not reach the sync pod".format(
+                    pod["id"], placed.get("publicIp"), retries))
+            return placed
+        log("pod {} landed on the sync pod's own machine ({}); pods there cannot "
+            "reach each other -- replacing it".format(pod["id"], placed.get("publicIp")))
+        api.terminate_pod(pod["id"])
+        pod = create()
+    return pod

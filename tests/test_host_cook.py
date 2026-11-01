@@ -266,12 +266,19 @@ def test_main_runs_topcook_and_terminates_self_on_success(monkeypatch, tmp_path)
     calls = []
     envs = []
 
-    def fake_run(command, env=None, timeout=None, stdout=None, stderr=None, text=None):
+    class FakeProc:
+        pid = 4242
+
+        def wait(self, timeout=None):
+            return 0
+
+    def fake_popen(command, env=None, stdout=None, stderr=None, text=None,
+                   start_new_session=None):
         calls.append(command)
         envs.append(env)
-        return subprocess.CompletedProcess(command, 0, stdout="cook ok\n")
+        return FakeProc()
 
-    monkeypatch.setattr(host_cook.subprocess, "run", fake_run)
+    monkeypatch.setattr(host_cook.subprocess, "Popen", fake_popen)
     terminated = []
     monkeypatch.setattr(host_cook, "terminate_pod", lambda pod_id, key: terminated.append(pod_id))
     monkeypatch.setattr(host_cook, "sweep_render_pods", lambda *a, **k: None)
@@ -376,3 +383,55 @@ def test_main_terminates_self_even_on_an_unexpected_exception(monkeypatch, tmp_p
     rc = host_cook.main()  # must not raise
 
     assert terminated == ["pod1"]
+
+
+
+# -- cancel reaches a stuck cook (live 2026-11-01) ----------------------------
+
+
+class _StuckProc:
+    pid = 999999999
+
+    def __init__(self):
+        self.killed = False
+
+    def wait(self, timeout=None):
+        if self.killed:
+            return -9
+        raise subprocess.TimeoutExpired("cook", timeout)
+
+
+def _clock(step=5.0):
+    t = [0.0]
+
+    def now():
+        t[0] += step
+        return t[0]
+    return now
+
+
+def test_a_cancel_the_cook_never_reads_kills_it_after_the_grace(monkeypatch):
+    proc = _StuckProc()
+    killed = []
+    monkeypatch.setattr(host_cook, "_kill_group", lambda p: (killed.append(p), setattr(p, "killed", True)))
+    rc = host_cook.wait_for_cook(proc, "/x/cancel", max_seconds=10_000, grace_s=60,
+                                 poll_s=0, now=_clock(), exists=lambda _p: True)
+    assert rc == 1 and killed == [proc]
+
+
+def test_no_cancel_means_the_ceiling_decides(monkeypatch):
+    proc = _StuckProc()
+    killed = []
+    monkeypatch.setattr(host_cook, "_kill_group", lambda p: killed.append(p))
+    rc = host_cook.wait_for_cook(proc, "/x/cancel", max_seconds=100, grace_s=60,
+                                 poll_s=0, now=_clock(), exists=lambda _p: False)
+    assert rc is None and killed == [proc]
+
+
+def test_a_cook_that_finishes_returns_its_exit_code():
+    class Done:
+        pid = 1
+
+        def wait(self, timeout=None):
+            return 3
+    assert host_cook.wait_for_cook(Done(), "/x/cancel", max_seconds=100) == 3

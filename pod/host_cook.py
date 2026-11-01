@@ -183,13 +183,61 @@ def build_host_command(hython, hip_path, top_path, pkg_dir):
             '--taskgraphout', os.path.join(pkg_dir, 'taskgraph_out.bin')]
 
 
-def _failed_job(pkg_dir, reason):
+#: After Cancel Selected Job, how long the cook gets to stop by itself before
+#: it is killed. A cook stuck in a blocking call (live 2026-11-01: an sftp
+#: transfer that could never connect) never reaches the code that reads the
+#: cancel marker, so without this a cancelled job ran to its 4-hour ceiling.
+CANCEL_GRACE_S = 180
+
+
+def _kill_group(proc):
+    import signal
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(proc.pid, sig)
+        except (OSError, ProcessLookupError):
+            return
+        try:
+            proc.wait(timeout=15)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+
+
+def wait_for_cook(proc, cancel_path, max_seconds, grace_s=CANCEL_GRACE_S,
+                  poll_s=5, now=time.monotonic, exists=os.path.exists):
+    """Wait for the cook process; returns its exit code, or None on timeout.
+
+    Kills the process group when the runtime ceiling passes, or when a cancel
+    marker has been there for ``grace_s`` without the cook stopping itself.
+    """
+    start = now()
+    cancel_seen = None
+    while True:
+        try:
+            return proc.wait(timeout=poll_s)
+        except subprocess.TimeoutExpired:
+            pass
+        t = now()
+        if t - start >= max_seconds:
+            _kill_group(proc)
+            return None
+        if cancel_seen is None and exists(cancel_path):
+            cancel_seen = t
+            log("cancel requested -- giving the cook {}s to stop by itself".format(grace_s))
+        if cancel_seen is not None and t - cancel_seen >= grace_s:
+            log("cook did not stop {}s after cancel -- killing it".format(grace_s))
+            _kill_group(proc)
+            return 1
+
+
+def _failed_job(pkg_dir, reason, state='failed'):
     try:
         path = os.path.join(pkg_dir, 'job.json')
         with open(path) as f:
             job = json.load(f)
         if job.get('state') not in ('complete', 'failed', 'canceled'):
-            job.update(state='failed', error=reason, updated_at=time.time())
+            job.update(state=state, error=reason, updated_at=time.time())
             with open(path + '.tmp', 'w') as f:
                 json.dump(job, f)
             os.replace(path + '.tmp', path)
@@ -313,22 +361,26 @@ def main():
         t0 = time.monotonic()
         os.makedirs(pkg_dir, exist_ok=True)
         with open(os.path.join(pkg_dir, 'host.log'), 'a') as output:
-            proc = subprocess.run(
-                command, env=env, timeout=max_minutes * 60 - 30,
-                stdout=output, stderr=subprocess.STDOUT, text=True,
+            proc = subprocess.Popen(
+                command, env=env, stdout=output, stderr=subprocess.STDOUT, text=True,
+                start_new_session=True,
             )
-        rc = proc.returncode
-        log("cook finished in {:.0f}s, exit {}".format(time.monotonic() - t0, rc))
-    except subprocess.TimeoutExpired as e:
-        log("cook did not finish within {} minutes -- killed".format(max_minutes))
-        if e.stdout:
-            sys.stdout.write(e.stdout[-20000:])
+            rc = wait_for_cook(proc, os.path.join(pkg_dir, 'cancel'),
+                               max_seconds=max_minutes * 60 - 30)
+        if rc is None:
+            log("cook did not finish within {} minutes -- killed".format(max_minutes))
+            rc = 1
+        else:
+            log("cook finished in {:.0f}s, exit {}".format(time.monotonic() - t0, rc))
     except Exception as e:  # noqa: BLE001 - this process must still terminate the pod
         log("cook raised an unexpected error ({}) -- terminating anyway".format(type(e).__name__))
     finally:
         watchdog.cancel()
         if rc != 0:
-            _failed_job(pkg_dir, 'Host cook failed or exceeded its runtime limit. See host.log.')
+            if os.path.exists(os.path.join(pkg_dir, 'cancel')):
+                _failed_job(pkg_dir, 'Cancelled.', state='canceled')
+            else:
+                _failed_job(pkg_dir, 'Host cook failed or exceeded its runtime limit. See host.log.')
         sweep_render_pods(pod_id, user, cook_id, api_key)
         terminate_pod(pod_id, api_key)
     return rc
