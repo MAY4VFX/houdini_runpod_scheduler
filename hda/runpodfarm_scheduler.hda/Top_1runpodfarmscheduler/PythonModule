@@ -4177,7 +4177,26 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
             key=lambda n: n.path())
         for n in upload_nodes:
             n.dirtyAllWorkItems(False)
-            n.cookWorkItems(block=True)
+            # Ask File Review HERE, on the main thread, before the blocking
+            # cook: from inside cookWorkItems(block=True) the cook's own
+            # window cannot reach the main thread it is blocking (live
+            # 2026-11-01: 10 silent minutes, then the remembered selection).
+            # The cook then runs on the answer just given.
+            confirm = n.parm("rpfarm_confirm")
+            asked_here = False
+            if confirm is not None and confirm.eval() and hou.isUIAvailable():
+                review = getattr(n.hdaModule(), "reviewBeforeSubmit", None)
+                if review is not None:
+                    if not review(n):
+                        raise CookError("Upload cancelled in File Review -- "
+                                        "nothing was submitted to the farm.")
+                    confirm.set(0)
+                    asked_here = True
+            try:
+                n.cookWorkItems(block=True)
+            finally:
+                if asked_here:
+                    confirm.set(1)
             nodes = [n] + list(n.allSubChildren())
             failed = [wi.name for top in nodes if top.getPDGNode()
                       for wi in top.getPDGNode().workItems if wi.state == pdg.workItemState.CookedFail]

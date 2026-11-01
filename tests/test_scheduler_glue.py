@@ -3242,3 +3242,23 @@ def test_run_job_repairs_the_stale_toggle_before_pdg_picks_the_node():
     assert "except Exception as exc:" in wrapper[pdg_call:]
     assert "hou.ui.displayMessage(" in wrapper[pdg_call:]
     assert "_report(node, 'rpfarm_status_text'" in wrapper[pdg_call:]
+
+
+def test_run_job_asks_file_review_before_the_blocking_upload_cook():
+    """Live 2026-11-01: Run Job cooked the upload with block=True from the
+    button callback (the main thread) and the cook's window, posted to the
+    main thread from PDG's thread, could not open until the cook finished:
+    a 10-minute silent hang. The window is asked first, on the main thread;
+    Cancel stops the submit; the cook then runs on that answer and the
+    Confirm toggle is restored afterwards."""
+    src = MODULE.read_text()
+    inner = src[src.index("def _submitAsJobInner(self, node_name):"):]
+    inner = inner[:inner.index("\n    def ", 1)]
+    ask = inner.index('"reviewBeforeSubmit"')
+    cook = inner.index("n.cookWorkItems(block=True)")
+    assert ask < cook
+    assert "Upload cancelled in File Review" in inner
+    assert "confirm.set(1)" in inner[cook:]
+    upload = (MODULE.parent.parent.parent / "runpodfarm_upload.hda" / "Top_1runpodfarmupload"
+              / "PythonModule").read_text()
+    assert "def reviewBeforeSubmit(node):" in upload

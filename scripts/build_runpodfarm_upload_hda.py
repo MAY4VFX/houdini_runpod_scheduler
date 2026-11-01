@@ -378,7 +378,26 @@ def previewUpload(kwargs):
     Confirm toggle. Any choice made here is kept, so previewing IS how you
     set the selection for a batch cook that will never open a window.
     """
-    node = kwargs["node"]
+    if _review(kwargs["node"], "preview") is None:
+        _say("preview closed with Cancel -- nothing changed")
+
+
+def reviewBeforeSubmit(node):
+    """Run Job's File Review, on the main thread, BEFORE the upload cook.
+
+    Run Job cooks this node with block=True from the button callback, i.e.
+    ON the main thread; the cook's own window is posted to the main thread
+    from PDG's thread and so could not open until the cook it belongs to had
+    finished -- a 10-minute silent hang, then the remembered selection
+    (live 2026-11-01, owner's yoyo scene). Asking here first, and letting
+    the cook use the answer just given, is the same window at the moment it
+    can actually appear. Returns False when the artist pressed Cancel.
+    """
+    return _review(node, "cook") is not None
+
+
+def _review(node, intent):
+    """The File Review window for ``node``; the chosen paths, or None on Cancel."""
     import hou
 
     from rpfarm import config as rpcfg
@@ -421,11 +440,11 @@ def previewUpload(kwargs):
     try:
         paths = rppf.choose_uploads(node, scan, usd, env_refs, ask=True, log=_say,
                                     job_dir=job_dir, remote_project=remote_project,
-                                    cfg=cfg, api=api, intent="preview")
+                                    cfg=cfg, api=api, intent=intent)
     except rppf.UploadCancelled:
-        _say("preview closed with Cancel -- nothing changed")
-        return
+        return None
     _say("{} file(s)/directory(ies) would upload".format(len(paths)))
+    return paths
 
 
 def clearExclusions(kwargs):
