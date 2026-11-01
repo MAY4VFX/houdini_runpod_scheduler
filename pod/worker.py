@@ -904,6 +904,9 @@ def make_server(host, port, log_dir="/workspace/ledger/logs"):
             gpu_utils=_gpu_utils_or_none,
             load=CpuMeter(),
             terminate=terminate_self,
+            # flush: the container dies right after this line is written, and
+            # an unflushed print never reached the boot log (live 2026-11-01).
+            log=lambda message: print(message, flush=True),
         )
 
         def _watch():
