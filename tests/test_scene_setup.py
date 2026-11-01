@@ -374,3 +374,38 @@ def test_other_rop_types_are_not_touched():
     assert fetch.parms["usecustomoutput"].sets == 0
     assert ss.point_fetch_at_image(None, rop) == ""
     assert ss.point_fetch_at_image(fetch, None) == ""
+
+
+def test_rerun_on_an_existing_graph_keeps_the_artists_decisions():
+    """Live 2026-11-01, the owner's yoyo scene: an old graph (upload, gate,
+    a wedge of three cameras, a Single Frame ROP Fetch, Max Pods 2,
+    compression off). Re-running the tool to add Download switched the fetch
+    to Frame Range -- 3 renders would have become 720 -- and overwrote Max
+    Pods and compression. Adopted nodes now keep every value."""
+    net = FakeNetwork()
+    sched = net.createNode(ss.SCHEDULER_TYPE, "rpfarm")
+    sched.parms["rpfarm_maxpods"].value = 2
+    sched.parms["rpfarm_project"].value = "yoyo"
+    upload = net.createNode(ss.UPLOAD_TYPE, "upload")
+    upload.parms["rpfarm_compress"].value = "off"
+    upload.parms["rpfarm_project"].value = "yoyo"
+    fetch = net.createNode(ss.FETCH_TYPE, "render")
+    fetch.parms["roppath"].value = "/stage/render_cams"
+    fetch.parms["framegeneration"].value = 0
+    for node in (sched, upload, fetch):
+        for parm in node.parms.values():
+            parm.sets = 0
+
+    result = ss.build(net, project="other", frames=240,
+                      rop_candidates=["/stage/render_cams", "/stage/a", "/stage/b"])
+
+    assert roles(result.created) == {"gate", "download"}
+    assert fetch.parms["framegeneration"].value == 0
+    assert fetch.parms["roppath"].value == "/stage/render_cams"
+    assert sched.parms["rpfarm_maxpods"].value == 2
+    assert sched.parms["rpfarm_project"].value == "yoyo"
+    assert upload.parms["rpfarm_compress"].value == "off"
+    assert upload.parms["rpfarm_project"].value == "yoyo"
+    # The fetch already named its ROP: no "ROP Path is empty" in the report.
+    assert result.rop == "/stage/render_cams"
+    assert not any("ROP Path is empty" in line for line in ss.report(result))

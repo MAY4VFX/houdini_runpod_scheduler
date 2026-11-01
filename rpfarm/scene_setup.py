@@ -231,43 +231,62 @@ def build(parent, project="", frames=1, rop_candidates=(), max_pods=DEFAULT_MAX_
         result.created.append((role, node.path()))
         return node, True
 
-    scheduler, _ = adopt_or_create(SCHEDULER_TYPE, SCHEDULER_NAME, "scheduler")
+    scheduler, scheduler_is_new = adopt_or_create(SCHEDULER_TYPE, SCHEDULER_NAME, "scheduler")
     upload, upload_is_new = adopt_or_create(UPLOAD_TYPE, UPLOAD_NAME, "upload")
     gate, gate_is_new = adopt_or_create(GATE_TYPE, GATE_NAME, "gate")
     fetch, fetch_is_new = adopt_or_create(FETCH_TYPE, FETCH_NAME, "render")
     download, download_is_new = adopt_or_create(DOWNLOAD_TYPE, 'download', 'download')
+
+    # -- what has to hold for the graph to work at all, adopted or not.
+    # With a Download TOP in the graph, the scheduler's own auto-download
+    # would fetch the same frames a second time.
     _set(scheduler, 'rpfarm_downloadoutputs', 0)
     if not _eval_string(scheduler.parm('submitjobnode')):
         _set(scheduler, 'submitjobnode', fetch.path())
 
-    # -- preconfigure from the scene, and only where the scene has an answer.
-    #    A parm left alone keeps the asset's own default expression, which
-    #    is live and follows the config; a literal written here would freeze
-    #    it. So "" means "the scene did not say", not "set it to empty".
-    if project:
-        _set(scheduler, "rpfarm_project", project)
-        _set(upload, "rpfarm_project", project)
-    _set(upload, "rpfarm_projectoverride", 0)
-    _set(scheduler, "rpfarm_maxpods", result.max_pods)
+    # -- preconfigure from the scene, NEW nodes only. An adopted node carries
+    #    the artist's decisions, and this tool must not overwrite them: live
+    #    2026-11-01 on the owner's yoyo scene, re-running it on an existing
+    #    graph switched a deliberate Single Frame ROP Fetch to Frame Range
+    #    (3 renders became 720), raised Max Pods 2 -> 4 and turned compression
+    #    back on. A parm left alone also keeps the asset's own default
+    #    expression, which follows the config; a literal written here would
+    #    freeze it.
+    if scheduler_is_new:
+        if project:
+            _set(scheduler, "rpfarm_project", project)
+        _set(scheduler, "rpfarm_maxpods", result.max_pods)
+    if upload_is_new:
+        if project:
+            _set(upload, "rpfarm_project", project)
+        _set(upload, "rpfarm_projectoverride", 0)
+        # The asset's defaults are already the right answer for these two
+        # (Dependencies = "This cook's branch", Compression = "Auto"), so they
+        # are asserted rather than assumed: a graph built by this tool has the
+        # scope and compression the artist was promised even if a future
+        # default changes underneath.
+        _set(upload, "rpfarm_mode", "deps")
+        _set(upload, "rpfarm_scope", "branch")
+        _set(upload, "rpfarm_compress", "auto")
 
-    # The asset's defaults are already the right answer for these two
-    # (Dependencies = "This cook's branch", Compression = "Auto"), so they
-    # are asserted rather than assumed: a graph built by this tool has the
-    # scope and compression the artist was promised even if a future default
-    # changes underneath.
-    _set(upload, "rpfarm_mode", "deps")
-    _set(upload, "rpfarm_scope", "branch")
-    _set(upload, "rpfarm_compress", "auto")
-
-    if result.rop:
+    existing_rop = "" if fetch_is_new else _eval_string(fetch.parm("roppath"))
+    if existing_rop:
+        # The fetch already names its ROP: that is the answer, not the
+        # candidate list (reporting "ROP Path is empty" here was wrong).
+        result.rop = existing_rop
+    elif result.rop:
         _set(fetch, "roppath", result.rop)
+    if fetch_is_new:
+        # "Frame Range", not "ROP Node Configuration": the latter hands the
+        # whole range to the ROP as ONE work item that renders every frame in
+        # one hython -- on one pod. One item per frame is what makes this a
+        # farm. range1/range2 keep their $FSTART/$FEND expressions so the graph
+        # follows the scene's range instead of freezing today's.
+        _set(fetch, "framegeneration", 1)
+    if result.rop:
+        # Safe on an adopted fetch too: it only acts where no output parm was
+        # chosen, and it is what lets re-cooks skip frames already on disk.
         point_fetch_at_image(fetch, _resolve(parent, result.rop))
-    # "Frame Range", not "ROP Node Configuration": the latter hands the whole
-    # range to the ROP as ONE work item that renders every frame in one
-    # hython -- on one pod. One item per frame is what makes this a farm.
-    # range1/range2 keep their $FSTART/$FEND expressions so the graph follows
-    # the scene's range instead of freezing today's.
-    _set(fetch, "framegeneration", 1)
 
     # -- wiring. Only ever fills an empty input, so a rerun on a graph the
     #    artist has since rearranged does not rewire it behind their back.
