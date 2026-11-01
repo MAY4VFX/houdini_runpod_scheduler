@@ -3273,3 +3273,13 @@ def test_run_job_upload_check_skips_children_without_work_items():
     inner = inner[:inner.index("\n    def ", 1)]
     assert 'getattr(top.getPDGNode(), "workItems", None)' in inner
     assert "top.getPDGNode().workItems" not in inner
+
+
+def test_run_job_saves_before_pdg_asks_about_unsaved_changes():
+    """Live 2026-11-01: every Run Job opened PDG's "save before cooking?"
+    although Run Job saves the scene itself anyway (loading alone marks it
+    modified via the status text). The wrapper saves first."""
+    src = MODULE.read_text()
+    wrapper = src[src.index("def submitGraphAsJob(kwargs, node):"):]
+    wrapper = wrapper[:wrapper.index("\ndef ", 1)]
+    assert wrapper.index("hou.hipFile.save()") < wrapper.index("submitGraphAsJob(kwargs, node, 'RunPod Farm')")

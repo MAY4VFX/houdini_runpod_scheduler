@@ -4511,6 +4511,18 @@ def submitGraphAsJob(kwargs, node):
         use.set(1)
         print('[rpfarm] usesubmitjobnode was 0 (stale, pre-R71 node); set to 1 '
               'so Run Job sends Farm Target')
+    # Run Job saves the scene itself before anything leaves (the farm renders
+    # the .hip on disk). PDG's own "Unsaved Changes -- save before cooking?"
+    # was therefore a question with no real choice, and it appeared on every
+    # Run Job: loading the scene alone updates our status text and marks it
+    # modified (live 2026-11-01; also noted in BS 2026-09-27). Saved here,
+    # the dialog does not come up.
+    try:
+        if hou.hipFile.hasUnsavedChanges() and hou.hipFile.path() and \
+                not hou.hipFile.isNewFile():
+            hou.hipFile.save()
+    except Exception:
+        pass  # PDG's own dialog remains the fallback
     try:
         submitGraphAsJob(kwargs, node, 'RunPod Farm')
     except Exception as exc:
