@@ -1938,3 +1938,57 @@ def test_read_item_log_tail_on_an_empty_uri_is_empty_not_an_error():
 def test_read_item_log_tail_never_raises_on_a_missing_file(tmp_path):
     missing = tmp_path / "gone.log"
     assert read_item_log_tail("file://" + str(missing)) == ""
+
+
+# -- Download falls back to the ROP's own output (live 2026-11-01, PLA) -------
+
+
+def test_rop_output_pair_walks_up_to_the_rop_fetch_and_reads_the_rop(monkeypatch):
+    import sys
+    import types
+
+    from rpfarm import packages as rppkg
+
+    class Parm:
+        def __init__(self, v):
+            self.v = v
+
+        def eval(self):
+            return self.v
+
+        def rawValue(self):
+            return self.v
+
+    class Node:
+        def __init__(self, parms):
+            self.parms = parms
+
+        def parm(self, n):
+            return self.parms.get(n)
+
+    rop = Node({"outputimage": Parm("/Users/artist/BS/render/pla_0011.$F4.exr"),
+                "lopoutput": Parm("__render__.usd")})
+    fetch = Node({"roppath": Parm("/stage/render_shot0011")})
+    merge = Node({})
+    topnet = types.SimpleNamespace(node=lambda name: {"fetch_shot0011": fetch, "render_all": merge}.get(name))
+
+    fake_hou = types.SimpleNamespace(
+        node=lambda p: rop if p == "/stage/render_shot0011" else None,
+        frame=lambda: 1.0,
+        text=types.SimpleNamespace(expandStringAtFrame=lambda s, f: s.replace("$F4", "%04d" % int(f))))
+    monkeypatch.setitem(sys.modules, "hou", fake_hou)
+
+    class Item:
+        def __init__(self, node_name, parent=None):
+            self.node = types.SimpleNamespace(name=node_name)
+            self.parent = parent
+            self.hasFrame = True
+            self.frame = 7
+
+        def hasAttrib(self, _n):
+            return False
+
+    item = Item("download_source", Item("render_all", Item("fetch_shot0011")))
+    pair = rppkg.rop_output_pair(item, topnet, {"/Users/artist": "/workspace/projects/artist/pla"})
+    assert pair == ("/workspace/projects/artist/pla/BS/render/pla_0011.0007.exr",
+                    "/Users/artist/BS/render/pla_0011.0007.exr")

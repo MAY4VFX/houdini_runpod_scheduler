@@ -1373,3 +1373,73 @@ def _transfer_download_item(item, cfg, sftp, sync_client, overwrite, progress_cb
                 st = os.stat(entry.local)
                 result['verified'][entry.local] = {'size': st.st_size, 'mtime_ns': st.st_mtime_ns}
     return result
+
+
+# -- the ROP's own output, for items that reported only a stage --------------
+
+#: Output parameters asked in order; the first one that yields a path wins.
+#: Same order as the scheduler's own fallback (_ROP_OUTPUT_PARMS).
+ROP_OUTPUT_PARMS = ("outputimage", "picture", "vm_picture", "sopoutput",
+                    "copoutput", "dopoutput", "lopoutput", "usdoutput",
+                    "outputfilepath1")
+
+
+def item_attrib(work_item, name):
+    """One attribute of a work item, whatever its type, or None."""
+    try:
+        if not work_item.hasAttrib(name):
+            return None
+    except Exception:  # noqa: BLE001
+        return None
+    for accessor in ("stringAttribValue", "intAttribValue", "floatAttribValue", "attribValue"):
+        getter = getattr(work_item, accessor, None)
+        if getter is None:
+            continue
+        try:
+            return getter(name)
+        except Exception:  # noqa: BLE001
+            continue
+    return None
+
+
+def rop_output_pair(work_item, topnet, path_map, log=None):
+    """``(farm, local)`` for where the ROP behind ``work_item`` wrote, or None.
+
+    ``work_item`` may sit below the ROP Fetch (a merge, a switch, the
+    Download's own source): its ``parent`` chain is walked to the first item
+    whose TOP node has a ``roppath``. A usdrender_rop reports its
+    ``__render__.usd`` stage as the item's output, and a ROP Fetch set to
+    "Custom Path List" reports that too -- live 2026-11-01 on the owner's PLA
+    scene, two rendered shots came home as nothing, the Download cook ended
+    "successfully" with a warning. The ROP itself knows its image path; the
+    item knows its frame and attributes. Needs Houdini.
+    """
+    import hou
+
+    item = work_item
+    for _ in range(16):
+        if item is None:
+            return None
+        node = topnet.node(item.node.name) if topnet is not None else None
+        roppath = node.parm("roppath") if node is not None else None
+        if roppath is not None:
+            break
+        item = getattr(item, "parent", None)
+    else:
+        return None
+    rop = hou.node(roppath.eval() or "")
+    if rop is None:
+        return None
+    frame = float(item.frame) if item.hasFrame else hou.frame()
+    for name in ROP_OUTPUT_PARMS:
+        parm = rop.parm(name)
+        if parm is None:
+            continue
+        raw, missing = expand_item_attribs(parm.rawValue(), lambda a: item_attrib(item, a), log=log)
+        if missing:
+            return None  # a path with a hole in it is a guess, not an answer
+        local = hou.text.expandStringAtFrame(raw, frame)
+        if not local or local.endswith("/") or local.endswith(".usd"):
+            continue
+        return map_output_pair(local, path_map)
+    return None

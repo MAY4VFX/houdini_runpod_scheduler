@@ -364,6 +364,16 @@ if mode == \"outputs\":
             pair = rppkg.map_output_pair(rppkg.result_data_path(rd), path_map)
             if pair:
                 item_pairs.append(pair)
+        if not item_pairs and result_data:
+            # Only a stage came back (usdrender_rop / \"Custom Path List\"):
+            # ask the ROP behind this item where it really wrote.
+            fallback = rppkg.rop_output_pair(up, node.parent(), path_map)
+            if fallback:
+                print(\"[rpfarm-download] {} reported only {}; taking the ROP's own \"
+                      \"output instead: {}\".format(
+                          up.name, rppkg.result_data_path(result_data[0]), fallback[1]),
+                      flush=True)
+                item_pairs.append(fallback)
         if not item_pairs:
             if result_data:
                 # Reported outputs that map to nothing local is a real fault

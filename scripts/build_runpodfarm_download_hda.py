@@ -246,7 +246,7 @@ _ASSET_FINGERPRINT = {
     'monitoring.py': (6320, '941db2f923c756ae'),
     'mq.py': (2124, '174afbd9f49ad86f'),
     'package_runner.py': (9652, '939de3e067b005db'),
-    'packages.py': (63842, '42a0a9d34bdf67a8'),
+    'packages.py': (66578, 'f6fb078971088ab2'),
     'pods.py': (38719, '63f9d25e63602de4'),
     'preflight.py': (45206, 'bea8fc057bc7e32a'),
     'progress.py': (3696, '48f1d06649c5666b'),
@@ -482,6 +482,16 @@ if mode == "outputs":
             pair = rppkg.map_output_pair(rppkg.result_data_path(rd), path_map)
             if pair:
                 item_pairs.append(pair)
+        if not item_pairs and result_data:
+            # Only a stage came back (usdrender_rop / "Custom Path List"):
+            # ask the ROP behind this item where it really wrote.
+            fallback = rppkg.rop_output_pair(up, node.parent(), path_map)
+            if fallback:
+                print("[rpfarm-download] {} reported only {}; taking the ROP's own "
+                      "output instead: {}".format(
+                          up.name, rppkg.result_data_path(result_data[0]), fallback[1]),
+                      flush=True)
+                item_pairs.append(fallback)
         if not item_pairs:
             if result_data:
                 # Reported outputs that map to nothing local is a real fault
