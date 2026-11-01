@@ -701,3 +701,100 @@ def test_a_kernel_without_proc_pid_io_does_not_report_false_activity():
 
     assert live.moved_bytes() is None
     assert live.busy_idle_s() is None
+
+
+# -- orphan watchdog (owner's rule, 2026-11-01) --------------------------------
+
+
+def _watchdog(**over):
+    state = dict(contact=3600.0, busy=0, alive=None, gpu=[0], load=0.05)
+    state.update(over)
+    calls = []
+    dog = worker.OrphanWatchdog(
+        orphan_s=1200.0,
+        contact_idle_s=lambda: state["contact"],
+        busy_tasks=lambda: state["busy"],
+        liveness_idle_s=lambda: state["alive"],
+        gpu_utils=lambda: state["gpu"],
+        load=lambda: state["load"],
+        terminate=lambda: (calls.append(1) or (True, "ok")),
+        log=lambda *_: None,
+    )
+    return dog, state, calls
+
+
+def _checks(dog, n):
+    return [dog.check() for _ in range(n)]
+
+
+def test_an_abandoned_idle_pod_terminates_after_consecutive_idle_checks():
+    dog, _state, calls = _watchdog()
+    assert _checks(dog, 2) == [False, False]
+    assert dog.check() is True
+    assert calls == [1]
+    assert dog.check() is True and calls == [1]  # never asks twice
+
+
+@pytest.mark.parametrize("over", [
+    {"contact": 60.0},          # a controller talked to it a minute ago
+    {"busy": 1},                # a task is running
+    {"alive": 30.0},            # ssh/transfer seen 30 s ago
+    {"gpu": [40]},              # GPU working
+    {"gpu": None},              # nvidia-smi unreadable -> treated as busy
+    {"load": 3.0},              # CPU working
+    {"load": None},             # /proc/loadavg unreadable -> treated as busy
+])
+def test_any_sign_of_life_keeps_the_pod(over):
+    dog, _state, calls = _watchdog(**over)
+    assert _checks(dog, 10) == [False] * 10
+    assert calls == []
+
+
+def test_one_busy_sample_restarts_the_idle_count():
+    dog, state, calls = _watchdog()
+    _checks(dog, 2)
+    state["gpu"] = [90]
+    assert dog.check() is False
+    state["gpu"] = [0]
+    assert _checks(dog, 2) == [False, False]
+    assert dog.check() is True
+
+
+def test_zero_minutes_turns_the_watchdog_off():
+    dog, _state, calls = _watchdog()
+    dog.orphan_s = 0
+    assert _checks(dog, 5) == [False] * 5 and calls == []
+
+
+def test_terminate_self_without_the_pod_key_refuses_quietly():
+    ok, detail = worker.terminate_self(api_key="", pod_id="p1")
+    assert ok is False and "RUNPOD_API_KEY" in detail
+
+
+def test_terminate_self_sends_podterminate_for_its_own_pod():
+    seen = {}
+
+    class Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return b'{"data": {"podTerminate": null}}'
+
+    def fake_urlopen(req, timeout):
+        seen["body"] = req.data.decode()
+        seen["auth"] = req.headers.get("Authorization")
+        return Resp()
+
+    ok, _detail = worker.terminate_self(api_key="k", pod_id="pod123", urlopen=fake_urlopen)
+    assert ok is True
+    assert 'podTerminate(input: {podId: \\"pod123\\"})' in seen["body"]
+    assert seen["auth"] == "Bearer k"
+
+
+def test_cpu_load_reads_the_one_minute_average():
+    assert worker.cpu_load(read=lambda _p: "0.42 0.30 0.10 1/99 123\n") == 0.42
+    assert worker.cpu_load(read=lambda _p: (_ for _ in ()).throw(OSError())) is None

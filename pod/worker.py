@@ -442,6 +442,129 @@ class LastRequest:
             return max(0.0, self._clock() - self._at)
 
 
+#: Minutes a GPU pod waits, abandoned and doing nothing, before it terminates
+#: itself. RPFARM_ORPHAN_MIN overrides it; 0 turns the watchdog off.
+ORPHAN_MIN_DEFAULT = 20
+_ORPHAN_CHECK_S = 30
+#: How many consecutive checks must see CPU and GPU idle on top of the silent
+#: controller -- one quiet sample between two frames is not "idle".
+_ORPHAN_IDLE_CHECKS = 3
+_ORPHAN_GPU_PCT = 5
+_ORPHAN_LOADAVG = 0.5
+_GRAPHQL_URL = "https://api.runpod.io/graphql"
+
+
+def cpu_load(read=None):
+    """The 1-minute load average, or None when /proc/loadavg is unreadable."""
+    try:
+        text = (read or Liveness._read_file)("/proc/loadavg")
+        return float(text.split()[0])
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def terminate_self(api_key=None, pod_id=None, urlopen=None):
+    """Ask RunPod to terminate THIS pod. Returns (ok, detail).
+
+    Uses the key RunPod itself puts in every pod (RUNPOD_API_KEY), not the
+    artist's: checked live 2026-11-01, that key sees only its own pod (another
+    pod of the same account reads back as null) and may call podTerminate on
+    it. So a GPU pod can end itself without the farm ever handing it the
+    account key -- the rule that keeps a stolen pod from spending money.
+    """
+    import urllib.request
+
+    api_key = api_key if api_key is not None else os.environ.get("RUNPOD_API_KEY", "")
+    pod_id = pod_id if pod_id is not None else os.environ.get("RUNPOD_POD_ID", "")
+    if not api_key or not pod_id:
+        return False, "no RUNPOD_API_KEY/RUNPOD_POD_ID in this pod"
+    body = json.dumps({"query": 'mutation { podTerminate(input: {podId: "%s"}) }' % pod_id}).encode()
+    req = urllib.request.Request(_GRAPHQL_URL, data=body, method="POST", headers={
+        "Content-Type": "application/json", "Authorization": "Bearer " + api_key})
+    try:
+        with (urlopen or urllib.request.urlopen)(req, timeout=30) as resp:
+            payload = json.loads(resp.read() or b"{}")
+    except Exception as exc:  # noqa: BLE001
+        return False, "podTerminate request failed: {}".format(exc)
+    if payload.get("errors"):
+        return False, "podTerminate refused: {}".format(payload["errors"][0].get("message"))
+    return True, "podTerminate accepted"
+
+
+class OrphanWatchdog:
+    """Terminate an abandoned GPU pod -- and only a truly abandoned one.
+
+    Houdini crashing, being force-quit or losing its laptop lid mid-cook used
+    to leave its GPU pods running and billing until somebody noticed (live
+    2026-11-01: a killed hython left an RTX PRO 4000 at $0.57/h behind). The
+    owner's rule for ending one by itself: ALL of these at once --
+
+    * no controller has talked to it for ``orphan_s`` (any authorized request
+      counts, /health included: only the cook that created the pod holds its
+      token, so `farm kill`, which carries a different one, never counts);
+    * no task is running;
+    * nothing else has been alive on it for ``orphan_s`` (ssh, transfers);
+    * GPU and CPU have both been idle for the last few checks.
+
+    Everything fails toward "keep": an unreadable load average or GPU is
+    treated as busy. A false terminate costs a render; a false keep costs
+    cents per minute and the next cook's orphan note still names it.
+    """
+
+    def __init__(self, orphan_s, contact_idle_s, busy_tasks, liveness_idle_s,
+                 gpu_utils, load, terminate, log=print):
+        self.orphan_s = orphan_s
+        self._contact_idle_s = contact_idle_s
+        self._busy_tasks = busy_tasks
+        self._liveness_idle_s = liveness_idle_s
+        self._gpu_utils = gpu_utils
+        self._load = load
+        self._terminate = terminate
+        self._log = log
+        self._idle_checks = 0
+        self.terminated = False
+
+    def _resources_idle(self):
+        load = self._load()
+        if load is None or load > _ORPHAN_LOADAVG:
+            return False
+        utils = self._gpu_utils()
+        if utils is None:
+            return False
+        return all(u <= _ORPHAN_GPU_PCT for u in utils)
+
+    def check(self):
+        """One look. Returns True once it has asked RunPod to end the pod."""
+        if self.terminated or self.orphan_s <= 0:
+            return self.terminated
+        abandoned = (self._contact_idle_s() >= self.orphan_s
+                     and self._busy_tasks() == 0)
+        alive_idle = self._liveness_idle_s()
+        quiet = alive_idle is None or alive_idle >= self.orphan_s
+        if abandoned and quiet and self._resources_idle():
+            self._idle_checks += 1
+        else:
+            self._idle_checks = 0
+            return False
+        if self._idle_checks < _ORPHAN_IDLE_CHECKS:
+            return False
+        ok, detail = self._terminate()
+        self._log("[rpfarm-worker] no controller for {:.0f} min, no task, CPU/GPU idle -- "
+                  "terminating this pod: {}".format(self.orphan_s / 60.0, detail))
+        self.terminated = ok
+        if not ok:
+            self._idle_checks = 0  # try again after another full round
+        return ok
+
+
+def _gpu_utils_or_none():
+    gpus = get_gpu_info()
+    if not gpus:
+        # nvidia-smi missing or failing on a GPU pod: unknown, so "busy".
+        return None
+    return [g.get("utilization_pct", 100) for g in gpus]
+
+
 class Registry:
     """Tracks tasks and enforces the pod's slot limit."""
 
@@ -716,6 +839,9 @@ def make_server(host, port, log_dir="/workspace/ledger/logs"):
     slots = int(os.environ.get("RPFARM_SLOTS", "1"))
     registry = Registry(slots, log_dir)
     last_request = LastRequest()
+    # Any authorized request, /health included -- the orphan watchdog's
+    # "is my controller still there?" (see OrphanWatchdog).
+    last_contact = LastRequest()
     xpu = XpuSupport()
     liveness = Liveness()
 
@@ -732,6 +858,31 @@ def make_server(host, port, log_dir="/workspace/ledger/logs"):
 
     threading.Thread(target=_sample_liveness, name="rpfarm-liveness",
                      daemon=True).start()
+
+    try:
+        orphan_min = float(os.environ.get("RPFARM_ORPHAN_MIN", ORPHAN_MIN_DEFAULT))
+    except ValueError:
+        orphan_min = ORPHAN_MIN_DEFAULT
+    if role == "gpu" and orphan_min > 0:
+        watchdog = OrphanWatchdog(
+            orphan_s=orphan_min * 60.0,
+            contact_idle_s=last_contact.idle_s,
+            busy_tasks=registry.busy,
+            liveness_idle_s=liveness.busy_idle_s,
+            gpu_utils=_gpu_utils_or_none,
+            load=cpu_load,
+            terminate=terminate_self,
+        )
+
+        def _watch():
+            while not watchdog.terminated:
+                time.sleep(_ORPHAN_CHECK_S)
+                try:
+                    watchdog.check()
+                except Exception:  # noqa: BLE001 - the watchdog must not kill the worker
+                    pass
+
+        threading.Thread(target=_watch, name="rpfarm-orphan-watchdog", daemon=True).start()
     detached = DetachedRuns(os.path.join(WORKSPACE_ROOT, EXEC_DIR_REL))
 
     class Handler(BaseHTTPRequestHandler):
@@ -791,6 +942,7 @@ def make_server(host, port, log_dir="/workspace/ledger/logs"):
                 self._drain_body()
                 self._send_json(401, {"error": "unauthorized"})
                 return False
+            last_contact.touch()
             # /health is excluded on purpose: it is what `farm kill` and the
             # idle watchdog poll, so counting it would make the act of asking
             # "has anyone touched this pod?" the reason the answer is yes.
