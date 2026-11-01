@@ -1574,6 +1574,13 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
             self._log("HOUDINI_PATHMAP: {} mapping(s) for Houdini's own lookups "
                       "(PDG_PATHMAP unchanged)".format(len(self._pathmap)))
 
+    def _farmOcio(self):
+        """This workstation's $OCIO as its farm path, or "" when unmapped."""
+        local = os.environ.get("OCIO") or hou.getenv("OCIO")
+        if not local:
+            return ""
+        return rppkg.delocalize_via_pathmap(os.path.normpath(local), self._pathmap) or ""
+
     def _ensureOcioEnv(self, task_env):
         """Point the farm at the colour config that came up with the scene.
 
@@ -1589,6 +1596,16 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         else uses. Unset locally means unset here: both sides then fall back
         to the same bundled config, which is correct and needs no help.
         """
+        # On a Submit As Job host the artist's config arrives already as a
+        # farm path (RPFARM_HOST_OCIO, see submitAsJob); the host's own $OCIO
+        # is the pod's bundled config and must not win.
+        shipped = os.environ.get("RPFARM_HOST_OCIO")
+        if shipped:
+            task_env["OCIO"] = shipped
+            if not getattr(self, "_ocio_logged", False):
+                self._ocio_logged = True
+                self._log("OCIO: the submitting artist's config {}".format(shipped))
+            return
         local = os.environ.get("OCIO") or hou.getenv("OCIO")
         if not local:
             return
@@ -4407,6 +4424,12 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
                     "RPFARM_HOST_TOPPATH": node_name,
                     "RPFARM_HOST_PKGDIR": remote_pkg_dir,
                     "RPFARM_HOST_MAX_MINUTES": str(_SUBMIT_AS_JOB_MAX_MINUTES),
+                    # The artist's colour config, as the farm path the upload
+                    # put it at. The host's own $OCIO is the pod's bundled
+                    # config, so without this a Run Job rendered with a
+                    # different config than an ordinary cook of the same
+                    # scene (live 2026-11-01, yoyo).
+                    "RPFARM_HOST_OCIO": self._farmOcio(),
                 },
             )
             name = rppods.host_pod_name(self._cfg.user, self._project, self._cook_id)

@@ -435,3 +435,9 @@ def test_a_cook_that_finishes_returns_its_exit_code():
         def wait(self, timeout=None):
             return 3
     assert host_cook.wait_for_cook(Done(), "/x/cancel", max_seconds=100) == 3
+
+
+def test_host_cook_source_sets_ocio_from_the_artists_config():
+    import pathlib
+    src = (pathlib.Path(host_cook.__file__)).read_text()
+    assert 'env["OCIO"] = os.environ["RPFARM_HOST_OCIO"]' in src

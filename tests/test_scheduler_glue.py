@@ -3283,3 +3283,15 @@ def test_run_job_saves_before_pdg_asks_about_unsaved_changes():
     wrapper = src[src.index("def submitGraphAsJob(kwargs, node):"):]
     wrapper = wrapper[:wrapper.index("\ndef ", 1)]
     assert wrapper.index("hou.hipFile.save()") < wrapper.index("submitGraphAsJob(kwargs, node, 'RunPod Farm')")
+
+
+def test_run_job_ships_the_artists_colour_config_to_the_host():
+    """Live 2026-11-01: the host's $OCIO was the pod's bundled config, so a
+    Run Job rendered with a different colour config than an ordinary cook."""
+    src = MODULE.read_text()
+    inner = src[src.index("def _submitAsJobInner(self, node_name):"):]
+    inner = inner[:inner.index("\n    def ", 1)]
+    assert '"RPFARM_HOST_OCIO": self._farmOcio()' in inner
+    ocio = src[src.index("def _ensureOcioEnv(self, task_env):"):]
+    ocio = ocio[:ocio.index("\n    def ", 1)]
+    assert ocio.index('os.environ.get("RPFARM_HOST_OCIO")') < ocio.index('os.environ.get("OCIO")')

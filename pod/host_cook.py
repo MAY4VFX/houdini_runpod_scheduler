@@ -284,6 +284,11 @@ def main():
     # replaces the default path unless told to append to it.
     env["HOUDINI_OTLSCAN_PATH"] = hda_dir + (":" + existing_scan if existing_scan else ":&")
     env["RPFARM_ROOT"] = rpfarm_root
+    # The submitting artist's colour config (its farm path). The pod's own
+    # $OCIO is Houdini's bundled config; the cook here and every render task
+    # must use the artist's instead, as an ordinary cook does.
+    if os.environ.get("RPFARM_HOST_OCIO"):
+        env["OCIO"] = os.environ["RPFARM_HOST_OCIO"]
     # rpcfg.load() (rpfarm/config.py) reads $RPFARM_HOME/config.toml --
     # defaults to ~/.rpfarm, i.e. /root/.rpfarm on this pod, which does
     # not exist. Confirmed live (2026-09-10): the nested scheduler's
