@@ -795,6 +795,35 @@ def test_terminate_self_sends_podterminate_for_its_own_pod():
     assert seen["auth"] == "Bearer k"
 
 
-def test_cpu_load_reads_the_one_minute_average():
-    assert worker.cpu_load(read=lambda _p: "0.42 0.30 0.10 1/99 123\n") == 0.42
-    assert worker.cpu_load(read=lambda _p: (_ for _ in ()).throw(OSError())) is None
+def test_cpu_meter_measures_this_containers_cgroup_not_loadavg():
+    """Live 2026-11-01: /proc/loadavg on a 2-core pod read 61 (the whole
+    machine), so the watchdog never saw an idle pod."""
+    usage = {"v": 1_000_000}
+    t = {"v": 100.0}
+
+    def read(path):
+        assert path != "/proc/loadavg"
+        if path == "/sys/fs/cgroup/cpu.stat":
+            return "usage_usec {}\nuser_usec 1\n".format(usage["v"])
+        raise OSError(path)
+
+    meter = worker.CpuMeter(read=read, clock=lambda: t["v"])
+    assert meter() is None          # first sample: nothing to compare yet
+    usage["v"] += 500_000           # 0.5 s of CPU ...
+    t["v"] += 10.0                  # ... over 10 s
+    assert abs(meter() - 0.05) < 1e-9
+
+
+def test_cpu_meter_falls_back_to_cgroup_v1_and_to_none():
+    t = {"v": 0.0}
+
+    def v1(path):
+        if path.endswith("cpuacct.usage"):
+            return str(int(t["v"] * 2e9))  # 2 cores busy, in ns
+        raise OSError(path)
+
+    meter = worker.CpuMeter(read=v1, clock=lambda: t["v"])
+    meter()
+    t["v"] = 5.0
+    assert abs(meter() - 2.0) < 1e-6
+    assert worker.CpuMeter(read=lambda p: (_ for _ in ()).throw(OSError()))() is None

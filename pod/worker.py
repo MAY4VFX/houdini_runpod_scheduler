@@ -450,17 +450,49 @@ _ORPHAN_CHECK_S = 30
 #: controller -- one quiet sample between two frames is not "idle".
 _ORPHAN_IDLE_CHECKS = 3
 _ORPHAN_GPU_PCT = 5
-_ORPHAN_LOADAVG = 0.5
+#: Cores of THIS container's CPU time per second below which it counts as idle.
+_ORPHAN_CPU_CORES = 0.3
 _GRAPHQL_URL = "https://api.runpod.io/graphql"
 
 
-def cpu_load(read=None):
-    """The 1-minute load average, or None when /proc/loadavg is unreadable."""
+def _cgroup_cpu_usec(read):
+    """CPU time this container has used, in microseconds, or None.
+
+    cgroup v2 ``cpu.stat`` (usage_usec), else cgroup v1 ``cpuacct.usage``
+    (nanoseconds). NOT /proc/loadavg: inside a container that is the whole
+    physical machine's load -- measured live 2026-11-01 on a 2-core pod:
+    loadavg 61, from other tenants -- so an idle pod never looked idle.
+    """
     try:
-        text = (read or Liveness._read_file)("/proc/loadavg")
-        return float(text.split()[0])
+        for line in read("/sys/fs/cgroup/cpu.stat").splitlines():
+            key, _sep, value = line.partition(" ")
+            if key == "usage_usec":
+                return int(value)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        return int(read("/sys/fs/cgroup/cpuacct/cpuacct.usage").strip()) // 1000
     except Exception:  # noqa: BLE001
         return None
+
+
+class CpuMeter:
+    """Cores this container used since the previous call; None until it can tell."""
+
+    def __init__(self, read=None, clock=time.monotonic):
+        self._read = read or Liveness._read_file
+        self._clock = clock
+        self._last = None
+
+    def __call__(self):
+        usec = _cgroup_cpu_usec(self._read)
+        now = self._clock()
+        if usec is None:
+            return None
+        previous, self._last = self._last, (usec, now)
+        if previous is None or now <= previous[1]:
+            return None
+        return (usec - previous[0]) / 1e6 / (now - previous[1])
 
 
 def terminate_self(api_key=None, pod_id=None, urlopen=None):
@@ -526,7 +558,7 @@ class OrphanWatchdog:
 
     def _resources_idle(self):
         load = self._load()
-        if load is None or load > _ORPHAN_LOADAVG:
+        if load is None or load > _ORPHAN_CPU_CORES:
             return False
         utils = self._gpu_utils()
         if utils is None:
@@ -870,7 +902,7 @@ def make_server(host, port, log_dir="/workspace/ledger/logs"):
             busy_tasks=registry.busy,
             liveness_idle_s=liveness.busy_idle_s,
             gpu_utils=_gpu_utils_or_none,
-            load=cpu_load,
+            load=CpuMeter(),
             terminate=terminate_self,
         )
 
