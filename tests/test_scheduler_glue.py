@@ -3224,3 +3224,21 @@ def test_help_texts_are_labels_not_stored_strings():
         block = ds[block_start: ds.index("        }", block_start)]
         assert "type    label" in block, name
         assert "type    string" not in block, name
+
+
+def test_run_job_repairs_the_stale_toggle_before_pdg_picks_the_node():
+    """Live 2026-11-01, owner's yoyo scene: Run Job did nothing. PDG picks the
+    node to send from `usesubmitjobnode` BEFORE submitAsJob runs, so the
+    repair inside submitAsJob came too late -- PDG had already chosen the
+    display-flag Download, submitAsJob refused the mismatch, and the refusal
+    was shown nowhere. The button's own wrapper repairs first and reports
+    any refusal."""
+    src = MODULE.read_text()
+    wrapper = src[src.index("def submitGraphAsJob(kwargs, node):"):]
+    wrapper = wrapper[:wrapper.index("\ndef ", 1)]
+    repair = wrapper.index("use.set(1)")
+    pdg_call = wrapper.index("submitGraphAsJob(kwargs, node, 'RunPod Farm')")
+    assert repair < pdg_call
+    assert "except Exception as exc:" in wrapper[pdg_call:]
+    assert "hou.ui.displayMessage(" in wrapper[pdg_call:]
+    assert "_report(node, 'rpfarm_status_text'" in wrapper[pdg_call:]

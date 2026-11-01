@@ -4452,8 +4452,32 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
 
 
 def submitGraphAsJob(kwargs, node):
+    import hou
     from pdg.scheduler import submitGraphAsJob
-    submitGraphAsJob(kwargs, node, 'RunPod Farm')
+    # Repair the stale toggle BEFORE PDG reads it. pdg.scheduler picks the
+    # node to send from `usesubmitjobnode` before our submitAsJob runs; on a
+    # scheduler created under an older definition the stored 0 made it pick
+    # the display-flag node (Download), and submitAsJob then -- correctly --
+    # refused the mismatch. Repairing it only inside submitAsJob was too late
+    # (live 2026-11-01, owner's yoyo scene: Run Job did nothing at all).
+    use = node.parm('usesubmitjobnode')
+    if use is not None and not use.eval():
+        use.set(1)
+        print('[rpfarm] usesubmitjobnode was 0 (stale, pre-R71 node); set to 1 '
+              'so Run Job sends Farm Target')
+    try:
+        submitGraphAsJob(kwargs, node, 'RunPod Farm')
+    except Exception as exc:
+        # A refusal raised from a button callback is shown nowhere by PDG --
+        # the artist pressed Run Job and saw nothing. Say it.
+        msg = 'Run Job did not start: {}'.format(exc)
+        _report(node, 'rpfarm_status_text', msg)
+        try:
+            if hou.isUIAvailable():
+                hou.ui.displayMessage(msg, severity=hou.severityType.Error,
+                                      title='Run Job')
+        except Exception:
+            pass
 
 
 def _parentTopNet(node):
