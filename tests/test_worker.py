@@ -866,3 +866,33 @@ def test_submitted_task_runs_the_local_hython(tmp_path, monkeypatch):
                        "env": {"PDG_HFS": VOL, "N": 3}})
     assert task.command == LOCAL + "/bin/hython job.py"
     assert task.env == {"PDG_HFS": LOCAL, "N": 3}
+
+
+def test_tasks_switch_to_the_local_copy_once_it_is_ready(tmp_path, monkeypatch):
+    """The unpack runs in the background: tasks submitted before it is done
+    use the volume, the first one after the marker uses the copy."""
+    local = tmp_path / "hfs"
+    local.mkdir()
+    monkeypatch.setenv("RPFARM_VOLUME_HFS", VOL)
+    monkeypatch.setenv("HFS", VOL)
+    monkeypatch.setenv("RPFARM_LOCAL_HFS", str(local))
+    monkeypatch.setenv("PATH", VOL + "/bin:/usr/bin")
+    monkeypatch.setenv("HH", VOL + "/houdini")
+    monkeypatch.setenv("SHFS", "/workspace/houdini/shfs")
+    monkeypatch.setattr(worker.Registry, "_run", lambda self, task: None)
+    reg = worker.Registry(slots=2, log_dir=str(tmp_path))
+
+    before = reg.submit({"task_id": "t1", "command": VOL + "/bin/hython a.py"})
+    assert before.command == VOL + "/bin/hython a.py"
+    assert worker.build_env()["HFS"] == VOL
+
+    (local / ".rpfarm-ok").write_text("")
+    after = reg.submit({"task_id": "t2", "command": VOL + "/bin/hython a.py"})
+    assert after.command == str(local) + "/bin/hython a.py"
+    env = worker.build_env()
+    assert env["HFS"] == str(local)
+    assert env["HH"] == str(local) + "/houdini"
+    assert env["PATH"].startswith(str(local) + "/bin:")
+    assert VOL not in env["PATH"]
+    # the shared files stay on the volume
+    assert env["SHFS"] == "/workspace/houdini/shfs"

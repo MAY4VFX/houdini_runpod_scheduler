@@ -76,50 +76,68 @@ case "${RPFARM_ROLE:-}" in
       if [ "${_free_kb:-0}" -lt "$_HFS_MIN_FREE_KB" ]; then
         echo "houdini: only $((_free_kb / 1024 / 1024)) GB free on the pod disk -- running from the volume"
       else
-        _t0=$(date +%s)
-        # The pack stored files the volume failed to read as EMPTY and listed
-        # them in .rpfarm-hfs.repair: copy those few from the volume.
-        _hfs_repair() {
-          [ -f "$RPFARM_VOLUME_HFS/.rpfarm-hfs.repair" ] || return 0
-          while IFS= read -r _rel; do
-            [ -n "$_rel" ] || continue
-            # the volume's read failures are transient ("No such device or
-            # address" on a file that reads fine a moment later): retry
-            _n=0
-            until cp -p "$RPFARM_VOLUME_HFS/$_rel" "$_HFS_LOCAL/$_rel"; do
-              _n=$((_n + 1)); [ "$_n" -ge "${RPFARM_REPAIR_TRIES:-5}" ] && return 1
-              sleep "${RPFARM_REPAIR_PAUSE_S:-2}"
-            done
-          done < "$RPFARM_VOLUME_HFS/.rpfarm-hfs.repair"
-        }
-        # Unpacked as `nobody`: as root, unsquashfs restores each file's
-        # owner from the image, and the volume's uids (232072) do not exist
-        # in the pod's user namespace -- chown fails with EINVAL and the whole
-        # unpack reports failure (live 2026-11-03). Unprivileged it does not
-        # try. Tasks run as root and only read these files.
-        _unsq=(unsquashfs)
-        if [ "$(id -u)" = 0 ] && command -v setpriv >/dev/null 2>&1; then
-          chown nobody "$_HFS_LOCAL_ROOT"
-          _unsq=(setpriv --reuid=nobody --regid=nogroup --clear-groups unsquashfs)
-        fi
-        if "${_unsq[@]}" -q -n -f -p "$(nproc)" -d "$_HFS_LOCAL" "$_HFS_IMG" >/tmp/unsquashfs.log 2>&1 \
-            && _hfs_repair >>/tmp/unsquashfs.log 2>&1 \
-            && [ -f "$_HFS_LOCAL/houdini_setup_bash" ]; then
-          touch "$_HFS_LOCAL/.rpfarm-ok"
-          export HFS="$_HFS_LOCAL"
-          echo "houdini: unpacked $(du -sh "$_HFS_IMG" | cut -f1) image to $HFS in $(( $(date +%s) - _t0 ))s"
-        else
-          echo "houdini: unpack failed after $(( $(date +%s) - _t0 ))s ($(tail -1 /tmp/unsquashfs.log)) -- running from the volume"
-          rm -rf "$_HFS_LOCAL"
-        fi
+        # In the BACKGROUND: the worker must answer /health within the
+        # scheduler's 300 s or the pod is given up on. Live 2026-11-03 four
+        # pods in a row sat in a foreground unpack past that and were killed
+        # before printing a single line. Until the copy is complete, tasks
+        # run Houdini from the volume as before; worker.py switches each new
+        # task to the copy once .rpfarm-ok exists (RPFARM_LOCAL_HFS below).
+        export RPFARM_LOCAL_HFS="$_HFS_LOCAL"
+        (
+          _t0=$(date +%s)
+          # The pack stored files the volume failed to read as EMPTY and listed
+          # them in .rpfarm-hfs.repair: copy those few from the volume.
+          _hfs_repair() {
+            [ -f "$RPFARM_VOLUME_HFS/.rpfarm-hfs.repair" ] || return 0
+            while IFS= read -r _rel; do
+              [ -n "$_rel" ] || continue
+              # the volume's read failures are transient ("No such device or
+              # address" on a file that reads fine a moment later): retry
+              _n=0
+              until cp -p "$RPFARM_VOLUME_HFS/$_rel" "$_HFS_LOCAL/$_rel"; do
+                _n=$((_n + 1)); [ "$_n" -ge "${RPFARM_REPAIR_TRIES:-5}" ] && return 1
+                sleep "${RPFARM_REPAIR_PAUSE_S:-2}"
+              done
+            done < "$RPFARM_VOLUME_HFS/.rpfarm-hfs.repair"
+          }
+          # Unpacked as `nobody`: as root, unsquashfs restores each file's
+          # owner from the image, and the volume's uids (232072) do not exist
+          # in the pod's user namespace -- chown fails with EINVAL and the whole
+          # unpack reports failure (live 2026-11-03). Unprivileged it does not
+          # try. Tasks run as root and only read these files.
+          _unsq=(unsquashfs)
+          if [ "$(id -u)" = 0 ] && command -v setpriv >/dev/null 2>&1; then
+            chown nobody "$_HFS_LOCAL_ROOT"
+            _unsq=(setpriv --reuid=nobody --regid=nogroup --clear-groups unsquashfs)
+          fi
+          # nproc in a container can report the whole machine
+          _p=$(nproc); [ "$_p" -gt 8 ] && _p=8
+          "${_unsq[@]}" -q -n -f -p "$_p" -d "$_HFS_LOCAL" "$_HFS_IMG" >/tmp/unsquashfs.log 2>&1 &
+          _pid=$!
+          while kill -0 "$_pid" 2>/dev/null; do
+            sleep "${RPFARM_UNPACK_REPORT_S:-30}"
+            kill -0 "$_pid" 2>/dev/null && echo "houdini: unpacking... $(du -sm "$_HFS_LOCAL" 2>/dev/null | cut -f1) MB after $(( $(date +%s) - _t0 ))s"
+          done
+          if wait "$_pid" && _hfs_repair >>/tmp/unsquashfs.log 2>&1 \
+              && [ -f "$_HFS_LOCAL/houdini_setup_bash" ]; then
+            touch "$_HFS_LOCAL/.rpfarm-ok"
+            echo "houdini: unpacked $(du -sh "$_HFS_IMG" | cut -f1) image to $_HFS_LOCAL in $(( $(date +%s) - _t0 ))s -- new tasks use it"
+          else
+            echo "houdini: unpack failed after $(( $(date +%s) - _t0 ))s ($(tail -1 /tmp/unsquashfs.log)) -- tasks keep running from the volume"
+            rm -rf "$_HFS_LOCAL"
+          fi
+        ) &
+        echo "houdini: unpacking $_HFS_IMG to $_HFS_LOCAL in the background; tasks use the volume until it is done"
       fi
     fi
     ;;
 esac
 # Houdini 22 shared files: houdini_setup_bash looks for them at $HFS/../shfs.
 # On the volume that is /workspace/houdini/shfs; a local copy has no sibling,
-# so point at the volume one explicitly.
-if [ "$HFS" != "$RPFARM_VOLUME_HFS" ] && [ -z "${SHFS:-}" ] && [ -d "$RPFARM_VOLUME_HFS/../shfs" ]; then
+# so name the volume one explicitly -- and as a normalized path, never
+# "$HFS/../shfs": worker.py rewrites the volume HFS prefix to the local copy
+# in task environments, which would turn that into a folder that is not there.
+if [ -z "${SHFS:-}" ] && [ -d "$RPFARM_VOLUME_HFS/../shfs" ]; then
   export SHFS="$(cd "$RPFARM_VOLUME_HFS/../shfs" && pwd)"
   export HOUDINI_SHFS_PATH="$SHFS"
 fi

@@ -104,15 +104,37 @@ def get_gpu_info():
         return []
 
 
+def active_hfs():
+    """The Houdini a task started now should use.
+
+    pod/entrypoint.sh unpacks the local copy in the background and exports
+    ``RPFARM_LOCAL_HFS``; the copy counts once its ``.rpfarm-ok`` marker
+    exists. Until then (and on pods without an image) it is ``$HFS``, the
+    volume install the pod booted with.
+    """
+    local = os.environ.get("RPFARM_LOCAL_HFS", "")
+    if local and os.path.isfile(os.path.join(local, ".rpfarm-ok")):
+        return local
+    return os.environ.get("HFS", "")
+
+
 def build_env(task_env=None):
     """Construct the subprocess environment (adapted from v1's worker/executor.py::_build_env).
 
     Priority (highest wins): explicit task env overrides > Houdini PATH
     prepend > inherited process environment (which already carries HFS,
     set by the pod's own environment).
+
+    Once the local copy of Houdini is ready, everything the pod inherited
+    from sourcing the volume's houdini_setup_bash (PATH, HFS, HH, ...) is
+    pointed at the copy too, so the task's own `source houdini_setup_bash`
+    starts from a consistent environment.
     """
     env = os.environ.copy()
-    hfs = env.get("HFS", "")
+    hfs = active_hfs()
+    if hfs and hfs != env.get("HFS", ""):
+        env = {k: localize_hfs(v, hfs=hfs) for k, v in env.items()}
+        env["HFS"] = hfs
     if hfs:
         env["PATH"] = os.path.join(hfs, "bin") + ":" + env.get("PATH", "/usr/bin:/bin")
     env.update(task_env or {})
@@ -132,7 +154,7 @@ def localize_hfs(text, volume_hfs=None, hfs=None):
     just slowly.
     """
     volume_hfs = os.environ.get("RPFARM_VOLUME_HFS", "") if volume_hfs is None else volume_hfs
-    hfs = os.environ.get("HFS", "") if hfs is None else hfs
+    hfs = active_hfs() if hfs is None else hfs
     if not text or not volume_hfs or not hfs or volume_hfs == hfs:
         return text
     pattern = re.escape(volume_hfs.rstrip("/")) + r"(?=$|[/\s\"':;])"
