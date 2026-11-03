@@ -1992,3 +1992,20 @@ def test_rop_output_pair_walks_up_to_the_rop_fetch_and_reads_the_rop(monkeypatch
     pair = rppkg.rop_output_pair(item, topnet, {"/Users/artist": "/workspace/projects/artist/pla"})
     assert pair == ("/workspace/projects/artist/pla/BS/render/pla_0011.0007.exr",
                     "/Users/artist/BS/render/pla_0011.0007.exr")
+
+
+# -- houdini_pack_command -------------------------------------------------------
+
+def test_pack_command_writes_the_image_pods_look_for_atomically():
+    cmd = rppkg.houdini_pack_command("22.0.393")
+    img = "/workspace/houdini/22.0.393/.rpfarm-hfs.sqfs"
+    entrypoint = (pathlib.Path(__file__).resolve().parent.parent / "pod" / "entrypoint.sh").read_text()
+    # the same name pod/entrypoint.sh unpacks
+    assert '_HFS_IMG="$HFS/{}"'.format(rppkg.HOUDINI_IMAGE_NAME) in entrypoint
+    assert "mksquashfs /workspace/houdini/22.0.393 {}.tmp".format(img) in cmd
+    # a pod booting mid-pack must never see half an image
+    assert "mv -f {0}.tmp {0}".format(img) in cmd
+    # the image is inside the tree it packs: it must exclude itself
+    assert "-e .rpfarm-hfs.sqfs .rpfarm-hfs.sqfs.tmp" in cmd
+    # refuses to pack something that is not a Houdini install
+    assert cmd.startswith("[ -f /workspace/houdini/22.0.393/houdini_setup_bash ] ||")

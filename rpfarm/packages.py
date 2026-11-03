@@ -437,6 +437,43 @@ def houdini_install_preset(tar_local_path, version):
     return pairs, post_command
 
 
+#: The packed image of one Houdini install, kept inside that install so
+#: `houdini rm` removes both. Render and host pods unpack it onto their own
+#: disk at boot (pod/entrypoint.sh, step 3a); the name is shared with it.
+HOUDINI_IMAGE_NAME = ".rpfarm-hfs.sqfs"
+
+
+def houdini_pack_command(version):
+    """Shell command that packs ``/workspace/houdini/<version>`` into one
+    SquashFS image, run on the sync pod.
+
+    Why an image: Houdini is ~150k files, and every hython start used to
+    read them one by one off the MooseFS volume, which is latency-bound
+    (122-145 s per task, live 2026-11-01). One image is read sequentially
+    and unpacked on the pod in well under a minute (agent-board measured
+    17 s for 22.0.393, DECISIONS 40). It cannot be mounted instead: RunPod
+    pods have no /dev/fuse and no loop devices.
+
+    Written to a temp name and renamed, so a pod booting mid-pack never
+    unpacks half an image. The image excludes itself. Packing walks the
+    whole tree once (~15 min); it is needed again only after the install
+    itself changes.
+    """
+    install_dir = f"/workspace/houdini/{version}"
+    img = f"{install_dir}/{HOUDINI_IMAGE_NAME}"
+    return (
+        f'[ -f {install_dir}/houdini_setup_bash ] || '
+        f'{{ echo "no Houdini {version} at {install_dir}" >&2; exit 2; }}; '
+        f'rm -f {img}.tmp && t0=$(date +%s) && '
+        f'mksquashfs {install_dir} {img}.tmp -noappend -no-progress -quiet '
+        f'-comp zstd -Xcompression-level 6 -b 1M -processors "$(nproc)" '
+        f'-e {HOUDINI_IMAGE_NAME} {HOUDINI_IMAGE_NAME}.tmp && '
+        f'mv -f {img}.tmp {img} && '
+        f'python3 /opt/rpfarm/housekeeping.py invalidate houdini >/dev/null && '
+        f'echo "packed {img}: $(du -h {img} | cut -f1) in $(( $(date +%s) - t0 ))s"'
+    )
+
+
 #: Build-only packages for SideFX's resolver sample. None of these ever enter
 #: the pod image: the build happens once, here, while Houdini is being
 #: installed onto the volume, and only the 33 KB .so survives.

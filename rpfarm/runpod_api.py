@@ -120,7 +120,8 @@ class RunPodAPI:
     # -- pods ------------------------------------------------------------
 
     def _pod_body(self, name, template_id, volume_id, env, ports,
-                  datacenter=DEFAULT_DATACENTER, cloud_type=CLOUD_TYPE_SECURE):
+                  datacenter=DEFAULT_DATACENTER, cloud_type=CLOUD_TYPE_SECURE,
+                  container_disk_gb=None):
         """The fields every pod create shares.
 
         ``datacenter`` used to be the hardcoded :data:`DEFAULT_DATACENTER`
@@ -132,7 +133,7 @@ class RunPodAPI:
         got pods created in EU-RO-1 against a volume that was not there, and
         every cook failed.
         """
-        return {
+        body = {
             "name": name,
             "templateId": template_id,
             "networkVolumeId": volume_id,
@@ -143,9 +144,16 @@ class RunPodAPI:
             "supportPublicIp": True,
             "dataCenterIds": [datacenter or DEFAULT_DATACENTER],
         }
+        # Overrides the template's disk for this one pod: render and host
+        # pods unpack a local copy of Houdini there (pod/entrypoint.sh), the
+        # sync pod does not and keeps the template's small disk.
+        if container_disk_gb:
+            body["containerDiskInGb"] = int(container_disk_gb)
+        return body
 
     def create_gpu_pod(self, name, template_id, gpu_type_ids, volume_id, env, ports,
-                       datacenter=DEFAULT_DATACENTER, cloud_type=CLOUD_TYPE_SECURE):
+                       datacenter=DEFAULT_DATACENTER, cloud_type=CLOUD_TYPE_SECURE,
+                       container_disk_gb=None):
         """Create a GPU pod, trying ``gpu_type_ids`` in the order given.
 
         ``gpuTypePriority`` defaults to ``"availability"``, which picks
@@ -157,7 +165,7 @@ class RunPodAPI:
         priority list is a cost decision, so it is ``"custom"`` here.
         """
         body = self._pod_body(name, template_id, volume_id, env, ports, datacenter,
-                              cloud_type=cloud_type)
+                              cloud_type=cloud_type, container_disk_gb=container_disk_gb)
         body.update(
             {
                 "computeType": "GPU",
@@ -169,7 +177,8 @@ class RunPodAPI:
         return self._call("POST", "/pods", body)
 
     def create_cpu_pod(self, name, template_id, volume_id, env, ports, vcpu=2, flavors=("cpu3c", "cpu5c"),
-                       datacenter=DEFAULT_DATACENTER, cloud_type=CLOUD_TYPE_SECURE):
+                       datacenter=DEFAULT_DATACENTER, cloud_type=CLOUD_TYPE_SECURE,
+                       container_disk_gb=None):
         """Create a CPU pod, trying ``flavors`` in the order given.
 
         Same reasoning as :meth:`create_gpu_pod`. The openapi spec: "set to
@@ -179,7 +188,7 @@ class RunPodAPI:
         cpu3c against $0.07/h for cpu5c), so the order is the point.
         """
         body = self._pod_body(name, template_id, volume_id, env, ports, datacenter,
-                              cloud_type=cloud_type)
+                              cloud_type=cloud_type, container_disk_gb=container_disk_gb)
         body.update(
             {
                 "computeType": "CPU",

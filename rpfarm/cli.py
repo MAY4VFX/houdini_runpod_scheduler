@@ -992,7 +992,36 @@ def cmd_houdini_install(args):
         print()
         print(f"[OK] uploaded {_fmt_bytes(stats['bytes'])} in {stats['seconds']:.1f}s; installer ran on the sync pod")
         print(f"[OK] Houdini {version} installed to {HOUDINI_INSTALL_DIR}/{version}")
+        # The packed image is what makes pods start fast; an install without
+        # it still works, from the volume, so a failed pack is a warning.
+        if _pack_houdini(client, version) != 0:
+            print(f"[WARN] pods will run Houdini {version} from the volume until "
+                  f"`rpfarm houdini pack --version {version}` succeeds", file=sys.stderr)
     return 0
+
+
+def _pack_houdini(client, version):
+    print(f"packing Houdini {version} into one image for fast pod starts (~15 min) ...")
+    result = client.exec_wait(rppkg.houdini_pack_command(version), deadline_s=3600, poll_s=15)
+    out = ((result.get("stdout") or "") + (result.get("stderr") or "")).strip()
+    if result.get("exit_code") != 0:
+        print(f"[FAIL] pack: {out[-800:] or result}", file=sys.stderr)
+        return 1
+    print(f"[OK] {out.splitlines()[-1] if out else 'packed'}")
+    return 0
+
+
+def cmd_houdini_pack(args):
+    """Pack an installed Houdini into the image render and host pods unpack
+    at boot. ``houdini install`` does this itself; this is for installs made
+    before it did, and for redoing it after the install changed."""
+    cfg = rpcfg.load()
+    api = _make_api(cfg.api_key)
+    token = rpcfg.session_token()
+    version = args.version or cfg.houdini_version
+    print(f"connecting to sync pod for {cfg.user} ...")
+    _pod, client = _connect_sync_pod(api, cfg, token)
+    return _pack_houdini(client, version)
 
 
 def cmd_houdini_ls(args):
@@ -1426,7 +1455,8 @@ def cmd_farm_xpu(args):
     try:
         pod = api.create_gpu_pod(name, cfg.template_id, cfg.gpu_priority, cfg.volume_id,
                                  env, rppods.PORTS, datacenter=cfg.datacenter,
-                                 cloud_type=cfg.cloud_type)
+                                 cloud_type=cfg.cloud_type,
+                                 container_disk_gb=rppods.HOUDINI_POD_DISK_GB)
         ready = rppods.wait_ready(api, WorkerClient(pod["id"], token), pod["id"],
                                   timeout=args.timeout)
         health = WorkerClient(pod["id"], token).health() or {}
@@ -1521,6 +1551,8 @@ def build_parser():
     p_hi.add_argument("--tar", required=True, help="local path, or sftp://[user@]host/path")
     p_hi.add_argument("--version", default=None, help="defaults to config.toml's houdini_version")
     houdini_sub.add_parser("ls", help="list Houdini versions installed on the volume, with size")
+    p_hp = houdini_sub.add_parser("pack", help="pack an installed Houdini into one image, so pods start it from their own disk")
+    p_hp.add_argument("--version", default=None, help="defaults to config.toml's houdini_version")
     p_hrm = houdini_sub.add_parser("rm", help="delete one installed Houdini version from the volume (potentially tens of GB)")
     p_hrm.add_argument("version", help="e.g. 22.0.393, or \"legacy\" for a v1 flat install")
     p_hrm.add_argument("--dry-run", action="store_true", help="(default behaviour) show what would be freed; delete nothing")
@@ -1577,7 +1609,7 @@ def build_parser():
     return p
 
 
-_HOUDINI_HANDLERS = {"install": cmd_houdini_install, "ls": cmd_houdini_ls, "rm": cmd_houdini_rm}
+_HOUDINI_HANDLERS = {"install": cmd_houdini_install, "ls": cmd_houdini_ls, "pack": cmd_houdini_pack, "rm": cmd_houdini_rm}
 _STORAGE_HANDLERS = {
     "ls": cmd_storage_ls,
     "du": cmd_storage_du,

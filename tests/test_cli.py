@@ -871,9 +871,13 @@ def test_houdini_install_uploads_tar_and_runs_installer(tmp_path, monkeypatch, c
         return {"files": 1, "bytes": len(b"fake-tarball-contents"), "seconds": 0.01}
 
     monkeypatch.setattr(rppkg, "run_upload_item", fake_run_upload_item)
+    packed = []
+    monkeypatch.setattr(cli, "_pack_houdini", lambda client, version: packed.append(version) or 0)
 
     rc = cli.main(["houdini", "install", "--tar", str(tar_path), "--version", "22.0.393"])
     assert rc == 0
+    # a fresh install is packed into the image pods unpack at boot
+    assert packed == ["22.0.393"]
 
     item = captured["item"]
     assert item["remote_root"] == "/workspace/apps/dist"
@@ -1634,3 +1638,20 @@ def test_doctor_can_be_asked_to_use_the_cooks_path(monkeypatch, capsys):
 
     assert os.environ["PATH"] == tools.HOUDINI_LIKE_PATH
     assert "--dock-env" in capsys.readouterr().out
+
+
+def test_houdini_pack_runs_the_pack_command_on_the_sync_pod(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("RPFARM_HOME", str(tmp_path))
+    _write_cfg(tmp_path)
+    ran = []
+
+    class _Client:
+        def exec_wait(self, command, deadline_s, poll_s=5.0):
+            ran.append(command)
+            return {"exit_code": 0, "stdout": "packed /workspace/houdini/22.0.393/.rpfarm-hfs.sqfs: 4.1G in 900s\n"}
+
+    monkeypatch.setattr(cli, "_connect_sync_pod", lambda api, cfg, token, log=print: ({}, _Client()))
+    rc = cli.main(["houdini", "pack", "--version", "22.0.393"])
+    assert rc == 0
+    assert ran == [rppkg.houdini_pack_command("22.0.393")]
+    assert "4.1G" in capsys.readouterr().out

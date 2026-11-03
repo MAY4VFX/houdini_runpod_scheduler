@@ -326,3 +326,17 @@ def test_is_capacity_error_waits_on_5xx_and_gives_up_on_4xx():
 
 def test_is_capacity_error_is_false_for_anything_without_a_status():
     assert ra.is_capacity_error(ValueError("not a runpod error")) is False
+
+
+def test_pod_creates_can_ask_for_a_bigger_disk():
+    """Render and host pods unpack Houdini onto their own disk; the
+    template's 10 GB does not hold it, so those creates override it."""
+    t = FakeTransport([(200, {"id": "p1"}), (200, {"id": "p2"}), (200, {"id": "p3"})])
+    api = ra.RunPodAPI("k", transport=t)
+    api.create_gpu_pod("g", "tpl", ["NVIDIA A40"], "vol", {}, ["22/tcp"], container_disk_gb=25)
+    api.create_cpu_pod("h", "tpl", "vol", {}, ["22/tcp"], container_disk_gb=25)
+    api.create_cpu_pod("rpfarm-sync-may", "tpl", "vol", {}, ["22/tcp"])
+    assert t.calls[0][2]["containerDiskInGb"] == 25
+    assert t.calls[1][2]["containerDiskInGb"] == 25
+    # the sync pod keeps the template's disk
+    assert "containerDiskInGb" not in t.calls[2][2]

@@ -44,6 +44,10 @@ ENV DEBIAN_FRONTEND=noninteractive
 # "libatomic.so.1: cannot open shared object file".
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 openssh-server rsync curl ca-certificates zstd unzip \
+    # squashfs-tools: the sync pod packs each Houdini install into one image
+    # (mksquashfs) and render/host pods unpack it onto their local disk
+    # (unsquashfs) -- see the local-Houdini step in pod/entrypoint.sh.
+    squashfs-tools \
     tini \
     libatomic1 \
     libgl1-mesa-glx libglu1-mesa libxi6 libxmu6 libxrandr2 libxcursor1 \

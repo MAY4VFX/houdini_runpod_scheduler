@@ -41,6 +41,63 @@ done
 #    builds can live side by side on the same volume).
 export HOUDINI_VERSION="${HOUDINI_VERSION:-22.0.393}"
 export HFS="/workspace/houdini/${HOUDINI_VERSION}"
+# Where Houdini lives on the volume. Scheduler-side task commands name this
+# path; worker.py rewrites it to $HFS when the pod runs a local copy.
+export RPFARM_VOLUME_HFS="$HFS"
+# --- local-hfs begin (tests/test_entrypoint_local_hfs.py runs this block) ---
+
+# 3a. Local copy of Houdini (render and host pods).
+#     Houdini is ~150k files. Read one by one off the MooseFS network volume
+#     that is latency-bound: hython took 122-145 s just to start on every task
+#     (live 2026-11-01). One SquashFS image of the same tree is read
+#     sequentially and unpacked onto the pod's own disk in well under a
+#     minute, once per pod. RunPod pods have no /dev/fuse and no loop devices,
+#     so the image is unpacked, never mounted (agent-board DECISIONS 40).
+#     The image sits inside the version directory, so `houdini rm` removes it
+#     with the install. No image, no tool, too little disk or a failed unpack
+#     -> Houdini runs from the volume exactly as before.
+#     The sync pod does not run Houdini tasks and keeps the volume copy.
+_HFS_IMG="$HFS/.rpfarm-hfs.sqfs"
+_HFS_LOCAL_ROOT="${RPFARM_LOCAL_HFS_ROOT:-/opt/rpfarm-hfs}"
+_HFS_LOCAL="$_HFS_LOCAL_ROOT/${HOUDINI_VERSION}"
+_HFS_MIN_FREE_KB="${RPFARM_LOCAL_HFS_MIN_FREE_KB:-$((12 * 1024 * 1024))}"
+case "${RPFARM_ROLE:-}" in
+  gpu|host)
+    if [ -f "$_HFS_LOCAL/.rpfarm-ok" ]; then
+      export HFS="$_HFS_LOCAL"
+      echo "houdini: local copy already at $HFS"
+    elif [ ! -f "$_HFS_IMG" ]; then
+      echo "houdini: no image at $_HFS_IMG -- running from the volume (pack it: rpfarm houdini pack)"
+    elif ! command -v unsquashfs >/dev/null 2>&1; then
+      echo "houdini: unsquashfs missing from the pod image -- running from the volume"
+    else
+      mkdir -p "$_HFS_LOCAL_ROOT"
+      _free_kb=$(df -Pk "$_HFS_LOCAL_ROOT" | awk 'NR==2 {print $4}')
+      if [ "${_free_kb:-0}" -lt "$_HFS_MIN_FREE_KB" ]; then
+        echo "houdini: only $((_free_kb / 1024 / 1024)) GB free on the pod disk -- running from the volume"
+      else
+        _t0=$(date +%s)
+        if unsquashfs -q -n -f -p "$(nproc)" -d "$_HFS_LOCAL" "$_HFS_IMG" >/tmp/unsquashfs.log 2>&1 \
+            && [ -f "$_HFS_LOCAL/houdini_setup_bash" ]; then
+          touch "$_HFS_LOCAL/.rpfarm-ok"
+          export HFS="$_HFS_LOCAL"
+          echo "houdini: unpacked $(du -sh "$_HFS_IMG" | cut -f1) image to $HFS in $(( $(date +%s) - _t0 ))s"
+        else
+          echo "houdini: unpack failed ($(tail -1 /tmp/unsquashfs.log)) -- running from the volume"
+          rm -rf "$_HFS_LOCAL"
+        fi
+      fi
+    fi
+    ;;
+esac
+# Houdini 22 shared files: houdini_setup_bash looks for them at $HFS/../shfs.
+# On the volume that is /workspace/houdini/shfs; a local copy has no sibling,
+# so point at the volume one explicitly.
+if [ "$HFS" != "$RPFARM_VOLUME_HFS" ] && [ -z "${SHFS:-}" ] && [ -d "$RPFARM_VOLUME_HFS/../shfs" ]; then
+  export SHFS="$(cd "$RPFARM_VOLUME_HFS/../shfs" && pwd)"
+  export HOUDINI_SHFS_PATH="$SHFS"
+fi
+# --- local-hfs end ---
 if [ -d "$HFS" ] && [ -f "$HFS/houdini_setup_bash" ]; then
   # `set -u` MUST be off while sourcing houdini_setup_bash. SideFX's script
   # reads unset variables (on Houdini 21.0.792 it is `SHFS` at line 30;

@@ -26,6 +26,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import signal
 import subprocess
 import threading
@@ -116,6 +117,32 @@ def build_env(task_env=None):
         env["PATH"] = os.path.join(hfs, "bin") + ":" + env.get("PATH", "/usr/bin:/bin")
     env.update(task_env or {})
     return env
+
+
+def localize_hfs(text, volume_hfs=None, hfs=None):
+    """Point a task's Houdini paths at this pod's own copy of Houdini.
+
+    The scheduler names Houdini by its volume path
+    (``/workspace/houdini/<ver>/bin/hython``, ``__PDG_HFS__``): it cannot
+    know whether a pod unpacked a local copy. pod/entrypoint.sh exports
+    ``RPFARM_VOLUME_HFS`` (the volume path) and ``HFS`` (whatever this pod
+    really uses); when they differ, every whole-path occurrence of the first
+    becomes the second. Running hython off the volume is what cost ~2 min per
+    task, so a command that slipped through unrewritten would still work,
+    just slowly.
+    """
+    volume_hfs = os.environ.get("RPFARM_VOLUME_HFS", "") if volume_hfs is None else volume_hfs
+    hfs = os.environ.get("HFS", "") if hfs is None else hfs
+    if not text or not volume_hfs or not hfs or volume_hfs == hfs:
+        return text
+    pattern = re.escape(volume_hfs.rstrip("/")) + r"(?=$|[/\s\"':;])"
+    return re.sub(pattern, lambda _m: hfs.rstrip("/"), text)
+
+
+def localize_task(command, env):
+    """:func:`localize_hfs` over a task's command and every env value."""
+    return (localize_hfs(command),
+            {k: localize_hfs(v) if isinstance(v, str) else v for k, v in (env or {}).items()})
 
 
 def build_shell_command(command):
@@ -618,7 +645,8 @@ class Registry:
                 return None
             log_path = body.get("log_path") or os.path.join(self.log_dir, f"{task_id}.log")
             os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
-            task = Task(task_id, body["command"], body.get("env") or {}, body.get("cwd"), log_path)
+            command, env = localize_task(body["command"], body.get("env") or {})
+            task = Task(task_id, command, env, body.get("cwd"), log_path)
             self.tasks[task_id] = task
         threading.Thread(target=self._run, args=(task,), daemon=True).start()
         return task

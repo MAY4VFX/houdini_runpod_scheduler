@@ -37,6 +37,11 @@ from .worker_client import WorkerClient
 
 PORTS = ["22/tcp", "4440/tcp", "4442/tcp", "8000/http"]
 
+# Container disk for pods that run Houdini (render and Submit As Job host):
+# pod/entrypoint.sh unpacks the ~9 GB Houdini image there, and the template's
+# 10 GB disk does not hold it. The sync pod keeps the template's disk.
+HOUDINI_POD_DISK_GB = 25
+
 # Filenames inside the shipped Submit As Job host_pkg/ staging dir for
 # PDG's own serialize/deserializeWorkItems state (Ruling R71, second cut).
 # One shared source rather than a literal duplicated on both ends: the

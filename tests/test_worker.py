@@ -827,3 +827,42 @@ def test_cpu_meter_falls_back_to_cgroup_v1_and_to_none():
     t["v"] = 5.0
     assert abs(meter() - 2.0) < 1e-6
     assert worker.CpuMeter(read=lambda p: (_ for _ in ()).throw(OSError()))() is None
+
+
+# -- local copy of Houdini (pod/entrypoint.sh step 3a) -------------------------
+
+VOL = "/workspace/houdini/22.0.393"
+LOCAL = "/opt/rpfarm-hfs/22.0.393"
+
+
+def test_localize_hfs_points_volume_paths_at_the_local_copy():
+    cmd = '"/workspace/houdini/22.0.393/bin/hython" "/workspace/houdini/22.0.393/houdini/python3.13libs/pdgjob/rop.py" --x'
+    assert worker.localize_hfs(cmd, VOL, LOCAL) == (
+        '"/opt/rpfarm-hfs/22.0.393/bin/hython" "/opt/rpfarm-hfs/22.0.393/houdini/python3.13libs/pdgjob/rop.py" --x')
+    assert worker.localize_hfs("HFS=" + VOL, VOL, LOCAL) == "HFS=" + LOCAL
+
+
+def test_localize_hfs_leaves_other_paths_alone():
+    # a different version that merely starts with the same characters
+    assert worker.localize_hfs("/workspace/houdini/22.0.3930/bin/hython", VOL, LOCAL) == \
+        "/workspace/houdini/22.0.3930/bin/hython"
+    # the projects zone is not Houdini
+    assert worker.localize_hfs("/workspace/projects/may/x.hip", VOL, LOCAL) == "/workspace/projects/may/x.hip"
+
+
+def test_localize_hfs_is_a_no_op_without_a_local_copy():
+    cmd = VOL + "/bin/hython"
+    assert worker.localize_hfs(cmd, VOL, VOL) == cmd
+    assert worker.localize_hfs(cmd, "", LOCAL) == cmd
+    assert worker.localize_hfs(cmd, VOL, "") == cmd
+
+
+def test_submitted_task_runs_the_local_hython(tmp_path, monkeypatch):
+    monkeypatch.setenv("RPFARM_VOLUME_HFS", VOL)
+    monkeypatch.setenv("HFS", LOCAL)
+    monkeypatch.setattr(worker.Registry, "_run", lambda self, task: None)
+    reg = worker.Registry(slots=1, log_dir=str(tmp_path))
+    task = reg.submit({"task_id": "t1", "command": VOL + "/bin/hython job.py",
+                       "env": {"PDG_HFS": VOL, "N": 3}})
+    assert task.command == LOCAL + "/bin/hython job.py"
+    assert task.env == {"PDG_HFS": LOCAL, "N": 3}

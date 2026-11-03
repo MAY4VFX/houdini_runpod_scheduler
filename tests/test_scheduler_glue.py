@@ -1067,10 +1067,12 @@ class _PodApi:
         self._listing = list(existing_pods)
 
     def create_gpu_pod(self, name, template_id, gpu_list, volume_id, env, ports,
-                       datacenter=None, cloud_type=None):
+                       datacenter=None, cloud_type=None, container_disk_gb=None):
         pod_id = "pod{}".format(self._next_id)
         self._next_id += 1
         self.created.append((name, pod_id))
+        self.created_disks = getattr(self, "created_disks", {})
+        self.created_disks[pod_id] = container_disk_gb
         self.created_envs = getattr(self, "created_envs", {})
         self.created_envs[pod_id] = env
         pod = {"id": pod_id, "name": name}
@@ -1179,6 +1181,20 @@ def test_gpu_pods_get_the_per_cook_token_never_the_shared_one():
     assert api.created_envs[pod_id]["RPFARM_TOKEN"] == sched._cook_token
     assert api.created_envs[pod_id]["RPFARM_TOKEN"] != sched._token
     assert sched._clients[pod_id].token == sched._cook_token
+
+
+def test_gpu_pods_get_a_disk_that_holds_a_local_houdini():
+    """pod/entrypoint.sh unpacks Houdini onto the render pod's own disk;
+    the template's 10 GB would make every pod fall back to the volume."""
+    api = _PodApi()
+    sched = _ScaleUpScheduler(api)
+    ns = _scale_up_ns()
+    sched._scale_up = lambda count: ns["_scale_up"](sched, count)
+    sched._terminate_pod = lambda pod_id: ns["_terminate_pod"](sched, pod_id)
+
+    sched._scale_up(1)
+
+    assert api.created_disks[api.created[0][1]] == rppods.HOUDINI_POD_DISK_GB
 
 
 def test_a_pod_born_after_a_new_cook_started_is_also_terminated():
@@ -3319,3 +3335,15 @@ def test_changing_results_from_dirties_the_network():
     assert "script_callback='hou.phm().onJobChanged(kwargs)'" in src
     assert "def onJobChanged(kwargs):" in src
     assert "dirtyAllWorkItems(False)" in src[src.index("def onJobChanged(kwargs):"):]
+
+
+def test_the_submit_as_job_host_gets_a_disk_that_holds_a_local_houdini():
+    """The host runs the whole cook in hython; it unpacks Houdini at boot
+    like a render pod (pod/entrypoint.sh step 3a). Source-level, as the
+    other _submitAsJobInner checks."""
+    src = MODULE.read_text()
+    inner = src[src.index("def _submitAsJobInner(self, node_name):"):]
+    inner = inner[:inner.index("\n    def ", 1)]
+    create = inner[inner.index("self._api.create_cpu_pod("):]
+    create = create[:create.index("self._sync_pod")]
+    assert "container_disk_gb=rppods.HOUDINI_POD_DISK_GB" in create
