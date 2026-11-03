@@ -247,7 +247,7 @@ _ASSET_FINGERPRINT = {
     'mq.py': (2124, '174afbd9f49ad86f'),
     'package_runner.py': (9652, '939de3e067b005db'),
     'packages.py': (69249, '6adaa7280927d451'),
-    'pods.py': (38970, 'a5e90d9c7ba0c023'),
+    'pods.py': (39223, 'be299c38832f86a3'),
     'preflight.py': (45206, 'bea8fc057bc7e32a'),
     'progress.py': (3696, '48f1d06649c5666b'),
     'releases.py': (4735, 'c6b364ccfb3534b3'),

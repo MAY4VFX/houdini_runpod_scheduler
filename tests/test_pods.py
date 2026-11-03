@@ -254,6 +254,7 @@ def test_pod_env_without_extra():
         "RPFARM_PROJECT",
         "PUBLIC_KEY",
         "HOUDINI_VERSION",
+        "RPFARM_SYNC_IDLE_MIN",
         "SESINETD_HOST",
         "SESINETD_PORT",
     }
@@ -1041,3 +1042,12 @@ def test_gpu_pods_carry_the_orphan_threshold_and_sync_pods_do_not():
     c.gpu_orphan_min = 2
     assert pods.pod_env(c, "gpu", "t", 1, "pk")["RPFARM_ORPHAN_MIN"] == "2"
     assert "RPFARM_ORPHAN_MIN" not in pods.pod_env(c, "sync", "t", 1, "pk")
+
+
+def test_pod_env_gives_the_sync_pod_its_idle_threshold():
+    c = cfg()
+    c.sync_idle_min = 15
+    env = pods.pod_env(c, "sync", "tok", 4, "ssh-ed25519 AAA")
+    assert env["RPFARM_SYNC_IDLE_MIN"] == "15"
+    assert "RPFARM_ORPHAN_MIN" not in env
+    assert "RPFARM_SYNC_IDLE_MIN" not in pods.pod_env(c, "gpu", "tok", 1, "k")

@@ -896,3 +896,89 @@ def test_tasks_switch_to_the_local_copy_once_it_is_ready(tmp_path, monkeypatch):
     assert VOL not in env["PATH"]
     # the shared files stay on the volume
     assert env["SHFS"] == "/workspace/houdini/shfs"
+
+
+# -- the sync pod stops itself when nobody uses it ------------------------------
+
+_ESTABLISHED_MQ = "   3: 0100007F:1158 0100007F:C003 01 00000000:00000000 00:00000000 00000000     0        0 4\n"
+
+
+def test_a_cook_connected_to_the_shared_mq_keeps_the_sync_pod_alive():
+    """A long frame moves no files, but its cook holds the MQ relay open on
+    4440 (0x1158): that must read as 'someone is here'."""
+    read, listdir = _fake_proc(net_tcp=_ESTABLISHED_MQ)
+    live = worker.Liveness(read=read, listdir=listdir, clock=lambda: 100.0)
+    assert live.ssh_sessions() == 0
+    assert live.sessions() == 1
+    live.sample()
+    assert live.busy_idle_s() == 0.0
+
+
+def test_detached_runs_count_while_they_run(tmp_path):
+    class P:
+        def __init__(self, rc):
+            self.rc = rc
+
+        def poll(self):
+            return self.rc
+
+    runs = worker.DetachedRuns(str(tmp_path))
+    runs._procs = {"a": P(None), "b": P(0)}
+    assert runs.running() == 1
+
+
+def _urlopen_answering(*answers):
+    sent = []
+
+    class Resp:
+        def __init__(self, body):
+            self.body = body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return self.body
+
+    def fake(req, timeout):
+        sent.append(req.data.decode())
+        return Resp(answers[len(sent) - 1])
+
+    return fake, sent
+
+
+def test_stop_self_stops_the_pod():
+    fake, sent = _urlopen_answering(b'{"data": {"podStop": {"id": "s1"}}}')
+    ok, detail = worker.stop_self(api_key="k", pod_id="s1", urlopen=fake)
+    assert ok is True and "podStop accepted" in detail
+    assert len(sent) == 1 and 'podStop(input: {podId: \\"s1\\"})' in sent[0]
+
+
+def test_stop_self_terminates_when_stopping_is_refused():
+    fake, sent = _urlopen_answering(b'{"errors": [{"message": "no"}]}',
+                                    b'{"data": {"podTerminate": null}}')
+    ok, detail = worker.stop_self(api_key="k", pod_id="s1", urlopen=fake)
+    assert ok is True
+    assert "podTerminate" in sent[1]
+
+
+def test_the_sync_watchdog_stops_only_an_untouched_quiet_pod():
+    calls = []
+    state = {"contact": 0.0, "busy": 0, "alive": None, "load": 0.0}
+    dog = worker.OrphanWatchdog(
+        orphan_s=900, contact_idle_s=lambda: state["contact"],
+        busy_tasks=lambda: state["busy"], liveness_idle_s=lambda: state["alive"],
+        gpu_utils=lambda: [], load=lambda: state["load"],
+        terminate=lambda: calls.append(1) or (True, "podStop accepted"),
+        log=lambda m: None, action="stopping the sync pod")
+    # touched recently
+    assert [dog.check() for _ in range(5)] == [False] * 5
+    # untouched, but a pack is still running
+    state.update(contact=1000.0, busy=1)
+    assert [dog.check() for _ in range(5)] == [False] * 5
+    state.update(busy=0)
+    assert [dog.check() for _ in range(3)] == [False, False, True]
+    assert calls == [1]

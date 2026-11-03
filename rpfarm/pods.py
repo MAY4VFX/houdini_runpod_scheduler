@@ -125,6 +125,10 @@ def pod_env(cfg, role, token, slots, pubkey, extra=None, cook="", project=""):
     }
     if role == "gpu":
         env["RPFARM_ORPHAN_MIN"] = str(getattr(cfg, "gpu_orphan_min", 20))
+    elif role == "sync":
+        # the sync pod stops itself after this long untouched, Houdini open
+        # or not (pod/worker.py); 0 = never, same as the scheduler's timer
+        env["RPFARM_SYNC_IDLE_MIN"] = str(getattr(cfg, "sync_idle_min", 15))
     # Raises rather than starting a pod with no license server configured
     # at all: such a pod boots, bills, and fails every task on a license
     # error. sesinetd_url (Ruling R69) wins when set -- entrypoint.sh reads

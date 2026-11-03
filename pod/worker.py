@@ -264,6 +264,11 @@ class XpuSupport:
 # an interactive session and an rclone/sftp transfer hold one of these open.
 _TCP_ESTABLISHED = "01"
 _SSH_PORT = 22
+#: Ports whose established connections mean "someone is here": sshd (SFTP,
+#: rclone) and the shared PDG mqserver on the sync pod (4440 RPC, 4442 HTTP;
+#: rpfarm/mq.py). A cook holds its MQ relay open for its whole length, so an
+#: hour-long frame with no file traffic still keeps the sync pod alive.
+_SESSION_PORTS = frozenset({_SSH_PORT, 4440, 4442})
 
 # Processes that mean a transfer is in flight. sftp-server is what sshd forks
 # for rclone's SFTP backend; rclone/rsync/scp cover the pod-side direction.
@@ -315,6 +320,10 @@ class Liveness:
             return f.read()
 
     def ssh_sessions(self):
+        """Established connections to sshd (see :meth:`sessions`)."""
+        return self.sessions(ports=(_SSH_PORT,))
+
+    def sessions(self, ports=_SESSION_PORTS):
         """Established connections to this pod's sshd, or None if unreadable.
 
         Correct, and on its own not enough: verified on a live pod mid-upload,
@@ -340,7 +349,7 @@ class Liveness:
                     port = int(port_hex, 16)
                 except ValueError:
                     continue
-                if port == _SSH_PORT and state == _TCP_ESTABLISHED:
+                if port in ports and state == _TCP_ESTABLISHED:
                     total += 1
         return total if seen_any else None
 
@@ -433,7 +442,7 @@ class Liveness:
         The first sample cannot show a delta, so it never marks busy on bytes
         alone; two seconds later the next one can.
         """
-        sessions = self.ssh_sessions()
+        sessions = self.sessions()
         moved = self.moved_bytes()
         with self._lock:
             previous = self._last_bytes
@@ -553,23 +562,48 @@ def terminate_self(api_key=None, pod_id=None, urlopen=None):
     it. So a GPU pod can end itself without the farm ever handing it the
     account key -- the rule that keeps a stolen pod from spending money.
     """
-    import urllib.request
-
     api_key = api_key if api_key is not None else os.environ.get("RUNPOD_API_KEY", "")
     pod_id = pod_id if pod_id is not None else os.environ.get("RUNPOD_POD_ID", "")
+    return _pod_mutation("podTerminate", api_key, pod_id, urlopen)
+
+
+def _pod_mutation(name, api_key, pod_id, urlopen=None):
+    import urllib.request
+
     if not api_key or not pod_id:
         return False, "no RUNPOD_API_KEY/RUNPOD_POD_ID in this pod"
-    body = json.dumps({"query": 'mutation { podTerminate(input: {podId: "%s"}) }' % pod_id}).encode()
+    if name == "podStop":
+        query = 'mutation { podStop(input: {podId: "%s"}) { id desiredStatus } }' % pod_id
+    else:
+        query = 'mutation { %s(input: {podId: "%s"}) }' % (name, pod_id)
+    body = json.dumps({"query": query}).encode()
     req = urllib.request.Request(_GRAPHQL_URL, data=body, method="POST", headers={
         "Content-Type": "application/json", "Authorization": "Bearer " + api_key})
     try:
         with (urlopen or urllib.request.urlopen)(req, timeout=30) as resp:
             payload = json.loads(resp.read() or b"{}")
     except Exception as exc:  # noqa: BLE001
-        return False, "podTerminate request failed: {}".format(exc)
+        return False, "{} request failed: {}".format(name, exc)
     if payload.get("errors"):
-        return False, "podTerminate refused: {}".format(payload["errors"][0].get("message"))
-    return True, "podTerminate accepted"
+        return False, "{} refused: {}".format(name, payload["errors"][0].get("message"))
+    return True, "{} accepted".format(name)
+
+
+def stop_self(api_key=None, pod_id=None, urlopen=None):
+    """Ask RunPod to STOP this pod, terminating it if stopping is refused.
+
+    For the sync pod, whose owner policy is "stop first, delete later"
+    (rpfarm.pods.sync_pod_action): a stopped pod keeps its disk and the next
+    cook resumes it, or replaces it if the resume fails. Same per-pod key as
+    :func:`terminate_self`.
+    """
+    api_key = api_key if api_key is not None else os.environ.get("RUNPOD_API_KEY", "")
+    pod_id = pod_id if pod_id is not None else os.environ.get("RUNPOD_POD_ID", "")
+    ok, detail = _pod_mutation("podStop", api_key, pod_id, urlopen)
+    if ok:
+        return ok, detail
+    ok2, detail2 = _pod_mutation("podTerminate", api_key, pod_id, urlopen)
+    return ok2, "{}; {}".format(detail, detail2)
 
 
 class OrphanWatchdog:
@@ -593,7 +627,7 @@ class OrphanWatchdog:
     """
 
     def __init__(self, orphan_s, contact_idle_s, busy_tasks, liveness_idle_s,
-                 gpu_utils, load, terminate, log=print):
+                 gpu_utils, load, terminate, log=print, action="terminating this pod"):
         self.orphan_s = orphan_s
         self._contact_idle_s = contact_idle_s
         self._busy_tasks = busy_tasks
@@ -603,6 +637,7 @@ class OrphanWatchdog:
         self._terminate = terminate
         self._log = log
         self._idle_checks = 0
+        self._action = action
         self.terminated = False
 
     def _resources_idle(self):
@@ -631,7 +666,7 @@ class OrphanWatchdog:
             return False
         ok, detail = self._terminate()
         self._log("[rpfarm-worker] no controller for {:.0f} min, no task, CPU/GPU idle -- "
-                  "terminating this pod: {}".format(self.orphan_s / 60.0, detail))
+                  "{}: {}".format(self.orphan_s / 60.0, self._action, detail))
         self.terminated = ok
         if not ok:
             self._idle_checks = 0  # try again after another full round
@@ -865,6 +900,16 @@ class DetachedRuns:
             return False
         return True
 
+    def running(self):
+        """Detached commands still running in this worker (pack, rm, ...).
+
+        A `houdini pack` runs for over an hour and its CLI may stop polling
+        long before; the sync pod's idle watchdog must still see it.
+        """
+        with self._lock:
+            procs = list(self._procs.values())
+        return sum(1 for p in procs if p.poll() is None)
+
     def status(self, handle):
         paths = self.paths(handle)
         if not os.path.isfile(paths["script"]):
@@ -969,6 +1014,39 @@ def make_server(host, port, log_dir="/workspace/ledger/logs"):
 
         threading.Thread(target=_watch, name="rpfarm-orphan-watchdog", daemon=True).start()
     detached = DetachedRuns(os.path.join(WORKSPACE_ROOT, EXEC_DIR_REL))
+
+    # The sync pod's idle rule used to live only in an OPEN Houdini (the
+    # scheduler's timer), so a sync pod outlived every closed session at
+    # $0.06/h until somebody stopped it by hand. Same watchdog as the GPU
+    # pods', with the sync pod's own threshold and the owner's "stop first"
+    # policy. A live cook holds MQ connections, transfers move bytes and the
+    # scheduler polls it, so none of that ever looks idle.
+    try:
+        sync_idle_min = float(os.environ.get("RPFARM_SYNC_IDLE_MIN", "0"))
+    except ValueError:
+        sync_idle_min = 0.0
+    if role == "sync" and sync_idle_min > 0:
+        sync_watchdog = OrphanWatchdog(
+            orphan_s=sync_idle_min * 60.0,
+            contact_idle_s=last_contact.idle_s,
+            busy_tasks=lambda: registry.busy() + detached.running(),
+            liveness_idle_s=liveness.busy_idle_s,
+            gpu_utils=lambda: [],  # CPU pod: only the CPU decides
+            load=CpuMeter(),
+            terminate=stop_self,
+            log=lambda message: print(message, flush=True),
+            action="stopping the sync pod",
+        )
+
+        def _watch_sync():
+            while not sync_watchdog.terminated:
+                time.sleep(_ORPHAN_CHECK_S)
+                try:
+                    sync_watchdog.check()
+                except Exception:  # noqa: BLE001 - the watchdog must not kill the worker
+                    pass
+
+        threading.Thread(target=_watch_sync, name="rpfarm-sync-watchdog", daemon=True).start()
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
