@@ -47,7 +47,7 @@ def _ready(tmp_path):
     return (tmp_path / "local" / VERSION / ".rpfarm-ok").exists()
 
 
-def _run(tmp_path, vol, role="gpu", unsquashfs=True, fail=False, min_free_kb=1):
+def _run(tmp_path, vol, role="gpu", unsquashfs=True, fail=False, min_free_kb=1, repair_wait_s=10):
     bindir = tmp_path / "bin"
     bindir.mkdir(exist_ok=True)
     if unsquashfs:
@@ -64,7 +64,7 @@ def _run(tmp_path, vol, role="gpu", unsquashfs=True, fail=False, min_free_kb=1):
         "RPFARM_ROLE": role,
         "RPFARM_LOCAL_HFS_ROOT": str(tmp_path / "local"),
         "RPFARM_LOCAL_HFS_MIN_FREE_KB": str(min_free_kb),
-        "RPFARM_REPAIR_PAUSE_S": "0",
+        "RPFARM_REPAIR_WAIT_S": str(repair_wait_s),
         "RPFARM_UNPACK_REPORT_S": "0.1",
     }
     proc = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env)
@@ -155,27 +155,30 @@ def test_files_the_pack_could_not_read_are_copied_from_the_volume(tmp_path):
     assert (local / "toolkit" / "UT_LinuxUtil.h").read_text() == "real"
 
 
-def test_a_repair_that_fails_runs_from_the_volume(tmp_path):
+def test_a_file_that_does_not_read_on_the_volume_either_stays_empty(tmp_path):
+    """Live 2026-11-03: 21 of the 22 files the pack could not read do not
+    read on the volume at all; the copy is still used, those stay empty."""
     vol = _volume(tmp_path)
     (vol / ".rpfarm-hfs.repair").write_text("toolkit/gone.h\n")
     out, log = _run(tmp_path, vol)
-    assert out["HFS"] == str(vol)
-    assert not (tmp_path / "local" / VERSION).exists()
-    assert not _ready(tmp_path)
+    assert _ready(tmp_path)
+    assert "toolkit/gone.h does not read on the volume either" in log
+    assert "1 file(s) left empty" in log
 
 
-def test_a_repair_read_that_fails_once_is_retried(tmp_path):
+def test_a_repair_read_that_blocks_does_not_hold_up_the_copy(tmp_path):
+    """A read off the volume can block in the kernel for minutes; the
+    repair gives each file RPFARM_REPAIR_WAIT_S and moves on."""
     vol = _volume(tmp_path)
     (vol / "a.h").write_text("real")
     (vol / ".rpfarm-hfs.repair").write_text("a.h\n")
     bindir = tmp_path / "bin"
     bindir.mkdir()
-    # cp that fails the first time, like the volume's transient ENXIO
-    (bindir / "cp").write_text(
-        "#!/bin/bash\n"
-        'm="$(dirname "$0")/.failed"; [ -f "$m" ] || { touch "$m"; exit 1; }\n'
-        'exec /bin/cp "$@"\n')
+    (bindir / "cp").write_text("#!/bin/bash\nexec >/dev/null 2>&1\nsleep 30\n")
     (bindir / "cp").chmod(0o755)
-    _run(tmp_path, vol)
+    import time
+    t0 = time.time()
+    _, log = _run(tmp_path, vol, repair_wait_s=1)
+    assert time.time() - t0 < 20
     assert _ready(tmp_path)
-    assert (tmp_path / "local" / VERSION / "a.h").read_text() == "real"
+    assert "a.h does not read on the volume either" in log

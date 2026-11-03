@@ -86,19 +86,31 @@ case "${RPFARM_ROLE:-}" in
         (
           _t0=$(date +%s)
           # The pack stored files the volume failed to read as EMPTY and listed
-          # them in .rpfarm-hfs.repair: copy those few from the volume.
+          # them in .rpfarm-hfs.repair. Live 2026-11-03 21 of those 22 do not
+          # read on the volume at all -- a read blocks in the kernel (state D,
+          # minutes, immune to kill) -- so the volume install is just as
+          # broken there and an empty file is no worse. Best effort: each copy
+          # gets a few seconds, in the background so a blocked read cannot
+          # hold the unpack hostage; what does not arrive stays empty.
           _hfs_repair() {
             [ -f "$RPFARM_VOLUME_HFS/.rpfarm-hfs.repair" ] || return 0
+            _left=0
             while IFS= read -r _rel; do
               [ -n "$_rel" ] || continue
-              # the volume's read failures are transient ("No such device or
-              # address" on a file that reads fine a moment later): retry
-              _n=0
-              until cp -p "$RPFARM_VOLUME_HFS/$_rel" "$_HFS_LOCAL/$_rel"; do
-                _n=$((_n + 1)); [ "$_n" -ge "${RPFARM_REPAIR_TRIES:-5}" ] && return 1
-                sleep "${RPFARM_REPAIR_PAUSE_S:-2}"
+              _dst="$_HFS_LOCAL/$_rel"
+              cp -p "$RPFARM_VOLUME_HFS/$_rel" "$_dst.rpfarm-tmp" 2>/dev/null &
+              _cp=$!; _w=0
+              while kill -0 "$_cp" 2>/dev/null && [ "$_w" -lt "${RPFARM_REPAIR_WAIT_S:-10}" ]; do
+                sleep 1; _w=$((_w + 1))
               done
+              if ! kill -0 "$_cp" 2>/dev/null && wait "$_cp"; then
+                mv -f "$_dst.rpfarm-tmp" "$_dst"
+              else
+                _left=$((_left + 1))
+                echo "houdini: $_rel does not read on the volume either -- left empty"
+              fi
             done < "$RPFARM_VOLUME_HFS/.rpfarm-hfs.repair"
+            echo "houdini: repair done, $_left file(s) left empty"
           }
           # Unpacked as `nobody`: as root, unsquashfs restores each file's
           # owner from the image, and the volume's uids (232072) do not exist
@@ -118,8 +130,8 @@ case "${RPFARM_ROLE:-}" in
             sleep "${RPFARM_UNPACK_REPORT_S:-30}"
             kill -0 "$_pid" 2>/dev/null && echo "houdini: unpacking... $(du -sm "$_HFS_LOCAL" 2>/dev/null | cut -f1) MB after $(( $(date +%s) - _t0 ))s"
           done
-          if wait "$_pid" && _hfs_repair >>/tmp/unsquashfs.log 2>&1 \
-              && [ -f "$_HFS_LOCAL/houdini_setup_bash" ]; then
+          if wait "$_pid" && [ -f "$_HFS_LOCAL/houdini_setup_bash" ]; then
+            _hfs_repair
             touch "$_HFS_LOCAL/.rpfarm-ok"
             echo "houdini: unpacked $(du -sh "$_HFS_IMG" | cut -f1) image to $_HFS_LOCAL in $(( $(date +%s) - _t0 ))s -- new tasks use it"
           else
