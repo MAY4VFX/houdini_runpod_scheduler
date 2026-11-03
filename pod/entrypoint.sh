@@ -77,7 +77,17 @@ case "${RPFARM_ROLE:-}" in
         echo "houdini: only $((_free_kb / 1024 / 1024)) GB free on the pod disk -- running from the volume"
       else
         _t0=$(date +%s)
+        # The pack stored files the volume failed to read as EMPTY and listed
+        # them in .rpfarm-hfs.repair: copy those few from the volume.
+        _hfs_repair() {
+          [ -f "$RPFARM_VOLUME_HFS/.rpfarm-hfs.repair" ] || return 0
+          while IFS= read -r _rel; do
+            [ -n "$_rel" ] || continue
+            cp -p "$RPFARM_VOLUME_HFS/$_rel" "$_HFS_LOCAL/$_rel" || return 1
+          done < "$RPFARM_VOLUME_HFS/.rpfarm-hfs.repair"
+        }
         if unsquashfs -q -n -f -p "$(nproc)" -d "$_HFS_LOCAL" "$_HFS_IMG" >/tmp/unsquashfs.log 2>&1 \
+            && _hfs_repair >>/tmp/unsquashfs.log 2>&1 \
             && [ -f "$_HFS_LOCAL/houdini_setup_bash" ]; then
           touch "$_HFS_LOCAL/.rpfarm-ok"
           export HFS="$_HFS_LOCAL"

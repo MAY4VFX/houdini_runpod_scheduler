@@ -1,6 +1,7 @@
 import json
 import os
 import pathlib
+import re
 
 import rpfarm.packages as rppkg
 
@@ -2009,3 +2010,33 @@ def test_pack_command_writes_the_image_pods_look_for_atomically():
     assert "-e .rpfarm-hfs.sqfs .rpfarm-hfs.sqfs.tmp" in cmd
     # refuses to pack something that is not a Houdini install
     assert cmd.startswith("[ -f /workspace/houdini/22.0.393/houdini_setup_bash ] ||")
+
+
+def test_pack_command_lists_the_files_the_volume_failed_to_read(tmp_path):
+    """mksquashfs stores a file it could not read as EMPTY and only says so
+    in its output; the pack turns those lines into the repair list pods use.
+    Runs the real command under bash with a fake mksquashfs."""
+    import subprocess
+    root = tmp_path / "workspace" / "houdini" / "22.0.393"
+    root.mkdir(parents=True)
+    (root / "houdini_setup_bash").write_text("")
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    (bindir / "mksquashfs").write_text(
+        "#!/bin/bash\n"
+        'echo "Failed to read file $1/toolkit/include/UT/UT_LinuxUtil.h, creating empty file"\n'
+        'echo "Read failed because No such device or address"\n'
+        'echo "Failed to read file $1/qt/a b@3x.png, creating empty file"\n'
+        'touch "$2"\n')
+    (bindir / "mksquashfs").chmod(0o755)
+    (bindir / "python3").write_text("#!/bin/bash\nexit 0\n")
+    (bindir / "python3").chmod(0o755)
+    cmd = rppkg.houdini_pack_command("22.0.393").replace("/workspace", str(tmp_path / "workspace"))
+    cmd = cmd.replace("/tmp/rpfarm-mksquashfs.log", str(tmp_path / "mk.log"))
+    proc = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True,
+                          env={"PATH": "{}:/usr/bin:/bin".format(bindir)})
+    assert proc.returncode == 0, proc.stderr
+    assert (root / rppkg.HOUDINI_IMAGE_NAME).exists()
+    assert (root / rppkg.HOUDINI_IMAGE_REPAIR_NAME).read_text().splitlines() == [
+        "toolkit/include/UT/UT_LinuxUtil.h", "qt/a b@3x.png"]
+    assert re.search(r"files to repair after unpack: +2", proc.stdout)

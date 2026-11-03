@@ -121,3 +121,30 @@ def test_a_second_boot_reuses_the_unpacked_copy(tmp_path):
     out, log = _run(tmp_path, vol, fail=True)  # would fail if it unpacked again
     assert out["HFS"] == str(tmp_path / "local" / VERSION)
     assert "already" in log
+
+
+def test_files_the_pack_could_not_read_are_copied_from_the_volume(tmp_path):
+    vol = _volume(tmp_path)
+    (vol / "toolkit").mkdir()
+    (vol / "toolkit" / "UT_LinuxUtil.h").write_text("real")
+    (vol / ".rpfarm-hfs.repair").write_text("toolkit/UT_LinuxUtil.h\n")
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    # the image holds the file empty, as mksquashfs left it
+    (bindir / "unsquashfs").write_text(
+        "#!/bin/bash\n"
+        'while [ $# -gt 1 ]; do [ "$1" = "-d" ] && dest="$2"; shift; done\n'
+        'mkdir -p "$dest/toolkit" && touch "$dest/houdini_setup_bash" "$dest/toolkit/UT_LinuxUtil.h"\n')
+    (bindir / "unsquashfs").chmod(0o755)
+    out, _ = _run(tmp_path, vol, unsquashfs=False)
+    local = tmp_path / "local" / VERSION
+    assert out["HFS"] == str(local)
+    assert (local / "toolkit" / "UT_LinuxUtil.h").read_text() == "real"
+
+
+def test_a_repair_that_fails_runs_from_the_volume(tmp_path):
+    vol = _volume(tmp_path)
+    (vol / ".rpfarm-hfs.repair").write_text("toolkit/gone.h\n")
+    out, log = _run(tmp_path, vol)
+    assert out["HFS"] == str(vol)
+    assert not (tmp_path / "local" / VERSION).exists()

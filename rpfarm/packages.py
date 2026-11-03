@@ -441,6 +441,11 @@ def houdini_install_preset(tar_local_path, version):
 #: `houdini rm` removes both. Render and host pods unpack it onto their own
 #: disk at boot (pod/entrypoint.sh, step 3a); the name is shared with it.
 HOUDINI_IMAGE_NAME = ".rpfarm-hfs.sqfs"
+#: Files the volume failed to hand mksquashfs, which it then stores EMPTY
+#: ("Read failed because No such device or address": 14 of ~150k files on
+#: the first real pack, 2026-11-03). One path per line, relative to the
+#: install; pods copy these from the volume after unpacking.
+HOUDINI_IMAGE_REPAIR_NAME = ".rpfarm-hfs.repair"
 
 
 def houdini_pack_command(version):
@@ -461,14 +466,22 @@ def houdini_pack_command(version):
     """
     install_dir = f"/workspace/houdini/{version}"
     img = f"{install_dir}/{HOUDINI_IMAGE_NAME}"
+    repair = f"{install_dir}/{HOUDINI_IMAGE_REPAIR_NAME}"
+    log = "/tmp/rpfarm-mksquashfs.log"
     return (
         f'[ -f {install_dir}/houdini_setup_bash ] || '
         f'{{ echo "no Houdini {version} at {install_dir}" >&2; exit 2; }}; '
         f'rm -f {img}.tmp && t0=$(date +%s) && '
         f'mksquashfs {install_dir} {img}.tmp -noappend -no-progress -quiet '
         f'-comp zstd -Xcompression-level 6 -b 1M -processors "$(nproc)" '
-        f'-e {HOUDINI_IMAGE_NAME} {HOUDINI_IMAGE_NAME}.tmp && '
-        f'mv -f {img}.tmp {img} && '
+        f'-e {HOUDINI_IMAGE_NAME} {HOUDINI_IMAGE_NAME}.tmp '
+        f'{HOUDINI_IMAGE_REPAIR_NAME} {HOUDINI_IMAGE_REPAIR_NAME}.tmp >{log} 2>&1 '
+        f'|| {{ tail -5 {log} >&2; exit 1; }}; '
+        # every file mksquashfs had to store empty, relative to the install
+        f"sed -n 's#^Failed to read file {install_dir}/\\(.*\\), creating empty file$#\\1#p' {log} "
+        f'> {repair}.tmp && '
+        f'mv -f {repair}.tmp {repair} && mv -f {img}.tmp {img} && '
+        f'echo "files to repair after unpack: $(wc -l < {repair})" && '
         f'python3 /opt/rpfarm/housekeeping.py invalidate houdini >/dev/null && '
         f'echo "packed {img}: $(du -h {img} | cut -f1) in $(( $(date +%s) - t0 ))s"'
     )
