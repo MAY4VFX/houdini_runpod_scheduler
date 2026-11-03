@@ -86,7 +86,17 @@ case "${RPFARM_ROLE:-}" in
             cp -p "$RPFARM_VOLUME_HFS/$_rel" "$_HFS_LOCAL/$_rel" || return 1
           done < "$RPFARM_VOLUME_HFS/.rpfarm-hfs.repair"
         }
-        if unsquashfs -q -n -f -p "$(nproc)" -d "$_HFS_LOCAL" "$_HFS_IMG" >/tmp/unsquashfs.log 2>&1 \
+        # Unpacked as `nobody`: as root, unsquashfs restores each file's
+        # owner from the image, and the volume's uids (232072) do not exist
+        # in the pod's user namespace -- chown fails with EINVAL and the whole
+        # unpack reports failure (live 2026-11-03). Unprivileged it does not
+        # try. Tasks run as root and only read these files.
+        _unsq=(unsquashfs)
+        if [ "$(id -u)" = 0 ] && command -v setpriv >/dev/null 2>&1; then
+          chown nobody "$_HFS_LOCAL_ROOT"
+          _unsq=(setpriv --reuid=nobody --regid=nogroup --clear-groups unsquashfs)
+        fi
+        if "${_unsq[@]}" -q -n -f -p "$(nproc)" -d "$_HFS_LOCAL" "$_HFS_IMG" >/tmp/unsquashfs.log 2>&1 \
             && _hfs_repair >>/tmp/unsquashfs.log 2>&1 \
             && [ -f "$_HFS_LOCAL/houdini_setup_bash" ]; then
           touch "$_HFS_LOCAL/.rpfarm-ok"

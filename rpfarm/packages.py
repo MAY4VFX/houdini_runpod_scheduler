@@ -472,7 +472,7 @@ def houdini_pack_command(version):
         f'[ -f {install_dir}/houdini_setup_bash ] || '
         f'{{ echo "no Houdini {version} at {install_dir}" >&2; exit 2; }}; '
         f'rm -f {img}.tmp && t0=$(date +%s) && '
-        f'mksquashfs {install_dir} {img}.tmp -noappend -no-progress -quiet '
+        f'mksquashfs {install_dir} {img}.tmp -noappend -no-progress -quiet -all-root '
         f'-comp zstd -Xcompression-level 6 -b 1M -processors "$(nproc)" '
         f'-e {HOUDINI_IMAGE_NAME} {HOUDINI_IMAGE_NAME}.tmp '
         f'{HOUDINI_IMAGE_REPAIR_NAME} {HOUDINI_IMAGE_REPAIR_NAME}.tmp >{log} 2>&1 '
