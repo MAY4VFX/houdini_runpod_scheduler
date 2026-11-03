@@ -93,23 +93,27 @@ case "${RPFARM_ROLE:-}" in
           # gets a few seconds, in the background so a blocked read cannot
           # hold the unpack hostage; what does not arrive stays empty.
           _hfs_repair() {
-            [ -f "$RPFARM_VOLUME_HFS/.rpfarm-hfs.repair" ] || return 0
+            _list="$RPFARM_VOLUME_HFS/.rpfarm-hfs.repair"
+            [ -f "$_list" ] || return 0
+            # all at once: one shared wait instead of one per unreadable file
+            while IFS= read -r _rel; do
+              [ -n "$_rel" ] || continue
+              # own fds: a copy blocked for minutes must not hold the boot log open
+              { cp -p "$RPFARM_VOLUME_HFS/$_rel" "$_HFS_LOCAL/$_rel.rpfarm-tmp" \
+                  && mv -f "$_HFS_LOCAL/$_rel.rpfarm-tmp" "$_HFS_LOCAL/$_rel"; } </dev/null >/dev/null 2>&1 &
+            done < "$_list"
+            _w=0
+            while [ -n "$(jobs -r)" ] && [ "$_w" -lt "${RPFARM_REPAIR_WAIT_S:-10}" ]; do
+              sleep 1; _w=$((_w + 1))
+            done
             _left=0
             while IFS= read -r _rel; do
               [ -n "$_rel" ] || continue
-              _dst="$_HFS_LOCAL/$_rel"
-              cp -p "$RPFARM_VOLUME_HFS/$_rel" "$_dst.rpfarm-tmp" 2>/dev/null &
-              _cp=$!; _w=0
-              while kill -0 "$_cp" 2>/dev/null && [ "$_w" -lt "${RPFARM_REPAIR_WAIT_S:-10}" ]; do
-                sleep 1; _w=$((_w + 1))
-              done
-              if ! kill -0 "$_cp" 2>/dev/null && wait "$_cp"; then
-                mv -f "$_dst.rpfarm-tmp" "$_dst"
-              else
+              if [ ! -s "$_HFS_LOCAL/$_rel" ]; then
                 _left=$((_left + 1))
                 echo "houdini: $_rel does not read on the volume either -- left empty"
               fi
-            done < "$RPFARM_VOLUME_HFS/.rpfarm-hfs.repair"
+            done < "$_list"
             echo "houdini: repair done, $_left file(s) left empty"
           }
           # Unpacked as `nobody`: as root, unsquashfs restores each file's
