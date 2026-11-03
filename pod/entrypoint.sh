@@ -83,7 +83,13 @@ case "${RPFARM_ROLE:-}" in
           [ -f "$RPFARM_VOLUME_HFS/.rpfarm-hfs.repair" ] || return 0
           while IFS= read -r _rel; do
             [ -n "$_rel" ] || continue
-            cp -p "$RPFARM_VOLUME_HFS/$_rel" "$_HFS_LOCAL/$_rel" || return 1
+            # the volume's read failures are transient ("No such device or
+            # address" on a file that reads fine a moment later): retry
+            _n=0
+            until cp -p "$RPFARM_VOLUME_HFS/$_rel" "$_HFS_LOCAL/$_rel"; do
+              _n=$((_n + 1)); [ "$_n" -ge "${RPFARM_REPAIR_TRIES:-5}" ] && return 1
+              sleep "${RPFARM_REPAIR_PAUSE_S:-2}"
+            done
           done < "$RPFARM_VOLUME_HFS/.rpfarm-hfs.repair"
         }
         # Unpacked as `nobody`: as root, unsquashfs restores each file's
@@ -103,7 +109,7 @@ case "${RPFARM_ROLE:-}" in
           export HFS="$_HFS_LOCAL"
           echo "houdini: unpacked $(du -sh "$_HFS_IMG" | cut -f1) image to $HFS in $(( $(date +%s) - _t0 ))s"
         else
-          echo "houdini: unpack failed ($(tail -1 /tmp/unsquashfs.log)) -- running from the volume"
+          echo "houdini: unpack failed after $(( $(date +%s) - _t0 ))s ($(tail -1 /tmp/unsquashfs.log)) -- running from the volume"
           rm -rf "$_HFS_LOCAL"
         fi
       fi

@@ -59,6 +59,7 @@ def _run(tmp_path, vol, role="gpu", unsquashfs=True, fail=False, min_free_kb=1):
         "RPFARM_ROLE": role,
         "RPFARM_LOCAL_HFS_ROOT": str(tmp_path / "local"),
         "RPFARM_LOCAL_HFS_MIN_FREE_KB": str(min_free_kb),
+        "RPFARM_REPAIR_PAUSE_S": "0",
     }
     proc = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env)
     assert proc.returncode == 0, proc.stderr
@@ -148,3 +149,20 @@ def test_a_repair_that_fails_runs_from_the_volume(tmp_path):
     out, log = _run(tmp_path, vol)
     assert out["HFS"] == str(vol)
     assert not (tmp_path / "local" / VERSION).exists()
+
+
+def test_a_repair_read_that_fails_once_is_retried(tmp_path):
+    vol = _volume(tmp_path)
+    (vol / "a.h").write_text("real")
+    (vol / ".rpfarm-hfs.repair").write_text("a.h\n")
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    # cp that fails the first time, like the volume's transient ENXIO
+    (bindir / "cp").write_text(
+        "#!/bin/bash\n"
+        'm="$(dirname "$0")/.failed"; [ -f "$m" ] || { touch "$m"; exit 1; }\n'
+        'exec /bin/cp "$@"\n')
+    (bindir / "cp").chmod(0o755)
+    out, _ = _run(tmp_path, vol)
+    assert out["HFS"] == str(tmp_path / "local" / VERSION)
+    assert (tmp_path / "local" / VERSION / "a.h").read_text() == "real"
