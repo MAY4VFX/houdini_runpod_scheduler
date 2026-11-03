@@ -142,9 +142,22 @@ python3 scripts/install_release.py
 python3 -m rpfarm farm status
 python3 -m rpfarm costs
 python3 -m rpfarm houdini ls
+python3 -m rpfarm houdini pack
 python3 -m rpfarm storage ls
 python3 -m rpfarm smoke
 ```
+
+## Houdini на поде
+
+Houdini лежит на томе в `/workspace/houdini/<version>`, а рядом хранится его
+образ `.rpfarm-hfs.sqfs`. GPU- и host-поды распаковывают образ на свой диск
+в фоне, примерно за 40 с. Пока копия не готова, задачи берут Houdini с тома.
+Затем задача стартует за ~17 с вместо 76–150 с с тома.
+`houdini install` пакует образ сам. После любой правки установки на томе
+образ надо пересобрать: `python3 -m rpfarm houdini pack`. На 2-ядерном sync-поде
+это занимает около 1,5 ч. Файлы, которые том не отдал при упаковке, записываются
+в `.rpfarm-hfs.repair`, и под докачивает их с тома.
+Без образа всё работает с тома, только медленнее.
 
 `smoke` использует живую ферму и оплачиваемые поды. Для локальной проверки есть:
 
