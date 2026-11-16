@@ -259,7 +259,7 @@ _ASSET_FINGERPRINT = {
     'config.py': (20283, 'c000d0c5f26ab0e4'),
     'context.py': (4466, '2fa09a0d45931725'),
     'delivery.py': (3964, '63bb04491f97a3f3'),
-    'deps.py': (38558, '2daae12f5770289a'),
+    'deps.py': (48378, 'f7c92d2b1661c32d'),
     'dispatch.py': (24908, '2e9fa7ce1894bbf8'),
     'file_review.py': (16246, 'd81726007b4ba4dd'),
     'gpus.py': (8311, '7a28d5c2692b776e'),
@@ -605,6 +605,19 @@ if mode == "deps":
             asset_regex=asset_regex, texture_scope=texture_scope,
             problems=usd_problems) if rops else []
     usd = rpdeps.remove_pattern(usd, exclude_pattern)
+    # The hip chain also needs what no file reference names: the studio HDAs
+    # its branch is made of and the variables its parameters read that the
+    # .hip does not store (AYON's launcher sets them). Found here, uploaded
+    # like any file, and handed to the scheduler in $JOB/.rpfarm_job_env.json
+    # -- written on EVERY cook, empty in the husk chain, so nothing leaks.
+    otl_dirs, job_vars = [], {}
+    if not husk_usd:
+        hda_libs, otl_dirs, job_vars, extra_problems = rpdeps.hip_chain_extras(node, log=_say)
+        usd = list(usd) + [lib for lib in hda_libs if lib not in usd]
+        for problem in extra_problems:
+            _say("WARNING: " + problem)
+            _warn(problem)
+    rpdeps.write_job_environment(job_dir, otl_dirs, job_vars)
     # A URI scheme or a leftover $VARIABLE in an asset path, or a relative
     # layer path that climbs out of its folder: each renders WRONG on the
     # farm without an error (a black texture, a missing layer). Stop here,

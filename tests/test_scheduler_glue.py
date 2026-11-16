@@ -1594,6 +1594,9 @@ class _TaskEnvScheduler:
     def _ensureOcioEnv(self, task_env):
         pass
 
+    def _ensureJobEnv(self, task_env):
+        pass
+
     def resolveEnvParams(self, parmprefix, work_item, flag):
         return {}, []
 
@@ -3347,3 +3350,32 @@ def test_the_submit_as_job_host_gets_a_disk_that_holds_a_local_houdini():
     create = inner[inner.index("self._api.create_cpu_pod("):]
     create = create[:create.index("self._sync_pod")]
     assert "container_disk_gb=rppods.HOUDINI_POD_DISK_GB" in create
+
+
+def test_ensure_job_env_maps_hdas_and_variables_from_the_upload_file(tmp_path):
+    """BS sto_0050: the hip chain's studio HDAs and AYON variables reach the task."""
+    import json as _json
+    import os
+    from rpfarm import deps as _deps, packages as _pkg
+    ns = load_methods(["_ensureJobEnv"], {"json": _json, "os": os, "rpdeps": _deps, "rppkg": _pkg})
+
+    class _S:
+        _job_dir = str(tmp_path)
+        _pathmap = {str(tmp_path): "/workspace/projects/u/p", "/addons": "/workspace/projects/u/p/_ext/addons"}
+        logged = []
+
+        def _log(self, m):
+            self.logged.append(m)
+
+    _deps.write_job_environment(str(tmp_path), ["/addons/extend/otls"], {"TASK": "lookdev"})
+    env = {"HOUDINI_OTLSCAN_PATH": "/pkg/hda:&"}
+    ns["_ensureJobEnv"](_S(), env)
+    assert env["HOUDINI_OTLSCAN_PATH"] == "/workspace/projects/u/p/_ext/addons/extend/otls:/pkg/hda:&"
+    assert env["TASK"] == "lookdev"
+
+    empty = {}
+    _deps.write_job_environment(str(tmp_path))
+    s = _S()
+    s._jobenv_logged = True
+    ns["_ensureJobEnv"](s, empty)
+    assert empty == {}, "an empty file from a husk-chain cook adds nothing"

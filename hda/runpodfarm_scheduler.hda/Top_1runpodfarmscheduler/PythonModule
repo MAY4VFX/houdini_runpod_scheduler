@@ -222,7 +222,7 @@ _ASSET_FINGERPRINT = {
     'config.py': (20283, 'c000d0c5f26ab0e4'),
     'context.py': (4466, '2fa09a0d45931725'),
     'delivery.py': (3964, '63bb04491f97a3f3'),
-    'deps.py': (38558, '2daae12f5770289a'),
+    'deps.py': (48378, 'f7c92d2b1661c32d'),
     'dispatch.py': (24908, '2e9fa7ce1894bbf8'),
     'file_review.py': (16246, 'd81726007b4ba4dd'),
     'gpus.py': (8311, '7a28d5c2692b776e'),
@@ -1500,6 +1500,7 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
         self._ensurePathMapEnv(task_env)
         self._ensureHoudiniPathmapEnv(task_env)
         self._ensureOcioEnv(task_env)
+        self._ensureJobEnv(task_env)
 
         # Resolves the environment specified in the Job Parms scheduler section
         add_env, remove_env = self.resolveEnvParams(
@@ -1573,6 +1574,34 @@ class RunPodFarmScheduler(EventDispatchMixin, SimpleMQSchedulerMixin, PySchedule
             self._houdini_pathmap_logged = True
             self._log("HOUDINI_PATHMAP: {} mapping(s) for Houdini's own lookups "
                       "(PDG_PATHMAP unchanged)".format(len(self._pathmap)))
+
+    def _ensureJobEnv(self, task_env):
+        """The studio HDAs and variables the hip chain's branch needs.
+
+        runpodfarm_upload writes ``$JOB/.rpfarm_job_env.json`` on every cook
+        (empty in the husk chain): the folders of non-Houdini HDA libraries
+        the ROP Fetch branch uses, and the ``$VARIABLES`` its parameters read
+        that the .hip does not store -- AYON's $FOLDER/$TASK/$VER on BS
+        sto_0050. Both are mapped to their farm paths; HDA folders go in
+        front of HOUDINI_OTLSCAN_PATH so the hip opens with its node types.
+        """
+        path = os.path.join(self._job_dir, rpdeps.JOB_ENV_FILE)
+        try:
+            with open(path, "r") as f:
+                job_env = json.load(f)
+        except (OSError, ValueError):
+            return
+        updates, unmapped = rpdeps.farm_job_environment(
+            job_env, self._pathmap, rppkg.delocalize_via_pathmap,
+            task_env.get("HOUDINI_OTLSCAN_PATH", ""))
+        task_env.update(updates)
+        if not getattr(self, "_jobenv_logged", False):
+            self._jobenv_logged = True
+            if updates:
+                self._log("job environment: {}".format(", ".join(sorted(updates))))
+            for local in unmapped:
+                self._log("HDA folder {} was not uploaded -- its node types will be "
+                          "missing on the farm".format(local))
 
     def _farmOcio(self):
         """This workstation's $OCIO as its farm path, or "" when unmapped."""

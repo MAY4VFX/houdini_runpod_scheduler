@@ -940,3 +940,245 @@ def pathmap_env(path_map):
     ``sys.platform == "linux"``) will match against.
     """
     return json.dumps({"paths": [{local: {"zone": "LINUX", "path": remote}} for local, remote in path_map.items()]})
+
+
+# -- hip chain: the HDAs and variables a branch needs on the pod -------------
+#
+# BS sto_0050 (2026-11-16): the branch a ROP Fetch cooks uses three studio
+# LOP assets from AYON add-ons (ayon::lop_import, aa::setupaovs,
+# set_multilight) and output paths built from $FOLDER/$TASK/$VER/$ITEM/
+# $PRJ_NAME -- variables AYON's launcher sets and the .hip never stores.
+# A pod has neither: the hip opens with unknown node types and the paths
+# expand to nothing. Afanasy's af_husk solves the variables with an
+# explicit "Additive Variables" list; here they are FOUND, then shown.
+
+#: Variables Houdini itself defines or a pod sets for itself -- never shipped.
+_HOUDINI_OWN_VARS = frozenset({
+    "HIP", "HIPFILE", "HIPNAME", "HFS", "HH", "HB", "HOME", "OS", "F", "FF", "FPS",
+    "T", "SF", "ST", "FSTART", "FEND", "RFSTART", "RFEND", "N", "NFRAMES", "PI", "E",
+    "ACTIVETAKE", "OPNAME", "OPID", "OPTYPE", "CH", "CHOP", "PWD", "WEDGE", "WEDGENUM",
+    "HOUDINI_TEMP_DIR", "HOUDINI_USER_PREF_DIR", "HSITE", "TEMP", "TMP", "TMPDIR",
+    "USER", "JOB", "RENDERID", "PDG_DIR", "PDG_TEMP", "PDG_SCRIPTDIR", "PDG_ITEM_NAME",
+})
+
+_VAR_RE = re.compile(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)")
+
+
+def referenced_variables(texts):
+    """Names of ``$VARIABLES`` used in raw parameter strings, sorted.
+
+    Frame tokens ($F4, $FF), Houdini's own variables and the job directory
+    are excluded: the pod defines those itself, and shipping them would
+    pin the farm to this workstation's values.
+    """
+    names = set()
+    for text in texts:
+        for match in _VAR_RE.finditer(text or ""):
+            name = match.group(1)
+            if re.fullmatch(r"F\d*|FF", name) or name in _HOUDINI_OWN_VARS:
+                continue
+            names.add(name)
+    return sorted(names)
+
+
+def job_environment(names, getenv, hip_globals=()):
+    """``{name: value}`` for the variables a branch needs and the pod lacks.
+
+    A variable the .hip stores itself (``set -g``, listed in ``hip_globals``)
+    travels with the hip and is skipped; one that is unset here is reported
+    by the caller, not invented.
+    """
+    out = {}
+    for name in names:
+        if name in hip_globals:
+            continue
+        value = getenv(name)
+        if value:
+            out[name] = value
+    return out
+
+
+def foreign_modules(sources, is_outside_houdini):
+    """Top-level modules Python code imports that live outside Houdini.
+
+    ``sources`` -- Python source texts (an HDA's PythonModule, OnLoaded...).
+    ``is_outside_houdini(module) -> bool`` decides where a module lives; the
+    caller asks ``importlib`` in the running session. ``ayon_core`` is the
+    case this exists for: present on the workstation, absent on a pod, so
+    the asset's script fails there long after the money is spent.
+    """
+    import ast
+
+    found = set()
+    for source in sources:
+        try:
+            tree = ast.parse(source or "")
+        except SyntaxError:
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                mods = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+                mods = [node.module]
+            else:
+                continue
+            for mod in mods:
+                top = mod.split(".")[0]
+                if top and is_outside_houdini(top):
+                    found.add(top)
+    return sorted(found)
+
+
+_HDA_PY_SECTIONS = ("PythonModule", "OnLoaded", "OnCreated", "OnUpdated",
+                    "OnInputChanged", "OnNameChanged", "OnDeleted", "PreFirstCreate")
+
+
+def branch_hda_requirements(node_paths, log=None):
+    """HDA libraries a hip-chain branch uses that are not part of Houdini.
+
+    Returns ``(libraries, problems)``: ``libraries`` -- sorted library file
+    paths outside ``$HFS`` (an expanded .hda is a directory; either way it
+    uploads as is); ``problems`` -- one line per asset whose scripts import
+    a module that lives outside Houdini. The pod can load the asset; it
+    cannot run that script.
+    """
+    import importlib.util
+    import hou
+
+    say = log if log is not None else (lambda _m: None)
+    hfs = os.path.normpath(hou.getenv("HFS") or "")
+    sys_hfs = os.path.normpath(os.path.join(hfs, ".."))
+
+    def outside(module):
+        try:
+            spec = importlib.util.find_spec(module)
+        except Exception:
+            return False
+        origin = getattr(spec, "origin", None) if spec else None
+        if not origin or origin in ("built-in", "frozen"):
+            return False
+        real = os.path.realpath(origin)
+        return not (real.startswith(os.path.realpath(hfs)) or real.startswith(os.path.realpath(sys_hfs)))
+
+    libraries = {}
+    for path in node_paths or ():
+        node = hou.node(path)
+        if node is None:
+            continue
+        try:
+            definition = node.type().definition()
+        except Exception:
+            definition = None
+        if definition is None:
+            continue
+        lib = definition.libraryFilePath()
+        if not lib or lib == "Embedded" or os.path.realpath(lib).startswith(os.path.realpath(hfs)):
+            continue
+        libraries.setdefault(os.path.normpath(lib), set()).add(definition)
+    problems = []
+    for lib, definitions in sorted(libraries.items()):
+        for definition in sorted(definitions, key=lambda d: d.nodeTypeName()):
+            sources = []
+            sections = definition.sections()
+            for name in _HDA_PY_SECTIONS:
+                if name in sections:
+                    try:
+                        sources.append(sections[name].contents())
+                    except Exception:
+                        pass
+            mods = foreign_modules(sources, outside)
+            if mods:
+                problems.append("{} ({}) imports {} -- not on the pod".format(
+                    definition.nodeTypeName(), os.path.basename(lib), ", ".join(mods)))
+    say("hip chain: {} studio HDA librar(ies) in the branch, {} with scripts the pod "
+        "cannot run".format(len(libraries), len(problems)))
+    return sorted(libraries), problems
+
+
+JOB_ENV_FILE = ".rpfarm_job_env.json"
+
+
+def write_job_environment(job_dir, otl_dirs=(), env=None):
+    """``$JOB/.rpfarm_job_env.json`` -- what the scheduler adds to every task.
+
+    Written by EVERY upload cook, empty in the husk chain, so a previous hip
+    cook's assets and variables never leak into the next one.
+    """
+    path = os.path.join(job_dir, JOB_ENV_FILE)
+    with open(path, "w") as f:
+        json.dump({"otlscan": sorted(set(otl_dirs)), "env": dict(env or {})}, f, indent=1)
+    return path
+
+
+def farm_job_environment(job_env, path_map, delocalize, existing_otlscan=""):
+    """What a task's environment gains from ``.rpfarm_job_env.json``.
+
+    ``job_env`` -- the file's content; ``delocalize(local, path_map)`` -- the
+    local -> farm path function (``packages.delocalize_via_pathmap``).
+    Returns ``(updates, unmapped)``: ``updates`` -- env vars to set, with
+    HDA folders prepended to ``HOUDINI_OTLSCAN_PATH`` (``&`` keeps Houdini's
+    own scan path) and every value that is a local path turned into its
+    farm path; ``unmapped`` -- HDA folders nothing in this cook uploaded.
+    """
+    updates = {}
+    unmapped = []
+    farm_dirs = []
+    for local in (job_env or {}).get("otlscan", ()):
+        farm = delocalize(os.path.normpath(local), path_map)
+        if farm:
+            farm_dirs.append(farm)
+        else:
+            unmapped.append(local)
+    if farm_dirs:
+        rest = existing_otlscan or "&"
+        updates["HOUDINI_OTLSCAN_PATH"] = ":".join(farm_dirs + [rest])
+    for name, value in sorted(((job_env or {}).get("env") or {}).items()):
+        value = str(value)
+        farm = delocalize(os.path.normpath(value), path_map) if os.path.isabs(value) else None
+        updates[name] = farm or value
+    return updates, unmapped
+
+
+def hip_chain_extras(node, log=None):
+    """Everything the hip chain needs beyond its file references.
+
+    Returns ``(libraries, otl_dirs, env, problems)`` for the branch the
+    upload node *node*'s network cooks: studio HDA libraries to upload,
+    their folders for the pod's HOUDINI_OTLSCAN_PATH, the variables the
+    branch reads that the .hip does not store, and the lines worth a
+    warning (scripts that import what the pod lacks, variables unset here).
+    """
+    import hou
+
+    say = log if log is not None else (lambda _m: None)
+    branch = _branch_node_paths(node, say)
+    if not branch:
+        return [], [], {}, []
+    libraries, problems = branch_hda_requirements(sorted(branch), log=say)
+    otl_dirs = sorted({os.path.dirname(os.path.normpath(lib)) for lib in libraries})
+    texts = []
+    for path in branch:
+        target = hou.node(path)
+        if target is None:
+            continue
+        for parm in target.parms():
+            try:
+                if parm.parmTemplate().type() == hou.parmTemplateType.String:
+                    texts.append(parm.unexpandedString())
+            except Exception:
+                continue
+    names = referenced_variables(texts)
+    try:
+        out, _ = hou.hscript("set -s")
+        hip_globals = {line.split()[2] for line in out.splitlines()
+                       if line.startswith("set -g ") and len(line.split()) > 2}
+    except Exception:
+        hip_globals = set()
+    env = job_environment(names, lambda n: hou.getenv(n) or os.environ.get(n), hip_globals)
+    for name in names:
+        if name not in env and name not in hip_globals:
+            problems.append("${} is used by the branch but unset here -- it will be empty "
+                            "on the farm too".format(name))
+    if env:
+        say("hip chain: variables for the farm: {}".format(", ".join(sorted(env))))
+    return libraries, otl_dirs, env, problems

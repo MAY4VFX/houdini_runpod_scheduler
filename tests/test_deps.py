@@ -760,3 +760,49 @@ def test_an_ocio_that_points_at_nothing_is_said_out_loud(tmp_path):
     assert len(problems) == 1
     assert "no such file" in problems[0]
     assert "DIFFERENT colour config" in problems[0]
+
+
+# -- hip chain HDAs and variables (BS sto_0050, 2026-11-16) -------------------
+
+def test_referenced_variables_skips_frames_houdini_own_and_job():
+    texts = ["$FOLDER/$TASK/render/`chs(\"pass_name1\")`/`$VER`/`$PRJ_NAME`_`$ITEM`_$F4.exr",
+             "$HIP/geo/$OS.$F.bgeo.sc", "${JOB}/x", "$HOUDINI_TEMP_DIR/husk"]
+    assert deps.referenced_variables(texts) == ["FOLDER", "ITEM", "PRJ_NAME", "TASK", "VER"]
+
+
+def test_job_environment_skips_hip_globals_and_unset():
+    env = {"FOLDER": "/show/assets/ship", "TASK": "lookdev", "VER": "v019"}
+    got = deps.job_environment(["FOLDER", "TASK", "VER", "MISSING"], env.get, hip_globals={"VER"})
+    assert got == {"FOLDER": "/show/assets/ship", "TASK": "lookdev"}
+
+
+def test_foreign_modules_names_what_lives_outside_houdini():
+    src = ("import hou\nfrom ayon_core.pipeline import get_current_project_name\n"
+           "import json, ayon_houdini.api\nfrom . import local\n")
+    outside = {"ayon_core", "ayon_houdini"}.__contains__
+    assert deps.foreign_modules([src, "def broken(:"], outside) == ["ayon_core", "ayon_houdini"]
+
+
+def test_write_job_environment_is_always_a_complete_file(tmp_path):
+    path = deps.write_job_environment(str(tmp_path), ["/b/otls", "/a/otls", "/a/otls"], {"TASK": "lookdev"})
+    import json
+    assert json.load(open(path)) == {"otlscan": ["/a/otls", "/b/otls"], "env": {"TASK": "lookdev"}}
+    deps.write_job_environment(str(tmp_path))
+    assert json.load(open(path)) == {"otlscan": [], "env": {}}
+
+
+def test_farm_job_environment_maps_hda_dirs_and_path_values():
+    from rpfarm import packages
+    pmap = {"/studio/show": "/workspace/projects/u/show",
+            "/addons": "/workspace/projects/u/show/_ext/addons"}
+    job_env = {"otlscan": ["/addons/extend/otls", "/nowhere/otls"],
+               "env": {"FOLDER": "/studio/show/assets/ship", "TASK": "lookdev"}}
+    up, unmapped = deps.farm_job_environment(job_env, pmap, packages.delocalize_via_pathmap)
+    assert up["HOUDINI_OTLSCAN_PATH"] == "/workspace/projects/u/show/_ext/addons/extend/otls:&"
+    assert up["FOLDER"] == "/workspace/projects/u/show/assets/ship"
+    assert up["TASK"] == "lookdev"
+    assert unmapped == ["/nowhere/otls"]
+    up2, _ = deps.farm_job_environment({"otlscan": ["/addons/x"]}, pmap,
+                                       packages.delocalize_via_pathmap, existing_otlscan="/pkg/hda:&")
+    assert up2["HOUDINI_OTLSCAN_PATH"] == "/workspace/projects/u/show/_ext/addons/x:/pkg/hda:&"
+    assert deps.farm_job_environment({}, pmap, packages.delocalize_via_pathmap) == ({}, [])
