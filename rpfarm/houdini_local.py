@@ -599,6 +599,12 @@ SHELF_FILENAME = "rpfarm.shelf"
 SHELF_TOOL_NAME = "rpfarm_farm_setup"
 SHELF_TOOL_LABEL = "RunPod Farm Setup"
 SHELF_TOOL_ICON = "TOP/scheduler"
+#: The second entry: the hip chain even for a ROP that renders a stage --
+#: what Afanasy's plain ROP is next to af_husk. The first entry picks the
+#: chain from the ROP (husk for a stage), so this one is the deliberate
+#: exception, never a toggle on a node.
+SHELF_HIP_TOOL_NAME = "rpfarm_farm_setup_hip"
+SHELF_HIP_TOOL_LABEL = "RunPod Farm Setup (Hip)"
 
 #: THE TAB submenu. One name for the four assets and for the setup tool,
 #: defined once here and asserted by a test, because it was two: the assets'
@@ -666,7 +672,9 @@ scene_setup.run(kwargs)
 
 SHELF_TOOL_HELP = (
     "Build the RunPod farm graph in this TOP network: scheduler (set as the "
-    "network's TOP Scheduler), upload, a Wait For All gate and a ROP Fetch, "
+    "network's TOP Scheduler), upload, a Wait For All gate and the render node -- "
+    "for a ROP that renders a LOP stage the husk chain (ROP USD Output written in "
+    "this session, USD Render File on the pod), otherwise a ROP Fetch, "
     "preconfigured from this scene. Creating the nodes rather than copying "
     "them from another scene is the point -- a copied node brings the other "
     "scene's cached work items and its old definition with it. Safe to run "
@@ -679,7 +687,11 @@ _SHELF_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
  It should not be hand-edited when it is being used by the application.
  Note, that two definitions of the same element are not allowed in
  a single file. -->
+{tools}
+</shelfDocument>
+"""
 
+_SHELF_TOOL_TEMPLATE = """
   <tool name="{name}" label="{label}" icon="{icon}">
     <helpText><![CDATA[{help}]]></helpText>
     <toolMenuContext name="network">
@@ -687,9 +699,17 @@ _SHELF_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
     </toolMenuContext>
     <toolSubmenu>{submenu}</toolSubmenu>
     <script scriptType="python"><![CDATA[{script}]]></script>
-  </tool>
-</shelfDocument>
-"""
+  </tool>"""
+
+SHELF_HIP_TOOL_SCRIPT = SHELF_TOOL_SCRIPT.replace(
+    "scene_setup.run(kwargs)", 'scene_setup.run(kwargs, chain="hip")')
+
+SHELF_HIP_TOOL_HELP = (
+    "The same farm graph, but always the hip chain (upload, Wait For All, ROP "
+    "Fetch) -- also for a ROP that renders a LOP stage, which RunPod Farm Setup "
+    "otherwise sends through the husk chain (ROP USD Output in this session, "
+    "only that file and what it reads uploaded, husk on the pod)."
+)
 
 
 def shelf_tool_source() -> str:
@@ -702,18 +722,17 @@ def shelf_tool_source() -> str:
     installation slower and more fragile than the thing being installed.
     The format was taken from a file Houdini wrote, not invented.
     """
-    for field in (SHELF_TOOL_HELP, SHELF_TOOL_SCRIPT):
+    for field in (SHELF_TOOL_HELP, SHELF_TOOL_SCRIPT, SHELF_HIP_TOOL_HELP, SHELF_HIP_TOOL_SCRIPT):
         # A CDATA section ends at the first "]]>", so one inside the payload
         # would truncate the tool silently.
         assert "]]>" not in field, "a shelf payload must not contain ']]>'"
-    return _SHELF_TEMPLATE.format(
-        name=SHELF_TOOL_NAME,
-        label=SHELF_TOOL_LABEL,
-        icon=SHELF_TOOL_ICON,
-        help=SHELF_TOOL_HELP,
-        submenu=SHELF_TOOL_SUBMENU,
-        script=SHELF_TOOL_SCRIPT,
-    )
+    tools = "".join(_SHELF_TOOL_TEMPLATE.format(
+        name=name, label=label, icon=SHELF_TOOL_ICON, help=help_text,
+        submenu=SHELF_TOOL_SUBMENU, script=script)
+        for name, label, help_text, script in (
+            (SHELF_TOOL_NAME, SHELF_TOOL_LABEL, SHELF_TOOL_HELP, SHELF_TOOL_SCRIPT),
+            (SHELF_HIP_TOOL_NAME, SHELF_HIP_TOOL_LABEL, SHELF_HIP_TOOL_HELP, SHELF_HIP_TOOL_SCRIPT)))
+    return _SHELF_TEMPLATE.format(tools=tools)
 
 
 def shelf_tool_target(install: HoudiniInstall) -> Path:

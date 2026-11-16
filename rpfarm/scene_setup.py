@@ -11,9 +11,18 @@ cache to inherit, and the definition is whatever is installed right now.
 
 So the fix is to make building the graph cheaper than copying it.
 
-What it makes, and what it deliberately does not:
+What it makes, and what it deliberately does not -- one of two chains,
+chosen by what the ROP renders, the way Afanasy has af_husk next to its
+plain ROP (BS sto_0050, 2026-11-16):
 
-    runpodfarm_upload  ->  waitforall  ->  ropfetch
+    hip   runpodfarm_upload  ->  waitforall  ->  ropfetch
+    husk  ropusd  ->  runpodfarm_upload  ->  waitforall  ->  usdrender
+
+A ROP that renders a LOP stage (``usdrender_rop``) gets the husk chain: the
+stage is written in THIS session -- studio HDAs, AYON variables and all --
+by an In-Process ROP USD Output, only that file and what it reads travel,
+and husk renders it on the pod. Anything else gets the hip chain. The
+second TAB entry builds the hip chain for a stage ROP too.
 
 plus a ``runpodfarm_scheduler`` set as the topnet's own ``TOP Scheduler``.
 The gate is not decoration: upload emits one work item per package, every
@@ -51,6 +60,14 @@ GATE_TYPE = "waitforall"
 #: The scheduler a topnet creates for itself, and points at, when made.
 LOCAL_SCHEDULER_TYPE = "localscheduler"
 FETCH_TYPE = "ropfetch"
+#: The husk chain (a ROP that renders a LOP stage): SideFX's own nodes.
+WRITE_USD_TYPE = "ropusd"
+HUSK_TYPE = "usdrender"
+#: ROP types that render a USD stage -- these get the husk chain by default,
+#: as Afanasy hands a LOP render to af_husk rather than to its hip ROP.
+STAGE_ROP_TYPES = frozenset({"usdrender_rop", "usdrender"})
+CHAIN_HUSK = "husk"
+CHAIN_HIP = "hip"
 
 #: Names given to the nodes this creates. Fixed, because idempotency is by
 #: TYPE rather than by name -- but a predictable name is what an artist
@@ -59,6 +76,7 @@ SCHEDULER_NAME = "rpfarm"
 UPLOAD_NAME = "upload"
 GATE_NAME = "gate"
 FETCH_NAME = "render"
+WRITE_USD_NAME = "write_usd"
 
 #: Folders that name a *kind* of file rather than a project. When the .hip
 #: sits in one of these, the project is one level up: ".../airship/scenes"
@@ -197,6 +215,7 @@ class Result:
         self.rop = ""
         self.rop_candidates = []
         self.scheduler_assigned = False
+        self.chain = CHAIN_HIP
         self.notes = []
 
     @property
@@ -204,7 +223,7 @@ class Result:
         return bool(self.created)
 
 
-def build(parent, project="", frames=1, rop_candidates=(), max_pods=DEFAULT_MAX_PODS):
+def build(parent, project="", frames=1, rop_candidates=(), max_pods=DEFAULT_MAX_PODS, chain=None):
     """Create (or adopt) the farm graph inside ``parent``, a TOP network.
 
     ``parent`` is duck-typed on purpose -- ``createNode``, ``children``,
@@ -231,10 +250,21 @@ def build(parent, project="", frames=1, rop_candidates=(), max_pods=DEFAULT_MAX_
         result.created.append((role, node.path()))
         return node, True
 
+    rop_node = _resolve(parent, result.rop) if result.rop else None
+    if chain is None:
+        chain = choose_chain(_type_name(rop_node) if rop_node is not None else "",
+                             existing_types=set(existing))
+    result.chain = chain
+
     scheduler, scheduler_is_new = adopt_or_create(SCHEDULER_TYPE, SCHEDULER_NAME, "scheduler")
     upload, upload_is_new = adopt_or_create(UPLOAD_TYPE, UPLOAD_NAME, "upload")
     gate, gate_is_new = adopt_or_create(GATE_TYPE, GATE_NAME, "gate")
-    fetch, fetch_is_new = adopt_or_create(FETCH_TYPE, FETCH_NAME, "render")
+    if chain == CHAIN_HUSK:
+        writer, writer_is_new = adopt_or_create(WRITE_USD_TYPE, WRITE_USD_NAME, "write_usd")
+        fetch, fetch_is_new = adopt_or_create(HUSK_TYPE, FETCH_NAME, "render")
+    else:
+        writer, writer_is_new = None, False
+        fetch, fetch_is_new = adopt_or_create(FETCH_TYPE, FETCH_NAME, "render")
     download, download_is_new = adopt_or_create(DOWNLOAD_TYPE, 'download', 'download')
 
     # -- what has to hold for the graph to work at all, adopted or not.
@@ -269,6 +299,18 @@ def build(parent, project="", frames=1, rop_candidates=(), max_pods=DEFAULT_MAX_
         _set(upload, "rpfarm_scope", "branch")
         _set(upload, "rpfarm_compress", "auto")
 
+    if chain == CHAIN_HUSK:
+        configure_husk_chain(writer, writer_is_new, fetch, fetch_is_new, rop_node, result)
+        _wire(upload, 0, writer, result)
+        _wire(gate, 0, upload, result)
+        _wire(fetch, 0, gate, result)
+        _wire(download, 0, fetch, result)
+        _assign_scheduler(parent, scheduler, result)
+        if fetch_is_new or upload_is_new or gate_is_new or writer_is_new:
+            _call(parent, "layoutChildren")
+        _call(download, "setDisplayFlag", True)
+        return result
+
     existing_rop = "" if fetch_is_new else _eval_string(fetch.parm("roppath"))
     if existing_rop:
         # The fetch already names its ROP: that is the answer, not the
@@ -294,6 +336,16 @@ def build(parent, project="", frames=1, rop_candidates=(), max_pods=DEFAULT_MAX_
     _wire(fetch, 0, gate, result)
     _wire(download, 0, fetch, result)
 
+    _assign_scheduler(parent, scheduler, result)
+
+    if fetch_is_new or upload_is_new or gate_is_new:
+        _call(parent, "layoutChildren")
+    _call(download, "setDisplayFlag", True)
+    return result
+
+
+def _assign_scheduler(parent, scheduler, result):
+    """Point the topnet's TOP Scheduler at ``scheduler`` unless someone chose otherwise."""
     topscheduler = parent.parm("topscheduler")
     if topscheduler is not None:
         # A FRESH topnet is not blank here: Houdini creates it already
@@ -324,10 +376,102 @@ def build(parent, project="", frames=1, rop_candidates=(), max_pods=DEFAULT_MAX_
                 "the topnet's TOP Scheduler is already {} -- left alone; set it to {} "
                 "by hand if the farm is what you meant".format(current, scheduler.path()))
 
-    if fetch_is_new or upload_is_new or gate_is_new:
-        _call(parent, "layoutChildren")
-    _call(download, "setDisplayFlag", True)
-    return result
+
+
+def choose_chain(rop_type, existing_types=()):
+    """``husk`` for a ROP that renders a stage, else ``hip``.
+
+    An existing graph keeps its chain: a network that already has a ROP
+    Fetch is a hip chain the artist built, and adopting it as husk would
+    put a second render node next to it.
+    """
+    if FETCH_TYPE in existing_types and HUSK_TYPE not in existing_types:
+        return CHAIN_HIP
+    if HUSK_TYPE in existing_types or rop_type in STAGE_ROP_TYPES:
+        return CHAIN_HUSK
+    return CHAIN_HIP
+
+
+#: Where the husk chain writes the stage: next to the scene, one file per
+#: ROP, all frames as time samples. A cache, not a product.
+HUSK_USD_PATH = "$HIP/cache/rpfarm/$HIPNAME.{rop}.usd"
+
+
+def configure_husk_chain(writer, writer_is_new, render, render_is_new, rop, result):
+    """Preconfigure ROP USD Output + USD Render File from the stage ROP.
+
+    What has to hold, on new AND adopted nodes, because without it the farm
+    renders the wrong thing in silence:
+
+    * In-Process -- the stage is written HERE, in the artist's session; the
+      node's default (Out-of-Process on the topnet's scheduler) would write
+      it on the pod, which has neither the studio's HDAs nor its variables.
+    * Use Relative Paths off -- the delta sits under $JOB and the published
+      layers outside it, which land in two different trees on the volume.
+    * Write Files -- PDG's Automatic cache hands back the previous delta.
+
+    The rest (frame range, settings, renderer) only on new nodes, from the
+    ROP, as channel references so the graph follows the ROP.
+    """
+    _set(writer, "pdg_cooktype", "1")
+    _set(writer, "enableoutputprocessor_simplerelativepaths", 0)
+    _set(writer, "pdg_cachemode", "2")
+    rop_path = rop.path() if rop is not None else ""
+    if writer_is_new and rop is not None:
+        stage = _stage_lop_of(rop)
+        if stage:
+            _set(writer, "useloppath", 1)
+            _set(writer, "loppath", stage)
+        _set(writer, "lopoutput", HUSK_USD_PATH.format(rop=_name_of(rop)))
+        _set(writer, "framegeneration", "1")
+        _set(writer, "singletask", 1)
+        for i, ch in enumerate(("f1", "f2", "f3")):
+            _expr(writer, "f{}".format(i + 1), 'ch("{}/{}")'.format(rop_path, ch))
+    if render_is_new:
+        _set(render, "filesource", "1")
+        _set(render, "usdpath", '`chs("../{}/lopoutput")`'.format(_name_of(writer)))
+        _set(render, "createdirs", 1)
+        _set(render, "extraarguments", "--make-output-path")
+        if rop is not None:
+            for parm_name, source in (("renderer", "renderer"), ("settings", "rendersettings")):
+                value = _eval_string(rop.parm(source))
+                if value:
+                    _set(render, parm_name, value)
+            _set(render, "framegeneration", "1")
+            for i, ch in enumerate(("f1", "f2", "f3")):
+                _expr(render, "range{}".format(i + 1), 'ch("{}/{}")'.format(rop_path, ch))
+    if not rop_path:
+        result.notes.append("no stage ROP picked -- set LOP Path on {} and Render Settings "
+                            "on {}".format(writer.path(), render.path()))
+
+
+def _stage_lop_of(rop):
+    """Path of the LOP *rop* renders: its input, else its loppath."""
+    try:
+        wired = [n for n in rop.inputs() if n is not None]
+    except Exception:
+        wired = []
+    if wired:
+        return wired[0].path()
+    return _eval_string(rop.parm("loppath"))
+
+
+def _name_of(node):
+    try:
+        return node.name()
+    except AttributeError:
+        return node.path().rsplit("/", 1)[-1]
+
+
+def _expr(node, parm_name, expression):
+    parm = node.parm(parm_name)
+    if parm is None:
+        return
+    setter = getattr(parm, "setExpression", None)
+    if setter is not None:
+        setter(expression)
+    else:
+        parm.set(expression)
 
 
 def _eval_string(parm):
@@ -428,7 +572,7 @@ def report(result):
     """
     lines = []
     if result.created:
-        lines.append("built the farm graph: " + ", ".join(
+        lines.append("built the farm graph ({} chain): ".format(result.chain) + ", ".join(
             role for role, _ in result.created))
     if result.reused and not result.created:
         lines.append("already set up -- nothing added, nothing duplicated")
@@ -450,8 +594,12 @@ def report(result):
 # -- the entry point the shelf tool calls ------------------------------------
 
 
-def run(kwargs=None):
-    """Entry point for the TAB-menu tool. Needs Houdini."""
+def run(kwargs=None, chain=None):
+    """Entry point for the TAB-menu tools. Needs Houdini.
+
+    ``chain`` None picks it from the ROP (husk for a stage); ``"hip"`` is the
+    second TAB entry.
+    """
     import hou
 
     parent = _target_network(kwargs)
@@ -468,6 +616,7 @@ def run(kwargs=None):
         project=project_name(hip_dir, hip_file),
         frames=frame_count(start, end),
         rop_candidates=rop_candidates(),
+        chain=chain,
     )
 
     # Printed, never a dialog (Ruling R54). The graph it just built is the

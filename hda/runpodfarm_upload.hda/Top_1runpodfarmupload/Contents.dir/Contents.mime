@@ -478,10 +478,17 @@ def _set_out_of_process(wi, item_json_path):
     wi.addEnvironmentVar(\"PYTHONPATH\", rpfarm_pkg_root)
 
 
+# With an input (the husk chain: ROP USD Output above) this node generates
+# once every upstream item has cooked, and PDG then treats what it makes as
+# DYNAMIC items, which must name a parent -- \"Dynamic work items must have
+# an explicitly specified parent\" otherwise (live, BS sto_0050). The first
+# upstream item is the honest parent: the packages exist because of it.
+_parent = {\"parent\": upstream_items[0]} if upstream_items else {}
+
 pkg_items = []
 for it in items:
     name = \"upload_{:03d}_of_{:03d}\".format(it[\"index\"] + 1, len(items))
-    wi = item_holder.addWorkItem(name=name, inProcess=in_process)
+    wi = item_holder.addWorkItem(name=name, inProcess=in_process, **_parent)
     wi.setStringAttrib(\"rpfarm_item\", json.dumps(it))
     wi.setStringAttrib(\"rpfarm_role\", \"package\")
     wi.setIntAttrib(\"bytes\", it[\"bytes\"])
@@ -508,7 +515,7 @@ if post_command and pkg_items:
         \"bytes\": 0,
         \"post_command\": post_command,
     }
-    post_item = item_holder.addWorkItem(name=\"upload_post\", inProcess=in_process)
+    post_item = item_holder.addWorkItem(name=\"upload_post\", inProcess=in_process, **_parent)
     post_item.setStringAttrib(\"rpfarm_item\", json.dumps(post_dict))
     post_item.setStringAttrib(\"rpfarm_role\", \"post\")
     post_item.setIntAttrib(\"bytes\", 0)

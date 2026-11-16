@@ -264,7 +264,7 @@ _ASSET_FINGERPRINT = {
     'file_review.py': (16246, 'd81726007b4ba4dd'),
     'gpus.py': (8311, '7a28d5c2692b776e'),
     'host_render.py': (10983, 'a0139507d9f7fe7f'),
-    'houdini_local.py': (48596, '7902f068c70d702b'),
+    'houdini_local.py': (49873, 'bc97a99504f36f5b'),
     'jobs.py': (8732, '88bd5f01eed7897c'),
     'ledger.py': (17327, '70425e75fb216f01'),
     'monitoring.py': (6320, '941db2f923c756ae'),
@@ -276,7 +276,7 @@ _ASSET_FINGERPRINT = {
     'progress.py': (3696, '48f1d06649c5666b'),
     'releases.py': (4735, 'c6b364ccfb3534b3'),
     'runpod_api.py': (15078, '109a04839093e23c'),
-    'scene_setup.py': (21279, 'a49f1efe5f3e3e80'),
+    'scene_setup.py': (27503, '04b57d390ff40107'),
     'smoke.py': (42548, 'ce0c8d36fe763314'),
     'status.py': (458, '2205873427086b87'),
     'submission.py': (1621, '6b428346b41fab92'),
@@ -739,10 +739,17 @@ def _set_out_of_process(wi, item_json_path):
     wi.addEnvironmentVar("PYTHONPATH", rpfarm_pkg_root)
 
 
+# With an input (the husk chain: ROP USD Output above) this node generates
+# once every upstream item has cooked, and PDG then treats what it makes as
+# DYNAMIC items, which must name a parent -- "Dynamic work items must have
+# an explicitly specified parent" otherwise (live, BS sto_0050). The first
+# upstream item is the honest parent: the packages exist because of it.
+_parent = {"parent": upstream_items[0]} if upstream_items else {}
+
 pkg_items = []
 for it in items:
     name = "upload_{:03d}_of_{:03d}".format(it["index"] + 1, len(items))
-    wi = item_holder.addWorkItem(name=name, inProcess=in_process)
+    wi = item_holder.addWorkItem(name=name, inProcess=in_process, **_parent)
     wi.setStringAttrib("rpfarm_item", json.dumps(it))
     wi.setStringAttrib("rpfarm_role", "package")
     wi.setIntAttrib("bytes", it["bytes"])
@@ -769,7 +776,7 @@ if post_command and pkg_items:
         "bytes": 0,
         "post_command": post_command,
     }
-    post_item = item_holder.addWorkItem(name="upload_post", inProcess=in_process)
+    post_item = item_holder.addWorkItem(name="upload_post", inProcess=in_process, **_parent)
     post_item.setStringAttrib("rpfarm_item", json.dumps(post_dict))
     post_item.setStringAttrib("rpfarm_role", "post")
     post_item.setIntAttrib("bytes", 0)

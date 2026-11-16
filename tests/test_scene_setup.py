@@ -82,6 +82,12 @@ PARMS = {
     ss.UPLOAD_TYPE: ("rpfarm_project", "rpfarm_mode", "rpfarm_scope", "rpfarm_compress"),
     ss.GATE_TYPE: (),
     ss.FETCH_TYPE: ("roppath", "framegeneration"),
+    ss.WRITE_USD_TYPE: ("pdg_cooktype", "enableoutputprocessor_simplerelativepaths",
+                        "pdg_cachemode", "useloppath", "loppath", "lopoutput",
+                        "framegeneration", "singletask", "f1", "f2", "f3"),
+    ss.HUSK_TYPE: ("filesource", "usdpath", "createdirs", "extraarguments", "renderer",
+                   "settings", "framegeneration", "range1", "range2", "range3"),
+    "usdrender_rop": ("renderer", "rendersettings", "loppath", "f1", "f2", "f3"),
 }
 
 
@@ -409,3 +415,73 @@ def test_rerun_on_an_existing_graph_keeps_the_artists_decisions():
     # The fetch already named its ROP: no "ROP Path is empty" in the report.
     assert result.rop == "/stage/render_cams"
     assert not any("ROP Path is empty" in line for line in ss.report(result))
+
+
+
+# -- the husk chain (BS sto_0050, 2026-11-16) ---------------------------------
+
+
+def _stage_net():
+    net = FakeNetwork()
+    rop = net.createNode("usdrender_rop", "sto0050_render_local")
+    rop.parms["renderer"].value = "BRAY_HdKarmaXPU"
+    rop.parms["rendersettings"].value = "/Render/rendersettings_sto0050_side"
+    rop.parms["loppath"].value = "/stage/OUT_sto0050_side"
+    return net, rop
+
+
+def test_a_stage_rop_gets_the_husk_chain_like_af_husk():
+    net, rop = _stage_net()
+    result = ss.build(net, project="ship", rop_candidates=[rop.path()])
+    assert result.chain == ss.CHAIN_HUSK
+    by_type = {n.type().name(): n for n in net.children()}
+    assert ss.FETCH_TYPE not in by_type, "no ROP Fetch in the husk chain"
+    writer, upload = by_type[ss.WRITE_USD_TYPE], by_type[ss.UPLOAD_TYPE]
+    gate, render = by_type[ss.GATE_TYPE], by_type[ss.HUSK_TYPE]
+    assert upload.inputs()[0] is writer
+    assert gate.inputs()[0] is upload
+    assert render.inputs()[0] is gate
+    assert by_type[ss.DOWNLOAD_TYPE].inputs()[0] is render
+
+
+def test_the_husk_writer_writes_here_absolute_and_fresh():
+    net, rop = _stage_net()
+    ss.build(net, rop_candidates=[rop.path()])
+    w = next(n for n in net.children() if n.type().name() == ss.WRITE_USD_TYPE)
+    assert w.parms["pdg_cooktype"].value == "1", "In-Process: written in this session"
+    assert w.parms["enableoutputprocessor_simplerelativepaths"].value == 0
+    assert w.parms["pdg_cachemode"].value == "2", "Write Files: never a stale delta"
+    assert w.parms["loppath"].value == "/stage/OUT_sto0050_side"
+    assert w.parms["lopoutput"].value.endswith(".sto0050_render_local.usd")
+    assert 'ch("' in w.parms["f1"].value and "/f1" in w.parms["f1"].value
+
+
+def test_the_husk_render_reads_the_writer_and_the_rops_settings():
+    net, rop = _stage_net()
+    ss.build(net, rop_candidates=[rop.path()])
+    r = next(n for n in net.children() if n.type().name() == ss.HUSK_TYPE)
+    assert r.parms["usdpath"].value == '`chs("../write_usd/lopoutput")`'
+    assert r.parms["settings"].value == "/Render/rendersettings_sto0050_side"
+    assert r.parms["renderer"].value == "BRAY_HdKarmaXPU"
+    assert "--make-output-path" in r.parms["extraarguments"].value
+
+
+def test_the_hip_entry_builds_the_hip_chain_for_a_stage_rop_too():
+    net, rop = _stage_net()
+    result = ss.build(net, rop_candidates=[rop.path()], chain=ss.CHAIN_HIP)
+    assert result.chain == ss.CHAIN_HIP
+    types = {n.type().name() for n in net.children()}
+    assert ss.FETCH_TYPE in types and ss.HUSK_TYPE not in types and ss.WRITE_USD_TYPE not in types
+
+
+def test_an_existing_hip_graph_stays_a_hip_graph():
+    net, rop = _stage_net()
+    ss.build(net, rop_candidates=[rop.path()], chain=ss.CHAIN_HIP)
+    again = ss.build(net, rop_candidates=[rop.path()])
+    assert again.chain == ss.CHAIN_HIP
+    assert sum(1 for n in net.children() if n.type().name() == ss.HUSK_TYPE) == 0
+
+
+def test_a_non_stage_rop_stays_on_the_hip_chain():
+    assert ss.choose_chain("karma") == ss.CHAIN_HIP
+    assert ss.choose_chain("usdrender_rop") == ss.CHAIN_HUSK
