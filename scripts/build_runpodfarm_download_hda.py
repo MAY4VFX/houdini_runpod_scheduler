@@ -259,7 +259,7 @@ _ASSET_FINGERPRINT = {
     'sync.py': (20962, '6ae2a7b7e1e25f58'),
     'tls.py': (3642, 'f3e50ea6ebd0308f'),
     'tools.py': (4290, 'c5d3b026f125578f'),
-    'usddeps.py': (9631, '3c7192d3bd94d07f'),
+    'usddeps.py': (24473, 'deda9035250ea5d9'),
     'volume.py': (10038, 'dc11b185a58c9262'),
     'worker_client.py': (10012, '407feb11016dd01c'),
 }

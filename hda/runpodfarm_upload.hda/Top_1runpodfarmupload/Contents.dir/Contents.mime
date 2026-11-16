@@ -47,10 +47,10 @@ stat
 {
   create -1
   modify -1
-  author may@maymac01-2.local
+  author may@mac.lan
   access 0777
 }
-color UT_Color RGB 0.8 0.8 0.8
+color UT_Color RGB 0.8 0.8 0.8 
 delscript ""
 exprlanguage hscript
 end
@@ -107,10 +107,10 @@ stat
 {
   create -1
   modify -1
-  author may@maymac01-2.local
+  author may@mac.lan
   access 0777
 }
-color UT_Color RGB 0.8 0.8 0.8
+color UT_Color RGB 0.8 0.8 0.8 
 delscript ""
 exprlanguage hscript
 end
@@ -168,10 +168,10 @@ stat
 {
   create -1
   modify -1
-  author may@maymac01-2.local
+  author may@mac.lan
   access 0777
 }
-color UT_Color RGB 0.8 0.8 0.8
+color UT_Color RGB 0.8 0.8 0.8 
 delscript ""
 exprlanguage hscript
 end
@@ -202,7 +202,7 @@ savenodescript	[ 0	locks=0 ]	(	0	)
 savenodehda	[ 0	locks=0 ]	(	0	)
 sepparm2	[ 0	locks=0 ]	(	)
 processor	[ 0	locks=0 ]	(	0	0	0	)
-pdg_workitemgeneration	[ 0	locks=0 ]	(	"2"	)
+pdg_workitemgeneration	[ 0	locks=0 ]	(	"3"	)
 pdg_command	[ 0	locks=0 ]	(	""	)
 sepparm	[ 0	locks=0 ]	(	)
 callbacks	[ 0	locks=0 ]	(	0	0	0	0	0	)
@@ -320,14 +320,37 @@ if mode == \"deps\":
     ask = rppf.wants_window(node, log=_say)
     asset_regex = node.evalParm(\"rpfarm_assetregex\") or rpdeps.ASSET_REGEX
     exclude_pattern = node.evalParm(\"rpfarm_excludepattern\")
-    scan = rpdeps.scan_refs(
-        scope=node.evalParm(\"rpfarm_scope\") or rpdeps.SCOPE_BRANCH, node=node, log=_say,
-        asset_regex=asset_regex, exclude_pattern=exclude_pattern)
-    rops = rpdeps.cook_rops(node, log=_say)
-    usd = rpusd.collect_usd_refs(
-        rops, log=_say, deep=bool(node.evalParm(\"rpfarm_usddeep\")),
-        asset_regex=asset_regex) if rops else []
+    # Two chains, as Afanasy has af_husk and the plain ROP: which one this is
+    # is decided by what is wired above, not by a toggle.
+    # * husk -- a ROP USD Output (In-Process, the artist's own session) wrote
+    #   the stage as a file; the farm renders that file with husk, so the
+    #   file and what IT reads are the whole upload, and the hip stays home.
+    # * hip -- nothing USD above: the hip and its branch, as always.
+    texture_scope = node.evalParm(\"rpfarm_texscope\") or rpusd.SCOPE_UDIM
+    usd_problems = []
+    husk_usd = rpusd.husk_usd_inputs(node, upstream_items)
+    if husk_usd:
+        _say(\"husk chain: rendering {} -- the hip is not uploaded\".format(\", \".join(husk_usd)))
+        scan = rpdeps.RefScan(paths=(), output_paths=(), unresolved=())
+        usd = rpusd.file_dependencies(husk_usd, log=_say, asset_regex=asset_regex,
+                                      texture_scope=texture_scope, problems=usd_problems)
+    else:
+        scan = rpdeps.scan_refs(
+            scope=node.evalParm(\"rpfarm_scope\") or rpdeps.SCOPE_BRANCH, node=node, log=_say,
+            asset_regex=asset_regex, exclude_pattern=exclude_pattern)
+        rops = rpdeps.cook_rops(node, log=_say)
+        usd = rpusd.collect_usd_refs(
+            rops, log=_say, deep=bool(node.evalParm(\"rpfarm_usddeep\")),
+            asset_regex=asset_regex, texture_scope=texture_scope,
+            problems=usd_problems) if rops else []
     usd = rpdeps.remove_pattern(usd, exclude_pattern)
+    # A URI scheme or a leftover $VARIABLE in an asset path, or a relative
+    # layer path that climbs out of its folder: each renders WRONG on the
+    # farm without an error (a black texture, a missing layer). Stop here,
+    # with the list, before a single machine is rented.
+    if usd_problems:
+        raise hou.NodeError(\"USD paths that will not resolve on the farm:\\n  \" +
+                            \"\\n  \".join(usd_problems[:20]))
 
     # Dependencies named by the ENVIRONMENT, which no scanner can see: there
     # is no Parm for $OCIO, so hou.fileReferences() has nothing to report and
@@ -654,10 +677,10 @@ stat
 {
   create -1
   modify -1
-  author may@maymac01-2.local
+  author may@mac.lan
   access 0777
 }
-color UT_Color RGB 0.478 0.478 0.478
+color UT_Color RGB 0.478 0.478 0.478 
 delscript ""
 exprlanguage hscript
 end

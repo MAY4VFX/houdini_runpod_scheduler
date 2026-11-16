@@ -283,7 +283,7 @@ _ASSET_FINGERPRINT = {
     'sync.py': (20962, '6ae2a7b7e1e25f58'),
     'tls.py': (3642, 'f3e50ea6ebd0308f'),
     'tools.py': (4290, 'c5d3b026f125578f'),
-    'usddeps.py': (9631, '3c7192d3bd94d07f'),
+    'usddeps.py': (24473, 'deda9035250ea5d9'),
     'volume.py': (10038, 'dc11b185a58c9262'),
     'worker_client.py': (10012, '407feb11016dd01c'),
 }
@@ -409,13 +409,25 @@ def _review(node, intent):
     scope = node.evalParm("rpfarm_scope") or rpdeps.SCOPE_BRANCH
     asset_regex = node.evalParm("rpfarm_assetregex") or rpdeps.ASSET_REGEX
     exclude_pattern = node.evalParm("rpfarm_excludepattern")
-    scan = rpdeps.scan_refs(scope=scope, node=node, log=_say,
-                            asset_regex=asset_regex, exclude_pattern=exclude_pattern)
-    rops = rpdeps.cook_rops(node, log=_say)
-    usd = rpusd.collect_usd_refs(
-        rops, log=_say, deep=bool(node.evalParm("rpfarm_usddeep")),
-        asset_regex=asset_regex) if rops else []
+    texture_scope = node.evalParm("rpfarm_texscope") or rpusd.SCOPE_UDIM
+    usd_problems = []
+    husk_usd = rpusd.husk_usd_inputs(node)
+    if husk_usd:
+        _say("husk chain: rendering {} -- the hip is not uploaded".format(", ".join(husk_usd)))
+        scan = rpdeps.RefScan(paths=(), output_paths=(), unresolved=())
+        usd = rpusd.file_dependencies(husk_usd, log=_say, asset_regex=asset_regex,
+                                      texture_scope=texture_scope, problems=usd_problems)
+    else:
+        scan = rpdeps.scan_refs(scope=scope, node=node, log=_say,
+                                asset_regex=asset_regex, exclude_pattern=exclude_pattern)
+        rops = rpdeps.cook_rops(node, log=_say)
+        usd = rpusd.collect_usd_refs(
+            rops, log=_say, deep=bool(node.evalParm("rpfarm_usddeep")),
+            asset_regex=asset_regex, texture_scope=texture_scope,
+            problems=usd_problems) if rops else []
     usd = rpdeps.remove_pattern(usd, exclude_pattern)
+    for problem in usd_problems:
+        _warn(problem)
 
     # Same farm-state lookup the generate callback makes -- best-effort,
     # this button is exactly as entitled to a wrong-scene warning as a real
@@ -569,14 +581,37 @@ if mode == "deps":
     ask = rppf.wants_window(node, log=_say)
     asset_regex = node.evalParm("rpfarm_assetregex") or rpdeps.ASSET_REGEX
     exclude_pattern = node.evalParm("rpfarm_excludepattern")
-    scan = rpdeps.scan_refs(
-        scope=node.evalParm("rpfarm_scope") or rpdeps.SCOPE_BRANCH, node=node, log=_say,
-        asset_regex=asset_regex, exclude_pattern=exclude_pattern)
-    rops = rpdeps.cook_rops(node, log=_say)
-    usd = rpusd.collect_usd_refs(
-        rops, log=_say, deep=bool(node.evalParm("rpfarm_usddeep")),
-        asset_regex=asset_regex) if rops else []
+    # Two chains, as Afanasy has af_husk and the plain ROP: which one this is
+    # is decided by what is wired above, not by a toggle.
+    # * husk -- a ROP USD Output (In-Process, the artist's own session) wrote
+    #   the stage as a file; the farm renders that file with husk, so the
+    #   file and what IT reads are the whole upload, and the hip stays home.
+    # * hip -- nothing USD above: the hip and its branch, as always.
+    texture_scope = node.evalParm("rpfarm_texscope") or rpusd.SCOPE_UDIM
+    usd_problems = []
+    husk_usd = rpusd.husk_usd_inputs(node, upstream_items)
+    if husk_usd:
+        _say("husk chain: rendering {} -- the hip is not uploaded".format(", ".join(husk_usd)))
+        scan = rpdeps.RefScan(paths=(), output_paths=(), unresolved=())
+        usd = rpusd.file_dependencies(husk_usd, log=_say, asset_regex=asset_regex,
+                                      texture_scope=texture_scope, problems=usd_problems)
+    else:
+        scan = rpdeps.scan_refs(
+            scope=node.evalParm("rpfarm_scope") or rpdeps.SCOPE_BRANCH, node=node, log=_say,
+            asset_regex=asset_regex, exclude_pattern=exclude_pattern)
+        rops = rpdeps.cook_rops(node, log=_say)
+        usd = rpusd.collect_usd_refs(
+            rops, log=_say, deep=bool(node.evalParm("rpfarm_usddeep")),
+            asset_regex=asset_regex, texture_scope=texture_scope,
+            problems=usd_problems) if rops else []
     usd = rpdeps.remove_pattern(usd, exclude_pattern)
+    # A URI scheme or a leftover $VARIABLE in an asset path, or a relative
+    # layer path that climbs out of its folder: each renders WRONG on the
+    # farm without an error (a black texture, a missing layer). Stop here,
+    # with the list, before a single machine is rented.
+    if usd_problems:
+        raise hou.NodeError("USD paths that will not resolve on the farm:\\n  " +
+                            "\\n  ".join(usd_problems[:20]))
 
     # Dependencies named by the ENVIRONMENT, which no scanner can see: there
     # is no Parm for $OCIO, so hou.fileReferences() has nothing to report and
@@ -886,6 +921,11 @@ def main():
     pp.parm("topscheduler").setExpression(
         'hou.pwd().parent().path() + "/localscheduler"', language=hou.exprLanguage.Python
     )
+    # "All Upstream Items are Cooked": in the husk chain the scan reads the
+    # file the ROP USD Output wrote, so it must exist first -- Automatic
+    # generated this node while the delta was still being written. With no
+    # input (the hip chain, upload first) it generates at once, as before.
+    pp.parm("pdg_workitemgeneration").set("3")
     pp.parm("generate").set(GENERATE_CODE)
     pp.parm("addinternaldependencies").set(ADDDEPS_CODE)
     pp.parm("cooktask").set(COOKTASK_CODE)
@@ -978,6 +1018,20 @@ def main():
     # texture is a rendered-nothing GPU hour. Measured cost on the field
     # scene: +71 files / 1.6 GB of source textures the render did not read,
     # all of them visible and uncheckable in the USD window.
+    texscope_pt = hou.StringParmTemplate(
+        "rpfarm_texscope", "Textures", 1, default_value=("udim",),
+        menu_items=("udim", "stage", "referenced"),
+        menu_labels=("UDIM Tiles Under UV", "What the Stage Reads", "Everything Layers Reference"),
+        menu_type=hou.menuType.Normal)
+    texscope_pt.setHelp(
+        "Which textures upload. UDIM Tiles Under UV (default): only the materials bound "
+        "to geometry that renders, and of a <UDIM> texture only the tiles that geometry's "
+        "st lands on -- exact, since every ray reads a texture at the UV of the mesh it "
+        "hit; a texture read through its own texcoord travels whole. What the Stage "
+        "Reads: the same materials, every tile. Everything Layers Reference: all a layer "
+        "names, composed or not (the old behaviour; BS sto_0050: 14.4 GB vs 8.4 GB).")
+    texscope_pt.setConditional(hou.parmCondType.HideWhen, "{ rpfarm_mode != deps }")
+
     usddeep_pt = hou.ToggleParmTemplate("rpfarm_usddeep", "Scan USD Layer Files Too", default_value=True)
     usddeep_pt.setHelp(
         "On: also run UsdUtils.ComputeAllDependencies on every USD layer on disk, "
@@ -986,7 +1040,8 @@ def main():
         "reads. 0.02s per layer on a 1.6 GB layer, but reported slow on very large "
         "scenes; the cook logs the time it took."
     )
-    usddeep_pt.setConditional(hou.parmCondType.HideWhen, "{ rpfarm_mode != deps }")
+    usddeep_pt.setConditional(hou.parmCondType.HideWhen,
+                              "{ rpfarm_mode != deps } { rpfarm_texscope != referenced }")
 
     # Hidden, but a real parameter and not user data: it has to travel with
     # the scene, survive save/load, and be diffable when someone asks why a
@@ -1089,7 +1144,7 @@ def main():
 
     for pt in (
         mode_pt, scope_pt, context_pt, project_override_pt, project_pt, grouping_pt, packagegb_pt, compress_pt,
-        confirm_pt, usddeep_pt, assetregex_pt, excludepattern_pt,
+        confirm_pt, texscope_pt, usddeep_pt, assetregex_pt, excludepattern_pt,
         preview_pt, clearexclude_pt, exclude_pt,
         custom_pt, postcmd_pt, preset_pt, houtar_pt, houver_pt, inprocess_pt,
     ):

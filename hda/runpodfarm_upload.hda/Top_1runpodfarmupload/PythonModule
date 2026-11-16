@@ -210,7 +210,7 @@ _ASSET_FINGERPRINT = {
     'sync.py': (20962, '6ae2a7b7e1e25f58'),
     'tls.py': (3642, 'f3e50ea6ebd0308f'),
     'tools.py': (4290, 'c5d3b026f125578f'),
-    'usddeps.py': (9631, '3c7192d3bd94d07f'),
+    'usddeps.py': (24473, 'deda9035250ea5d9'),
     'volume.py': (10038, 'dc11b185a58c9262'),
     'worker_client.py': (10012, '407feb11016dd01c'),
 }
@@ -336,13 +336,25 @@ def _review(node, intent):
     scope = node.evalParm("rpfarm_scope") or rpdeps.SCOPE_BRANCH
     asset_regex = node.evalParm("rpfarm_assetregex") or rpdeps.ASSET_REGEX
     exclude_pattern = node.evalParm("rpfarm_excludepattern")
-    scan = rpdeps.scan_refs(scope=scope, node=node, log=_say,
-                            asset_regex=asset_regex, exclude_pattern=exclude_pattern)
-    rops = rpdeps.cook_rops(node, log=_say)
-    usd = rpusd.collect_usd_refs(
-        rops, log=_say, deep=bool(node.evalParm("rpfarm_usddeep")),
-        asset_regex=asset_regex) if rops else []
+    texture_scope = node.evalParm("rpfarm_texscope") or rpusd.SCOPE_UDIM
+    usd_problems = []
+    husk_usd = rpusd.husk_usd_inputs(node)
+    if husk_usd:
+        _say("husk chain: rendering {} -- the hip is not uploaded".format(", ".join(husk_usd)))
+        scan = rpdeps.RefScan(paths=(), output_paths=(), unresolved=())
+        usd = rpusd.file_dependencies(husk_usd, log=_say, asset_regex=asset_regex,
+                                      texture_scope=texture_scope, problems=usd_problems)
+    else:
+        scan = rpdeps.scan_refs(scope=scope, node=node, log=_say,
+                                asset_regex=asset_regex, exclude_pattern=exclude_pattern)
+        rops = rpdeps.cook_rops(node, log=_say)
+        usd = rpusd.collect_usd_refs(
+            rops, log=_say, deep=bool(node.evalParm("rpfarm_usddeep")),
+            asset_regex=asset_regex, texture_scope=texture_scope,
+            problems=usd_problems) if rops else []
     usd = rpdeps.remove_pattern(usd, exclude_pattern)
+    for problem in usd_problems:
+        _warn(problem)
 
     # Same farm-state lookup the generate callback makes -- best-effort,
     # this button is exactly as entitled to a wrong-scene warning as a real

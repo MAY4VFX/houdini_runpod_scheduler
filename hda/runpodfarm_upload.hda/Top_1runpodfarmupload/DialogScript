@@ -98,12 +98,25 @@
         hidewhen "{ rpfarm_mode != deps }"
     }
     parm {
+        name    "rpfarm_texscope"
+        label   "Textures"
+        type    string
+        default { "udim" }
+        help    "Which textures upload. UDIM Tiles Under UV (default): only the materials bound to geometry that renders, and of a <UDIM> texture only the tiles that geometry's st lands on -- exact, since every ray reads a texture at the UV of the mesh it hit; a texture read through its own texcoord travels whole. What the Stage Reads: the same materials, every tile. Everything Layers Reference: all a layer names, composed or not (the old behaviour; BS sto_0050: 14.4 GB vs 8.4 GB)."
+        hidewhen "{ rpfarm_mode != deps }"
+        menu {
+            "udim"          "UDIM Tiles Under UV"
+            "stage"         "What the Stage Reads"
+            "referenced"    "Everything Layers Reference"
+        }
+    }
+    parm {
         name    "rpfarm_usddeep"
         label   "Scan USD Layer Files Too"
         type    toggle
         default { "1" }
         help    "On: also run UsdUtils.ComputeAllDependencies on every USD layer on disk, which finds what the layer file references even when this session never composed it -- and expands <UDIM> itself. Off: only what the live stage reads. 0.02s per layer on a 1.6 GB layer, but reported slow on very large scenes; the cook logs the time it took."
-        hidewhen "{ rpfarm_mode != deps }"
+        hidewhen "{ rpfarm_mode != deps } { rpfarm_texscope != referenced }"
     }
     parm {
         name    "rpfarm_assetregex"

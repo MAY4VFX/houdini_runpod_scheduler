@@ -98,3 +98,91 @@ def test_stage_node_prefers_the_wired_input():
     assert usddeps.stage_node_of(_Node("/stage/render", inputs=[lop])) is lop
     assert usddeps.stage_node_of(_Node("/stage/render", loppath="/stage/other")).path() == "/stage/other"
     assert usddeps.stage_node_of(_Node("/stage/render")) is None
+
+
+# -- texture scopes (BS sto_0050, 2026-11-16) ---------------------------------
+
+def test_udim_tile_numbering():
+    assert usddeps.udim_tile(0.5, 0.5) == 1001
+    assert usddeps.udim_tile(1.2, 0.1) == 1002
+    assert usddeps.udim_tile(0.3, 1.7) == 1011
+    assert usddeps.udim_tile(5.9, 1.0) == 1016  # a UV exactly on the seam is the next tile
+
+
+def test_udim_tiles_from_plain_pairs():
+    assert usddeps.udim_tiles([(0.1, 0.1), (0.9, 0.2), (3.5, 1.5)]) == {1001, 1014}
+
+
+def _tiles(tmp_path, name, numbers):
+    for n in numbers:
+        (tmp_path / "{}.{}.exr".format(name, n)).write_bytes(b"x")
+    raw = str(tmp_path / "{}.<UDIM>.exr".format(name))
+    return raw, usddeps.expand_asset(raw, resolved="", layer_dir=str(tmp_path))
+
+
+def test_keep_tiles_keeps_only_tiles_under_uv(tmp_path):
+    raw, files = _tiles(tmp_path, "mid_BaseColor_ACES - ACEScg", ("1001", "1002", "1012"))
+    kept = usddeps.keep_tiles(raw, files, {1012})
+    assert [os.path.basename(p) for p in kept] == ["mid_BaseColor_ACES - ACEScg.1012.exr"]
+
+
+def test_keep_tiles_reads_the_token_position_not_the_last_digits(tmp_path):
+    # the tile sits BEFORE a version number; "last four digits" would read 0003
+    for n in ("1001", "1002"):
+        (tmp_path / "deck_{}_v0003.exr".format(n)).write_bytes(b"x")
+    raw = str(tmp_path / "deck_<UDIM>_v0003.exr")
+    files = usddeps.expand_asset(raw, resolved="", layer_dir=str(tmp_path), asset_regex=r"<udim>")
+    assert [os.path.basename(p) for p in usddeps.keep_tiles(raw, files, {1002})] == ["deck_1002_v0003.exr"]
+
+
+def test_keep_tiles_never_drops_what_is_not_a_tile(tmp_path):
+    raw, files = _tiles(tmp_path, "back1", ("1001",))
+    stranger = tmp_path / "back1.notatile.exr"
+    stranger.write_bytes(b"x")
+    kept = usddeps.keep_tiles(raw, files + [str(stranger)], {1005})
+    assert kept == [str(stranger)], "a match the template cannot place is kept, visible in the window"
+
+
+def test_keep_tiles_none_and_non_udim_keep_everything(tmp_path):
+    raw, files = _tiles(tmp_path, "bottom1", ("1001", "1002"))
+    assert usddeps.keep_tiles(raw, files, None) == files
+    flat = str(tmp_path / "wetness_deck_v001.exr")
+    assert usddeps.keep_tiles(flat, [flat], {1001}) == [flat]
+
+
+def test_asset_path_problems_names_schemes_and_leftover_variables():
+    assert "resolver" in usddeps.asset_path_problems("ayon://blacksilk/assets/ship?product=usdAsset")
+    assert "variable" in usddeps.asset_path_problems("$FOLDER/textures/a.<UDIM>.exr")
+    assert "variable" in usddeps.asset_path_problems("${JOB}/tex.exr")
+    assert usddeps.asset_path_problems("/studio/show/assets/tex.<UDIM>.exr") == ""
+    assert usddeps.asset_path_problems("file:///abs/tex.exr") == ""
+    assert usddeps.asset_path_problems("") == ""
+
+
+def test_scopes_are_a_closed_menu():
+    assert usddeps.TEXTURE_SCOPES == ("referenced", "stage", "udim")
+
+
+class _F:
+    def __init__(self, path):
+        self.path = path
+
+
+class _Item:
+    def __init__(self, outputs=(), expected=()):
+        self.outputFiles = [_F(p) for p in outputs]
+        self.expectedOutputFiles = [_F(p) for p in expected]
+
+
+def test_upstream_usd_files_takes_usd_outputs_once_in_order():
+    items = [_Item(outputs=["/a/delta.usd", "/a/render.exr"]),
+             _Item(expected=["/a/delta.usd", "/b/next.usdc"])]
+    assert usddeps.upstream_usd_files(items) == ["/a/delta.usd", "/b/next.usdc"]
+    assert usddeps.upstream_usd_files([]) == []
+
+
+def test_relative_escapes_flags_only_paths_that_climb_out():
+    refs = ["../../../../publish/usd/usdAsset/hero/ship_usd_usdAsset.usd",
+            "/Users/x/abs.usd", "./sibling.usd", "sub/child.usd", "ayon://p/a"]
+    got = usddeps.relative_escapes("/w/_gate/delta.usd", refs)
+    assert len(got) == 1 and "Use Relative Paths" in got[0]
