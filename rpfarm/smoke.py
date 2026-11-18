@@ -531,6 +531,10 @@ class PodWatcher(threading.Thread):
         while not self._stop.is_set():
             try:
                 for p in api.list_pods("rpfarm-"):
+                    # The listing carries no address (v2 reports ports only
+                    # per pod): ask for it only until this pod has shown one.
+                    if (self.pods.get(p["id"]) or {}).get("first_ip") is None:
+                        p = api.with_runtime(p)
                     self._record(p)
             except Exception:  # noqa: BLE001 - a watcher must never fail the run
                 pass

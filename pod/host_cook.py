@@ -32,9 +32,10 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
-RUNPOD_API_BASE = "https://rest.runpod.io/v1"
+RUNPOD_API_BASE = "https://api.runpod.io/v2"
 USER_AGENT = "rpfarm-host-cook/1"
 
 #: Hard ceiling on how long this pod is allowed to run, regardless of what
@@ -89,18 +90,29 @@ def list_cook_pods(user, cook_id, api_key):
     render pods, if any are still around. Read-only. Mirrors rpfarm.pods'
     own name format (rpfarm-<user>-<project>-<cook_id>-<n>) without
     importing rpfarm."""
-    try:
-        status, raw = _runpod_call("GET", "/pods", api_key)
-    except (urllib.error.URLError, OSError) as e:
-        log("could not list pods for the render-pod sweep ({})".format(type(e).__name__))
-        return []
-    if status >= 300:
-        log("could not list pods for the render-pod sweep (HTTP {})".format(status))
-        return []
-    try:
-        pods = json.loads(raw)
-    except (ValueError, TypeError):
-        return []
+    # v2 wraps the list ({"pods": [...], "pagination": {...}}) and pages it.
+    pods, cursor = [], None
+    for _page in range(50):  # a hard stop: this runs in a watchdog path
+        path = "/pods" + ("?cursor=" + urllib.parse.quote(cursor) if cursor else "")
+        try:
+            status, raw = _runpod_call("GET", path, api_key)
+        except (urllib.error.URLError, OSError) as e:
+            log("could not list pods for the render-pod sweep ({})".format(type(e).__name__))
+            return []
+        if status >= 300:
+            log("could not list pods for the render-pod sweep (HTTP {})".format(status))
+            return []
+        try:
+            page = json.loads(raw)
+        except (ValueError, TypeError):
+            return []
+        if not isinstance(page, dict):
+            return []
+        pods.extend(page.get("pods") or [])
+        paging = page.get("pagination") or {}
+        cursor = paging.get("nextCursor")
+        if not (paging.get("hasNextPage") and cursor):
+            break
     prefix = "rpfarm-{}-".format(user)
     return [p for p in pods
            if str(p.get("name", "")).startswith(prefix)
