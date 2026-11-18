@@ -4,14 +4,12 @@
 Volume and region come from ~/.rpfarm/config.toml (or SPIKE_VOLUME_ID /
 SPIKE_DATACENTER); nothing about one particular account is baked in here.
 
-Confirmed against https://rest.runpod.io/v1/openapi.json (PodCreateInput / Pod
-schemas) before running:
-  - request fields: computeType, cpuFlavorIds, vcpuCount, cloudType,
-    dataCenterIds, networkVolumeId, volumeMountPath, imageName,
-    containerDiskInGb, ports, supportPublicIp, env, dockerStartCmd.
-  - response fields: pod.publicIp (string, nullable), pod.portMappings
-    (object mapping internal port string -> external port int, nullable),
-    pod.costPerHr.
+Written for REST v2 (https://api.runpod.io/v2; v1 was retired 2026-11-15):
+  - request fields: name, image, cpu{id,vcpuCount}, cloud, dataCenterIds,
+    mounts.network[{volumeId,path}], disk, ports, env, cmd. There is no
+    supportPublicIp: a pod with 22/tcp in `ports` gets a public address anyway.
+  - response fields: pod.runtime.ports[{ip,private,public,type}] (GET /pods/{id}
+    only), pod.ssh.direct, pod.cost, pod.status.
 
 Creates the pod, waits for it to become reachable, prints the SSH command and
 raw JSON, then ALWAYS terminates the pod (DELETE + GET verification) in a
@@ -19,7 +17,7 @@ finally block - on success, on error, on Ctrl-C, and on the ready-wait
 timeout. To keep the pod alive for manual inspection (e.g. to run mqserver /
 port checks by hand), set SPIKE_KEEP_POD=1; the script then skips the DELETE
 and prints the exact curl command to terminate it yourself:
-  curl -X DELETE -H "Authorization: Bearer $RUNPOD_API_KEY" https://rest.runpod.io/v1/pods/<id>
+  curl -X DELETE -H "Authorization: Bearer $RUNPOD_API_KEY" https://api.runpod.io/v2/pods/<id>
 """
 import json, os, sys, time, urllib.request, urllib.error
 from pathlib import Path
@@ -29,7 +27,7 @@ if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 from rpfarm import config as rpcfg  # noqa: E402
 
-API = "https://rest.runpod.io/v1"
+API = "https://api.runpod.io/v2"
 KEY = os.environ["RUNPOD_API_KEY"]
 
 
@@ -115,19 +113,15 @@ pod = call(
     "/pods",
     {
         "name": "rpfarm-spike-sync",
-        "computeType": "CPU",
-        "cpuFlavorIds": ["cpu3c", "cpu5c"],
-        "vcpuCount": 2,
-        "cloudType": "SECURE",
+        "cpu": {"id": "cpu3c", "vcpuCount": 2},
+        "cloud": "SECURE",
         "dataCenterIds": [DATACENTER],
-        "networkVolumeId": VOLUME_ID,
-        "volumeMountPath": "/workspace",
-        "imageName": "runpod/base:1.0.2-ubuntu2204",
-        "containerDiskInGb": 10,
+        "mounts": {"network": [{"volumeId": VOLUME_ID, "path": "/workspace"}]},
+        "image": "runpod/base:1.0.2-ubuntu2204",
+        "disk": 10,
         "ports": ["22/tcp", "4440/tcp", "4442/tcp", "8000/http"],
-        "supportPublicIp": True,
         "env": {"PUBLIC_KEY": pubkey},
-        "dockerStartCmd": [
+        "cmd": [
             "bash",
             "-c",
             'mkdir -p ~/.ssh && echo "$PUBLIC_KEY" >> ~/.ssh/authorized_keys && '
@@ -148,10 +142,11 @@ try:
     ports = {}
     while True:
         p = call("GET", f"/pods/{pid}")
-        ports = p.get("portMappings") or {}
-        ip = p.get("publicIp")
+        tcp = [x for x in ((p.get("runtime") or {}).get("ports") or []) if x.get("type") == "tcp"]
+        ports = {str(x["private"]): x["public"] for x in tcp}
+        ip = tcp[0]["ip"] if tcp else None
         elapsed = time.time() - t0
-        print(f"  t={elapsed:.0f}s desiredStatus={p.get('desiredStatus')} ip={ip} ports={ports}")
+        print(f"  t={elapsed:.0f}s status={p.get('status')} ip={ip} ports={ports}")
         if ip and ports.get("22"):
             break
         if elapsed > 180:
@@ -162,7 +157,7 @@ try:
     print(f"ready in {time.time()-t0:.0f}s  ip={ip}  ports={ports}")
     if ip and ports.get("22"):
         print("ssh:", f"ssh -i {pubkey_path[:-4]} -p {ports['22']} root@{ip}")
-    print("costPerHr:", p.get("costPerHr"))
+    print("cost:", p.get("cost"))
     print(json.dumps(p, indent=1))
 finally:
     if os.environ.get("SPIKE_KEEP_POD") == "1":
