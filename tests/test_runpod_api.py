@@ -23,12 +23,14 @@ def test_create_cpu_pod_builds_body():
     pod = api.create_cpu_pod("rpfarm-sync-may", "tpl", "vol", {"A": "1"}, ["22/tcp"])
     assert pod["id"] == "p1"
     m, url, body, headers = t.calls[0]
-    assert (m, url) == ("POST", "https://rest.runpod.io/v1/pods")
-    assert body["computeType"] == "CPU" and body["networkVolumeId"] == "vol"
-    # "custom" honours the order of cpuFlavorIds; the default "availability"
-    # would ignore it and rent whatever RunPod has most of (ruling R18).
-    assert body["cpuFlavorPriority"] == "custom" and body["cpuFlavorIds"] == ["cpu3c", "cpu5c"]
-    assert body["volumeMountPath"] == "/workspace" and body["env"] == {"A": "1"}
+    assert (m, url) == ("POST", "https://api.runpod.io/v2/pods")
+    # v2: exactly one of gpu/cpu, nested; no computeType, no *Priority lists,
+    # no supportPublicIp (a 22/tcp pod gets a public address anyway).
+    assert body["cpu"] == {"id": "cpu3c", "vcpuCount": 2}
+    assert "gpu" not in body and "computeType" not in body and "supportPublicIp" not in body
+    assert body["templateId"] == "tpl" and body["cloud"] == "SECURE"
+    assert body["mounts"] == {"network": [{"volumeId": "vol", "path": "/workspace"}]}
+    assert body["env"] == {"A": "1"}
     assert headers["Authorization"] == "Bearer k"
 
 
@@ -39,15 +41,13 @@ def test_create_gpu_pod_builds_body():
         "rpfarm-gpu", "tpl", ["NVIDIA RTX A4500", "NVIDIA A40"], "vol", {"A": "1"}, ["22/tcp"])
     assert pod["id"] == "p1"
     m, url, body, headers = t.calls[0]
-    assert (m, url) == ("POST", "https://rest.runpod.io/v1/pods")
-    assert body["computeType"] == "GPU"
-    # The artist's GPU Priority list is a cost decision, so the order has to
-    # be honoured: "availability" ignores it and picks whatever RunPod has
-    # most of (ruling R18 -- a live cook got a $0.740/h 4090 over an A4500).
-    assert body["gpuTypePriority"] == "custom"
-    assert body["gpuTypeIds"] == ["NVIDIA RTX A4500", "NVIDIA A40"]
-    assert body["networkVolumeId"] == "vol"
-    assert body["volumeMountPath"] == "/workspace"
+    assert (m, url) == ("POST", "https://api.runpod.io/v2/pods")
+    # The artist's GPU Priority list is a cost decision (ruling R18 -- a live
+    # cook got a $0.740/h 4090 over an A4500). v2 takes one type per pod, so
+    # the first type is the first request.
+    assert body["gpu"] == {"id": "NVIDIA RTX A4500", "count": 1}
+    assert len(t.calls) == 1
+    assert body["mounts"] == {"network": [{"volumeId": "vol", "path": "/workspace"}]}
 
 
 def test_pod_creates_carry_the_configured_datacenter():
@@ -96,18 +96,19 @@ def test_pod_public_endpoint():
 
 
 def test_list_pods_filters_by_name_prefix():
-    t = FakeTransport([(200, [{"id": "p1", "name": "rpfarm-a"}, {"id": "p2", "name": "other"}])])
+    t = FakeTransport([(200, {"pods": [{"id": "p1", "name": "rpfarm-a"}, {"id": "p2", "name": "other"}],
+                              "pagination": {"hasNextPage": False, "nextCursor": None}})])
     api = ra.RunPodAPI("k", transport=t)
     pods = api.list_pods(name_prefix="rpfarm-")
     assert [p["id"] for p in pods] == ["p1"]
     m, url, body, headers = t.calls[0]
-    assert (m, url) == ("GET", "https://rest.runpod.io/v1/pods")
+    assert (m, url) == ("GET", "https://api.runpod.io/v2/pods")
 
 
 def test_get_volume_and_resize_and_create_and_delete():
     t = FakeTransport(
         [
-            (200, {"id": "v1", "size": 20}),
+            (200, {"id": "v1", "size": 20, "dataCenter": "EU-RO-1"}),
             (200, {"id": "v1", "size": 40}),
             (200, {"id": "v2"}),
             (204, {}),
@@ -116,21 +117,22 @@ def test_get_volume_and_resize_and_create_and_delete():
     api = ra.RunPodAPI("k", transport=t)
     v = api.get_volume("v1")
     assert v["id"] == "v1"
-    assert t.calls[0][:2] == ("GET", "https://rest.runpod.io/v1/networkvolumes/v1")
+    assert v["dataCenterId"] == "EU-RO-1"   # the v1 key callers read
+    assert t.calls[0][:2] == ("GET", "https://api.runpod.io/v2/network-volumes/v1")
 
     v = api.resize_volume("v1", 40)
     assert v["size"] == 40
-    assert t.calls[1][:2] == ("PATCH", "https://rest.runpod.io/v1/networkvolumes/v1")
+    assert t.calls[1][:2] == ("PATCH", "https://api.runpod.io/v2/network-volumes/v1")
     assert t.calls[1][2] == {"size": 40}
 
     v = api.create_volume("rpfarm-vol", 50, dc="EU-RO-1")
     assert v["id"] == "v2"
     m, url, body, headers = t.calls[2]
-    assert (m, url) == ("POST", "https://rest.runpod.io/v1/networkvolumes")
-    assert body == {"name": "rpfarm-vol", "size": 50, "dataCenterId": "EU-RO-1"}
+    assert (m, url) == ("POST", "https://api.runpod.io/v2/network-volumes")
+    assert body == {"name": "rpfarm-vol", "size": 50, "dataCenter": "EU-RO-1"}
 
     api.delete_volume("v1")
-    assert t.calls[3][:2] == ("DELETE", "https://rest.runpod.io/v1/networkvolumes/v1")
+    assert t.calls[3][:2] == ("DELETE", "https://api.runpod.io/v2/network-volumes/v1")
 
 
 def test_save_template_create_vs_update():
@@ -139,30 +141,32 @@ def test_save_template_create_vs_update():
 
     api.save_template("rpfarm-pod", "img:latest", ["22/tcp"], {"A": "1"})
     m, url, body, headers = t.calls[0]
-    assert (m, url) == ("POST", "https://rest.runpod.io/v1/templates")
-    assert body["name"] == "rpfarm-pod" and body["imageName"] == "img:latest"
+    assert (m, url) == ("POST", "https://api.runpod.io/v2/templates")
+    assert body["name"] == "rpfarm-pod" and body["image"] == "img:latest"
+    assert body["disk"] == 10 and "imageName" not in body
 
     api.save_template("rpfarm-pod", "img:latest", ["22/tcp"], {"A": "1"}, template_id="t1")
     m, url, body, headers = t.calls[1]
-    assert (m, url) == ("PATCH", "https://rest.runpod.io/v1/templates/t1")
+    assert (m, url) == ("PATCH", "https://api.runpod.io/v2/templates/t1")
 
 
 def test_billing_pods_and_volumes_query_params():
-    t = FakeTransport([(200, [{"id": "b1"}]), (200, [{"id": "b2"}])])
+    t = FakeTransport([(200, {"metadata": {}, "records": [{"podId": "b1", "totalAmount": 0.5}]}),
+                       (200, {"metadata": {}, "records": [{"networkVolumeId": "v", "totalAmount": 0.1}]})])
     api = ra.RunPodAPI("k", transport=t)
 
     pods = api.billing_pods("2026-01-01T00:00:00Z", "2026-01-31T23:59:59Z")
-    assert pods == [{"id": "b1"}]
+    assert [(b["podId"], b["amount"], b["totalAmount"]) for b in pods] == [("b1", 0.5, 0.5)]
     m, url, body, headers = t.calls[0]
     assert m == "GET"
-    assert url.startswith("https://rest.runpod.io/v1/billing/pods?")
+    assert url.startswith("https://api.runpod.io/v2/billing/pods?")
     assert "startTime=2026-01-01T00%3A00%3A00Z" in url
     assert "endTime=2026-01-31T23%3A59%3A59Z" in url
 
     vols = api.billing_volumes("2026-01-01T00:00:00Z", "2026-01-31T23:59:59Z")
-    assert vols == [{"id": "b2"}]
+    assert [(b["networkVolumeId"], b["amount"]) for b in vols] == [("v", 0.1)]
     m, url, body, headers = t.calls[1]
-    assert url.startswith("https://rest.runpod.io/v1/billing/networkvolumes?")
+    assert url.startswith("https://api.runpod.io/v2/billing/network-volumes?")
 
 
 def test_balance_uses_graphql_endpoint():
@@ -177,16 +181,19 @@ def test_balance_uses_graphql_endpoint():
 
 
 def test_list_volumes_and_list_templates():
-    t = FakeTransport([(200, [{"id": "v1"}]), (200, [{"id": "t1", "name": "rpfarm-pod"}])])
+    t = FakeTransport([
+        (200, {"networkVolumes": [{"id": "v1", "dataCenter": "EU-RO-1"}], "pagination": {"hasNextPage": False}}),
+        (200, {"templates": [{"id": "t1", "name": "rpfarm-pod", "image": "img:1"}], "pagination": {"hasNextPage": False}}),
+    ])
     api = ra.RunPodAPI("k", transport=t)
 
     vols = api.list_volumes()
-    assert vols == [{"id": "v1"}]
-    assert t.calls[0][:2] == ("GET", "https://rest.runpod.io/v1/networkvolumes")
+    assert vols == [{"id": "v1", "dataCenter": "EU-RO-1", "dataCenterId": "EU-RO-1"}]
+    assert t.calls[0][:2] == ("GET", "https://api.runpod.io/v2/network-volumes")
 
     templates = api.list_templates()
-    assert templates == [{"id": "t1", "name": "rpfarm-pod"}]
-    assert t.calls[1][:2] == ("GET", "https://rest.runpod.io/v1/templates")
+    assert templates == [{"id": "t1", "name": "rpfarm-pod", "image": "img:1", "imageName": "img:1"}]
+    assert t.calls[1][:2] == ("GET", "https://api.runpod.io/v2/templates")
 
 
 def test_gpu_types_uses_graphql_endpoint_with_dc():
@@ -213,7 +220,7 @@ def test_gpu_types_uses_graphql_endpoint_with_dc():
 
 def test_every_request_carries_an_explicit_user_agent():
     """Cloudflare 403s Python's default User-Agent on api.runpod.io."""
-    t = FakeTransport([(200, []), (200, {"data": {"myself": {"clientBalance": 1.0}}})])
+    t = FakeTransport([(200, {"pods": []}), (200, {"data": {"myself": {"clientBalance": 1.0}}})])
     api = ra.RunPodAPI("k", transport=t)
     api.list_pods()
     api.balance()
@@ -244,7 +251,7 @@ def test_default_transport_uses_a_verifying_ssl_context(monkeypatch):
         return FakeResponse()
 
     monkeypatch.setattr(ra.urllib.request, "urlopen", fake_urlopen)
-    ra._urllib_transport("GET", "https://rest.runpod.io/v1/pods", None, {})
+    ra._urllib_transport("GET", "https://api.runpod.io/v2/pods", None, {})
     assert seen["context"] is not None
     assert seen["context"].verify_mode == ssl.CERT_REQUIRED
 
@@ -255,7 +262,7 @@ def test_default_transport_turns_network_errors_into_runpoderror(monkeypatch):
 
     monkeypatch.setattr(ra.urllib.request, "urlopen", boom)
     with pytest.raises(ra.RunPodError) as excinfo:
-        ra._urllib_transport("GET", "https://rest.runpod.io/v1/pods", None, {})
+        ra._urllib_transport("GET", "https://api.runpod.io/v2/pods", None, {})
     assert excinfo.value.status == 0
 
 
@@ -276,10 +283,10 @@ def test_cloud_type_reaches_the_request_body_for_both_pod_kinds():
 
     api.create_gpu_pod("n", "tpl", ["A4500"], "vol", {}, [22],
                        cloud_type=ra.CLOUD_TYPE_COMMUNITY)
-    assert sent["cloudType"] == "COMMUNITY"
+    assert sent["cloud"] == "COMMUNITY"
 
     api.create_cpu_pod("n", "tpl", "vol", {}, [22], cloud_type=ra.CLOUD_TYPE_COMMUNITY)
-    assert sent["cloudType"] == "COMMUNITY"
+    assert sent["cloud"] == "COMMUNITY"
 
 
 def test_cloud_type_defaults_to_secure():
@@ -292,7 +299,7 @@ def test_cloud_type_defaults_to_secure():
     ra.RunPodAPI("key", transport=transport).create_gpu_pod(
         "n", "tpl", ["A4500"], "vol", {}, [22])
 
-    assert sent["cloudType"] == "SECURE"
+    assert sent["cloud"] == "SECURE"
 
 
 def test_interruptible_is_never_sent():
@@ -336,7 +343,165 @@ def test_pod_creates_can_ask_for_a_bigger_disk():
     api.create_gpu_pod("g", "tpl", ["NVIDIA A40"], "vol", {}, ["22/tcp"], container_disk_gb=25)
     api.create_cpu_pod("h", "tpl", "vol", {}, ["22/tcp"], container_disk_gb=25)
     api.create_cpu_pod("rpfarm-sync-may", "tpl", "vol", {}, ["22/tcp"])
-    assert t.calls[0][2]["containerDiskInGb"] == 25
-    assert t.calls[1][2]["containerDiskInGb"] == 25
+    assert t.calls[0][2]["disk"] == 25
+    assert t.calls[1][2]["disk"] == 25
     # the sync pod keeps the template's disk
-    assert "containerDiskInGb" not in t.calls[2][2]
+    assert "disk" not in t.calls[2][2]
+
+
+# ---------------------------------------------------------------------------
+# REST v2: shapes, pagination, fallback order, v1-shaped views
+# ---------------------------------------------------------------------------
+
+LIVE_POD = {
+    # Shape of GET /v2/pods/{id} for a RUNNING CPU pod, checked live 2026-11-18.
+    "id": "7ars8fv3gnyy6e", "name": "rpfarm-sync-may", "status": "RUNNING", "cost": 0.06,
+    "image": "ghcr.io/may4vfx/rpfarm-pod:9016ed0", "cloud": "SECURE", "dataCenterId": "EU-RO-1",
+    "createdAt": "2026-11-18T11:42:50.000Z", "startedAt": "2026-11-18T11:43:02.873Z",
+    "mounts": {"network": [{"volumeId": "vol1", "path": "/workspace"}]},
+    "cpu": {"id": "cpu3c", "vcpuCount": 2},
+    "env": {"RPFARM_USER": "may"},
+    "runtime": {"uptime": 16, "ports": [
+        {"ip": "213.173.105.101", "private": 4440, "public": 26760, "type": "tcp"},
+        {"ip": "100.65.35.124", "private": 8000, "public": 60784, "type": "http"},
+        {"ip": "213.173.105.101", "private": 22, "public": 26759, "type": "tcp"},
+    ]},
+    "ssh": {"direct": {"host": "213.173.105.101", "port": 26759}},
+}
+
+
+def test_normalize_pod_adds_the_v1_keys_alongside_v2_ones():
+    pod = ra.normalize_pod(LIVE_POD)
+    assert pod["desiredStatus"] == "RUNNING" and pod["status"] == "RUNNING"
+    assert pod["costPerHr"] == 0.06 and pod["cost"] == 0.06
+    assert pod["imageName"] == pod["image"]
+    assert pod["networkVolumeId"] == "vol1"
+    assert pod["lastStatusChange"] == "2026-11-18T11:43:02.873Z"
+    # only tcp ports have a public address; the http one is a private 100.x proxy hop
+    assert pod["publicIp"] == "213.173.105.101"
+    assert pod["portMappings"] == {"4440": 26760, "22": 26759}
+    assert ra.pod_public_endpoint(pod, 22) == ("213.173.105.101", 26759)
+    assert LIVE_POD.get("publicIp") is None   # the input is not mutated
+
+
+def test_normalize_pod_gpu_machine_type():
+    pod = ra.normalize_pod({"id": "g", "status": "RUNNING", "gpu": {"id": "NVIDIA GeForce RTX 4090", "count": 1}})
+    assert pod["machine"] == {"gpuTypeId": "NVIDIA GeForce RTX 4090"}
+
+
+@pytest.mark.parametrize("status,desired", [
+    ("PROVISIONING", "RUNNING"),   # v1 said RUNNING from the moment of creation
+    ("STARTING", "RUNNING"),
+    ("RUNNING", "RUNNING"),
+    ("EXITED", "EXITED"),
+    ("ERROR", "EXITED"),           # a failed pod is not a live cook / usable sync pod
+    ("TERMINATED", "TERMINATED"),
+])
+def test_normalize_pod_desired_status(status, desired):
+    assert ra.normalize_pod({"id": "p", "status": status})["desiredStatus"] == desired
+
+
+@pytest.mark.parametrize("status", ["EXITED", "STARTING", "PROVISIONING", "ERROR"])
+def test_a_pod_that_is_not_running_has_no_address_even_if_runtime_still_lists_ports(status):
+    """Seen live: just after a stop, ``EXITED`` still carried the old ports, and
+    just after a start the old ports came back before the new ones."""
+    pod = ra.normalize_pod(dict(LIVE_POD, status=status))
+    assert "publicIp" not in pod and "portMappings" not in pod
+    with pytest.raises(ra.RunPodError):
+        ra.pod_public_endpoint(pod, 22)
+
+
+def test_a_stopped_pod_has_no_last_status_change():
+    """v2 has no stop time. startedAt is the last START, so using it would make a
+    sync pod parked after a long run look stopped for hours -- and get deleted
+    by the stopped-for-N-minutes policy. Unknown never triggers an action."""
+    pod = ra.normalize_pod({"id": "p", "status": "EXITED", "startedAt": "2026-11-01T00:00:00Z",
+                            "createdAt": "2026-10-01T00:00:00Z"})
+    assert "lastStatusChange" not in pod
+
+
+def test_a_list_entry_has_no_address_until_with_runtime():
+    listed = dict(LIVE_POD, runtime=None)
+    t = FakeTransport([(200, {"pods": [listed], "pagination": {"hasNextPage": False}}), (200, LIVE_POD)])
+    api = ra.RunPodAPI("k", transport=t)
+    (pod,) = api.list_pods("rpfarm-")
+    assert "publicIp" not in pod
+    full = api.with_runtime(pod)
+    assert ra.pod_public_endpoint(full, 22) == ("213.173.105.101", 26759)
+    assert t.calls[1][:2] == ("GET", "https://api.runpod.io/v2/pods/7ars8fv3gnyy6e")
+    # and it costs nothing once the address is known
+    assert api.with_runtime(full) is full
+    assert len(t.calls) == 2
+
+
+def test_with_runtime_survives_a_vanished_pod():
+    t = FakeTransport([(404, {"error": "gone"})])
+    api = ra.RunPodAPI("k", transport=t)
+    pod = {"id": "p", "desiredStatus": "RUNNING"}
+    assert api.with_runtime(pod) is pod
+    # a stopped pod is never worth a request
+    assert api.with_runtime({"id": "q", "desiredStatus": "EXITED"}) == {"id": "q", "desiredStatus": "EXITED"}
+    assert len(t.calls) == 1
+
+
+def test_lists_follow_the_pagination_cursor():
+    t = FakeTransport([
+        (200, {"pods": [{"id": "a", "name": "x1"}], "pagination": {"hasNextPage": True, "nextCursor": "c1"}}),
+        (200, {"pods": [{"id": "b", "name": "x2"}], "pagination": {"hasNextPage": False, "nextCursor": None}}),
+    ])
+    pods = ra.RunPodAPI("k", transport=t).list_pods()
+    assert [p["id"] for p in pods] == ["a", "b"]
+    assert t.calls[0][1] == "https://api.runpod.io/v2/pods"
+    assert t.calls[1][1] == "https://api.runpod.io/v2/pods?cursor=c1"
+
+
+def test_gpu_priority_is_walked_one_request_per_type():
+    t = FakeTransport([(400, {"detail": "no such GPU here"}), (500, {"detail": "no instances"}),
+                       (201, {"id": "p9", "status": "RUNNING"})])
+    api = ra.RunPodAPI("k", transport=t)
+    pod = api.create_gpu_pod("g", "tpl", ["A", "B", "C"], "vol", {}, ["22/tcp"])
+    assert pod["id"] == "p9" and pod["desiredStatus"] == "RUNNING"
+    assert [c[2]["gpu"]["id"] for c in t.calls] == ["A", "B", "C"]
+
+
+def test_every_type_refused_raises_the_capacity_error_if_there_was_one():
+    t = FakeTransport([(500, {"detail": "no instances"}), (400, {"detail": "unknown"})])
+    with pytest.raises(ra.RunPodError) as e:
+        ra.RunPodAPI("k", transport=t).create_gpu_pod("g", "tpl", ["A", "B"], "vol", {}, [])
+    assert ra.is_capacity_error(e.value)
+
+
+@pytest.mark.parametrize("status", [401, 403, 422, 429])
+def test_auth_schema_and_rate_errors_stop_the_walk(status):
+    t = FakeTransport([(status, {"detail": "no"}), (201, {"id": "never"})])
+    with pytest.raises(ra.RunPodError):
+        ra.RunPodAPI("k", transport=t).create_gpu_pod("g", "tpl", ["A", "B"], "vol", {}, [])
+    assert len(t.calls) == 1
+
+
+def test_stop_start_use_the_action_endpoint():
+    t = FakeTransport([(200, {}), (200, {})])
+    api = ra.RunPodAPI("k", transport=t)
+    api.stop_pod("p1")
+    api.start_pod("p1")
+    assert [(c[0], c[1], c[2]) for c in t.calls] == [
+        ("POST", "https://api.runpod.io/v2/pods/p1/action", {"action": "stop"}),
+        ("POST", "https://api.runpod.io/v2/pods/p1/action", {"action": "start"}),
+    ]
+
+
+def test_get_pod_still_raises_on_404_and_terminate_still_swallows_it():
+    api = ra.RunPodAPI("k", transport=FakeTransport([(404, {}), (404, {})]))
+    with pytest.raises(ra.RunPodError) as e:
+        api.get_pod("gone")
+    assert e.value.status == 404
+    api.terminate_pod("gone")
+
+
+def test_pod_billing_rows_keep_the_keys_the_ledger_reads():
+    t = FakeTransport([(200, {"records": [{"podId": "p", "totalAmount": 0.25, "gpuAmount": 0.2,
+                                           "startTime": "2026-11-12T00:00:00Z"}]})])
+    (row,) = ra.RunPodAPI("k", transport=t).billing_pods("a", "b")
+    assert row["amount"] == 0.25 and row["podId"] == "p"
+    # v2 has no billed-time field: 0 means unknown to merge_billing
+    assert row["timeBilledMs"] == 0

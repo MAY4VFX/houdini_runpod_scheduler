@@ -88,6 +88,26 @@ def test_find_running_sync_pod_finds_it():
     assert pod["id"] == "sync1"
 
 
+def test_find_running_sync_pod_returns_it_with_an_address_from_the_real_client():
+    """v2's list has no ports (``runtime`` is null there): the pod found in a
+    listing must come back with the address its caller is about to open."""
+    import json
+
+    from rpfarm import runpod_api as ra
+
+    listed = {"id": "sync1", "name": "rpfarm-sync-may", "status": "RUNNING", "runtime": None}
+    full = dict(listed, runtime={"ports": [{"ip": "9.9.9.9", "private": 22, "public": 1022, "type": "tcp"}]})
+    answers = {"https://api.runpod.io/v2/pods": {"pods": [listed], "pagination": {"hasNextPage": False}},
+               "https://api.runpod.io/v2/pods/sync1": full}
+
+    def transport(method, url, body, headers):
+        return 200, json.dumps(answers[url]).encode()
+
+    pod = rppods.find_running_sync_pod(ra.RunPodAPI("k", transport=transport), cfg())
+
+    assert ra.pod_public_endpoint(pod, 22) == ("9.9.9.9", 1022)
+
+
 def test_find_running_sync_pod_creates_nothing_when_none_is_up():
     api = FakeAPI()
 

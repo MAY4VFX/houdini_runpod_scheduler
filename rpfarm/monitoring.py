@@ -91,7 +91,7 @@ def snapshot(cfg, job_id='', include_ledger=False, housekeeping=False):
             volume = api.get_volume(cfg.volume_id)
             result['volume'] = '{} · {} GB allocated'.format(cfg.volume_id, volume.get('size', '?'))
             if include_ledger:
-                ip, port = pod_public_endpoint(selected_sync, 22)
+                ip, port = pod_public_endpoint(pods.with_runtime(api, selected_sync), 22)
                 target = sync.SftpTarget(ip, port, cfg.ssh_key_path)
                 sync.rclone_copy_dir(str(config.home() / 'ledger'), target, 'down',
                                      cfg.rclone_path, '/workspace/ledger')

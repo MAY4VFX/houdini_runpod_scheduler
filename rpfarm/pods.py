@@ -519,6 +519,18 @@ def _sync_volume_matches(pod, cfg):
     return not volume or volume == cfg.volume_id
 
 
+def with_runtime(api, pod):
+    """``pod`` from a listing, with its public address filled in.
+
+    ``RunPodAPI.list_pods`` entries carry no ``publicIp``/``portMappings`` (v2
+    returns ``runtime`` only for a single pod). This is the one extra request
+    for the one pod a caller is about to connect to. An ``api`` without
+    ``with_runtime`` (a test double, a custom client) passes the pod through.
+    """
+    fill = getattr(api, "with_runtime", None)
+    return fill(pod) if fill else pod
+
+
 def find_running_sync_pod(api, cfg, log=None):
     """This user's sync pod, if one is already RUNNING -- read-only.
 
@@ -537,7 +549,9 @@ def find_running_sync_pod(api, cfg, log=None):
         say("could not check for a running sync pod: {}".format(e))
         return None
     running = [p for p in existing if p.get("desiredStatus") == "RUNNING" and _sync_volume_matches(p, cfg)]
-    return running[0] if running else None
+    # The list has no addresses (v2 only reports ports on a single pod), and
+    # every caller of this goes on to open the pod's port 22.
+    return with_runtime(api, running[0]) if running else None
 
 
 def _find_or_create_sync_pod(api, cfg, token, pubkey, log, cloud_type=None, woken=None):

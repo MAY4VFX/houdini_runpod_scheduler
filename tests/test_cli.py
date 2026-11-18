@@ -20,8 +20,8 @@ class FakeTransport:
     """URL/method-routed fake for RunPodAPI's injectable transport.
 
     Handlers are looked up by ``(method, url-suffix)``, checked longest
-    suffix first so ``/networkvolumes/vol123`` doesn't accidentally match
-    a generic ``/networkvolumes`` handler meant for the collection.
+    suffix first so ``/network-volumes/vol123`` doesn't accidentally match
+    a generic ``/network-volumes`` handler meant for the collection.
     """
 
     def __init__(self, handlers):
@@ -36,19 +36,24 @@ class FakeTransport:
         raise AssertionError(f"no fake handler for {method} {url}")
 
 
+def _page(key, items):
+    """A v2 list response: wrapped and paginated."""
+    return json.dumps({key: items, "pagination": {"hasNextPage": False, "nextCursor": None}}).encode()
+
+
 def _setup_handlers(volumes=None, templates=None, balance=42.0):
-    volumes = volumes if volumes is not None else [{"id": "vol123", "dataCenterId": "EU-RO-1", "size": 50}]
+    volumes = volumes if volumes is not None else [{"id": "vol123", "dataCenter": "EU-RO-1", "size": 50}]
     templates = templates if templates is not None else []
     return {
-        ("GET", "/pods"): (200, json.dumps([]).encode()),
+        ("GET", "/pods"): (200, _page("pods", [])),
         ("POST", "graphql"): lambda body: (
             (200, json.dumps({"data": {"myself": {"clientBalance": balance}}}).encode())
             if "clientBalance" in body["query"]
             else (200, json.dumps({"data": {"gpuTypes": []}}).encode())
         ),
-        ("GET", "/networkvolumes"): (200, json.dumps(volumes).encode()),
-        ("GET", "/networkvolumes/vol123"): (200, json.dumps(volumes[0] if volumes else {}).encode()),
-        ("GET", "/templates"): (200, json.dumps(templates).encode()),
+        ("GET", "/network-volumes"): (200, _page("networkVolumes", volumes)),
+        ("GET", "/network-volumes/vol123"): (200, json.dumps(volumes[0] if volumes else {}).encode()),
+        ("GET", "/templates"): (200, _page("templates", templates)),
         ("POST", "/templates"): (200, json.dumps({"id": "tpl123", "name": "rpfarm-pod"}).encode()),
     }
 
@@ -140,11 +145,11 @@ def test_setup_non_interactive_without_api_key_fails_cleanly(tmp_path, monkeypat
 def test_setup_creates_volume_and_template_when_none_exist(tmp_path, monkeypatch):
     monkeypatch.setenv("RPFARM_HOME", str(tmp_path))
     handlers = _setup_handlers(volumes=[], templates=[])
-    handlers[("POST", "/networkvolumes")] = (
-        200, json.dumps({"id": "newvol", "dataCenterId": "EU-RO-1", "size": 50}).encode()
+    handlers[("POST", "/network-volumes")] = (
+        200, json.dumps({"id": "newvol", "dataCenter": "EU-RO-1", "size": 50}).encode()
     )
-    handlers[("GET", "/networkvolumes/newvol")] = (
-        200, json.dumps({"id": "newvol", "dataCenterId": "EU-RO-1", "size": 50}).encode()
+    handlers[("GET", "/network-volumes/newvol")] = (
+        200, json.dumps({"id": "newvol", "dataCenter": "EU-RO-1", "size": 50}).encode()
     )
     monkeypatch.setattr(cli, "_transport", FakeTransport(handlers))
     monkeypatch.setattr(houdini_local, "find_houdini_installations", lambda: [])
@@ -174,9 +179,9 @@ def test_setup_rerun_preserves_hand_edited_and_doctor_written_fields(tmp_path, m
     rpcfg.save(existing)
 
     handlers = {
-        ("GET", "/pods"): (200, json.dumps([]).encode()),
+        ("GET", "/pods"): (200, _page("pods", [])),
         ("POST", "graphql"): (200, json.dumps({"data": {"myself": {"clientBalance": 42.0}}}).encode()),
-        ("GET", "/networkvolumes/vol123"): (200, json.dumps({"id": "vol123", "dataCenterId": "EU-RO-1", "size": 50}).encode()),
+        ("GET", "/network-volumes/vol123"): (200, json.dumps({"id": "vol123", "dataCenter": "EU-RO-1", "size": 50}).encode()),
     }
     monkeypatch.setattr(cli, "_transport", FakeTransport(handlers))
     monkeypatch.setattr(houdini_local, "find_houdini_installations", lambda: [])
@@ -201,9 +206,9 @@ def test_setup_rerun_without_api_key_flag_reuses_configured_key(tmp_path, monkey
     rpcfg.save(rpcfg.Config(api_key="storedkey", user="tester", volume_id="vol123", template_id="tpl123"))
 
     handlers = {
-        ("GET", "/pods"): (200, json.dumps([]).encode()),
+        ("GET", "/pods"): (200, _page("pods", [])),
         ("POST", "graphql"): (200, json.dumps({"data": {"myself": {"clientBalance": 42.0}}}).encode()),
-        ("GET", "/networkvolumes/vol123"): (200, json.dumps({"id": "vol123", "dataCenterId": "EU-RO-1", "size": 50}).encode()),
+        ("GET", "/network-volumes/vol123"): (200, json.dumps({"id": "vol123", "dataCenter": "EU-RO-1", "size": 50}).encode()),
     }
     monkeypatch.setattr(cli, "_transport", FakeTransport(handlers))
     monkeypatch.setattr(houdini_local, "find_houdini_installations", lambda: [])
@@ -250,10 +255,10 @@ def test_doctor_all_ok_with_no_sync_pod_running(tmp_path, monkeypatch, capsys):
     (tmp_path / "id_ed25519.pub").write_text("x")
 
     handlers = _setup_handlers()
-    handlers[("GET", "/networkvolumes/vol123")] = (
-        200, json.dumps({"id": "vol123", "size": 50, "dataCenterId": "EU-RO-1"}).encode()
+    handlers[("GET", "/network-volumes/vol123")] = (
+        200, json.dumps({"id": "vol123", "size": 50, "dataCenter": "EU-RO-1"}).encode()
     )
-    handlers[("GET", "/templates")] = (200, json.dumps([{"id": "tpl123", "imageName": "img:latest"}]).encode())
+    handlers[("GET", "/templates")] = (200, _page("templates", [{"id": "tpl123", "image": "img:latest"}]))
     monkeypatch.setattr(cli, "_transport", FakeTransport(handlers))
     monkeypatch.setattr(houdini_local, "find_houdini_installations", lambda: [])
     monkeypatch.setattr("socket.create_connection", lambda *a, **k: (_ for _ in ()).throw(OSError("blocked in test")))
@@ -278,10 +283,10 @@ def test_doctor_names_the_unset_license_server_instead_of_probing_nothing(tmp_pa
     (tmp_path / "id_ed25519.pub").write_text("x")
 
     handlers = _setup_handlers()
-    handlers[("GET", "/networkvolumes/vol123")] = (
-        200, json.dumps({"id": "vol123", "size": 50, "dataCenterId": "EU-RO-1"}).encode()
+    handlers[("GET", "/network-volumes/vol123")] = (
+        200, json.dumps({"id": "vol123", "size": 50, "dataCenter": "EU-RO-1"}).encode()
     )
-    handlers[("GET", "/templates")] = (200, json.dumps([{"id": "tpl123", "imageName": "img:latest"}]).encode())
+    handlers[("GET", "/templates")] = (200, _page("templates", [{"id": "tpl123", "image": "img:latest"}]))
     monkeypatch.setattr(cli, "_transport", FakeTransport(handlers))
     monkeypatch.setattr(houdini_local, "find_houdini_installations", lambda: [])
 
@@ -308,10 +313,10 @@ def test_doctor_probes_the_sesinetd_url_host_and_never_prints_the_secret(tmp_pat
     (tmp_path / "id_ed25519.pub").write_text("x")
 
     handlers = _setup_handlers()
-    handlers[("GET", "/networkvolumes/vol123")] = (
-        200, json.dumps({"id": "vol123", "size": 50, "dataCenterId": "EU-RO-1"}).encode()
+    handlers[("GET", "/network-volumes/vol123")] = (
+        200, json.dumps({"id": "vol123", "size": 50, "dataCenter": "EU-RO-1"}).encode()
     )
-    handlers[("GET", "/templates")] = (200, json.dumps([{"id": "tpl123", "imageName": "img:latest"}]).encode())
+    handlers[("GET", "/templates")] = (200, _page("templates", [{"id": "tpl123", "image": "img:latest"}]))
     monkeypatch.setattr(cli, "_transport", FakeTransport(handlers))
     monkeypatch.setattr(houdini_local, "find_houdini_installations", lambda: [])
 
@@ -426,10 +431,10 @@ def _fake_install(tmp_path, version="22.0.393"):
 
 def _doctor_handlers():
     handlers = _setup_handlers()
-    handlers[("GET", "/networkvolumes/vol123")] = (
-        200, json.dumps({"id": "vol123", "size": 50, "dataCenterId": "EU-RO-1"}).encode())
+    handlers[("GET", "/network-volumes/vol123")] = (
+        200, json.dumps({"id": "vol123", "size": 50, "dataCenter": "EU-RO-1"}).encode())
     handlers[("GET", "/templates")] = (
-        200, json.dumps([{"id": "tpl123", "imageName": "img:latest"}]).encode())
+        200, _page("templates", [{"id": "tpl123", "image": "img:latest"}]))
     return handlers
 
 
@@ -707,7 +712,7 @@ def test_storage_recreate_creates_volume_and_updates_config(tmp_path, monkeypatc
     _write_cfg(tmp_path, volume_id="oldvol", datacenter="EU-RO-1")
 
     handlers = {
-        ("POST", "/networkvolumes"): (200, json.dumps({"id": "newvol", "size": 100, "dataCenterId": "EU-RO-1"}).encode()),
+        ("POST", "/network-volumes"): (200, json.dumps({"id": "newvol", "size": 100, "dataCenter": "EU-RO-1"}).encode()),
     }
     monkeypatch.setattr(cli, "_transport", FakeTransport(handlers))
 
@@ -717,7 +722,7 @@ def test_storage_recreate_creates_volume_and_updates_config(tmp_path, monkeypatc
     assert cfg.volume_id == "newvol"
     out = capsys.readouterr().out
     assert "created new volume newvol" in out
-    assert "networkvolumes/oldvol" in out  # the printed delete-old-volume command
+    assert "network-volumes/oldvol" in out  # the printed delete-old-volume command
 
 
 def test_storage_recreate_with_tar_and_version_installs_houdini(tmp_path, monkeypatch, capsys):
@@ -725,7 +730,7 @@ def test_storage_recreate_with_tar_and_version_installs_houdini(tmp_path, monkey
     _write_cfg(tmp_path, volume_id="oldvol")
 
     handlers = {
-        ("POST", "/networkvolumes"): (200, json.dumps({"id": "newvol", "size": 100, "dataCenterId": "EU-RO-1"}).encode()),
+        ("POST", "/network-volumes"): (200, json.dumps({"id": "newvol", "size": 100, "dataCenter": "EU-RO-1"}).encode()),
     }
     monkeypatch.setattr(cli, "_transport", FakeTransport(handlers))
 
@@ -1013,8 +1018,8 @@ def test_storage_grow_resizes_volume(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("RPFARM_HOME", str(tmp_path))
     _write_cfg(tmp_path)
     handlers = {
-        ("GET", "/networkvolumes/vol123"): (200, json.dumps({"id": "vol123", "size": 50}).encode()),
-        ("PATCH", "/networkvolumes/vol123"): (200, json.dumps({"id": "vol123", "size": 70}).encode()),
+        ("GET", "/network-volumes/vol123"): (200, json.dumps({"id": "vol123", "size": 50}).encode()),
+        ("PATCH", "/network-volumes/vol123"): (200, json.dumps({"id": "vol123", "size": 70}).encode()),
     }
     monkeypatch.setattr(cli, "_transport", FakeTransport(handlers))
     rc = cli.main(["storage", "grow", "+20"])
@@ -1047,10 +1052,12 @@ def test_farm_status_computes_uptime_and_cost_from_real_pod_shape(tmp_path, monk
     monkeypatch.setenv("RPFARM_HOME", str(tmp_path))
     _write_cfg(tmp_path, user="tester")
     pod = {
-        "id": "gpu1", "name": "rpfarm-tester-shotA-abc123-0", "desiredStatus": "RUNNING",
-        "costPerHr": 0.34, "createdAt": "2026-09-03 21:19:39.775 +0000 UTC",
+        # v2 shape: actual `status`, `cost`, ISO timestamps (v1 sent
+        # "2026-09-03 21:19:39.775 +0000 UTC" and `desiredStatus`/`costPerHr`).
+        "id": "gpu1", "name": "rpfarm-tester-shotA-abc123-0", "status": "RUNNING",
+        "cost": 0.34, "createdAt": "2026-09-03T21:19:39.775Z",
     }
-    monkeypatch.setattr(cli, "_transport", FakeTransport({("GET", "/pods"): (200, json.dumps([pod]).encode())}))
+    monkeypatch.setattr(cli, "_transport", FakeTransport({("GET", "/pods"): (200, _page("pods", [pod]))}))
     monkeypatch.setattr(cli.time, "time", lambda: 1788470379.775 + 3600)  # exactly 1h later
     rc = cli.main(["farm", "status"])
     assert rc == 0
@@ -1062,7 +1069,7 @@ def test_farm_status_computes_uptime_and_cost_from_real_pod_shape(tmp_path, monk
 def test_farm_status_prints_no_pods_running(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("RPFARM_HOME", str(tmp_path))
     _write_cfg(tmp_path)
-    monkeypatch.setattr(cli, "_transport", FakeTransport({("GET", "/pods"): (200, json.dumps([]).encode())}))
+    monkeypatch.setattr(cli, "_transport", FakeTransport({("GET", "/pods"): (200, _page("pods", []))}))
     rc = cli.main(["farm", "status"])
     assert rc == 0
     assert "no rpfarm pods running" in capsys.readouterr().out
@@ -1079,7 +1086,7 @@ def test_farm_kill_sync_terminates_matching_pod_only(tmp_path, monkeypatch, caps
 
     def transport(method, url, body, headers):
         if method == "GET" and url.endswith("/pods"):
-            return 200, json.dumps(pods).encode()
+            return 200, _page("pods", pods)
         if method == "DELETE":
             terminated.append(url)
             return 204, b""
@@ -1089,7 +1096,7 @@ def test_farm_kill_sync_terminates_matching_pod_only(tmp_path, monkeypatch, caps
     monkeypatch.setattr(cli, "_health_probe", _idle_health)
     rc = cli.main(["farm", "kill", "--sync"])
     assert rc == 0
-    assert terminated == ["https://rest.runpod.io/v1/pods/sync1"]
+    assert terminated == ["https://api.runpod.io/v2/pods/sync1"]
     assert "terminated rpfarm-sync-tester" in capsys.readouterr().out
 
 
@@ -1106,7 +1113,7 @@ def _idle_health(pod):
 def _farm_kill_transport(pods, terminated):
     def transport(method, url, body, headers):
         if method == "GET" and url.endswith("/pods"):
-            return 200, json.dumps(pods).encode()
+            return 200, _page("pods", pods)
         if method == "DELETE":
             terminated.append(url)
             return 204, b""
@@ -1132,8 +1139,8 @@ def test_farm_kill_all_only_terminates_this_users_own_pods(tmp_path, monkeypatch
     rc = cli.main(["farm", "kill", "--all"])
     assert rc == 0
     assert sorted(terminated) == [
-        "https://rest.runpod.io/v1/pods/mine1",
-        "https://rest.runpod.io/v1/pods/mine2",
+        "https://api.runpod.io/v2/pods/mine1",
+        "https://api.runpod.io/v2/pods/mine2",
     ]
 
 
@@ -1153,7 +1160,7 @@ def test_farm_kill_everyone_terminates_every_rpfarm_pod(tmp_path, monkeypatch, c
     # the human typing "yes".
     rc = cli.main(["farm", "kill", "--everyone", "--yes"])
     assert rc == 0
-    assert sorted(terminated) == sorted(f"https://rest.runpod.io/v1/pods/{p['id']}" for p in pods)
+    assert sorted(terminated) == sorted(f"https://api.runpod.io/v2/pods/{p['id']}" for p in pods)
 
 
 def test_farm_kill_no_flag_refuses(tmp_path, monkeypatch, capsys):
@@ -1177,7 +1184,7 @@ def test_farm_kill_pod_terminates_exact_id(tmp_path, monkeypatch, capsys):
 
     rc = cli.main(["farm", "kill", "--pod", "abc123"])
     assert rc == 0
-    assert terminated == ["https://rest.runpod.io/v1/pods/abc123"]
+    assert terminated == ["https://api.runpod.io/v2/pods/abc123"]
 
 
 # -- the guards that make the default incapable of the real incident ---------
@@ -1258,7 +1265,7 @@ def test_even_if_running_takes_a_busy_pod_but_only_after_confirmation(tmp_path, 
     # says yes
     rc = cli.main(["farm", "kill", "--all", "--even-if-running"], prompt=lambda _p: "yes")
     assert rc == 0
-    assert terminated == ["https://rest.runpod.io/v1/pods/busy1"]
+    assert terminated == ["https://api.runpod.io/v2/pods/busy1"]
 
 
 def test_everyone_needs_confirmation_before_taking_another_users_pod(tmp_path, monkeypatch, capsys):
@@ -1310,7 +1317,7 @@ def test_kill_pod_by_id_with_the_override_still_asks(tmp_path, monkeypatch, caps
                   prompt=lambda _p: "yes")
 
     assert rc == 0
-    assert terminated == ["https://rest.runpod.io/v1/pods/busy1"]
+    assert terminated == ["https://api.runpod.io/v2/pods/busy1"]
 
 
 # -- costs ------------------------------------------------------------------
@@ -1512,7 +1519,7 @@ def test_housekeeping_failure_message_survives_the_merged_log():
 
 def test_setup_records_the_adopted_volumes_region(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("RPFARM_HOME", str(tmp_path))
-    volumes = [{"id": "vol123", "dataCenterId": "US-KS-2", "size": 50}]
+    volumes = [{"id": "vol123", "dataCenter": "US-KS-2", "size": 50}]
     monkeypatch.setattr(cli, "_transport", FakeTransport(_setup_handlers(volumes=volumes)))
     monkeypatch.setattr(houdini_local, "find_houdini_installations", lambda: [])
     monkeypatch.setattr(rpcfg, "rclone_bin", lambda *a, **k: str(tmp_path / "bin" / "rclone"))
@@ -1527,7 +1534,7 @@ def test_setup_warns_loudly_when_the_volumes_region_is_not_the_recorded_one(tmp_
     silently."""
     monkeypatch.setenv("RPFARM_HOME", str(tmp_path))
     _write_cfg(tmp_path, datacenter="EU-RO-1")
-    volumes = [{"id": "vol123", "dataCenterId": "US-KS-2", "size": 50}]
+    volumes = [{"id": "vol123", "dataCenter": "US-KS-2", "size": 50}]
     monkeypatch.setattr(cli, "_transport", FakeTransport(_setup_handlers(volumes=volumes)))
     monkeypatch.setattr(houdini_local, "find_houdini_installations", lambda: [])
     monkeypatch.setattr(rpcfg, "rclone_bin", lambda *a, **k: str(tmp_path / "bin" / "rclone"))
@@ -1546,8 +1553,8 @@ def test_doctor_fails_when_the_volume_is_in_another_region_than_the_pods(tmp_pat
     (tmp_path / "id_ed25519.pub").write_text("x")
 
     handlers = _setup_handlers()
-    handlers[("GET", "/networkvolumes/vol123")] = (
-        200, json.dumps({"id": "vol123", "size": 50, "dataCenterId": "US-KS-2"}).encode()
+    handlers[("GET", "/network-volumes/vol123")] = (
+        200, json.dumps({"id": "vol123", "size": 50, "dataCenter": "US-KS-2"}).encode()
     )
     monkeypatch.setattr(cli, "_transport", FakeTransport(handlers))
     monkeypatch.setattr(houdini_local, "find_houdini_installations", lambda: [])
@@ -1566,8 +1573,8 @@ def test_doctor_says_nothing_about_regions_when_they_agree(tmp_path, monkeypatch
     (tmp_path / "id_ed25519.pub").write_text("x")
 
     handlers = _setup_handlers()
-    handlers[("GET", "/networkvolumes/vol123")] = (
-        200, json.dumps({"id": "vol123", "size": 50, "dataCenterId": "US-KS-2"}).encode()
+    handlers[("GET", "/network-volumes/vol123")] = (
+        200, json.dumps({"id": "vol123", "size": 50, "dataCenter": "US-KS-2"}).encode()
     )
     monkeypatch.setattr(cli, "_transport", FakeTransport(handlers))
     monkeypatch.setattr(houdini_local, "find_houdini_installations", lambda: [])

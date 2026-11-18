@@ -47,7 +47,7 @@ stat
 {
   create -1
   modify -1
-  author may@maymac01-2.local
+  author may@mac.lan
   access 0777
 }
 color UT_Color RGB 0.8 0.8 0.8
@@ -107,7 +107,7 @@ stat
 {
   create -1
   modify -1
-  author may@maymac01-2.local
+  author may@mac.lan
   access 0777
 }
 color UT_Color RGB 0.8 0.8 0.8
@@ -168,7 +168,7 @@ stat
 {
   create -1
   modify -1
-  author may@maymac01-2.local
+  author may@mac.lan
   access 0777
 }
 color UT_Color RGB 0.8 0.8 0.8
@@ -654,7 +654,7 @@ stat
 {
   create -1
   modify -1
-  author may@maymac01-2.local
+  author may@mac.lan
   access 0777
 }
 color UT_Color RGB 0.478 0.478 0.478

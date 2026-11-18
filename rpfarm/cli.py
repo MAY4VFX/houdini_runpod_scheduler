@@ -185,7 +185,7 @@ def _find_running_sync_pod(api, cfg):
     name = rppods.sync_pod_name(cfg.user)
     for p in api.list_pods(name):
         if p.get("name") == name and p.get("desiredStatus") == "RUNNING":
-            return p
+            return rppods.with_runtime(api, p)
     return None
 
 
@@ -1240,7 +1240,7 @@ def cmd_storage_recreate(args):
 
     print("Projects re-sync from local copies on their next cook -- local is the source of truth.")
     print("When you're done migrating, delete the OLD volume yourself (never automatic):")
-    print(f'  curl -X DELETE -H "Authorization: Bearer $RUNPOD_API_KEY" https://rest.runpod.io/v1/networkvolumes/{old_id}')
+    print(f'  curl -X DELETE -H "Authorization: Bearer $RUNPOD_API_KEY" https://api.runpod.io/v2/network-volumes/{old_id}')
     return 0
 
 
