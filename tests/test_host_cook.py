@@ -72,7 +72,7 @@ def test_terminate_pod_calls_delete_and_logs_only_the_pod_id_and_status(monkeypa
     host_cook.terminate_pod("pod123", "secret-key-value")
 
     assert seen["method"] == "DELETE"
-    assert seen["url"] == "https://rest.runpod.io/v1/pods/pod123"
+    assert seen["url"] == "https://api.runpod.io/v2/pods/pod123"
     assert seen["auth"] == "Bearer secret-key-value"
     out = capsys.readouterr().out
     assert "pod123" in out
@@ -116,13 +116,34 @@ def test_list_cook_pods_filters_by_user_prefix_and_cook_id_segment(monkeypatch):
     ]
 
     def fake_urlopen(req, timeout=None):
-        return _FakeResponse(200, json.dumps(pods).encode())
+        return _FakeResponse(200, json.dumps({"pods": pods, "pagination": {"hasNextPage": False}}).encode())
 
     monkeypatch.setattr(host_cook.urllib.request, "urlopen", fake_urlopen)
 
     found = host_cook.list_cook_pods("may", "cookid1", "key")
 
     assert [p["id"] for p in found] == ["a"]
+
+
+def test_list_cook_pods_follows_the_v2_pagination_cursor(monkeypatch):
+    pages = {
+        "https://api.runpod.io/v2/pods": {
+            "pods": [{"id": "a", "name": "rpfarm-may-airship-cookid1-1"}],
+            "pagination": {"hasNextPage": True, "nextCursor": "c1"}},
+        "https://api.runpod.io/v2/pods?cursor=c1": {
+            "pods": [{"id": "b", "name": "rpfarm-may-airship-cookid1-2"}],
+            "pagination": {"hasNextPage": False, "nextCursor": None}},
+    }
+    urls = []
+
+    def fake_urlopen(req, timeout=None):
+        urls.append(req.full_url)
+        return _FakeResponse(200, json.dumps(pages[req.full_url]).encode())
+
+    monkeypatch.setattr(host_cook.urllib.request, "urlopen", fake_urlopen)
+
+    assert [p["id"] for p in host_cook.list_cook_pods("may", "cookid1", "key")] == ["a", "b"]
+    assert len(urls) == 2
 
 
 def test_list_cook_pods_degrades_to_empty_on_any_failure(monkeypatch):
