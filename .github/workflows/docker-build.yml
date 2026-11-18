@@ -69,7 +69,7 @@ jobs:
           TEMPLATE_ID: ${{ vars.RPFARM_TEMPLATE_ID }}
           IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.short_sha }}
         run: |
-          curl -sf -X PATCH "https://rest.runpod.io/v1/templates/$TEMPLATE_ID" \
+          curl -sf -X PATCH "https://api.runpod.io/v2/templates/$TEMPLATE_ID" \
             -H "Authorization: Bearer $RUNPOD_API_KEY" \
             -H "Content-Type: application/json" \
-            -d "{\"imageName\":\"$IMAGE\"}"
+            -d "{\"image\":\"$IMAGE\"}"
